@@ -1,4 +1,6 @@
-# The binary locates the packaged DuckDB relative to itself. Each rpath must
+# Cargo commands run from the native workspace so this configuration and
+# native/rust-toolchain.toml are discovered together. The binary locates the
+# packaged DuckDB relative to itself. Each rpath must
 # match where the bundler places the library (tauri.linux.conf.json puts the
 # .so in /usr/lib/viewda next to /usr/bin/viewda; tauri.macos.conf.json puts
 # the .dylib in Viewda.app/Contents/Frameworks). CI verifies the resolution
