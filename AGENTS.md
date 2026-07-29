@@ -11,6 +11,9 @@ Rules that apply to every task:
 - The UI never touches data or files. Everything goes through the Rust
   core's engine protocol; data crosses as Arrow columns.
 - Layers stay swappable: third-party UI dependencies live behind adapters.
+- `native/data-engine` must not depend on Tauri.
+- Frontend code imports Tauri APIs only through
+  `native/desktop/ui/src/desktop.ts`.
 
 Git:
 
@@ -21,3 +24,6 @@ Git:
 - Atomic commits: one logical change each.
 - User-facing changes get a plain-language entry in `## Unreleased` of
   `CHANGELOG.md` — same commit as the change.
+- `CHANGELOG.md` describes the user-visible delta from the latest release.
+  Changes to unreleased work edit the existing entry instead of recording
+  intermediate states that users never received.
