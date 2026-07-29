@@ -1,0 +1,15 @@
+# The binary locates the packaged DuckDB relative to itself. Each rpath must
+# match where the bundler places the library (tauri.linux.conf.json puts the
+# .so in /usr/lib/viewda next to /usr/bin/viewda; tauri.macos.conf.json puts
+# the .dylib in Viewda.app/Contents/Frameworks). CI verifies the resolution
+# from the extracted package with the dev environment stripped. Windows needs
+# no rpath: tauri.windows.conf.json installs duckdb.dll beside viewda.exe.
+
+[target.x86_64-unknown-linux-gnu]
+rustflags = ["-C", "link-arg=-Wl,-rpath,$ORIGIN/../lib/viewda"]
+
+[target.aarch64-apple-darwin]
+rustflags = ["-C", "link-arg=-Wl,-rpath,@loader_path/../Frameworks"]
+
+[target.x86_64-apple-darwin]
+rustflags = ["-C", "link-arg=-Wl,-rpath,@loader_path/../Frameworks"]

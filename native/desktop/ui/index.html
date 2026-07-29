@@ -1,0 +1,29 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="color-scheme" content="light dark" />
+    <style>
+      :root {
+        --app-background: #f4f3ef;
+        --update-accent: #725814;
+        --update-accent-strong: #62501f;
+        background: var(--app-background);
+      }
+
+      @media (prefers-color-scheme: dark) {
+        :root {
+          --app-background: #141617;
+          --update-accent: #dfc783;
+          --update-accent-strong: #ead8a4;
+        }
+      }
+    </style>
+    <title>Viewda</title>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>
