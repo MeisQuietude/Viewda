@@ -905,8 +905,10 @@ jobs:
         run: |
           version=${GITHUB_REF_NAME#v}
           debian_version=$(scripts/release.sh debian-version "$version")
+          debian_asset="Viewda_${debian_version}_amd64.deb"
+          release_deb="Viewda_${version}_amd64.deb"
           expected=(
-            "Viewda_${debian_version}_amd64.deb"
+            "$debian_asset"
             "Viewda_${version}_amd64.AppImage"
             "Viewda_${version}_amd64.AppImage.sig"
             "Viewda_${version}_arm64.dmg"
@@ -926,6 +928,12 @@ jobs:
           for asset in "${expected[@]}"; do
             test -f "release-assets/$asset"
           done
+          # Debian needs `~` inside the package for prerelease ordering, but
+          # GitHub normalizes that character in asset names. Publish the
+          # SemVer filename while preserving the verified package metadata.
+          test ! -e "release-assets/$release_deb"
+          mv "release-assets/$debian_asset" "release-assets/$release_deb"
+          expected[0]="$release_deb"
           scripts/release.sh updater-manifest \
             "$version" \
             "$RUNNER_TEMP/release-notes.md" \
@@ -941,9 +949,8 @@ jobs:
       - name: Create the draft GitHub Release
         run: |
           version=${GITHUB_REF_NAME#v}
-          debian_version=$(scripts/release.sh debian-version "$version")
           expected=(
-            "Viewda_${debian_version}_amd64.deb"
+            "Viewda_${version}_amd64.deb"
             "Viewda_${version}_amd64.AppImage"
             "Viewda_${version}_amd64.AppImage.sig"
             "Viewda_${version}_arm64.dmg"
