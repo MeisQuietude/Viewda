@@ -27,7 +27,7 @@ a file someone just handed you.
    attempted automatically at most once per 24 hours and available on demand;
    automatic checks can be disabled.
 3. **The basics are free forever.** Viewing, SQL, export, metadata — never
-   behind a paywall. MIT, in the open.
+   behind a paywall. Apache License 2.0, in the open.
 
 ## What it does today
 
@@ -118,4 +118,4 @@ it. Publishing refreshes the Stable and Latest update channels on GitHub Pages.
 
 ## License
 
-[MIT](LICENSE)
+[Apache License 2.0](LICENSE)
