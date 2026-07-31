@@ -893,7 +893,9 @@ jobs:
             "$RUNNER_TEMP/release-notes.md"
 
       # Tag-only updater companions and the directly installable artifacts are
-      # merged without their Actions ZIP transport, then uploaded to the draft.
+      # merged without their Actions ZIP transport. Detached signatures remain
+      # build inputs: their values are embedded in the updater manifest instead
+      # of being exposed as separate release assets.
       - name: Download the verified release inputs
         uses: actions/download-artifact@v8
         with:
@@ -901,7 +903,7 @@ jobs:
           path: release-assets
           merge-multiple: true
 
-      - name: Verify and checksum the release assets
+      - name: Verify the release inputs
         run: |
           version=${GITHUB_REF_NAME#v}
           debian_version=$(scripts/release.sh debian-version "$version")
@@ -939,12 +941,6 @@ jobs:
             "$RUNNER_TEMP/release-notes.md" \
             release-assets \
             "release-assets/Viewda_${version}_updater.json"
-          expected+=("Viewda_${version}_updater.json")
-          (
-            cd release-assets
-            sha256sum "${expected[@]}" > SHA256SUMS
-          )
-          cat release-assets/SHA256SUMS
 
       - name: Create the draft GitHub Release
         run: |
@@ -952,18 +948,13 @@ jobs:
           expected=(
             "Viewda_${version}_amd64.deb"
             "Viewda_${version}_amd64.AppImage"
-            "Viewda_${version}_amd64.AppImage.sig"
             "Viewda_${version}_arm64.dmg"
             "Viewda_${version}_arm64.app.tar.gz"
-            "Viewda_${version}_arm64.app.tar.gz.sig"
             "Viewda_${version}_universal.dmg"
             "Viewda_${version}_x64.dmg"
             "Viewda_${version}_x64.app.tar.gz"
-            "Viewda_${version}_x64.app.tar.gz.sig"
             "Viewda_${version}_x64-setup.exe"
-            "Viewda_${version}_x64-setup.exe.sig"
             "Viewda_${version}_updater.json"
-            SHA256SUMS
           )
           assets=()
           for asset in "${expected[@]}"; do

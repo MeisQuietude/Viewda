@@ -113,9 +113,10 @@ git push origin v0.1.0-alpha.1
 
 The tag workflow requires a GitHub-verified tag on `main` and the
 `TAURI_SIGNING_PRIVATE_KEY` repository secret. It builds and verifies every
-installer, signs update payloads, writes `SHA256SUMS`, and creates a draft
-release. Smoke-test its assets on physical target machines before publishing
-it. Publishing refreshes the Stable and Latest update channels on GitHub Pages.
+installer, embeds update signatures in the updater manifest, and creates a
+draft release. Smoke-test its assets on physical target machines before
+publishing it. Publishing refreshes the Stable and Latest update channels on
+GitHub Pages.
 
 ## License
 
