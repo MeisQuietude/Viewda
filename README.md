@@ -4,7 +4,8 @@ A free, fully offline, cross-platform Apache Parquet viewer. Double-click a
 file bigger than your RAM — it opens in under a second, in an interface that
 belongs on your desktop.
 
-> **Status: pre-alpha.** No public release is available yet.
+> **Status: early alpha.** Published builds are available under
+> [GitHub Releases](https://github.com/MeisQuietude/Viewda/releases).
 
 ## Why
 
@@ -46,7 +47,7 @@ a file someone just handed you.
 
 ## Installation
 
-There is no release to install yet. Once the first build appears under
+Download the latest build from
 [GitHub Releases](https://github.com/MeisQuietude/Viewda/releases):
 
 - **macOS:** choose Apple silicon for an M-series Mac, Intel for an older Intel
