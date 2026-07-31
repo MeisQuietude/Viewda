@@ -7,10 +7,10 @@ authors = ["Stepan Savelyev <mail@meisquietude.com>"]
 description = "A free, offline Apache Parquet viewer."
 edition = "2024"
 homepage = "https://github.com/MeisQuietude/Viewda"
-license = "MIT"
+license = "Apache-2.0"
 repository = "https://github.com/MeisQuietude/Viewda"
 rust-version = "1.97.1"
-version = "0.0.1"
+version = "0.1.0-alpha.1"
 
 [workspace.dependencies]
 semver = { version = "=1.0.28", features = ["serde"] }

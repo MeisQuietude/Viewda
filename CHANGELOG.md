@@ -8,6 +8,8 @@ Backward-incompatible entries start with **Breaking:**.
 
 ## Unreleased
 
+## 0.1.0-alpha.1 — 2026-08-01
+
 ### Added
 
 - The initial Viewda desktop application shell and native installers for Linux
