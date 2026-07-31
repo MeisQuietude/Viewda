@@ -1,0 +1,8 @@
+.DS_Store
+native/target/
+native/.duckdb/
+native/.toolchain/
+native/desktop/gen/
+native/desktop/node_modules/
+native/desktop/ui/dist/
+native/desktop/ui/node_modules/

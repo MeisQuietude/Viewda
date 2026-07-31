@@ -1,0 +1,46 @@
+name: Publish update channels
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: viewda-update-channels
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    name: Publish stable and latest manifests
+    runs-on: ubuntu-24.04
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Check out the release tooling
+        uses: actions/checkout@v6
+
+      - name: Install the pinned Node.js
+        run: scripts/install-node.sh
+
+      - name: Build the channel endpoints
+        run: scripts/publish-update-channels.sh "$RUNNER_TEMP/site"
+
+      - name: Configure GitHub Pages
+        uses: actions/configure-pages@v5
+
+      - name: Upload the Pages artifact
+        uses: actions/upload-pages-artifact@v4
+        with:
+          path: ${{ runner.temp }}/site
+
+      - name: Deploy the channel endpoints
+        id: deployment
+        uses: actions/deploy-pages@v4

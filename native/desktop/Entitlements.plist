@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<!--
+  Ad hoc signatures carry no Team ID, and macOS 26 library validation
+  refuses any non-platform library without a shared one - the packaged
+  DuckDB would be rejected by dyld at launch. Disabling library validation
+  applies to the whole process. Viewda mitigates that exposure by supporting
+  no dynamically loaded plugins or runtime code downloads, using a fixed
+  bundle rpath, and verifying the upstream DuckDB archive before thinning
+  and signing it (scripts/install-duckdb.sh). Remove this entitlement once a
+  real signing identity (Apple Developer ID) gives both binaries a common
+  Team ID.
+-->
+<dict>
+  <key>com.apple.security.cs.disable-library-validation</key>
+  <true/>
+</dict>
+</plist>

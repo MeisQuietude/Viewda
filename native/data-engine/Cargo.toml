@@ -1,0 +1,19 @@
+[package]
+name = "viewda-data-engine"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+duckdb = "=1.10505.0"
+parquet = "=58.4.0"
+serde.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+arrow-array = "=58.4.0"
+arrow-schema = "=58.4.0"
+tempfile = "=3.27.0"

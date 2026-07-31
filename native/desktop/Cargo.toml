@@ -1,0 +1,35 @@
+[package]
+name = "viewda-desktop"
+version.workspace = true
+authors.workspace = true
+description.workspace = true
+edition.workspace = true
+homepage.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[lib]
+name = "viewda_desktop"
+crate-type = ["lib"]
+
+[[bin]]
+name = "viewda"
+path = "src/main.rs"
+
+[build-dependencies]
+tauri-build = { version = "=2.6.3", features = [] }
+
+[dependencies]
+semver.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tauri.workspace = true
+tauri-plugin-dialog = "=2.7.2"
+tauri-plugin-opener = "=2.5.4"
+tauri-plugin-updater = "=2.10.1"
+thiserror.workspace = true
+viewda-data-engine = { path = "../data-engine" }
+
+[dev-dependencies]
+tempfile = "=3.27.0"
