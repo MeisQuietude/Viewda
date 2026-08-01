@@ -12,7 +12,12 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { App, formatFileSize } from "./App";
 import * as desktop from "./desktop";
 
+vi.mock("./data-grid/DataGrid", () => ({
+  DataGrid: () => <section aria-label="Data">Grid data</section>,
+}));
+
 let requestSettings: (() => void) | undefined;
+let requestOpenSource: (() => void) | undefined;
 let reportUpdate: ((update: desktop.UpdateInfo) => void) | undefined;
 let reportOpenedSource: (() => void) | undefined;
 
@@ -24,6 +29,7 @@ afterEach(() => {
 
 beforeEach(() => {
   requestSettings = undefined;
+  requestOpenSource = undefined;
   reportUpdate = undefined;
   reportOpenedSource = undefined;
   vi.spyOn(desktop, "getEngineStatus").mockResolvedValue({
@@ -35,7 +41,10 @@ beforeEach(() => {
   vi.spyOn(desktop, "openRecentSource").mockRejectedValue(
     new desktop.OpenSourceError("unsupported"),
   );
-  vi.spyOn(desktop, "onOpenSourceRequested").mockResolvedValue(() => {});
+  vi.spyOn(desktop, "onOpenSourceRequested").mockImplementation((handler) => {
+    requestOpenSource = handler;
+    return Promise.resolve(() => {});
+  });
   vi.spyOn(desktop, "onSettingsRequested").mockImplementation((handler) => {
     requestSettings = handler;
     return Promise.resolve(() => {});
@@ -159,6 +168,7 @@ describe("App", () => {
       },
     ]);
     vi.spyOn(desktop, "openRecentSource").mockResolvedValue({
+      generation: 1,
       displayName: "events.parquet",
       sizeBytes: 2048,
       rowCount: 4,
@@ -243,7 +253,8 @@ describe("App", () => {
   });
 
   it("opens a local source and renders its path-free summary", async () => {
-    vi.spyOn(desktop, "openLocalSource").mockResolvedValue({
+    const openSource = vi.spyOn(desktop, "openLocalSource").mockResolvedValue({
+      generation: 1,
       displayName: "people.parquet",
       sizeBytes: 1_300_000,
       rowCount: 1_234_567,
@@ -284,10 +295,16 @@ describe("App", () => {
     expect(await screen.findByText("people.parquet")).toHaveClass(
       "file-context",
     );
+    expect(screen.queryByText("Parquet source")).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Data" })).toHaveAttribute(
+      "aria-pressed",
+      "true",
+    );
+    expect(screen.getByLabelText("Data")).toHaveTextContent("Grid data");
+    fireEvent.click(screen.getByRole("button", { name: "Structure" }));
     expect(container.querySelector(".source-heading")).not.toHaveTextContent(
       "people.parquet",
     );
-    expect(screen.queryByText("Parquet source")).not.toBeInTheDocument();
 
     const facts = screen.getByLabelText("File facts");
     expect(
@@ -328,9 +345,33 @@ describe("App", () => {
     expect(schema?.querySelector(".schema-logical")).toBeNull();
     expect(schema?.querySelector("kbd")).toBeNull();
     expect(
-      screen.getByText("Data preview is not in this build yet."),
-    ).toHaveClass("data-preview-note");
+      screen.queryByText("Data preview is not in this build yet."),
+    ).not.toBeInTheDocument();
     expect(screen.queryByText(/[/\\]people\.parquet/)).not.toBeInTheDocument();
+
+    fireEvent.keyDown(window, { key: "1", ctrlKey: true });
+    expect(screen.getByRole("button", { name: "Data" })).toHaveAttribute(
+      "aria-pressed",
+      "true",
+    );
+    fireEvent.keyDown(window, { key: "2", metaKey: true });
+    expect(screen.getByRole("button", { name: "Structure" })).toHaveAttribute(
+      "aria-pressed",
+      "true",
+    );
+
+    fireEvent.keyDown(window, { key: "1", ctrlKey: true });
+    openSource.mockRejectedValueOnce(
+      new desktop.OpenSourceError("permissionDenied"),
+    );
+    await act(async () => requestOpenSource?.());
+    expect(screen.getByRole("button", { name: "Data" })).toHaveAttribute(
+      "aria-pressed",
+      "true",
+    );
+    expect(await screen.findByRole("alert")).toHaveTextContent(
+      "Viewda cannot read that file. Check its permissions and try again.",
+    );
   });
 
   it("treats dialog cancellation as an unchanged empty state", async () => {
@@ -366,6 +407,7 @@ describe("App", () => {
       .mockResolvedValueOnce(null)
       .mockResolvedValueOnce({
         source: {
+          generation: 2,
           displayName: "launched.parquet",
           sizeBytes: 128,
           rowCount: 3,
@@ -395,6 +437,7 @@ describe("App", () => {
     );
     vi.spyOn(desktop, "takeOpenedSource").mockResolvedValue({
       source: {
+        generation: 2,
         displayName: "launched.parquet",
         sizeBytes: 128,
         rowCount: 3,
@@ -410,6 +453,7 @@ describe("App", () => {
       resolveRestore({
         version: "0.1.0",
         source: {
+          generation: 1,
           displayName: "restored.parquet",
           sizeBytes: 256,
           rowCount: 6,
@@ -631,6 +675,7 @@ describe("App", () => {
       version: "0.1.0",
       sourceError: null,
       source: {
+        generation: 2,
         displayName: "restored.parquet",
         sizeBytes: 4096,
         rowCount: 12,

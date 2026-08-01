@@ -39,11 +39,14 @@ import {
   type UpdateSettings,
   UpdateCommandError,
 } from "./desktop";
+import { DataGrid } from "./data-grid/DataGrid";
 
 type Readiness =
   | { kind: "loading" }
   | { kind: "ready"; engine: EngineStatus }
   | { kind: "error" };
+
+type SourceMode = "data" | "structure";
 
 type TitlebarUpdate =
   | { kind: "available"; version: string; simulated: boolean }
@@ -65,6 +68,7 @@ export function App() {
   const [readiness, setReadiness] = useState<Readiness>({ kind: "loading" });
   const [source, setSource] = useState<SourceSummary | null>(null);
   const [sourceError, setSourceError] = useState<SourceErrorCode | null>(null);
+  const [sourceMode, setSourceMode] = useState<SourceMode>("data");
   const [opening, setOpening] = useState(false);
   const [recentSources, setRecentSources] = useState<RecentSource[]>([]);
   const [updateSettings, setUpdateSettings] = useState<UpdateSettings | null>(
@@ -97,6 +101,7 @@ export function App() {
       const selected = await openLocalSource();
       if (selected !== null) {
         setSource(selected);
+        setSourceMode("data");
       }
     } catch (error) {
       setSourceError(
@@ -113,6 +118,7 @@ export function App() {
 
     try {
       setSource(await openRecentSource(id));
+      setSourceMode("data");
     } catch (error) {
       const code =
         error instanceof OpenSourceError ? error.code : "unsupported";
@@ -137,6 +143,7 @@ export function App() {
       setSourceError(activation.sourceError);
       if (activation.source !== null) {
         setSource(activation.source);
+        setSourceMode("data");
       }
     } catch {
       setSourceError("unsupported");
@@ -313,6 +320,8 @@ export function App() {
         });
         if (!receivedOpenedSource.current && restored.source !== null) {
           setSource(restored.source);
+          setSourceMode("data");
+          setSourceMode("data");
         }
         if (!receivedOpenedSource.current && restored.sourceError !== null) {
           setSourceError(restored.sourceError);
@@ -387,6 +396,33 @@ export function App() {
     },
     [],
   );
+
+  useEffect(() => {
+    if (source === null) {
+      return;
+    }
+    const switchMode = (event: globalThis.KeyboardEvent) => {
+      if (!(event.metaKey || event.ctrlKey) || event.altKey) {
+        return;
+      }
+      const target = event.target;
+      if (
+        target instanceof HTMLElement &&
+        (target.isContentEditable ||
+          target instanceof HTMLInputElement ||
+          target instanceof HTMLSelectElement ||
+          target instanceof HTMLTextAreaElement)
+      ) {
+        return;
+      }
+      if (event.key === "1" || event.key === "2") {
+        event.preventDefault();
+        setSourceMode(event.key === "1" ? "data" : "structure");
+      }
+    };
+    window.addEventListener("keydown", switchMode);
+    return () => window.removeEventListener("keydown", switchMode);
+  }, [source]);
 
   const runUpdateCheck = useCallback(async (allowDowngrade = false) => {
     setCheckingUpdates(true);
@@ -559,6 +595,9 @@ export function App() {
         <span className={`file-context${source === null ? " is-empty" : ""}`}>
           {source?.displayName ?? "No file open"}
         </span>
+        {source !== null && (
+          <ModeSwitch mode={sourceMode} onMode={setSourceMode} />
+        )}
         <TitlebarUpdateStatus
           update={titlebarUpdate}
           onActivate={installAvailableUpdate}
@@ -567,7 +606,7 @@ export function App() {
         />
       </header>
 
-      <div className="workspace">
+      <div className={`workspace${source === null ? " is-empty" : ""}`}>
         {source === null ? (
           <section className="empty-state" aria-label="Open a Parquet file">
             {readiness.kind === "loading" && (
@@ -599,12 +638,27 @@ export function App() {
             {sourceError !== null && <SourceErrorMessage code={sourceError} />}
           </section>
         ) : (
-          <SourceDetails
-            opening={opening}
-            source={source}
-            sourceError={sourceError}
-            onOpen={openSource}
-          />
+          <>
+            <div className="mode-panel" hidden={sourceMode !== "data"}>
+              <div className="data-mode">
+                {sourceError !== null && (
+                  <SourceErrorMessage code={sourceError} />
+                )}
+                <DataGrid key={source.generation} source={source} />
+              </div>
+            </div>
+            <div
+              className="mode-panel structure-mode-panel"
+              hidden={sourceMode !== "structure"}
+            >
+              <SourceDetails
+                opening={opening}
+                source={source}
+                sourceError={sourceError}
+                onOpen={openSource}
+              />
+            </div>
+          </>
         )}
       </div>
 
@@ -688,6 +742,35 @@ function RecentFiles({
         </li>
       ))}
     </ul>
+  );
+}
+
+function ModeSwitch({
+  mode,
+  onMode,
+}: {
+  mode: SourceMode;
+  onMode: (mode: SourceMode) => void;
+}) {
+  return (
+    <div className="mode-switch" role="group" aria-label="File view">
+      <button
+        type="button"
+        aria-pressed={mode === "data"}
+        title={`Data (${shortcutModifier}1)`}
+        onClick={() => onMode("data")}
+      >
+        Data
+      </button>
+      <button
+        type="button"
+        aria-pressed={mode === "structure"}
+        title={`Structure (${shortcutModifier}2)`}
+        onClick={() => onMode("structure")}
+      >
+        Structure
+      </button>
+    </div>
   );
 }
 
@@ -1151,9 +1234,6 @@ function SourceDetails({
           ))}
         </ul>
       </div>
-      <p className="data-preview-note">
-        Data preview is not in this build yet.
-      </p>
     </section>
   );
 }

@@ -14,6 +14,9 @@ Backward-incompatible entries start with **Breaking:**.
 - Viewda appears as an Open With option for Apache Parquet files without
   replacing the user's default application. Settings can make Viewda the
   default through the platform-supported user action.
+- Local Parquet rows now open in a virtualized data grid with type-aware
+  values, memory-bounded raw TSV copying, row selection, column resize, pin and
+  hide controls, and a Data or Structure view switch.
 
 ### Fixed
 

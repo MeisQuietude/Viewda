@@ -7,9 +7,11 @@ use std::{ffi::OsString, path::Path};
 
 use serde::Serialize;
 use tauri::{Emitter, Manager};
-use viewda_data_engine::{SourceError, SourceSummary};
+use viewda_data_engine::SourceError;
 
-use crate::{OpenSourceError, OpenedSource, SourceOpenIntent, inspect_selected_source};
+use crate::{
+    OpenSourceError, OpenedSource, OpenedSourceInfo, SourceOpenIntent, inspect_selected_source,
+};
 
 pub const OPENED_SOURCE_AVAILABLE_EVENT: &str = "opened-source-available";
 
@@ -21,7 +23,7 @@ pub struct PendingOpenedSource(Mutex<Option<OpenedSourceActivation>>);
 #[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct OpenedSourceActivation {
-    source: Option<SourceSummary>,
+    source: Option<OpenedSourceInfo>,
     source_error: Option<SourceError>,
 }
 
@@ -37,8 +39,8 @@ pub fn open_path(app: &tauri::AppHandle, path: PathBuf) {
     let inspected = inspect_selected_source(app, path, SourceOpenIntent::Explicit)
         .and_then(crate::require_explicit_source);
     let activation = match inspected {
-        Ok((_, summary)) => OpenedSourceActivation {
-            source: Some(summary),
+        Ok((_, source)) => OpenedSourceActivation {
+            source: Some(source),
             source_error: None,
         },
         Err(OpenSourceError::Source(error)) => OpenedSourceActivation {

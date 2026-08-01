@@ -13,9 +13,11 @@ use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Manager, State};
 use tauri_plugin_updater::{Update, UpdaterExt};
 use thiserror::Error;
-use viewda_data_engine::{SourceError, SourceSummary};
+use viewda_data_engine::SourceError;
 
-use crate::{OpenSourceError, OpenedSource, SourceOpenIntent, inspect_selected_source};
+use crate::{
+    OpenSourceError, OpenedSource, OpenedSourceInfo, SourceOpenIntent, inspect_selected_source,
+};
 
 const UPDATE_STATE_FILE: &str = "updates.json";
 const STABLE_ENDPOINT: &str = "https://meisquietude.github.io/Viewda/updates/stable.json";
@@ -61,7 +63,7 @@ pub struct UpdateInfo {
 #[serde(rename_all = "camelCase")]
 pub struct PostUpdateState {
     pub version: String,
-    pub source: Option<SourceSummary>,
+    pub source: Option<OpenedSourceInfo>,
     pub source_error: Option<SourceError>,
 }
 
@@ -307,7 +309,7 @@ pub async fn take_post_update_state(
             .await
             .map_err(|_| UpdateError::Storage)?;
             match inspected {
-                Ok(Some((_, summary))) => (Some(summary), None),
+                Ok(Some((_, source))) => (Some(source), None),
                 Ok(None) => (None, None),
                 Err(OpenSourceError::Source(error)) => (None, Some(error)),
                 Err(OpenSourceError::Recent(_)) => return Err(UpdateError::Storage),

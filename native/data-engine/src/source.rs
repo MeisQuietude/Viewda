@@ -68,14 +68,7 @@ pub enum SourceError {
 
 /// Reads local Parquet metadata without loading row values or exposing the path.
 pub fn inspect_local_source(path: &Path) -> Result<SourceSummary, SourceError> {
-    let mut file = File::open(path).map_err(map_io_error)?;
-    let metadata = file.metadata().map_err(map_io_error)?;
-
-    if !metadata.is_file() {
-        return Err(SourceError::Unsupported);
-    }
-
-    verify_magic(&mut file, metadata.len())?;
+    let (mut file, size_bytes) = open_local_source(path)?;
     file.seek(SeekFrom::Start(0)).map_err(map_io_error)?;
 
     let reader = SerializedFileReader::new(file).map_err(map_parquet_error)?;
@@ -98,11 +91,23 @@ pub fn inspect_local_source(path: &Path) -> Result<SourceSummary, SourceError> {
 
     Ok(SourceSummary {
         display_name,
-        size_bytes: metadata.len(),
+        size_bytes,
         row_count,
         row_group_count: parquet_metadata.num_row_groups(),
         schema,
     })
+}
+
+pub(crate) fn open_local_source(path: &Path) -> Result<(File, u64), SourceError> {
+    let mut file = File::open(path).map_err(map_io_error)?;
+    let metadata = file.metadata().map_err(map_io_error)?;
+
+    if !metadata.is_file() {
+        return Err(SourceError::Unsupported);
+    }
+
+    verify_magic(&mut file, metadata.len())?;
+    Ok((file, metadata.len()))
 }
 
 fn verify_magic(file: &mut File, size: u64) -> Result<(), SourceError> {

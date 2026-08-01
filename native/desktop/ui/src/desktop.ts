@@ -14,6 +14,7 @@ export interface EngineStatus {
 }
 
 export interface SourceSummary {
+  generation: number;
   displayName: string;
   sizeBytes: number;
   rowCount: number;
@@ -98,6 +99,18 @@ export type SourceErrorCode =
   | "corruptFooter"
   | "unsupported";
 
+export type DataWindowErrorCode =
+  | "noSourceOpen"
+  | "sourceChanged"
+  | "notFound"
+  | "permissionDenied"
+  | "notParquet"
+  | "corruptSource"
+  | "unsupported"
+  | "windowTooLarge"
+  | "queryEngineUnavailable"
+  | "encodingFailed";
+
 export type UpdateErrorCode =
   "unavailable" | "storage" | "noPendingUpdate" | "manualInstall";
 
@@ -105,6 +118,13 @@ export class OpenSourceError extends Error {
   constructor(readonly code: SourceErrorCode) {
     super(code);
     this.name = "OpenSourceError";
+  }
+}
+
+export class DataWindowCommandError extends Error {
+  constructor(readonly code: DataWindowErrorCode) {
+    super(code);
+    this.name = "DataWindowCommandError";
   }
 }
 
@@ -208,6 +228,22 @@ async function invokeSource<T>(
   }
 }
 
+export async function getDataWindow(
+  generation: number,
+  rowOffset: number,
+  rowCount: number,
+): Promise<ArrayBuffer> {
+  try {
+    return await invoke<ArrayBuffer>("get_data_window", {
+      generation,
+      rowOffset,
+      rowCount,
+    });
+  } catch (error) {
+    throw new DataWindowCommandError(readDataWindowErrorCode(error));
+  }
+}
+
 export function onOpenSourceRequested(
   handler: () => void,
 ): Promise<UnlistenFn> {
@@ -241,6 +277,28 @@ function readSourceErrorCode(error: unknown): SourceErrorCode {
       code === "notParquet" ||
       code === "corruptFooter" ||
       code === "unsupported"
+    ) {
+      return code;
+    }
+  }
+
+  return "unsupported";
+}
+
+function readDataWindowErrorCode(error: unknown): DataWindowErrorCode {
+  if (typeof error === "object" && error !== null && "code" in error) {
+    const code = error.code;
+    if (
+      code === "noSourceOpen" ||
+      code === "sourceChanged" ||
+      code === "notFound" ||
+      code === "permissionDenied" ||
+      code === "notParquet" ||
+      code === "corruptSource" ||
+      code === "unsupported" ||
+      code === "windowTooLarge" ||
+      code === "queryEngineUnavailable" ||
+      code === "encodingFailed"
     ) {
       return code;
     }
