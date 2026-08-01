@@ -94,6 +94,10 @@ jobs:
       - name: Verify the workspace
         run: scripts/run.sh check
 
+      - name: Check metadata-only examples
+        working-directory: native/data-engine
+        run: cargo check --no-default-features --examples
+
       - name: Build the Linux artifact
         run: scripts/run.sh bundle
 

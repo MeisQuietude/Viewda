@@ -1,16 +1,22 @@
 //! Shell-independent data operations for Viewda.
 
 mod source;
+#[cfg(feature = "query-engine")]
 mod window;
 
+#[cfg(feature = "query-engine")]
 use duckdb::Connection;
+#[cfg(feature = "query-engine")]
 use serde::Serialize;
+#[cfg(feature = "query-engine")]
 use thiserror::Error;
 
 pub use source::{SchemaField, SourceError, SourceSummary, inspect_local_source};
+#[cfg(feature = "query-engine")]
 pub use window::{DataWindowError, DataWindowReader};
 
 /// Describes the data engine backing the desktop shell.
+#[cfg(feature = "query-engine")]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct EngineStatus {
@@ -23,6 +29,7 @@ pub struct EngineStatus {
 }
 
 /// Stable readiness failures for the packaged query engine.
+#[cfg(feature = "query-engine")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error, Serialize)]
 #[serde(tag = "code", rename_all = "camelCase")]
 pub enum EngineError {
@@ -32,6 +39,7 @@ pub enum EngineError {
 }
 
 /// Opens packaged DuckDB in memory and reports a readiness response.
+#[cfg(feature = "query-engine")]
 pub fn engine_status() -> Result<EngineStatus, EngineError> {
     let query_engine = Connection::open_in_memory()
         .map_err(|_| EngineError::QueryEngineUnavailable)?
@@ -45,7 +53,7 @@ pub fn engine_status() -> Result<EngineStatus, EngineError> {
     })
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "query-engine"))]
 mod tests {
     use super::*;
 
