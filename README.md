@@ -32,7 +32,12 @@ a file someone just handed you.
 
 ## What it does today
 
-- Opens a local Parquet file and shows its size, row counts and schema.
+- **Opens local Parquet files**, from the app or straight from your file
+  manager, and keeps recent ones a click away.
+- **Shows the data**: every row of the file, values exactly as stored, any
+  selection ready to copy as TSV.
+- **Shows the structure**: size, row counts, row groups and the nested schema
+  as the file really stores it.
 
 ## What it will do
 
@@ -99,7 +104,7 @@ release version instead.
 Prepare and verify the version on a branch:
 
 ```sh
-scripts/release.sh prepare 0.1.0-alpha.1
+scripts/release.sh prepare 0.1.0-alpha.2
 # Move Unreleased entries under a dated version heading.
 scripts/run.sh check
 ```
@@ -108,8 +113,8 @@ Commit the version and changelog together. After that commit reaches `main`,
 create and push a signed annotated tag:
 
 ```sh
-git tag --sign --annotate v0.1.0-alpha.1 --message "Viewda 0.1.0-alpha.1"
-git push origin v0.1.0-alpha.1
+git tag --sign --annotate v0.1.0-alpha.2 --message "Viewda 0.1.0-alpha.2"
+git push origin v0.1.0-alpha.2
 ```
 
 The tag workflow requires a GitHub-verified tag on `main` and the

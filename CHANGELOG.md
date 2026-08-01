@@ -8,6 +8,8 @@ Backward-incompatible entries start with **Breaking:**.
 
 ## Unreleased
 
+## 0.1.0-alpha.2 — 2026-08-02
+
 ### Added
 
 - The start screen now lists and reopens up to eight recent files.
