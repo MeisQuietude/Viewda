@@ -16,6 +16,8 @@ Backward-incompatible entries start with **Breaking:**.
 
 - The macOS native title bar no longer draws the Viewda window name over the
   in-app header.
+- Source errors restored after an update now show their specific recovery
+  message instead of the generic unsupported-file error.
 
 ## 0.1.0-alpha.1 — 2026-08-01
 
