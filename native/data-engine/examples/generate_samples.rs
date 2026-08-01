@@ -304,13 +304,13 @@ fn print_usage() {
            wide  --rows 1000 --columns 10000 --batch-rows 50 --row-group-rows 250\n\
          \n\
          Common options:\n\
-          --null-rate RATE       Null fraction, 0 <= RATE < 1 (default: 0.1)\n\
+           --null-rate RATE       Null fraction, 0 <= RATE < 1 (default: 0.1)\n\
            --seed SEED            Deterministic unsigned integer seed (default: 42)\n\
            --batch-rows ROWS      Rows materialized per Arrow batch\n\
            --row-group-rows ROWS  Maximum rows per Parquet row group\n\
            --columns COLUMNS      Top-level fields (wide default: 10000)\n\
            --rows ROWS            Total rows for rows and wide\n\
-          --target-size SIZE     Size target; accepts GB/GiB suffixes and may overshoot by one row group"
+           --target-size SIZE     Size target; accepts GB/GiB suffixes and may overshoot by one row group"
     );
 }
 

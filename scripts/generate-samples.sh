@@ -9,6 +9,7 @@
 # target filesystem needs room for the complete output; Cargo also needs room
 # for release artifacts under native/target. The only tool prerequisite is
 # rustup; native/rust-toolchain.toml selects the repository toolchain.
+# ArrowWriter buffers one row group: size peaks near 170 MB by default; lower --row-group-rows to reduce it.
 
 set -euo pipefail
 
