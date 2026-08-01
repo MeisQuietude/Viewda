@@ -414,7 +414,7 @@ button:focus-visible,
   align-items: center;
   padding: 0 10px;
   overflow: hidden;
-  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  grid-template-columns: auto minmax(0, 1fr);
   gap: 20px;
   border: 0;
   border-radius: 5px;

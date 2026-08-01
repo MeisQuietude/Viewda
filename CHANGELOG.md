@@ -10,8 +10,7 @@ Backward-incompatible entries start with **Breaking:**.
 
 ### Added
 
-- The start screen now lists up to eight recent files and reopens them without
-  accepting local paths back from the interface.
+- The start screen now lists and reopens up to eight recent files.
 
 ### Fixed
 

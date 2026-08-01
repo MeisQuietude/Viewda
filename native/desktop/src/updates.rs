@@ -15,7 +15,7 @@ use tauri_plugin_updater::{Update, UpdaterExt};
 use thiserror::Error;
 use viewda_data_engine::{SourceError, SourceSummary};
 
-use crate::{OpenedSource, inspect_selected_source};
+use crate::{OpenSourceError, OpenedSource, inspect_selected_source};
 
 const UPDATE_STATE_FILE: &str = "updates.json";
 const STABLE_ENDPOINT: &str = "https://meisquietude.github.io/Viewda/updates/stable.json";
@@ -307,7 +307,8 @@ pub async fn take_post_update_state(
                     .map_err(|_| UpdateError::Storage)?;
             match inspected {
                 Ok((_, summary)) => (Some(summary), None),
-                Err(error) => (None, Some(error.source_error())),
+                Err(OpenSourceError::Source(error)) => (None, Some(error)),
+                Err(OpenSourceError::Recent(_)) => (None, Some(SourceError::Unsupported)),
             }
         }
         None => (None, None),

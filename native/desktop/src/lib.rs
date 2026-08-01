@@ -40,61 +40,18 @@ impl OpenedSource {
         self.path
             .lock()
             .map(|path| path.clone())
-            .map_err(|_| OpenSourceError::Storage)
+            .map_err(|_| RecentSourceError::Storage.into())
     }
 }
 
 /// Stable failures exposed by every source-opening command.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error, Serialize)]
-#[serde(tag = "code", rename_all = "camelCase")]
+#[serde(untagged)]
 enum OpenSourceError {
-    #[error("The selected file no longer exists.")]
-    NotFound,
-    #[error("Viewda does not have permission to read the selected file.")]
-    PermissionDenied,
-    #[error("The selected file is not a Parquet file.")]
-    NotParquet,
-    #[error("The Parquet footer is damaged or incomplete.")]
-    CorruptFooter,
-    #[error("This source is not supported yet.")]
-    Unsupported,
-    #[error("The recent-source list could not be read or saved.")]
-    Storage,
-    #[error("The requested recent source does not exist.")]
-    UnknownRecent,
-}
-
-impl From<SourceError> for OpenSourceError {
-    fn from(error: SourceError) -> Self {
-        match error {
-            SourceError::NotFound => Self::NotFound,
-            SourceError::PermissionDenied => Self::PermissionDenied,
-            SourceError::NotParquet => Self::NotParquet,
-            SourceError::CorruptFooter => Self::CorruptFooter,
-            SourceError::Unsupported => Self::Unsupported,
-        }
-    }
-}
-
-impl From<RecentSourceError> for OpenSourceError {
-    fn from(error: RecentSourceError) -> Self {
-        match error {
-            RecentSourceError::Storage => Self::Storage,
-            RecentSourceError::UnknownRecent => Self::UnknownRecent,
-        }
-    }
-}
-
-impl OpenSourceError {
-    fn source_error(self) -> SourceError {
-        match self {
-            Self::NotFound => SourceError::NotFound,
-            Self::PermissionDenied => SourceError::PermissionDenied,
-            Self::NotParquet => SourceError::NotParquet,
-            Self::CorruptFooter => SourceError::CorruptFooter,
-            Self::Unsupported | Self::Storage | Self::UnknownRecent => SourceError::Unsupported,
-        }
-    }
+    #[error(transparent)]
+    Source(#[from] SourceError),
+    #[error(transparent)]
+    Recent(#[from] RecentSourceError),
 }
 
 /// Reports whether the shell-independent engine is linked and responsive.
@@ -123,14 +80,12 @@ async fn open_local_source(
         let Some(selected) = selected else {
             return Ok(None);
         };
-        let path = selected
-            .into_path()
-            .map_err(|_| OpenSourceError::Unsupported)?;
+        let path = selected.into_path().map_err(|_| SourceError::Unsupported)?;
 
         inspect_selected_source(&app, path).map(Some)
     })
     .await
-    .map_err(|_| OpenSourceError::Unsupported)??;
+    .map_err(|_| SourceError::Unsupported)??;
 
     Ok(inspected.map(|(_, summary)| summary))
 }
@@ -149,7 +104,7 @@ fn inspect_selected_source_at_path(
     opened_source: &OpenedSource,
     path: PathBuf,
 ) -> Result<(PathBuf, SourceSummary), OpenSourceError> {
-    let summary = inspect_local_source(&path).map_err(OpenSourceError::from)?;
+    let summary = inspect_local_source(&path)?;
     remember_inspected_source(recent_sources_path, opened_source, path, summary)
 }
 
@@ -169,7 +124,7 @@ fn remember_inspected_source(
     *opened_source
         .path
         .lock()
-        .map_err(|_| OpenSourceError::Storage)? = Some(canonical_path.clone());
+        .map_err(|_| RecentSourceError::Storage)? = Some(canonical_path.clone());
     Ok((canonical_path, summary))
 }
 
@@ -193,7 +148,7 @@ async fn open_recent_source(
     let result =
         tauri::async_runtime::spawn_blocking(move || open_recent_source_with_app(&app, &id))
             .await
-            .map_err(|_| OpenSourceError::Unsupported)?;
+            .map_err(|_| SourceError::Unsupported)?;
 
     result.map(|(_, summary)| summary)
 }
@@ -215,7 +170,7 @@ fn open_recent_source_at_path(
         .recents
         .path_for_id_path(recent_sources_path, id)?;
     let result = inspect_selected_source_at_path(Some(recent_sources_path), opened_source, path);
-    if result == Err(OpenSourceError::NotFound) {
+    if result == Err(SourceError::NotFound.into()) {
         // Preserve the existing source error even if cleaning a damaged store fails.
         let _ = opened_source.recents.remove_path(recent_sources_path, id);
     }
@@ -394,7 +349,7 @@ mod tests {
                 &opened_source,
                 missing,
             ),
-            Err(OpenSourceError::NotFound)
+            Err(SourceError::NotFound.into())
         );
     }
 
@@ -409,7 +364,7 @@ mod tests {
                 &opened_source,
                 "recent-that-does-not-exist",
             ),
-            Err(OpenSourceError::UnknownRecent)
+            Err(RecentSourceError::UnknownRecent.into())
         );
     }
 
@@ -463,13 +418,27 @@ mod tests {
 
         assert_eq!(
             open_recent_source_at_path(&recent_sources_path, &opened_source, "recent-1"),
-            Err(OpenSourceError::NotFound)
+            Err(SourceError::NotFound.into())
         );
         assert_eq!(
             opened_source
                 .recents
                 .path_for_id_path(&recent_sources_path, "recent-1"),
             Err(RecentSourceError::UnknownRecent)
+        );
+    }
+
+    #[test]
+    fn source_and_recent_errors_keep_their_flat_wire_format() {
+        assert_eq!(
+            serde_json::to_value(OpenSourceError::from(SourceError::NotFound))
+                .expect("source error JSON"),
+            serde_json::json!({ "code": "notFound" })
+        );
+        assert_eq!(
+            serde_json::to_value(OpenSourceError::from(RecentSourceError::UnknownRecent))
+                .expect("recent-source error JSON"),
+            serde_json::json!({ "code": "unknownRecent" })
         );
     }
 

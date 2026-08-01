@@ -74,16 +74,16 @@ impl RecentSourcesStore {
         let mut stored = read_state_file(state_path)?;
         let canonical_home = home.and_then(|home| fs::canonicalize(home).ok());
         let original_len = stored.entries.len();
-        stored.entries.retain(|entry| entry.path.exists());
+        stored.entries.retain(|entry| entry.path.is_file());
         if stored.entries.len() != original_len {
             write_state_file(state_path, &stored)?;
         }
 
-        stored
+        Ok(stored
             .entries
             .iter()
             .map(|entry| display_entry(entry, canonical_home.as_deref()))
-            .collect()
+            .collect())
     }
 
     pub(crate) fn record_path(
@@ -153,17 +153,13 @@ pub(crate) fn state_path(app: &AppHandle) -> Result<PathBuf, RecentSourceError> 
         .map_err(|_| RecentSourceError::Storage)
 }
 
-fn display_entry(
-    entry: &StoredRecentSource,
-    home: Option<&Path>,
-) -> Result<RecentSource, RecentSourceError> {
+fn display_entry(entry: &StoredRecentSource, home: Option<&Path>) -> RecentSource {
     let name = entry
         .path
         .file_name()
         .map(|name| name.to_string_lossy().into_owned())
-        .filter(|name| !name.is_empty())
-        .ok_or(RecentSourceError::Storage)?;
-    let parent = entry.path.parent().ok_or(RecentSourceError::Storage)?;
+        .unwrap_or_default();
+    let parent = entry.path.parent().unwrap_or(Path::new(""));
     let directory = home
         .and_then(|home| parent.strip_prefix(home).ok())
         .map(|relative| {
@@ -185,11 +181,11 @@ fn display_entry(
             )
         });
 
-    Ok(RecentSource {
+    RecentSource {
         id: entry.id.clone(),
         name,
         directory,
-    })
+    }
 }
 
 fn read_state_file(path: &Path) -> Result<StoredRecentSources, RecentSourceError> {
