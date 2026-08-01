@@ -143,6 +143,12 @@ button {
   margin: 12px;
 }
 
+.data-grid-loading {
+  margin: auto;
+  color: #777c7c;
+  font-size: 13px;
+}
+
 .data-grid-view {
   position: relative;
   display: flex;
@@ -929,6 +935,10 @@ button:focus-visible,
 
   .empty-message {
     color: #afb4b3;
+  }
+
+  .data-grid-loading {
+    color: #8d9391;
   }
 
   .shortcut-hints dt {
