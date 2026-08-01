@@ -1,4 +1,6 @@
 import {
+  lazy,
+  Suspense,
   useCallback,
   useEffect,
   useRef,
@@ -39,7 +41,11 @@ import {
   type UpdateSettings,
   UpdateCommandError,
 } from "./desktop";
-import { DataGrid } from "./data-grid/DataGrid";
+
+const DataGrid = lazy(async () => {
+  const { DataGrid: Grid } = await import("./data-grid/DataGrid");
+  return { default: Grid };
+});
 
 type Readiness =
   | { kind: "loading" }
@@ -191,6 +197,12 @@ export function App() {
     return () => {
       active = false;
     };
+  }, [readiness.kind]);
+
+  useEffect(() => {
+    if (readiness.kind === "ready") {
+      void import("./data-grid/DataGrid");
+    }
   }, [readiness.kind]);
 
   useEffect(() => {
@@ -644,7 +656,15 @@ export function App() {
                 {sourceError !== null && (
                   <SourceErrorMessage code={sourceError} />
                 )}
-                <DataGrid key={source.generation} source={source} />
+                <Suspense
+                  fallback={
+                    <p className="data-grid-loading" role="status">
+                      Loading data grid…
+                    </p>
+                  }
+                >
+                  <DataGrid key={source.generation} source={source} />
+                </Suspense>
               </div>
             </div>
             <div
