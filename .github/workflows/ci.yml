@@ -229,10 +229,15 @@ jobs:
             host-architecture: arm64
             artifact-architecture: arm64
             dmg-architecture: aarch64
+            verify-workspace: true
           - runner: macos-26-intel
             host-architecture: x86_64
             artifact-architecture: x64
             dmg-architecture: x64
+            # The arm64 runner already covers macOS workspace behavior. The
+            # release build and launch probe below remain the x64 architecture
+            # gate without compiling the debug and test profiles again.
+            verify-workspace: false
     runs-on: ${{ matrix.runner }}
     env:
       CARGO_SYSTEM_LAYER: ${{ matrix.runner }}
@@ -281,7 +286,12 @@ jobs:
         run: test "$(uname -m)" = "${{ matrix.host-architecture }}"
 
       - name: Verify the workspace
+        if: ${{ matrix.verify-workspace }}
         run: scripts/run.sh check
+
+      - name: Prepare the artifact build
+        if: ${{ !matrix.verify-workspace }}
+        run: scripts/run.sh setup
 
       - name: Build the macOS ${{ matrix.artifact-architecture }} artifact
         run: scripts/run.sh bundle
