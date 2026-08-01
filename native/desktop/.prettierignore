@@ -1,3 +1,4 @@
 gen
+linux/*.hbs
 node_modules
 ui/dist

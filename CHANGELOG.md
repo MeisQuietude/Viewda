@@ -11,6 +11,9 @@ Backward-incompatible entries start with **Breaking:**.
 ### Added
 
 - The start screen now lists and reopens up to eight recent files.
+- Viewda appears as an Open With option for Apache Parquet files without
+  replacing the user's default application. Settings can make Viewda the
+  default through the platform-supported user action.
 
 ### Fixed
 

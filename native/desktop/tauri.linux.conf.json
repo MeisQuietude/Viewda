@@ -5,8 +5,10 @@
     "linux": {
       "deb": {
         "section": "devel",
+        "desktopTemplate": "linux/Viewda.desktop.hbs",
         "files": {
-          "/usr/lib/viewda/libduckdb.so": "../.duckdb/libduckdb.so"
+          "/usr/lib/viewda/libduckdb.so": "../.duckdb/libduckdb.so",
+          "/usr/share/mime/packages/viewda.xml": "linux/application-vnd.apache.parquet.xml"
         }
       }
     }

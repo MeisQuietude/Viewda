@@ -1,10 +1,21 @@
 //! Tauri adapter for the Viewda desktop application.
 
+mod default_application;
+mod launch;
 mod recents;
 mod updates;
 
 use std::{path::PathBuf, sync::Mutex};
 
+#[cfg(not(target_os = "macos"))]
+use std::ffi::OsString;
+
+use default_application::{get_default_application_status, set_default_application};
+#[cfg(not(target_os = "macos"))]
+use launch::open_from_args;
+#[cfg(target_os = "macos")]
+use launch::open_path;
+use launch::{PendingOpenedSource, take_opened_source};
 use recents::{RecentSource, RecentSourceError, RecentSourcesStore};
 use serde::Serialize;
 use tauri::{
@@ -30,17 +41,57 @@ const SETTINGS_REQUESTED_EVENT: &str = "settings-requested";
 const UPDATE_AVAILABLE_EVENT: &str = "update-available";
 
 #[derive(Default)]
+struct OpenedSourceState {
+    path: Option<PathBuf>,
+    blocks_restore: bool,
+}
+
+#[derive(Default)]
 struct OpenedSource {
-    path: Mutex<Option<PathBuf>>,
+    state: Mutex<OpenedSourceState>,
     recents: RecentSourcesStore,
 }
 
 impl OpenedSource {
-    fn current_path(&self) -> Result<Option<PathBuf>, OpenSourceError> {
-        self.path
+    fn lock_state(&self) -> Result<std::sync::MutexGuard<'_, OpenedSourceState>, OpenSourceError> {
+        self.state
             .lock()
-            .map(|path| path.clone())
             .map_err(|_| RecentSourceError::Storage.into())
+    }
+
+    fn mark_explicit(&self) -> Result<(), OpenSourceError> {
+        self.lock_state()?.blocks_restore = true;
+        Ok(())
+    }
+
+    fn remember_opened_path(
+        &self,
+        recent_sources_path: Option<&std::path::Path>,
+        path: PathBuf,
+        intent: SourceOpenIntent,
+    ) -> Result<bool, OpenSourceError> {
+        let mut state = self.lock_state()?;
+        if intent == SourceOpenIntent::Restore && state.blocks_restore {
+            return Ok(false);
+        }
+        state.path = Some(path.clone());
+        if intent == SourceOpenIntent::Explicit {
+            state.blocks_restore = true;
+        }
+        if let Some(recent_sources_path) = recent_sources_path {
+            // Keep source state and recents in the same order when restore races an explicit open.
+            // The source is already open; history remains best-effort.
+            let _ = self.recents.record_path(recent_sources_path, &path);
+        }
+        Ok(true)
+    }
+
+    fn current_path(&self) -> Result<Option<PathBuf>, OpenSourceError> {
+        Ok(self.lock_state()?.path.clone())
+    }
+
+    fn blocks_restore(&self) -> Result<bool, OpenSourceError> {
+        Ok(self.lock_state()?.blocks_restore)
     }
 }
 
@@ -52,6 +103,12 @@ enum OpenSourceError {
     Source(#[from] SourceError),
     #[error(transparent)]
     Recent(#[from] RecentSourceError),
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SourceOpenIntent {
+    Explicit,
+    Restore,
 }
 
 /// Reports whether the shell-independent engine is linked and responsive.
@@ -82,7 +139,7 @@ async fn open_local_source(
         };
         let path = selected.into_path().map_err(|_| SourceError::Unsupported)?;
 
-        inspect_selected_source(&app, path).map(Some)
+        inspect_selected_source(&app, path, SourceOpenIntent::Explicit)
     })
     .await
     .map_err(|_| SourceError::Unsupported)??;
@@ -93,19 +150,35 @@ async fn open_local_source(
 fn inspect_selected_source(
     app: &tauri::AppHandle,
     path: PathBuf,
-) -> Result<(PathBuf, SourceSummary), OpenSourceError> {
+    intent: SourceOpenIntent,
+) -> Result<Option<(PathBuf, SourceSummary)>, OpenSourceError> {
     let opened_source = app.state::<OpenedSource>();
     let recent_sources_path = recents::state_path(app).ok();
-    inspect_selected_source_at_path(recent_sources_path.as_deref(), opened_source.inner(), path)
+    inspect_selected_source_at_path(
+        recent_sources_path.as_deref(),
+        opened_source.inner(),
+        path,
+        intent,
+    )
 }
 
 fn inspect_selected_source_at_path(
     recent_sources_path: Option<&std::path::Path>,
     opened_source: &OpenedSource,
     path: PathBuf,
-) -> Result<(PathBuf, SourceSummary), OpenSourceError> {
-    let summary = inspect_local_source(&path)?;
-    remember_inspected_source(recent_sources_path, opened_source, path, summary)
+    intent: SourceOpenIntent,
+) -> Result<Option<(PathBuf, SourceSummary)>, OpenSourceError> {
+    if intent == SourceOpenIntent::Restore && opened_source.blocks_restore()? {
+        return Ok(None);
+    }
+    let summary = match inspect_local_source(&path) {
+        Ok(summary) => summary,
+        Err(_) if intent == SourceOpenIntent::Restore && opened_source.blocks_restore()? => {
+            return Ok(None);
+        }
+        Err(error) => return Err(error.into()),
+    };
+    remember_inspected_source(recent_sources_path, opened_source, path, summary, intent)
 }
 
 fn remember_inspected_source(
@@ -113,19 +186,23 @@ fn remember_inspected_source(
     opened_source: &OpenedSource,
     path: PathBuf,
     summary: SourceSummary,
-) -> Result<(PathBuf, SourceSummary), OpenSourceError> {
+    intent: SourceOpenIntent,
+) -> Result<Option<(PathBuf, SourceSummary)>, OpenSourceError> {
     let canonical_path = std::fs::canonicalize(&path).unwrap_or(path);
-    if let Some(recent_sources_path) = recent_sources_path {
-        // Opening a source is the primary operation; history is best-effort.
-        let _ = opened_source
-            .recents
-            .record_path(recent_sources_path, &canonical_path);
+    if !opened_source.remember_opened_path(recent_sources_path, canonical_path.clone(), intent)? {
+        return Ok(None);
     }
-    *opened_source
-        .path
-        .lock()
-        .map_err(|_| RecentSourceError::Storage)? = Some(canonical_path.clone());
-    Ok((canonical_path, summary))
+    Ok(Some((canonical_path, summary)))
+}
+
+fn require_explicit_source(
+    source: Option<(PathBuf, SourceSummary)>,
+) -> Result<(PathBuf, SourceSummary), OpenSourceError> {
+    debug_assert!(
+        source.is_some(),
+        "an explicit source open cannot be superseded by restore"
+    );
+    source.ok_or_else(|| SourceError::Unsupported.into())
 }
 
 /// Returns existing recent sources without exposing their paths.
@@ -169,7 +246,13 @@ fn open_recent_source_at_path(
     let path = opened_source
         .recents
         .path_for_id_path(recent_sources_path, id)?;
-    let result = inspect_selected_source_at_path(Some(recent_sources_path), opened_source, path);
+    let result = inspect_selected_source_at_path(
+        Some(recent_sources_path),
+        opened_source,
+        path,
+        SourceOpenIntent::Explicit,
+    )
+    .and_then(require_explicit_source);
     if result == Err(SourceError::NotFound.into()) {
         // Preserve the existing source error even if cleaning a damaged store fails.
         let _ = opened_source.recents.remove_path(recent_sources_path, id);
@@ -226,12 +309,35 @@ fn manual_update_check_dialog(
 /// Starts the Viewda desktop application.
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    tauri::Builder::default()
+    let builder = tauri::Builder::default();
+    #[cfg(not(target_os = "macos"))]
+    let builder = builder.plugin(tauri_plugin_single_instance::init(|app, args, cwd| {
+        open_from_args(
+            app,
+            args.into_iter().map(OsString::from),
+            std::path::Path::new(&cwd),
+        );
+        if let Some(window) = app.get_webview_window("main") {
+            let _ = window.show();
+            let _ = window.set_focus();
+        }
+    }));
+
+    builder
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
         .manage(OpenedSource::default())
+        .manage(PendingOpenedSource::default())
         .manage(PendingUpdate::default())
         .manage(UpdateStateStore::default())
+        .setup(|_app| {
+            #[cfg(not(target_os = "macos"))]
+            {
+                let cwd = std::env::current_dir().unwrap_or_default();
+                open_from_args(_app.handle(), std::env::args_os(), &cwd);
+            }
+            Ok(())
+        })
         .menu(|app| {
             // Built on top of the default menu, never a replacement: on
             // macOS the first submenu always becomes the application menu,
@@ -313,6 +419,9 @@ pub fn run() {
             open_local_source,
             get_recent_sources,
             open_recent_source,
+            take_opened_source,
+            get_default_application_status,
+            set_default_application,
             get_update_settings,
             set_update_settings,
             check_for_update,
@@ -321,8 +430,20 @@ pub fn run() {
             take_post_update_state,
             open_releases_page
         ])
-        .run(tauri::generate_context!())
-        .expect("Viewda desktop runtime failed");
+        .build(tauri::generate_context!())
+        .expect("Viewda desktop runtime failed")
+        .run(|_app, _event| {
+            #[cfg(target_os = "macos")]
+            if let tauri::RunEvent::Opened { urls } = _event
+                && let Some(path) = urls.into_iter().find_map(|url| url.to_file_path().ok())
+            {
+                open_path(_app, path);
+                if let Some(window) = _app.get_webview_window("main") {
+                    let _ = window.show();
+                    let _ = window.set_focus();
+                }
+            }
+        });
 }
 
 #[cfg(test)]
@@ -348,6 +469,7 @@ mod tests {
                 Some(&directory.path().join("recents.json")),
                 &opened_source,
                 missing,
+                SourceOpenIntent::Explicit,
             ),
             Err(SourceError::NotFound.into())
         );
@@ -389,8 +511,10 @@ mod tests {
             &opened_source,
             source_path.clone(),
             summary.clone(),
+            SourceOpenIntent::Explicit,
         )
-        .expect("history storage is best-effort");
+        .expect("history storage is best-effort")
+        .expect("explicit source is accepted");
 
         assert_eq!(
             opened.0,
@@ -440,6 +564,99 @@ mod tests {
                 .expect("recent-source error JSON"),
             serde_json::json!({ "code": "unknownRecent" })
         );
+    }
+
+    #[test]
+    fn explicit_activation_prevents_restore_from_replacing_the_native_source() {
+        let opened_source = OpenedSource::default();
+        let launched = PathBuf::from("launched.parquet");
+
+        assert!(
+            opened_source
+                .remember_opened_path(None, launched.clone(), SourceOpenIntent::Explicit)
+                .expect("source state")
+        );
+        assert!(
+            !opened_source
+                .remember_opened_path(
+                    None,
+                    PathBuf::from("restored.parquet"),
+                    SourceOpenIntent::Restore,
+                )
+                .expect("source state")
+        );
+        assert_eq!(opened_source.current_path(), Ok(Some(launched)));
+    }
+
+    #[test]
+    fn restore_bumps_recents_only_when_it_becomes_the_opened_source() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let recent_sources_path = directory.path().join("recents.json");
+        let restored_path = directory.path().join("restored.parquet");
+        let explicit_path = directory.path().join("explicit.parquet");
+        std::fs::write(&restored_path, b"restored source").expect("restored fixture");
+        std::fs::write(&explicit_path, b"explicit source").expect("explicit fixture");
+        let opened_source = OpenedSource::default();
+        opened_source
+            .recents
+            .record_path(&recent_sources_path, &restored_path)
+            .expect("restored recent");
+        opened_source
+            .recents
+            .record_path(&recent_sources_path, &explicit_path)
+            .expect("explicit recent");
+        let summary = SourceSummary {
+            display_name: "source.parquet".to_owned(),
+            size_bytes: 1,
+            row_count: 1,
+            row_group_count: 1,
+            schema: Vec::new(),
+        };
+        let first_recent_id = || {
+            let stored: serde_json::Value = serde_json::from_slice(
+                &std::fs::read(&recent_sources_path).expect("recent sources"),
+            )
+            .expect("recent sources JSON");
+            stored["entries"][0]["id"]
+                .as_str()
+                .expect("recent source id")
+                .to_owned()
+        };
+
+        assert!(
+            remember_inspected_source(
+                Some(&recent_sources_path),
+                &opened_source,
+                restored_path.clone(),
+                summary.clone(),
+                SourceOpenIntent::Restore,
+            )
+            .expect("restore source state")
+            .is_some()
+        );
+        assert_eq!(first_recent_id(), "recent-1");
+
+        remember_inspected_source(
+            Some(&recent_sources_path),
+            &opened_source,
+            explicit_path,
+            summary.clone(),
+            SourceOpenIntent::Explicit,
+        )
+        .expect("explicit source state")
+        .expect("explicit source is accepted");
+        assert!(
+            remember_inspected_source(
+                Some(&recent_sources_path),
+                &opened_source,
+                restored_path,
+                summary,
+                SourceOpenIntent::Restore,
+            )
+            .expect("restore source state")
+            .is_none()
+        );
+        assert_eq!(first_recent_id(), "recent-2");
     }
 
     #[test]

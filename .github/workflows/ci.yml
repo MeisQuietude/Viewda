@@ -131,11 +131,19 @@ jobs:
             | grep -F "$DUCKDB_LIB_DIR/libduckdb.so"
           dpkg-deb --contents "$package" \
             | grep -F 'usr/lib/viewda/libduckdb.so'
+          dpkg-deb --contents "$package" \
+            | grep -F 'usr/share/mime/packages/viewda.xml'
           extracted=$(mktemp -d)
           trap 'rm -rf "$extracted"' EXIT
           dpkg-deb --extract "$package" "$extracted"
           grep -Fx 'Categories=Development;' \
             "$extracted/usr/share/applications/Viewda.desktop"
+          grep -Fx 'Exec=viewda %f' \
+            "$extracted/usr/share/applications/Viewda.desktop"
+          grep -Fx 'MimeType=application/vnd.apache.parquet' \
+            "$extracted/usr/share/applications/Viewda.desktop"
+          grep -F 'mime-type type="application/vnd.apache.parquet"' \
+            "$extracted/usr/share/mime/packages/viewda.xml"
           # Resolution is checked with the dev environment stripped: the
           # installed package must stand on its own RUNPATH.
           resolved_library=$(
@@ -283,6 +291,7 @@ jobs:
           app=native/target/release/bundle/macos/Viewda.app
           executable="$app/Contents/MacOS/viewda"
           library="$app/Contents/Frameworks/libduckdb.dylib"
+          plist="$app/Contents/Info.plist"
           test -f "$library"
           test "$(
             lipo -archs "$library"
@@ -293,6 +302,15 @@ jobs:
             | grep -A2 LC_RPATH \
             | grep -F '@loader_path/../Frameworks'
           codesign --verify --deep --strict "$app"
+          test "$(plutil -extract CFBundleDocumentTypes.0.CFBundleTypeRole raw "$plist")" = Viewer
+          test "$(plutil -extract CFBundleDocumentTypes.0.LSHandlerRank raw "$plist")" = Alternate
+          test "$(plutil -extract CFBundleDocumentTypes.0.CFBundleTypeExtensions.0 raw "$plist")" = parquet
+          test "$(plutil -extract CFBundleDocumentTypes.0.LSItemContentTypes.0 raw "$plist")" \
+            = io.github.meisquietude.viewda.parquet
+          test "$(plutil -extract UTExportedTypeDeclarations.0.UTTypeIdentifier raw "$plist")" \
+            = io.github.meisquietude.viewda.parquet
+          test "$(/usr/libexec/PlistBuddy -c 'Print :UTExportedTypeDeclarations:0:UTTypeTagSpecification:public.mime-type' "$plist")" \
+            = application/vnd.apache.parquet
 
           # Comparing these fields catches a regression to the upstream
           # vendor signature. Equal `TeamIdentifier=not set` values do not
@@ -691,6 +709,10 @@ jobs:
             throw "Expected an unsigned installer, got $($signature.Status)."
           }
 
+          $parquetKey = "HKCU:\Software\Classes\.parquet"
+          New-Item -Path $parquetKey -Force | Out-Null
+          Set-Item -Path $parquetKey -Value "Existing.Parquet"
+
           $installDir = Join-Path $env:RUNNER_TEMP "viewda-installed"
           $install = Start-Process `
             -FilePath $installer.FullName `
@@ -700,8 +722,20 @@ jobs:
           if ($install.ExitCode -ne 0) {
             throw "NSIS exited with code $($install.ExitCode)."
           }
+          if ((Get-Item $parquetKey).GetValue("") -ne "Existing.Parquet") {
+            throw "The installer replaced the existing .parquet default."
+          }
+          $openWith = Get-Item "$parquetKey\OpenWithProgids"
+          if ($openWith.GetValueNames() -notcontains "Viewda.Parquet") {
+            throw "Viewda was not registered as an Open With handler."
+          }
 
           $executable = Join-Path $installDir "viewda.exe"
+          $openCommand = (Get-Item "HKCU:\Software\Classes\Viewda.Parquet\shell\open\command").GetValue("")
+          $expectedOpenCommand = "`"$executable`" `"%1`""
+          if ($openCommand -ne $expectedOpenCommand) {
+            throw "Unexpected .parquet open command: $openCommand"
+          }
           $library = Join-Path $installDir "duckdb.dll"
           if (!(Test-Path $executable)) {
             throw "The installed Viewda executable is missing."

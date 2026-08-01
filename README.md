@@ -59,7 +59,8 @@ Download the latest build from
 - **Linux x64:** download the AppImage, run
   `chmod +x Viewda_*.AppImage`, then open it. The AppImage is recommended
   because it supports in-app updates. The `.deb` package is a manual-update
-  fallback and is not recommended for most users.
+  fallback and is not recommended for most users. AppImage file associations
+  require integration through appimaged or AppImageLauncher.
 
 ## Under the hood
 

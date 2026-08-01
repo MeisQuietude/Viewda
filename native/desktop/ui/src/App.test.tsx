@@ -14,6 +14,7 @@ import * as desktop from "./desktop";
 
 let requestSettings: (() => void) | undefined;
 let reportUpdate: ((update: desktop.UpdateInfo) => void) | undefined;
+let reportOpenedSource: (() => void) | undefined;
 
 afterEach(() => {
   cleanup();
@@ -24,6 +25,7 @@ afterEach(() => {
 beforeEach(() => {
   requestSettings = undefined;
   reportUpdate = undefined;
+  reportOpenedSource = undefined;
   vi.spyOn(desktop, "getEngineStatus").mockResolvedValue({
     name: "Viewda data engine",
     version: "0.0.1",
@@ -42,6 +44,10 @@ beforeEach(() => {
     reportUpdate = handler;
     return Promise.resolve(() => {});
   });
+  vi.spyOn(desktop, "onOpenedSourceAvailable").mockImplementation((handler) => {
+    reportOpenedSource = handler;
+    return Promise.resolve(() => {});
+  });
   vi.spyOn(desktop, "getUpdateSettings").mockResolvedValue({
     channel: "stable",
     automaticChecks: true,
@@ -51,7 +57,14 @@ beforeEach(() => {
   vi.spyOn(desktop, "discardPendingUpdate").mockResolvedValue();
   vi.spyOn(desktop, "installPendingUpdate").mockResolvedValue();
   vi.spyOn(desktop, "takePostUpdateState").mockResolvedValue(null);
+  vi.spyOn(desktop, "takeOpenedSource").mockResolvedValue(null);
   vi.spyOn(desktop, "openReleasesPage").mockResolvedValue();
+  vi.spyOn(desktop, "getDefaultApplicationStatus").mockResolvedValue({
+    kind: "canSet",
+  });
+  vi.spyOn(desktop, "setDefaultApplication").mockResolvedValue({
+    kind: "default",
+  });
 });
 
 async function openSettings() {
@@ -348,6 +361,83 @@ describe("App", () => {
     ).toBeEnabled();
   });
 
+  it("renders a path-free source forwarded by native file activation", async () => {
+    vi.spyOn(desktop, "takeOpenedSource")
+      .mockResolvedValueOnce(null)
+      .mockResolvedValueOnce({
+        source: {
+          displayName: "launched.parquet",
+          sizeBytes: 128,
+          rowCount: 3,
+          rowGroupCount: 1,
+          schema: [],
+        },
+        sourceError: null,
+      });
+    render(<App />);
+
+    await waitFor(() => expect(reportOpenedSource).toBeTypeOf("function"));
+    act(() => reportOpenedSource?.());
+
+    expect(await screen.findByText("launched.parquet")).toHaveClass(
+      "file-context",
+    );
+  });
+
+  it("keeps an explicitly opened source ahead of post-update restore", async () => {
+    let resolveRestore: (
+      state: desktop.PostUpdateState | null,
+    ) => void = () => {};
+    vi.spyOn(desktop, "takePostUpdateState").mockReturnValue(
+      new Promise((resolve) => {
+        resolveRestore = resolve;
+      }),
+    );
+    vi.spyOn(desktop, "takeOpenedSource").mockResolvedValue({
+      source: {
+        displayName: "launched.parquet",
+        sizeBytes: 128,
+        rowCount: 3,
+        rowGroupCount: 1,
+        schema: [],
+      },
+      sourceError: null,
+    });
+    render(<App />);
+
+    expect(await screen.findByText("launched.parquet")).toBeInTheDocument();
+    await act(async () => {
+      resolveRestore({
+        version: "0.1.0",
+        source: {
+          displayName: "restored.parquet",
+          sizeBytes: 256,
+          rowCount: 6,
+          rowGroupCount: 1,
+          schema: [],
+        },
+        sourceError: null,
+      });
+    });
+
+    expect(screen.getByText("launched.parquet")).toBeInTheDocument();
+    expect(screen.queryByText("restored.parquet")).not.toBeInTheDocument();
+  });
+
+  it("shows a recoverable error for a missing native file activation", async () => {
+    vi.spyOn(desktop, "takeOpenedSource")
+      .mockResolvedValueOnce(null)
+      .mockResolvedValueOnce({ source: null, sourceError: "notFound" });
+    render(<App />);
+
+    await waitFor(() => expect(reportOpenedSource).toBeTypeOf("function"));
+    act(() => reportOpenedSource?.());
+
+    expect(await screen.findByRole("alert")).toHaveTextContent(
+      "That file is no longer available. Choose it again.",
+    );
+  });
+
   it("installs an available update directly from the titlebar", async () => {
     vi.spyOn(desktop, "checkForUpdate").mockResolvedValue({
       version: "0.1.0",
@@ -403,6 +493,21 @@ describe("App", () => {
     render(<App />);
 
     const dialog = await openSettings();
+    expect(
+      await within(dialog).findByRole("button", { name: "Make default" }),
+    ).toBeInTheDocument();
+    const defaultApplicationLabel = within(dialog).getByText(
+      "Default application",
+    );
+    const defaultApplicationCopy =
+      defaultApplicationLabel.closest(".settings-row-copy");
+    expect(defaultApplicationCopy).toContainElement(
+      within(dialog).getByText("Open .parquet files in Viewda by default."),
+    );
+    expect(defaultApplicationLabel).toHaveClass("settings-row-label");
+    expect(
+      within(dialog).getByRole("button", { name: "Make default" }),
+    ).toHaveClass("tonal-button");
     expect(within(dialog).getByText("0.0.1 · DuckDB v1.5.5")).toHaveClass(
       "settings-version",
     );
@@ -431,11 +536,73 @@ describe("App", () => {
     const close = screen.getByRole("button", { name: "Close" });
     close.focus();
     fireEvent.keyDown(dialog, { key: "Tab" });
-    expect(channel).toHaveFocus();
+    expect(screen.getByRole("button", { name: "Make default" })).toHaveFocus();
     fireEvent.keyDown(dialog, { key: "Escape" });
     expect(
       screen.queryByRole("dialog", { name: "Settings" }),
     ).not.toBeInTheDocument();
+  });
+
+  it("changes the default application only after the Settings action", async () => {
+    const makeDefault = vi.spyOn(desktop, "setDefaultApplication");
+    render(<App />);
+
+    const dialog = await openSettings();
+    expect(makeDefault).not.toHaveBeenCalled();
+    fireEvent.click(
+      await within(dialog).findByRole("button", { name: "Make default" }),
+    );
+
+    expect(
+      await within(dialog).findByText("Viewda is the default"),
+    ).toHaveClass("settings-note");
+    expect(makeDefault).toHaveBeenCalledOnce();
+  });
+
+  it("defers the Windows default choice to system Settings", async () => {
+    vi.spyOn(desktop, "getDefaultApplicationStatus").mockResolvedValue({
+      kind: "systemSettings",
+    });
+    render(<App />);
+
+    const dialog = await openSettings();
+    expect(
+      await within(dialog).findByText("Finish the choice in Windows Settings."),
+    ).toBeInTheDocument();
+    fireEvent.click(
+      within(dialog).getByRole("button", { name: "Open Default apps" }),
+    );
+    expect(desktop.setDefaultApplication).toHaveBeenCalledOnce();
+  });
+
+  it("disables the Linux action when xdg-utils is unavailable", async () => {
+    vi.spyOn(desktop, "getDefaultApplicationStatus").mockResolvedValue({
+      kind: "unavailable",
+    });
+    render(<App />);
+
+    const dialog = await openSettings();
+    expect(
+      await within(dialog).findByText("xdg-utils is not installed."),
+    ).toBeInTheDocument();
+    expect(
+      within(dialog).getByRole("button", { name: "Make default" }),
+    ).toBeDisabled();
+  });
+
+  it("disables the action for an unintegrated AppImage", async () => {
+    vi.spyOn(desktop, "getDefaultApplicationStatus").mockResolvedValue({
+      kind: "unintegratedAppImage",
+    });
+    render(<App />);
+
+    const dialog = await openSettings();
+    expect(
+      await within(dialog).findByText("Integrate the AppImage first."),
+    ).toBeInTheDocument();
+    expect(
+      within(dialog).getByRole("button", { name: "Make default" }),
+    ).toBeDisabled();
   });
 
   it("surfaces a prerelease from the Latest channel without changing its version", async () => {

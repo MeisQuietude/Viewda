@@ -58,12 +58,29 @@ export interface PostUpdateState {
   sourceError: SourceErrorCode | null;
 }
 
+export type DefaultApplicationStatus =
+  | { kind: "default" }
+  | { kind: "canSet" }
+  | { kind: "unavailable" }
+  | { kind: "unintegratedAppImage" }
+  | { kind: "systemSettings" };
+
+export interface OpenedSourceActivation {
+  source: SourceSummary | null;
+  sourceError: SourceErrorCode | null;
+}
+
 interface NativeSourceError {
   code: SourceErrorCode;
 }
 
 interface NativePostUpdateState {
   version: string;
+  source: SourceSummary | null;
+  sourceError: NativeSourceError | null;
+}
+
+interface NativeOpenedSourceActivation {
   source: SourceSummary | null;
   sourceError: NativeSourceError | null;
 }
@@ -140,6 +157,26 @@ export function takePostUpdateState(): Promise<PostUpdateState | null> {
   );
 }
 
+export function takeOpenedSource(): Promise<OpenedSourceActivation | null> {
+  return invoke<NativeOpenedSourceActivation | null>("take_opened_source").then(
+    (activation) =>
+      activation === null
+        ? null
+        : {
+            source: activation.source,
+            sourceError: activation.sourceError?.code ?? null,
+          },
+  );
+}
+
+export function getDefaultApplicationStatus(): Promise<DefaultApplicationStatus> {
+  return invoke<DefaultApplicationStatus>("get_default_application_status");
+}
+
+export function setDefaultApplication(): Promise<DefaultApplicationStatus> {
+  return invoke<DefaultApplicationStatus>("set_default_application");
+}
+
 export function openReleasesPage(): Promise<void> {
   return invokeUpdate("open_releases_page");
 }
@@ -187,6 +224,12 @@ export function onUpdateAvailable(
   return listen<UpdateInfo>("update-available", ({ payload }) =>
     handler(payload),
   );
+}
+
+export function onOpenedSourceAvailable(
+  handler: () => void,
+): Promise<UnlistenFn> {
+  return listen("opened-source-available", handler);
 }
 
 function readSourceErrorCode(error: unknown): SourceErrorCode {
