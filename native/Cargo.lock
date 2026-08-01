@@ -5090,6 +5090,7 @@ name = "viewda-data-engine"
 version = "0.1.0-alpha.1"
 dependencies = [
  "arrow-array",
+ "arrow-ipc",
  "arrow-schema",
  "duckdb",
  "parquet",

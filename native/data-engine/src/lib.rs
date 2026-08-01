@@ -1,12 +1,14 @@
 //! Shell-independent data operations for Viewda.
 
 mod source;
+mod window;
 
 use duckdb::Connection;
 use serde::Serialize;
 use thiserror::Error;
 
 pub use source::{SchemaField, SourceError, SourceSummary, inspect_local_source};
+pub use window::{DataWindowError, DataWindowReader};
 
 /// Describes the data engine backing the desktop shell.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]

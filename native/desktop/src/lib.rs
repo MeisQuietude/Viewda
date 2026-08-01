@@ -5,7 +5,10 @@ mod launch;
 mod recents;
 mod updates;
 
-use std::{path::PathBuf, sync::Mutex};
+use std::{
+    path::PathBuf,
+    sync::{Arc, Mutex},
+};
 
 #[cfg(not(target_os = "macos"))]
 use std::ffi::OsString;
@@ -30,7 +33,8 @@ use updates::{
     install_pending_update, open_releases_page, set_update_settings, take_post_update_state,
 };
 use viewda_data_engine::{
-    EngineError, EngineStatus, SourceError, SourceSummary, engine_status, inspect_local_source,
+    DataWindowError, DataWindowReader, EngineError, EngineStatus, SourceError, SourceSummary,
+    engine_status, inspect_local_source,
 };
 
 const OPEN_SOURCE_MENU_ID: &str = "open-local-source";
@@ -41,57 +45,49 @@ const SETTINGS_REQUESTED_EVENT: &str = "settings-requested";
 const UPDATE_AVAILABLE_EVENT: &str = "update-available";
 
 #[derive(Default)]
-struct OpenedSourceState {
-    path: Option<PathBuf>,
-    blocks_restore: bool,
-}
-
-#[derive(Default)]
-struct OpenedSource {
-    state: Mutex<OpenedSourceState>,
+pub(crate) struct OpenedSource {
+    state: Arc<Mutex<OpenedSourceState>>,
     recents: RecentSourcesStore,
 }
 
-impl OpenedSource {
-    fn lock_state(&self) -> Result<std::sync::MutexGuard<'_, OpenedSourceState>, OpenSourceError> {
-        self.state
-            .lock()
-            .map_err(|_| RecentSourceError::Storage.into())
-    }
+#[derive(Default)]
+struct OpenedSourceState {
+    generation: u64,
+    session: Option<OpenedSourceSession>,
+    blocks_restore: bool,
+}
 
-    fn mark_explicit(&self) -> Result<(), OpenSourceError> {
-        self.lock_state()?.blocks_restore = true;
-        Ok(())
-    }
+struct OpenedSourceSession {
+    generation: u64,
+    path: PathBuf,
+    reader: DataWindowReader,
+}
 
-    fn remember_opened_path(
-        &self,
-        recent_sources_path: Option<&std::path::Path>,
-        path: PathBuf,
-        intent: SourceOpenIntent,
-    ) -> Result<bool, OpenSourceError> {
-        let mut state = self.lock_state()?;
-        if intent == SourceOpenIntent::Restore && state.blocks_restore {
-            return Ok(false);
-        }
-        state.path = Some(path.clone());
-        if intent == SourceOpenIntent::Explicit {
-            state.blocks_restore = true;
-        }
-        if let Some(recent_sources_path) = recent_sources_path {
-            // Keep source state and recents in the same order when restore races an explicit open.
-            // The source is already open; history remains best-effort.
-            let _ = self.recents.record_path(recent_sources_path, &path);
-        }
-        Ok(true)
-    }
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct OpenedSourceInfo {
+    generation: u64,
+    #[serde(flatten)]
+    summary: SourceSummary,
+}
 
-    fn current_path(&self) -> Result<Option<PathBuf>, OpenSourceError> {
-        Ok(self.lock_state()?.path.clone())
-    }
+#[derive(Debug, PartialEq, Eq, Serialize)]
+#[serde(untagged)]
+enum DataWindowCommandError {
+    Session(DataWindowSessionError),
+    Engine(DataWindowError),
+}
 
-    fn blocks_restore(&self) -> Result<bool, OpenSourceError> {
-        Ok(self.lock_state()?.blocks_restore)
+#[derive(Debug, PartialEq, Eq, Serialize)]
+#[serde(tag = "code", rename_all = "camelCase")]
+enum DataWindowSessionError {
+    NoSourceOpen,
+    SourceChanged,
+}
+
+impl From<DataWindowError> for DataWindowCommandError {
+    fn from(error: DataWindowError) -> Self {
+        Self::Engine(error)
     }
 }
 
@@ -111,10 +107,113 @@ enum SourceOpenIntent {
     Restore,
 }
 
+impl OpenedSource {
+    fn lock_state(&self) -> Result<std::sync::MutexGuard<'_, OpenedSourceState>, OpenSourceError> {
+        self.state
+            .lock()
+            .map_err(|_| RecentSourceError::Storage.into())
+    }
+
+    fn mark_explicit(&self) -> Result<(), OpenSourceError> {
+        self.lock_state()?.blocks_restore = true;
+        Ok(())
+    }
+
+    fn install(
+        &self,
+        recent_sources_path: Option<&std::path::Path>,
+        path: PathBuf,
+        summary: SourceSummary,
+        intent: SourceOpenIntent,
+    ) -> Result<Option<OpenedSourceInfo>, OpenSourceError> {
+        let mut state = self.lock_state()?;
+        if intent == SourceOpenIntent::Restore && state.blocks_restore {
+            return Ok(None);
+        }
+        let generation = state
+            .generation
+            .checked_add(1)
+            .ok_or(SourceError::Unsupported)?;
+        state.generation = generation;
+        state.session = Some(OpenedSourceSession {
+            generation,
+            reader: DataWindowReader::new(path.clone()),
+            path,
+        });
+        if intent == SourceOpenIntent::Explicit {
+            state.blocks_restore = true;
+        }
+        if let Some(recent_sources_path) = recent_sources_path {
+            // Keep source state and recents in the same order when restore races an explicit open.
+            // The source is already open; history remains best-effort.
+            let path = &state.session.as_ref().ok_or(SourceError::Unsupported)?.path;
+            let _ = self.recents.record_path(recent_sources_path, path);
+        }
+        Ok(Some(OpenedSourceInfo {
+            generation,
+            summary,
+        }))
+    }
+
+    pub(crate) fn current_path(&self) -> Result<Option<PathBuf>, OpenSourceError> {
+        Ok(self
+            .lock_state()?
+            .session
+            .as_ref()
+            .map(|session| session.path.clone()))
+    }
+
+    fn blocks_restore(&self) -> Result<bool, OpenSourceError> {
+        Ok(self.lock_state()?.blocks_restore)
+    }
+}
+
 /// Reports whether the shell-independent engine is linked and responsive.
 #[tauri::command]
 fn get_engine_status() -> Result<EngineStatus, EngineError> {
     engine_status()
+}
+
+/// Returns a bounded row window as a raw Arrow IPC response.
+#[tauri::command]
+async fn get_data_window(
+    generation: u64,
+    row_offset: u64,
+    row_count: u32,
+    opened_source: tauri::State<'_, OpenedSource>,
+) -> Result<tauri::ipc::Response, DataWindowCommandError> {
+    let state = Arc::clone(&opened_source.state);
+    let bytes = tauri::async_runtime::spawn_blocking(move || {
+        let mut state = state.lock().map_err(|_| DataWindowError::Unsupported)?;
+        fetch_opened_source_window(&mut state, generation, row_offset, row_count)
+    })
+    .await
+    .map_err(|_| DataWindowError::QueryEngineUnavailable)??;
+
+    Ok(tauri::ipc::Response::new(bytes))
+}
+
+fn fetch_opened_source_window(
+    state: &mut OpenedSourceState,
+    generation: u64,
+    row_offset: u64,
+    row_count: u32,
+) -> Result<Vec<u8>, DataWindowCommandError> {
+    let session = state
+        .session
+        .as_mut()
+        .ok_or(DataWindowCommandError::Session(
+            DataWindowSessionError::NoSourceOpen,
+        ))?;
+    if session.generation != generation {
+        return Err(DataWindowCommandError::Session(
+            DataWindowSessionError::SourceChanged,
+        ));
+    }
+    session
+        .reader
+        .fetch(row_offset, row_count)
+        .map_err(Into::into)
 }
 
 /// Owns the native file dialog and passes the selected path directly to data-engine.
@@ -126,7 +225,7 @@ fn get_engine_status() -> Result<EngineStatus, EngineError> {
 #[tauri::command]
 async fn open_local_source(
     app: tauri::AppHandle,
-) -> Result<Option<SourceSummary>, OpenSourceError> {
+) -> Result<Option<OpenedSourceInfo>, OpenSourceError> {
     // blocking_pick_file would stall the async runtime thread.
     let inspected = tauri::async_runtime::spawn_blocking(move || {
         let selected = app
@@ -144,14 +243,14 @@ async fn open_local_source(
     .await
     .map_err(|_| SourceError::Unsupported)??;
 
-    Ok(inspected.map(|(_, summary)| summary))
+    Ok(inspected.map(|(_, source)| source))
 }
 
 fn inspect_selected_source(
     app: &tauri::AppHandle,
     path: PathBuf,
     intent: SourceOpenIntent,
-) -> Result<Option<(PathBuf, SourceSummary)>, OpenSourceError> {
+) -> Result<Option<(PathBuf, OpenedSourceInfo)>, OpenSourceError> {
     let opened_source = app.state::<OpenedSource>();
     let recent_sources_path = recents::state_path(app).ok();
     inspect_selected_source_at_path(
@@ -167,7 +266,7 @@ fn inspect_selected_source_at_path(
     opened_source: &OpenedSource,
     path: PathBuf,
     intent: SourceOpenIntent,
-) -> Result<Option<(PathBuf, SourceSummary)>, OpenSourceError> {
+) -> Result<Option<(PathBuf, OpenedSourceInfo)>, OpenSourceError> {
     if intent == SourceOpenIntent::Restore && opened_source.blocks_restore()? {
         return Ok(None);
     }
@@ -187,17 +286,16 @@ fn remember_inspected_source(
     path: PathBuf,
     summary: SourceSummary,
     intent: SourceOpenIntent,
-) -> Result<Option<(PathBuf, SourceSummary)>, OpenSourceError> {
+) -> Result<Option<(PathBuf, OpenedSourceInfo)>, OpenSourceError> {
     let canonical_path = std::fs::canonicalize(&path).unwrap_or(path);
-    if !opened_source.remember_opened_path(recent_sources_path, canonical_path.clone(), intent)? {
-        return Ok(None);
-    }
-    Ok(Some((canonical_path, summary)))
+    let source =
+        opened_source.install(recent_sources_path, canonical_path.clone(), summary, intent)?;
+    Ok(source.map(|source| (canonical_path, source)))
 }
 
 fn require_explicit_source(
-    source: Option<(PathBuf, SourceSummary)>,
-) -> Result<(PathBuf, SourceSummary), OpenSourceError> {
+    source: Option<(PathBuf, OpenedSourceInfo)>,
+) -> Result<(PathBuf, OpenedSourceInfo), OpenSourceError> {
     debug_assert!(
         source.is_some(),
         "an explicit source open cannot be superseded by restore"
@@ -221,19 +319,19 @@ async fn get_recent_sources(app: tauri::AppHandle) -> Result<Vec<RecentSource>, 
 async fn open_recent_source(
     app: tauri::AppHandle,
     id: String,
-) -> Result<SourceSummary, OpenSourceError> {
+) -> Result<OpenedSourceInfo, OpenSourceError> {
     let result =
         tauri::async_runtime::spawn_blocking(move || open_recent_source_with_app(&app, &id))
             .await
             .map_err(|_| SourceError::Unsupported)?;
 
-    result.map(|(_, summary)| summary)
+    result.map(|(_, source)| source)
 }
 
 fn open_recent_source_with_app(
     app: &tauri::AppHandle,
     id: &str,
-) -> Result<(PathBuf, SourceSummary), OpenSourceError> {
+) -> Result<(PathBuf, OpenedSourceInfo), OpenSourceError> {
     let opened_source = app.state::<OpenedSource>();
     open_recent_source_at_path(&recents::state_path(app)?, opened_source.inner(), id)
 }
@@ -242,7 +340,7 @@ fn open_recent_source_at_path(
     recent_sources_path: &std::path::Path,
     opened_source: &OpenedSource,
     id: &str,
-) -> Result<(PathBuf, SourceSummary), OpenSourceError> {
+) -> Result<(PathBuf, OpenedSourceInfo), OpenSourceError> {
     let path = opened_source
         .recents
         .path_for_id_path(recent_sources_path, id)?;
@@ -422,6 +520,7 @@ pub fn run() {
             take_opened_source,
             get_default_application_status,
             set_default_application,
+            get_data_window,
             get_update_settings,
             set_update_settings,
             check_for_update,
@@ -520,7 +619,8 @@ mod tests {
             opened.0,
             std::fs::canonicalize(source_path).expect("source path")
         );
-        assert_eq!(opened.1, summary);
+        assert_eq!(opened.1.generation, 1);
+        assert_eq!(opened.1.summary, summary);
         assert_eq!(
             opened_source.current_path().expect("opened-source state"),
             Some(opened.0)
@@ -570,20 +670,33 @@ mod tests {
     fn explicit_activation_prevents_restore_from_replacing_the_native_source() {
         let opened_source = OpenedSource::default();
         let launched = PathBuf::from("launched.parquet");
+        let summary = SourceSummary {
+            display_name: "source.parquet".to_owned(),
+            size_bytes: 1,
+            row_count: 1,
+            row_group_count: 1,
+            schema: Vec::new(),
+        };
 
+        opened_source
+            .install(
+                None,
+                launched.clone(),
+                summary.clone(),
+                SourceOpenIntent::Explicit,
+            )
+            .expect("source state")
+            .expect("explicit source is accepted");
         assert!(
             opened_source
-                .remember_opened_path(None, launched.clone(), SourceOpenIntent::Explicit)
-                .expect("source state")
-        );
-        assert!(
-            !opened_source
-                .remember_opened_path(
+                .install(
                     None,
                     PathBuf::from("restored.parquet"),
+                    summary,
                     SourceOpenIntent::Restore,
                 )
                 .expect("source state")
+                .is_none()
         );
         assert_eq!(opened_source.current_path(), Ok(Some(launched)));
     }
@@ -657,6 +770,56 @@ mod tests {
             .is_none()
         );
         assert_eq!(first_recent_id(), "recent-2");
+    }
+
+    #[test]
+    fn a_window_request_without_a_source_has_a_stable_error() {
+        assert_eq!(
+            serde_json::to_value(DataWindowCommandError::Session(
+                DataWindowSessionError::NoSourceOpen,
+            ))
+            .expect("session error is serializable"),
+            serde_json::json!({ "code": "noSourceOpen" })
+        );
+    }
+
+    #[test]
+    fn a_stale_generation_cannot_read_the_replacement_source() {
+        let opened_source = OpenedSource::default();
+        let summary = SourceSummary {
+            display_name: "source.parquet".into(),
+            size_bytes: 8,
+            row_count: 1,
+            row_group_count: 1,
+            schema: Vec::new(),
+        };
+        let first = opened_source
+            .install(
+                None,
+                PathBuf::from("first.parquet"),
+                summary.clone(),
+                SourceOpenIntent::Explicit,
+            )
+            .expect("first source state")
+            .expect("first source is accepted");
+        let second = opened_source
+            .install(
+                None,
+                PathBuf::from("second.parquet"),
+                summary,
+                SourceOpenIntent::Explicit,
+            )
+            .expect("replacement source state")
+            .expect("replacement source is accepted");
+        let mut state = opened_source.state.lock().expect("opened source state");
+
+        assert!(second.generation > first.generation);
+        assert_eq!(
+            fetch_opened_source_window(&mut state, first.generation, 0, 1),
+            Err(DataWindowCommandError::Session(
+                DataWindowSessionError::SourceChanged,
+            ))
+        );
     }
 
     #[test]

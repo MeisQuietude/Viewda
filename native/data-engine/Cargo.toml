@@ -8,6 +8,7 @@ repository.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+arrow-ipc = "=58.4.0"
 duckdb = "=1.10505.0"
 parquet = "=58.4.0"
 serde.workspace = true
