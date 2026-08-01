@@ -8,6 +8,11 @@ Backward-incompatible entries start with **Breaking:**.
 
 ## Unreleased
 
+### Added
+
+- The start screen now lists up to eight recent files and reopens them without
+  accepting local paths back from the interface.
+
 ### Fixed
 
 - The macOS native title bar no longer draws the Viewda window name over the

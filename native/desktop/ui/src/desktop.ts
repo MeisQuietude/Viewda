@@ -21,6 +21,12 @@ export interface SourceSummary {
   schema: SchemaField[];
 }
 
+export interface RecentSource {
+  id: string;
+  name: string;
+  directory: string;
+}
+
 export interface SchemaField {
   name: string;
   physicalType: string;
@@ -125,8 +131,23 @@ export function showMainWindow(): Promise<void> {
 }
 
 export async function openLocalSource(): Promise<SourceSummary | null> {
+  return invokeSource<SourceSummary | null>("open_local_source");
+}
+
+export function getRecentSources(): Promise<RecentSource[]> {
+  return invoke<RecentSource[]>("get_recent_sources");
+}
+
+export function openRecentSource(id: string): Promise<SourceSummary> {
+  return invokeSource<SourceSummary>("open_recent_source", { id });
+}
+
+async function invokeSource<T>(
+  command: string,
+  args?: Record<string, unknown>,
+): Promise<T> {
   try {
-    return await invoke<SourceSummary | null>("open_local_source");
+    return await invoke<T>(command, args);
   } catch (error) {
     throw new OpenSourceError(readSourceErrorCode(error));
   }

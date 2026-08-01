@@ -11,18 +11,21 @@ import {
   checkForUpdate,
   discardPendingUpdate,
   getEngineStatus,
+  getRecentSources,
   getUpdateSettings,
   installPendingUpdate,
   onOpenSourceRequested,
   onSettingsRequested,
   onUpdateAvailable,
   openLocalSource,
+  openRecentSource,
   openReleasesPage,
   OpenSourceError,
   setUpdateSettings as persistUpdateSettings,
   shortcutModifier,
   takePostUpdateState,
   type EngineStatus,
+  type RecentSource,
   type SchemaField,
   type SourceErrorCode,
   type SourceSummary,
@@ -58,6 +61,7 @@ export function App() {
   const [source, setSource] = useState<SourceSummary | null>(null);
   const [sourceError, setSourceError] = useState<SourceErrorCode | null>(null);
   const [opening, setOpening] = useState(false);
+  const [recentSources, setRecentSources] = useState<RecentSource[]>([]);
   const [updateSettings, setUpdateSettings] = useState<UpdateSettings | null>(
     null,
   );
@@ -90,6 +94,26 @@ export function App() {
     }
   }, []);
 
+  const openRecent = useCallback(async (id: string) => {
+    setOpening(true);
+    setSourceError(null);
+
+    try {
+      setSource(await openRecentSource(id));
+    } catch (error) {
+      const code =
+        error instanceof OpenSourceError ? error.code : "unsupported";
+      setSourceError(code);
+      if (code === "notFound") {
+        setRecentSources((entries) =>
+          entries.filter((entry) => entry.id !== id),
+        );
+      }
+    } finally {
+      setOpening(false);
+    }
+  }, []);
+
   useEffect(() => {
     let active = true;
 
@@ -109,6 +133,29 @@ export function App() {
       active = false;
     };
   }, []);
+
+  useEffect(() => {
+    if (readiness.kind !== "ready") {
+      return;
+    }
+    let active = true;
+
+    getRecentSources()
+      .then((entries) => {
+        if (active) {
+          setRecentSources(entries);
+        }
+      })
+      .catch(() => {
+        if (active) {
+          setRecentSources([]);
+        }
+      });
+
+    return () => {
+      active = false;
+    };
+  }, [readiness.kind]);
 
   useEffect(() => {
     let active = true;
@@ -445,6 +492,11 @@ export function App() {
             {readiness.kind === "ready" && (
               <>
                 <OpenButton opening={opening} onOpen={openSource} />
+                <RecentFiles
+                  entries={recentSources}
+                  opening={opening}
+                  onOpen={openRecent}
+                />
                 <p className="empty-message">
                   Your data never leaves this machine.
                 </p>
@@ -491,6 +543,60 @@ export function App() {
         />
       )}
     </main>
+  );
+}
+
+function RecentFiles({
+  entries,
+  opening,
+  onOpen,
+}: {
+  entries: RecentSource[];
+  opening: boolean;
+  onOpen: (id: string) => Promise<void>;
+}) {
+  const buttons = useRef<Array<HTMLButtonElement | null>>([]);
+
+  if (entries.length === 0) {
+    return null;
+  }
+
+  const focusSibling = (index: number, offset: number) => {
+    const next = (index + offset + entries.length) % entries.length;
+    buttons.current[next]?.focus();
+  };
+
+  return (
+    <ul className="recent-files" aria-label="Recent files">
+      {entries.map((entry, index) => (
+        <li key={entry.id}>
+          <button
+            ref={(button) => {
+              buttons.current[index] = button;
+            }}
+            type="button"
+            aria-label={`Open ${entry.name} from ${entry.directory}`}
+            disabled={opening}
+            onClick={() => void onOpen(entry.id)}
+            onKeyDown={(event) => {
+              if (event.key === "ArrowDown") {
+                event.preventDefault();
+                focusSibling(index, 1);
+              } else if (event.key === "ArrowUp") {
+                event.preventDefault();
+                focusSibling(index, -1);
+              } else if (event.key === "Enter") {
+                event.preventDefault();
+                void onOpen(entry.id);
+              }
+            }}
+          >
+            <span className="recent-file-name">{entry.name}</span>
+            <span className="recent-file-directory">{entry.directory}</span>
+          </button>
+        </li>
+      ))}
+    </ul>
   );
 }
 

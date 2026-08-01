@@ -1,14 +1,18 @@
 //! Tauri adapter for the Viewda desktop application.
 
+mod recents;
 mod updates;
 
 use std::{path::PathBuf, sync::Mutex};
 
+use recents::{RecentSource, RecentSourceError, RecentSourcesStore};
+use serde::Serialize;
 use tauri::{
     Emitter, Manager,
     menu::{Menu, MenuItemBuilder, MenuItemKind, PredefinedMenuItem, SubmenuBuilder},
 };
 use tauri_plugin_dialog::{DialogExt, MessageDialogKind};
+use thiserror::Error;
 use updates::{
     PendingUpdate, UpdateError, UpdateInfo, UpdateStateStore, check_for_update,
     check_for_update_with_state, discard_pending_update, get_update_settings,
@@ -26,7 +30,72 @@ const SETTINGS_REQUESTED_EVENT: &str = "settings-requested";
 const UPDATE_AVAILABLE_EVENT: &str = "update-available";
 
 #[derive(Default)]
-struct OpenedSource(Mutex<Option<PathBuf>>);
+struct OpenedSource {
+    path: Mutex<Option<PathBuf>>,
+    recents: RecentSourcesStore,
+}
+
+impl OpenedSource {
+    fn current_path(&self) -> Result<Option<PathBuf>, OpenSourceError> {
+        self.path
+            .lock()
+            .map(|path| path.clone())
+            .map_err(|_| OpenSourceError::Storage)
+    }
+}
+
+/// Stable failures exposed by every source-opening command.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error, Serialize)]
+#[serde(tag = "code", rename_all = "camelCase")]
+enum OpenSourceError {
+    #[error("The selected file no longer exists.")]
+    NotFound,
+    #[error("Viewda does not have permission to read the selected file.")]
+    PermissionDenied,
+    #[error("The selected file is not a Parquet file.")]
+    NotParquet,
+    #[error("The Parquet footer is damaged or incomplete.")]
+    CorruptFooter,
+    #[error("This source is not supported yet.")]
+    Unsupported,
+    #[error("The recent-source list could not be read or saved.")]
+    Storage,
+    #[error("The requested recent source does not exist.")]
+    UnknownRecent,
+}
+
+impl From<SourceError> for OpenSourceError {
+    fn from(error: SourceError) -> Self {
+        match error {
+            SourceError::NotFound => Self::NotFound,
+            SourceError::PermissionDenied => Self::PermissionDenied,
+            SourceError::NotParquet => Self::NotParquet,
+            SourceError::CorruptFooter => Self::CorruptFooter,
+            SourceError::Unsupported => Self::Unsupported,
+        }
+    }
+}
+
+impl From<RecentSourceError> for OpenSourceError {
+    fn from(error: RecentSourceError) -> Self {
+        match error {
+            RecentSourceError::Storage => Self::Storage,
+            RecentSourceError::UnknownRecent => Self::UnknownRecent,
+        }
+    }
+}
+
+impl OpenSourceError {
+    fn source_error(self) -> SourceError {
+        match self {
+            Self::NotFound => SourceError::NotFound,
+            Self::PermissionDenied => SourceError::PermissionDenied,
+            Self::NotParquet => SourceError::NotParquet,
+            Self::CorruptFooter => SourceError::CorruptFooter,
+            Self::Unsupported | Self::Storage | Self::UnknownRecent => SourceError::Unsupported,
+        }
+    }
+}
 
 /// Reports whether the shell-independent engine is linked and responsive.
 #[tauri::command]
@@ -43,8 +112,7 @@ fn get_engine_status() -> Result<EngineStatus, EngineError> {
 #[tauri::command]
 async fn open_local_source(
     app: tauri::AppHandle,
-    opened_source: tauri::State<'_, OpenedSource>,
-) -> Result<Option<SourceSummary>, SourceError> {
+) -> Result<Option<SourceSummary>, OpenSourceError> {
     // blocking_pick_file would stall the async runtime thread.
     let inspected = tauri::async_runtime::spawn_blocking(move || {
         let selected = app
@@ -55,26 +123,103 @@ async fn open_local_source(
         let Some(selected) = selected else {
             return Ok(None);
         };
-        let path = selected.into_path().map_err(|_| SourceError::Unsupported)?;
+        let path = selected
+            .into_path()
+            .map_err(|_| OpenSourceError::Unsupported)?;
 
-        inspect_selected_source(path).map(Some)
+        inspect_selected_source(&app, path).map(Some)
     })
     .await
-    .map_err(|_| SourceError::Unsupported)??;
-
-    if let Some((path, _)) = &inspected {
-        *opened_source
-            .0
-            .lock()
-            .map_err(|_| SourceError::Unsupported)? = Some(path.clone());
-    }
+    .map_err(|_| OpenSourceError::Unsupported)??;
 
     Ok(inspected.map(|(_, summary)| summary))
 }
 
-fn inspect_selected_source(path: PathBuf) -> Result<(PathBuf, SourceSummary), SourceError> {
-    let summary = inspect_local_source(&path)?;
-    Ok((path, summary))
+fn inspect_selected_source(
+    app: &tauri::AppHandle,
+    path: PathBuf,
+) -> Result<(PathBuf, SourceSummary), OpenSourceError> {
+    let opened_source = app.state::<OpenedSource>();
+    let recent_sources_path = recents::state_path(app).ok();
+    inspect_selected_source_at_path(recent_sources_path.as_deref(), opened_source.inner(), path)
+}
+
+fn inspect_selected_source_at_path(
+    recent_sources_path: Option<&std::path::Path>,
+    opened_source: &OpenedSource,
+    path: PathBuf,
+) -> Result<(PathBuf, SourceSummary), OpenSourceError> {
+    let summary = inspect_local_source(&path).map_err(OpenSourceError::from)?;
+    remember_inspected_source(recent_sources_path, opened_source, path, summary)
+}
+
+fn remember_inspected_source(
+    recent_sources_path: Option<&std::path::Path>,
+    opened_source: &OpenedSource,
+    path: PathBuf,
+    summary: SourceSummary,
+) -> Result<(PathBuf, SourceSummary), OpenSourceError> {
+    let canonical_path = std::fs::canonicalize(&path).unwrap_or(path);
+    if let Some(recent_sources_path) = recent_sources_path {
+        // Opening a source is the primary operation; history is best-effort.
+        let _ = opened_source
+            .recents
+            .record_path(recent_sources_path, &canonical_path);
+    }
+    *opened_source
+        .path
+        .lock()
+        .map_err(|_| OpenSourceError::Storage)? = Some(canonical_path.clone());
+    Ok((canonical_path, summary))
+}
+
+/// Returns existing recent sources without exposing their paths.
+#[tauri::command]
+async fn get_recent_sources(app: tauri::AppHandle) -> Result<Vec<RecentSource>, RecentSourceError> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let opened_source = app.state::<OpenedSource>();
+        opened_source.recents.list(&app)
+    })
+    .await
+    .map_err(|_| RecentSourceError::Storage)?
+}
+
+/// Reopens a Rust-owned recent source selected by its opaque identifier.
+#[tauri::command]
+async fn open_recent_source(
+    app: tauri::AppHandle,
+    id: String,
+) -> Result<SourceSummary, OpenSourceError> {
+    let result =
+        tauri::async_runtime::spawn_blocking(move || open_recent_source_with_app(&app, &id))
+            .await
+            .map_err(|_| OpenSourceError::Unsupported)?;
+
+    result.map(|(_, summary)| summary)
+}
+
+fn open_recent_source_with_app(
+    app: &tauri::AppHandle,
+    id: &str,
+) -> Result<(PathBuf, SourceSummary), OpenSourceError> {
+    let opened_source = app.state::<OpenedSource>();
+    open_recent_source_at_path(&recents::state_path(app)?, opened_source.inner(), id)
+}
+
+fn open_recent_source_at_path(
+    recent_sources_path: &std::path::Path,
+    opened_source: &OpenedSource,
+    id: &str,
+) -> Result<(PathBuf, SourceSummary), OpenSourceError> {
+    let path = opened_source
+        .recents
+        .path_for_id_path(recent_sources_path, id)?;
+    let result = inspect_selected_source_at_path(Some(recent_sources_path), opened_source, path);
+    if result == Err(OpenSourceError::NotFound) {
+        // Preserve the existing source error even if cleaning a damaged store fails.
+        let _ = opened_source.recents.remove_path(recent_sources_path, id);
+    }
+    result
 }
 
 fn check_for_updates_from_menu(app: &tauri::AppHandle) {
@@ -211,6 +356,8 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             get_engine_status,
             open_local_source,
+            get_recent_sources,
+            open_recent_source,
             get_update_settings,
             set_update_settings,
             check_for_update,
@@ -238,8 +385,92 @@ mod tests {
     #[test]
     fn selected_paths_cross_directly_into_the_data_engine() {
         let missing = PathBuf::from("/viewda-test/source-that-does-not-exist.parquet");
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let opened_source = OpenedSource::default();
 
-        assert_eq!(inspect_selected_source(missing), Err(SourceError::NotFound));
+        assert_eq!(
+            inspect_selected_source_at_path(
+                Some(&directory.path().join("recents.json")),
+                &opened_source,
+                missing,
+            ),
+            Err(OpenSourceError::NotFound)
+        );
+    }
+
+    #[test]
+    fn opening_an_unknown_recent_id_returns_a_typed_error() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let opened_source = OpenedSource::default();
+
+        assert_eq!(
+            open_recent_source_at_path(
+                &directory.path().join("recents.json"),
+                &opened_source,
+                "recent-that-does-not-exist",
+            ),
+            Err(OpenSourceError::UnknownRecent)
+        );
+    }
+
+    #[test]
+    fn history_write_failures_do_not_override_a_successful_inspection() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let source_path = directory.path().join("source.parquet");
+        std::fs::write(&source_path, b"already inspected by the caller").expect("source fixture");
+        let blocked_parent = directory.path().join("not-a-directory");
+        std::fs::write(&blocked_parent, b"file blocks recents.json").expect("blocked store");
+        let opened_source = OpenedSource::default();
+        let summary = SourceSummary {
+            display_name: "source.parquet".to_owned(),
+            size_bytes: 31,
+            row_count: 1,
+            row_group_count: 1,
+            schema: Vec::new(),
+        };
+
+        let opened = remember_inspected_source(
+            Some(&blocked_parent.join("recents.json")),
+            &opened_source,
+            source_path.clone(),
+            summary.clone(),
+        )
+        .expect("history storage is best-effort");
+
+        assert_eq!(
+            opened.0,
+            std::fs::canonicalize(source_path).expect("source path")
+        );
+        assert_eq!(opened.1, summary);
+        assert_eq!(
+            opened_source.current_path().expect("opened-source state"),
+            Some(opened.0)
+        );
+    }
+
+    #[test]
+    fn opening_a_recent_source_removes_it_when_the_file_disappeared() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let recent_sources_path = directory.path().join("recents.json");
+        let source_path = directory.path().join("gone.parquet");
+        let opened_source = OpenedSource::default();
+        std::fs::write(&source_path, b"not inspected before removal").expect("source fixture");
+        opened_source
+            .recents
+            .record_path(&recent_sources_path, &source_path)
+            .expect("recent source");
+        std::fs::remove_file(source_path).expect("remove source fixture");
+
+        assert_eq!(
+            open_recent_source_at_path(&recent_sources_path, &opened_source, "recent-1"),
+            Err(OpenSourceError::NotFound)
+        );
+        assert_eq!(
+            opened_source
+                .recents
+                .path_for_id_path(&recent_sources_path, "recent-1"),
+            Err(RecentSourceError::UnknownRecent)
+        );
     }
 
     #[test]

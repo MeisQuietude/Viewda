@@ -13,9 +13,9 @@ use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Manager, State};
 use tauri_plugin_updater::{Update, UpdaterExt};
 use thiserror::Error;
-use viewda_data_engine::{SourceError, SourceSummary, inspect_local_source};
+use viewda_data_engine::{SourceError, SourceSummary};
 
-use crate::OpenedSource;
+use crate::{OpenedSource, inspect_selected_source};
 
 const UPDATE_STATE_FILE: &str = "updates.json";
 const STABLE_ENDPOINT: &str = "https://meisquietude.github.io/Viewda/updates/stable.json";
@@ -267,10 +267,8 @@ pub async fn install_pending_update(
         .take()
         .ok_or(UpdateError::NoPendingUpdate)?;
     let source_path = opened_source
-        .0
-        .lock()
-        .map_err(|_| UpdateError::Storage)?
-        .clone();
+        .current_path()
+        .map_err(|_| UpdateError::Storage)?;
     let restart = PendingRestart {
         version: update.version.clone(),
         source_path,
@@ -290,7 +288,6 @@ pub async fn install_pending_update(
 pub async fn take_post_update_state(
     app: AppHandle,
     store: State<'_, UpdateStateStore>,
-    opened_source: State<'_, OpenedSource>,
 ) -> Result<Option<PostUpdateState>, UpdateError> {
     let restart = store.mutate(&app, |stored| {
         stored
@@ -305,15 +302,12 @@ pub async fn take_post_update_state(
     let (source, source_error) = match restart.source_path {
         Some(path) => {
             let inspected =
-                tauri::async_runtime::spawn_blocking(move || (inspect_local_source(&path), path))
+                tauri::async_runtime::spawn_blocking(move || inspect_selected_source(&app, path))
                     .await
                     .map_err(|_| UpdateError::Storage)?;
             match inspected {
-                (Ok(summary), path) => {
-                    *opened_source.0.lock().map_err(|_| UpdateError::Storage)? = Some(path);
-                    (Some(summary), None)
-                }
-                (Err(error), _) => (None, Some(error)),
+                Ok((_, summary)) => (Some(summary), None),
+                Err(error) => (None, Some(error.source_error())),
             }
         }
         None => (None, None),
