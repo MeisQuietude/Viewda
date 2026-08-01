@@ -8,6 +8,11 @@ Backward-incompatible entries start with **Breaking:**.
 
 ## Unreleased
 
+### Fixed
+
+- The macOS native title bar no longer draws the Viewda window name over the
+  in-app header.
+
 ## 0.1.0-alpha.1 — 2026-08-01
 
 ### Added
