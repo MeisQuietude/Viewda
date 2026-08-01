@@ -1,0 +1,151 @@
+# GitHub caps Actions cache storage at 10 GB and LRU eviction can remove main's
+# live caches, while caches from deleted branches survive for up to seven days.
+name: Clean up Actions caches
+
+on:
+  delete:
+  workflow_dispatch:
+
+permissions:
+  actions: write
+
+jobs:
+  cleanup:
+    name: Remove orphaned branch caches
+    runs-on: ubuntu-latest
+    steps:
+      - name: Delete obsolete caches
+        env:
+          DELETED_REF: ${{ github.event.ref }}
+          DELETED_REF_TYPE: ${{ github.event.ref_type }}
+          EVENT_NAME: ${{ github.event_name }}
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          main_ref=refs/heads/main
+          work_dir=$(mktemp -d)
+          trap 'rm -rf "$work_dir"' EXIT
+
+          case "$EVENT_NAME" in
+            delete)
+              if [[ "$DELETED_REF_TYPE" != branch ]]; then
+                printf 'Skipping deleted ref type: %s\n' "$DELETED_REF_TYPE"
+                exit 0
+              fi
+
+              target_ref="refs/heads/$DELETED_REF"
+              if [[ "$target_ref" == "$main_ref" ]]; then
+                printf 'Refusing to delete caches for protected ref: %s\n' "$main_ref"
+                exit 0
+              fi
+              ;;
+            workflow_dispatch)
+              declare -A live_refs=()
+              repository_url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY.git"
+              git ls-remote --heads \
+                "$repository_url" \
+                > "$work_dir/heads.tsv"
+              # pull_request workflows cache against GitHub's merge refs.
+              git ls-remote "$repository_url" 'refs/pull/*/merge' \
+                > "$work_dir/pull-requests.tsv"
+
+              for refs_file in heads.tsv pull-requests.tsv; do
+                while IFS=$'\t' read -r _ live_ref; do
+                  live_refs["$live_ref"]=1
+                done < "$work_dir/$refs_file"
+              done
+
+              if [[ -z "${live_refs[$main_ref]+present}" ]]; then
+                printf 'Refusing cleanup: live branch listing omitted %s\n' \
+                  "$main_ref" >&2
+                exit 1
+              fi
+              ;;
+            *)
+              printf 'Unsupported event: %s\n' "$EVENT_NAME" >&2
+              exit 1
+              ;;
+          esac
+
+          gh api --method GET --paginate \
+            "/repos/$GITHUB_REPOSITORY/actions/caches" \
+            -f per_page=100 \
+            --jq '.actions_caches[] | [.id, .ref, .size_in_bytes] | @tsv' \
+            > "$work_dir/caches.tsv"
+
+          deleted_count=0
+          deleted_bytes=0
+          delete_failures=0
+
+          to_mb() {
+            awk -v bytes="$1" 'BEGIN { printf "%.1f", bytes / 1000000 }'
+          }
+
+          while IFS=$'\t' read -r cache_id cache_ref cache_size; do
+            if [[ ! "$cache_id" =~ ^[0-9]+$ \
+              || ! "$cache_size" =~ ^[0-9]+$ \
+              || -z "$cache_ref" ]]; then
+              printf 'Invalid cache record: id=%s ref=%s sizeBytes=%s\n' \
+                "$cache_id" "$cache_ref" "$cache_size" >&2
+              exit 1
+            fi
+
+            if [[ "$cache_ref" == "$main_ref" ]]; then
+              continue
+            fi
+
+            if [[ "$EVENT_NAME" == delete ]]; then
+              [[ "$cache_ref" == "$target_ref" ]] || continue
+            elif [[ -n "${live_refs[$cache_ref]+present}" ]]; then
+              continue
+            fi
+
+            if gh api --method DELETE --include \
+              "/repos/$GITHUB_REPOSITORY/actions/caches/$cache_id" \
+              > "$work_dir/delete-response" \
+              2> "$work_dir/delete-error"; then
+              printf 'Deleted cache id=%s ref=%s sizeBytes=%s sizeMB=%s\n' \
+                "$cache_id" "$cache_ref" "$cache_size" \
+                "$(to_mb "$cache_size")"
+              deleted_count=$((deleted_count + 1))
+              deleted_bytes=$((deleted_bytes + cache_size))
+            else
+              delete_status=
+              IFS=' ' read -r _ delete_status _ \
+                < "$work_dir/delete-response" || true
+              if [[ "$delete_status" == 404 ]]; then
+                printf 'Cache already absent id=%s ref=%s sizeBytes=%s\n' \
+                  "$cache_id" "$cache_ref" "$cache_size"
+              else
+                cat "$work_dir/delete-error" >&2
+                printf 'Failed to delete cache id=%s ref=%s sizeBytes=%s\n' \
+                  "$cache_id" "$cache_ref" "$cache_size" >&2
+                delete_failures=$((delete_failures + 1))
+              fi
+            fi
+          done < "$work_dir/caches.tsv"
+
+          gh api "/repos/$GITHUB_REPOSITORY/actions/cache/usage" \
+            --jq '[.active_caches_count, .active_caches_size_in_bytes] | @tsv' \
+            > "$work_dir/usage.tsv"
+          IFS=$'\t' read -r remaining_count remaining_bytes \
+            < "$work_dir/usage.tsv"
+
+          if [[ ! "$remaining_count" =~ ^[0-9]+$ \
+            || ! "$remaining_bytes" =~ ^[0-9]+$ ]]; then
+            printf 'Invalid cache usage: count=%s sizeBytes=%s\n' \
+              "$remaining_count" "$remaining_bytes" >&2
+            exit 1
+          fi
+
+          printf 'Freed: count=%s sizeMB=%s\n' \
+            "$deleted_count" "$(to_mb "$deleted_bytes")"
+          printf 'Remaining usage: count=%s sizeMB=%s\n' \
+            "$remaining_count" "$(to_mb "$remaining_bytes")"
+
+          if (( delete_failures > 0 )); then
+            printf 'Failed to delete %s cache(s)\n' "$delete_failures" >&2
+            exit 1
+          fi
