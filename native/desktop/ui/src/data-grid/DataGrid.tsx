@@ -27,16 +27,22 @@ import {
 } from "./arrow-window";
 import { copyRowLimit } from "./copy-limit";
 import { formatCellValue, usesMonospaceCells } from "./format-cell";
+import {
+  nextScrollState,
+  requestContainsVisibleRows,
+  requestSatisfiesRequest,
+  rowRequest,
+  windowSatisfiesRequest,
+  type RowRequest,
+  type ScrollState,
+} from "./row-window";
 
 import "@glideapps/glide-data-grid/dist/index.css";
 
 const ROW_HEIGHT = 28;
 const HEADER_HEIGHT = 32;
-const ROW_RESERVE = 24;
 const INITIAL_ROWS = 64;
 const COPY_CHUNK_ROWS = 512;
-// Must match data-engine's MAX_WINDOW_ROWS; Rust validates every command at the boundary.
-const MAX_WINDOW_ROWS = 512;
 const MAX_CACHED_CELLS = 20_000;
 const GRID_HEADER_FONT_STYLE = "600 12px";
 const UI_FONT_FAMILY =
@@ -54,13 +60,6 @@ interface ColumnState {
   width: number;
   pinned: boolean;
   hidden: boolean;
-}
-
-interface RowRequest {
-  offset: number;
-  count: number;
-  visibleStart: number;
-  visibleEnd: number;
 }
 
 interface HeaderMenu {
@@ -95,7 +94,8 @@ export function DataGrid({ source }: { source: SourceSummary }) {
   const copyTailRef = useRef<Promise<void>>(Promise.resolve());
   const copyWindowsRef = useRef(new Map<number, Promise<ArrowDataWindow>>());
   const pendingRequestRef = useRef<RowRequest | null>(null);
-  const requestActiveRef = useRef(false);
+  const activeRequestRef = useRef<RowRequest | null>(null);
+  const scrollStateRef = useRef<ScrollState>({ direction: 0, boundary: 0 });
   const aliveRef = useRef(true);
   const schemaLoadedRef = useRef(false);
   const menuRef = useRef<HTMLDivElement>(null);
@@ -188,14 +188,14 @@ export function DataGrid({ source }: { source: SourceSummary }) {
   );
 
   const drainRequests = useCallback(async () => {
-    if (requestActiveRef.current) {
+    if (activeRequestRef.current !== null) {
       return;
     }
-    requestActiveRef.current = true;
 
     while (aliveRef.current && pendingRequestRef.current !== null) {
       const request = pendingRequestRef.current;
       pendingRequestRef.current = null;
+      activeRequestRef.current = request;
       try {
         const bytes = await getDataWindow(
           source.generation,
@@ -219,7 +219,11 @@ export function DataGrid({ source }: { source: SourceSummary }) {
           );
         }
         const pending = pendingRequestRef.current;
-        if (pending === null || requestContainsVisibleRows(request, pending)) {
+        if (pending !== null && requestSatisfiesRequest(request, pending)) {
+          pendingRequestRef.current = null;
+        }
+        const latest = pendingRequestRef.current;
+        if (latest === null || requestContainsVisibleRows(request, latest)) {
           dataWindowRef.current = decoded;
           cellCacheRef.current.clear();
           gridRef.current?.updateCells(
@@ -231,21 +235,35 @@ export function DataGrid({ source }: { source: SourceSummary }) {
         if (aliveRef.current && pendingRequestRef.current === null) {
           setLoadError(dataWindowErrorMessage(error));
         }
+      } finally {
+        activeRequestRef.current = null;
       }
     }
-
-    requestActiveRef.current = false;
   }, [source.generation]);
 
   const requestRows = useCallback(
     (visibleStart: number, visibleCount: number) => {
-      const request = rowRequest(source.rowCount, visibleStart, visibleCount);
+      const scrollState = nextScrollState(scrollStateRef.current, visibleStart);
+      scrollStateRef.current = scrollState;
+      const request = rowRequest(
+        source.rowCount,
+        visibleStart,
+        visibleCount,
+        scrollState.direction,
+      );
       const current = dataWindowRef.current;
       if (
         current !== null &&
-        request.visibleStart >= current.rowOffset &&
-        request.visibleEnd <= current.rowOffset + current.rowCount
+        windowSatisfiesRequest(current.rowOffset, current.rowCount, request)
       ) {
+        return;
+      }
+      const pending = pendingRequestRef.current;
+      if (pending !== null && requestSatisfiesRequest(pending, request)) {
+        return;
+      }
+      const active = activeRequestRef.current;
+      if (active !== null && requestSatisfiesRequest(active, request)) {
         return;
       }
       pendingRequestRef.current = request;
@@ -564,36 +582,6 @@ function takeSelection(
 
 function loadingCell(): GridCell {
   return { kind: GridCellKind.Loading, allowOverlay: false };
-}
-
-function rowRequest(
-  totalRows: number,
-  visibleStart: number,
-  visibleCount: number,
-): RowRequest {
-  if (totalRows === 0) {
-    return { offset: 0, count: 0, visibleStart: 0, visibleEnd: 0 };
-  }
-  const safeStart = Math.max(0, Math.min(totalRows - 1, visibleStart));
-  const safeCount = Math.max(1, visibleCount);
-  const offset = Math.max(0, safeStart - ROW_RESERVE);
-  const visibleEnd = Math.min(totalRows, safeStart + safeCount);
-  const end = Math.min(
-    totalRows,
-    offset + MAX_WINDOW_ROWS,
-    visibleEnd + ROW_RESERVE,
-  );
-  return { offset, count: end - offset, visibleStart: safeStart, visibleEnd };
-}
-
-function requestContainsVisibleRows(
-  request: RowRequest,
-  pending: RowRequest,
-): boolean {
-  return (
-    pending.visibleStart >= request.offset &&
-    pending.visibleEnd <= request.offset + request.count
-  );
 }
 
 function loadedWindowDamage(
