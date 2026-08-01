@@ -199,6 +199,29 @@ button:focus-visible,
   font-size: 12px;
 }
 
+.settings-row-copy {
+  display: flex;
+  min-width: 0;
+  flex: 1;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.settings-row-label {
+  white-space: nowrap;
+}
+
+.settings-row-copy .settings-note {
+  text-align: left;
+}
+
+.settings-note {
+  color: #777c7c;
+  font-size: 12px;
+  line-height: 1.35;
+  text-align: right;
+}
+
 .update-message {
   margin: 8px 0 0;
   color: #777c7c;
@@ -231,6 +254,7 @@ button:focus-visible,
 }
 
 .text-button,
+.tonal-button,
 .update-action,
 .dialog-close {
   min-height: 32px;
@@ -240,6 +264,21 @@ button:focus-visible,
   font-size: 12px;
   font-weight: 650;
   cursor: pointer;
+}
+
+.tonal-button {
+  flex: none;
+  color: #f7f7f3;
+  background: #2a2d2e;
+}
+
+.tonal-button:hover:not(:disabled) {
+  background: #333738;
+}
+
+.tonal-button:disabled {
+  cursor: default;
+  opacity: 0.5;
 }
 
 .text-button {
@@ -633,6 +672,10 @@ button:focus-visible,
     color: #8d9391;
   }
 
+  .settings-note {
+    color: #8d9391;
+  }
+
   .update-indicator.is-installing,
   .post-update-status,
   .simulated-badge,
@@ -648,6 +691,16 @@ button:focus-visible,
 
   .text-button:hover {
     background: rgb(223 199 131 / 8%);
+  }
+
+  .tonal-button {
+    border: 1px solid rgb(240 240 235 / 16%);
+    color: #f0f0eb;
+    background: #2a2d2e;
+  }
+
+  .tonal-button:hover:not(:disabled) {
+    background: #333738;
   }
 
   .update-action {

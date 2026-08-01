@@ -10,11 +10,13 @@ import {
 import {
   checkForUpdate,
   discardPendingUpdate,
+  getDefaultApplicationStatus,
   getEngineStatus,
   getRecentSources,
   getUpdateSettings,
   installPendingUpdate,
   onOpenSourceRequested,
+  onOpenedSourceAvailable,
   onSettingsRequested,
   onUpdateAvailable,
   openLocalSource,
@@ -22,8 +24,11 @@ import {
   openReleasesPage,
   OpenSourceError,
   setUpdateSettings as persistUpdateSettings,
+  setDefaultApplication,
   shortcutModifier,
   takePostUpdateState,
+  takeOpenedSource,
+  type DefaultApplicationStatus,
   type EngineStatus,
   type RecentSource,
   type SchemaField,
@@ -70,11 +75,19 @@ export function App() {
   );
   const [downgrade, setDowngrade] = useState<UpdateInfo | null>(null);
   const [settingsOpen, setSettingsOpen] = useState(false);
+  const [defaultApplication, setDefaultApplicationStatus] =
+    useState<DefaultApplicationStatus | null>(null);
+  const [changingDefaultApplication, setChangingDefaultApplication] =
+    useState(false);
+  const [defaultApplicationMessage, setDefaultApplicationMessage] = useState<
+    string | null
+  >(null);
   const [checkingUpdates, setCheckingUpdates] = useState(false);
   const [installingDowngrade, setInstallingDowngrade] = useState(false);
   const [updateMessage, setUpdateMessage] = useState<string | null>(null);
   const simulatedInstallTimer = useRef<number | null>(null);
   const dismissTimer = useRef<number | null>(null);
+  const receivedOpenedSource = useRef(false);
 
   const openSource = useCallback(async () => {
     setOpening(true);
@@ -111,6 +124,22 @@ export function App() {
       }
     } finally {
       setOpening(false);
+    }
+  }, []);
+
+  const receiveOpenedSource = useCallback(async () => {
+    try {
+      const activation = await takeOpenedSource();
+      if (activation === null) {
+        return;
+      }
+      receivedOpenedSource.current = true;
+      setSourceError(activation.sourceError);
+      if (activation.source !== null) {
+        setSource(activation.source);
+      }
+    } catch {
+      setSourceError("unsupported");
     }
   }, []);
 
@@ -183,6 +212,27 @@ export function App() {
 
   useEffect(() => {
     let active = true;
+    let unlisten = () => {};
+
+    onOpenedSourceAvailable(() => void receiveOpenedSource())
+      .then((stopListening) => {
+        if (active) {
+          unlisten = stopListening;
+          void receiveOpenedSource();
+        } else {
+          stopListening();
+        }
+      })
+      .catch(() => void receiveOpenedSource());
+
+    return () => {
+      active = false;
+      unlisten();
+    };
+  }, [receiveOpenedSource]);
+
+  useEffect(() => {
+    let active = true;
     let unlistenSettings = () => {};
     let unlistenUpdate = () => {};
 
@@ -223,6 +273,31 @@ export function App() {
   }, []);
 
   useEffect(() => {
+    if (!settingsOpen) {
+      return;
+    }
+
+    let active = true;
+    setDefaultApplicationStatus(null);
+    setDefaultApplicationMessage(null);
+    getDefaultApplicationStatus()
+      .then((status) => {
+        if (active) {
+          setDefaultApplicationStatus(status);
+        }
+      })
+      .catch(() => {
+        if (active) {
+          setDefaultApplicationStatus({ kind: "unavailable" });
+        }
+      });
+
+    return () => {
+      active = false;
+    };
+  }, [settingsOpen]);
+
+  useEffect(() => {
     let active = true;
 
     takePostUpdateState()
@@ -236,10 +311,10 @@ export function App() {
           simulated: false,
           dismissing: false,
         });
-        if (restored.source !== null) {
+        if (!receivedOpenedSource.current && restored.source !== null) {
           setSource(restored.source);
         }
-        if (restored.sourceError !== null) {
+        if (!receivedOpenedSource.current && restored.sourceError !== null) {
           setSourceError(restored.sourceError);
         }
       })
@@ -466,6 +541,18 @@ export function App() {
     }
   }, []);
 
+  const makeDefaultApplication = useCallback(async () => {
+    setChangingDefaultApplication(true);
+    setDefaultApplicationMessage(null);
+    try {
+      setDefaultApplicationStatus(await setDefaultApplication());
+    } catch {
+      setDefaultApplicationMessage("Could not change the default application.");
+    } finally {
+      setChangingDefaultApplication(false);
+    }
+  }, []);
+
   return (
     <main className="app-shell">
       <header className="titlebar">
@@ -523,6 +610,8 @@ export function App() {
 
       {settingsOpen && updateSettings !== null && (
         <SettingsDialog
+          defaultApplication={defaultApplication}
+          defaultApplicationMessage={defaultApplicationMessage}
           settings={updateSettings}
           engine={readiness.kind === "ready" ? readiness.engine : null}
           checking={checkingUpdates}
@@ -531,7 +620,9 @@ export function App() {
           onChannel={changeUpdateChannel}
           onCheck={runUpdateCheck}
           onClose={() => setSettingsOpen(false)}
+          onMakeDefault={makeDefaultApplication}
           onSimulate={simulateUpdate}
+          changingDefaultApplication={changingDefaultApplication}
         />
       )}
       {downgrade !== null && (
@@ -667,6 +758,8 @@ function SimulatedBadge() {
 }
 
 function SettingsDialog({
+  defaultApplication,
+  defaultApplicationMessage,
   settings,
   engine,
   checking,
@@ -675,8 +768,12 @@ function SettingsDialog({
   onChannel,
   onCheck,
   onClose,
+  onMakeDefault,
   onSimulate,
+  changingDefaultApplication,
 }: {
+  defaultApplication: DefaultApplicationStatus | null;
+  defaultApplicationMessage: string | null;
   settings: UpdateSettings;
   engine: EngineStatus | null;
   checking: boolean;
@@ -685,7 +782,9 @@ function SettingsDialog({
   onChannel: (channel: UpdateChannel) => Promise<void>;
   onCheck: () => Promise<void>;
   onClose: () => void;
+  onMakeDefault: () => Promise<void>;
   onSimulate: () => void;
+  changingDefaultApplication: boolean;
 }) {
   return (
     <ModalDialog
@@ -694,6 +793,27 @@ function SettingsDialog({
       onClose={onClose}
     >
       <h2 id="settings-title">Settings</h2>
+      <section className="settings-section" aria-labelledby="files-title">
+        <p id="files-title" className="eyebrow">
+          Files
+        </p>
+        <div className="settings-row">
+          <span className="settings-row-copy">
+            <span className="settings-row-label">Default application</span>
+            <span className="settings-note">
+              {defaultApplicationDescription(
+                defaultApplication,
+                defaultApplicationMessage,
+              )}
+            </span>
+          </span>
+          <DefaultApplicationControl
+            status={defaultApplication}
+            changing={changingDefaultApplication}
+            onMakeDefault={onMakeDefault}
+          />
+        </div>
+      </section>
       <section className="settings-section" aria-labelledby="updates-title">
         <p id="updates-title" className="eyebrow">
           Updates
@@ -757,6 +877,62 @@ function SettingsDialog({
       </div>
     </ModalDialog>
   );
+}
+
+function DefaultApplicationControl({
+  status,
+  changing,
+  onMakeDefault,
+}: {
+  status: DefaultApplicationStatus | null;
+  changing: boolean;
+  onMakeDefault: () => Promise<void>;
+}) {
+  if (status === null) {
+    return <span className="settings-note">Checking…</span>;
+  }
+  if (status.kind === "default") {
+    return <span className="settings-note">Viewda is the default</span>;
+  }
+
+  const unavailable =
+    status.kind === "unavailable" || status.kind === "unintegratedAppImage";
+  const systemSettings = status.kind === "systemSettings";
+  return (
+    <button
+      className="tonal-button"
+      type="button"
+      disabled={changing || unavailable}
+      onClick={() => void onMakeDefault()}
+    >
+      {changing
+        ? systemSettings
+          ? "Opening…"
+          : "Changing…"
+        : systemSettings
+          ? "Open Default apps"
+          : "Make default"}
+    </button>
+  );
+}
+
+function defaultApplicationDescription(
+  status: DefaultApplicationStatus | null,
+  message: string | null,
+): string {
+  if (message !== null) {
+    return message;
+  }
+  if (status?.kind === "unintegratedAppImage") {
+    return "Integrate the AppImage first.";
+  }
+  if (status?.kind === "unavailable") {
+    return "xdg-utils is not installed.";
+  }
+  if (status?.kind === "systemSettings") {
+    return "Finish the choice in Windows Settings.";
+  }
+  return "Open .parquet files in Viewda by default.";
 }
 
 function DowngradeDialog({

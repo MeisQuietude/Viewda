@@ -58,6 +58,33 @@ export interface PostUpdateState {
   sourceError: SourceErrorCode | null;
 }
 
+export type DefaultApplicationStatus =
+  | { kind: "default" }
+  | { kind: "canSet" }
+  | { kind: "unavailable" }
+  | { kind: "unintegratedAppImage" }
+  | { kind: "systemSettings" };
+
+export interface OpenedSourceActivation {
+  source: SourceSummary | null;
+  sourceError: SourceErrorCode | null;
+}
+
+interface NativeSourceError {
+  code: SourceErrorCode;
+}
+
+interface NativePostUpdateState {
+  version: string;
+  source: SourceSummary | null;
+  sourceError: NativeSourceError | null;
+}
+
+interface NativeOpenedSourceActivation {
+  source: SourceSummary | null;
+  sourceError: NativeSourceError | null;
+}
+
 export function shortcutModifierFor(platform: string): string {
   return /Mac|iPhone|iPad|iPod/.test(platform) ? "⌘" : "Ctrl+";
 }
@@ -119,7 +146,35 @@ export function installPendingUpdate(): Promise<void> {
 }
 
 export function takePostUpdateState(): Promise<PostUpdateState | null> {
-  return invoke<PostUpdateState | null>("take_post_update_state");
+  return invoke<NativePostUpdateState | null>("take_post_update_state").then(
+    (state) =>
+      state === null
+        ? null
+        : {
+            ...state,
+            sourceError: state.sourceError?.code ?? null,
+          },
+  );
+}
+
+export function takeOpenedSource(): Promise<OpenedSourceActivation | null> {
+  return invoke<NativeOpenedSourceActivation | null>("take_opened_source").then(
+    (activation) =>
+      activation === null
+        ? null
+        : {
+            source: activation.source,
+            sourceError: activation.sourceError?.code ?? null,
+          },
+  );
+}
+
+export function getDefaultApplicationStatus(): Promise<DefaultApplicationStatus> {
+  return invoke<DefaultApplicationStatus>("get_default_application_status");
+}
+
+export function setDefaultApplication(): Promise<DefaultApplicationStatus> {
+  return invoke<DefaultApplicationStatus>("set_default_application");
 }
 
 export function openReleasesPage(): Promise<void> {
@@ -169,6 +224,12 @@ export function onUpdateAvailable(
   return listen<UpdateInfo>("update-available", ({ payload }) =>
     handler(payload),
   );
+}
+
+export function onOpenedSourceAvailable(
+  handler: () => void,
+): Promise<UnlistenFn> {
+  return listen("opened-source-available", handler);
 }
 
 function readSourceErrorCode(error: unknown): SourceErrorCode {

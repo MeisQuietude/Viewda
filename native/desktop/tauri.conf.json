@@ -42,6 +42,20 @@
       "icons/icon.icns",
       "icons/icon.ico"
     ],
+    "fileAssociations": [
+      {
+        "ext": ["parquet"],
+        "name": "Viewda.Parquet",
+        "description": "Apache Parquet file",
+        "mimeType": "application/vnd.apache.parquet",
+        "role": "Viewer",
+        "rank": "Alternate",
+        "exportedType": {
+          "identifier": "io.github.meisquietude.viewda.parquet",
+          "conformsTo": ["public.data"]
+        }
+      }
+    ],
     "macOS": {
       "signingIdentity": "-"
     }

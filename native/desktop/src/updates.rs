@@ -15,7 +15,7 @@ use tauri_plugin_updater::{Update, UpdaterExt};
 use thiserror::Error;
 use viewda_data_engine::{SourceError, SourceSummary};
 
-use crate::{OpenSourceError, OpenedSource, inspect_selected_source};
+use crate::{OpenSourceError, OpenedSource, SourceOpenIntent, inspect_selected_source};
 
 const UPDATE_STATE_FILE: &str = "updates.json";
 const STABLE_ENDPOINT: &str = "https://meisquietude.github.io/Viewda/updates/stable.json";
@@ -301,14 +301,16 @@ pub async fn take_post_update_state(
     };
     let (source, source_error) = match restart.source_path {
         Some(path) => {
-            let inspected =
-                tauri::async_runtime::spawn_blocking(move || inspect_selected_source(&app, path))
-                    .await
-                    .map_err(|_| UpdateError::Storage)?;
+            let inspected = tauri::async_runtime::spawn_blocking(move || {
+                inspect_selected_source(&app, path, SourceOpenIntent::Restore)
+            })
+            .await
+            .map_err(|_| UpdateError::Storage)?;
             match inspected {
-                Ok((_, summary)) => (Some(summary), None),
+                Ok(Some((_, summary))) => (Some(summary), None),
+                Ok(None) => (None, None),
                 Err(OpenSourceError::Source(error)) => (None, Some(error)),
-                Err(OpenSourceError::Recent(_)) => (None, Some(SourceError::Unsupported)),
+                Err(OpenSourceError::Recent(_)) => return Err(UpdateError::Storage),
             }
         }
         None => (None, None),
