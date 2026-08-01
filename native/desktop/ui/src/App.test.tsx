@@ -29,6 +29,10 @@ beforeEach(() => {
     version: "0.0.1",
     queryEngineVersion: "v1.5.5",
   });
+  vi.spyOn(desktop, "getRecentSources").mockResolvedValue([]);
+  vi.spyOn(desktop, "openRecentSource").mockRejectedValue(
+    new desktop.OpenSourceError("unsupported"),
+  );
   vi.spyOn(desktop, "onOpenSourceRequested").mockResolvedValue(() => {});
   vi.spyOn(desktop, "onSettingsRequested").mockImplementation((handler) => {
     requestSettings = handler;
@@ -110,6 +114,7 @@ describe("App", () => {
     expect(
       screen.queryByText("Your data never leaves this machine."),
     ).not.toBeInTheDocument();
+    expect(desktop.getRecentSources).not.toHaveBeenCalled();
     expectShortcutHints();
   });
 
@@ -127,6 +132,86 @@ describe("App", () => {
     expectShortcutHints();
   });
 
+  it("renders recent files and opens the keyboard-selected entry by id", async () => {
+    vi.spyOn(desktop, "getRecentSources").mockResolvedValue([
+      {
+        id: "recent-8",
+        name: "people.parquet",
+        directory: "~/Data",
+      },
+      {
+        id: "recent-7",
+        name: "events.parquet",
+        directory: "~/Projects/metrics",
+      },
+    ]);
+    vi.spyOn(desktop, "openRecentSource").mockResolvedValue({
+      displayName: "events.parquet",
+      sizeBytes: 2048,
+      rowCount: 4,
+      rowGroupCount: 1,
+      schema: [],
+    });
+
+    render(<App />);
+    const list = await screen.findByRole("list", { name: "Recent files" });
+    const entries = within(list).getAllByRole("button");
+    const firstEntry = entries[0]!;
+    const secondEntry = entries[1]!;
+
+    expect(within(firstEntry).getByText("people.parquet")).toHaveClass(
+      "recent-file-name",
+    );
+    expect(within(firstEntry).getByText("~/Data")).toHaveClass(
+      "recent-file-directory",
+    );
+    firstEntry.focus();
+    fireEvent.keyDown(firstEntry, { key: "ArrowDown" });
+    expect(secondEntry).toHaveFocus();
+    fireEvent.keyDown(secondEntry, { key: "Enter" });
+
+    await waitFor(() =>
+      expect(desktop.openRecentSource).toHaveBeenCalledWith("recent-7"),
+    );
+    expect(await screen.findByText("events.parquet")).toHaveClass(
+      "file-context",
+    );
+  });
+
+  it("does not render the recent-files block for an empty list", async () => {
+    render(<App />);
+
+    await readyOpenButton();
+    await waitFor(() => expect(desktop.getRecentSources).toHaveBeenCalled());
+    expect(
+      screen.queryByRole("list", { name: "Recent files" }),
+    ).not.toBeInTheDocument();
+  });
+
+  it("removes a vanished recent file and shows the existing not-found error", async () => {
+    vi.spyOn(desktop, "getRecentSources").mockResolvedValue([
+      {
+        id: "recent-missing",
+        name: "gone.parquet",
+        directory: "~/Data",
+      },
+    ]);
+    vi.spyOn(desktop, "openRecentSource").mockRejectedValue(
+      new desktop.OpenSourceError("notFound"),
+    );
+
+    render(<App />);
+    const list = await screen.findByRole("list", { name: "Recent files" });
+    fireEvent.click(within(list).getByRole("button"));
+
+    expect(await screen.findByRole("alert")).toHaveTextContent(
+      "That file is no longer available. Choose it again.",
+    );
+    expect(
+      screen.queryByRole("list", { name: "Recent files" }),
+    ).not.toBeInTheDocument();
+  });
+
   it("shows a recoverable startup error", async () => {
     vi.spyOn(desktop, "getEngineStatus").mockRejectedValue(
       new Error("engine unavailable"),
@@ -140,6 +225,7 @@ describe("App", () => {
     expect(
       screen.queryByRole("button", { name: "Open Parquet file…" }),
     ).not.toBeInTheDocument();
+    expect(desktop.getRecentSources).not.toHaveBeenCalled();
     expectShortcutHints();
   });
 
