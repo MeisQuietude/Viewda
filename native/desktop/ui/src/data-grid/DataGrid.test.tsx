@@ -1,8 +1,10 @@
 import {
+  GridCellKind,
   type DataEditorProps,
   type DataEditorRef,
 } from "@glideapps/glide-data-grid";
 import { cleanup, render, waitFor } from "@testing-library/react";
+import { utf8 } from "@uwdata/flechette";
 import { act } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -61,9 +63,12 @@ beforeEach(() => {
   decodeArrowWindow.mockImplementation(
     (_bytes: ArrayBuffer, rowOffset: number): ArrowDataWindow => ({
       rowOffset,
-      rowCount: 100,
+      rowCount: 512,
       table: {
-        schema: { fields: [] },
+        schema: {
+          fields: Array.from({ length: 8 }, () => ({ type: utf8() })),
+        },
+        getChildAt: () => ({ at: (row: number) => `row ${row}` }),
       } as unknown as ArrowDataWindow["table"],
     }),
   );
@@ -87,11 +92,13 @@ describe("DataGrid window rendering", () => {
   it("damages the loaded visible cells so canvas loading gaps repaint", async () => {
     render(<DataGrid source={source} />);
 
+    await waitFor(() => expect(editorMock.updateCells).toHaveBeenCalledOnce());
+    editorMock.updateCells.mockClear();
     const visibleRegionChanged = editorMock.props?.onVisibleRegionChanged;
     expect(visibleRegionChanged).toBeTypeOf("function");
     act(() => {
-      visibleRegionChanged?.({ x: 3, y: 500, width: 4, height: 5 }, 0, 0, {
-        freezeRegions: [{ x: 0, y: 500, width: 1, height: 5 }],
+      visibleRegionChanged?.({ x: 3, y: 1_000, width: 4, height: 5 }, 0, 0, {
+        freezeRegions: [{ x: 0, y: 1_000, width: 1, height: 5 }],
       });
     });
 
@@ -102,10 +109,52 @@ describe("DataGrid window rendering", () => {
       cell: readonly [number, number];
     }[];
     expect(damage).toHaveLength(25);
-    expect(damage).toContainEqual({ cell: [0, 500] });
-    expect(damage).toContainEqual({ cell: [3, 500] });
-    expect(damage).toContainEqual({ cell: [6, 504] });
-    expect(damage).not.toContainEqual({ cell: [1, 500] });
+    expect(damage).toContainEqual({ cell: [0, 1_000] });
+    expect(damage).toContainEqual({ cell: [3, 1_000] });
+    expect(damage).toContainEqual({ cell: [6, 1_004] });
+    expect(damage).not.toContainEqual({ cell: [1, 1_000] });
+  });
+
+  it("keeps loaded cells populated without duplicate prefetches", async () => {
+    render(<DataGrid source={source} />);
+
+    await waitFor(() => expect(desktop.getDataWindow).toHaveBeenCalledOnce());
+    expect(desktop.getDataWindow).toHaveBeenLastCalledWith(7, 0, 512);
+    await waitFor(() => expect(editorMock.updateCells).toHaveBeenCalledOnce());
+
+    const nextWindow = deferred<ArrayBuffer>();
+    vi.mocked(desktop.getDataWindow).mockImplementationOnce(
+      () => nextWindow.promise,
+    );
+    const visibleRegionChanged = editorMock.props?.onVisibleRegionChanged;
+    const getCellContent = editorMock.props?.getCellContent;
+    act(() => {
+      visibleRegionChanged?.({ x: 0, y: 400, width: 4, height: 5 }, 0, 0, {
+        freezeRegions: [],
+      });
+    });
+    await waitFor(() => expect(desktop.getDataWindow).toHaveBeenCalledTimes(2));
+    expect(desktop.getDataWindow).toHaveBeenLastCalledWith(
+      7,
+      expect.any(Number),
+      512,
+    );
+
+    act(() => {
+      visibleRegionChanged?.({ x: 0, y: 401, width: 4, height: 5 }, 0, 0, {
+        freezeRegions: [],
+      });
+    });
+    expect(desktop.getDataWindow).toHaveBeenCalledTimes(2);
+    expect(getCellContent?.([0, 401]).kind).toBe(GridCellKind.Text);
+
+    await act(async () => {
+      nextWindow.resolve(new ArrayBuffer(0));
+    });
+    await waitFor(() =>
+      expect(editorMock.updateCells).toHaveBeenCalledTimes(2),
+    );
+    expect(desktop.getDataWindow).toHaveBeenCalledTimes(2);
   });
 
   it("keeps scrolling inside the grid without column snapping or overscroll", () => {
@@ -140,3 +189,11 @@ describe("DataGrid window rendering", () => {
     expect(drawContent).toHaveBeenCalledOnce();
   });
 });
+
+function deferred<T>() {
+  let resolvePromise!: (value: T | PromiseLike<T>) => void;
+  const promise = new Promise<T>((resolve) => {
+    resolvePromise = resolve;
+  });
+  return { promise, resolve: resolvePromise };
+}
