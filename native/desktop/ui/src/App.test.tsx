@@ -717,7 +717,7 @@ describe("App", () => {
       allowDowngrade: true,
     });
     const wait = screen.getByRole("button", { name: "Wait for next stable" });
-    expect(wait).toHaveFocus();
+    await waitFor(() => expect(wait).toHaveFocus());
     fireEvent.keyDown(wait, { key: "Escape" });
     await waitFor(() => expect(discard).toHaveBeenCalledOnce());
     expect(
