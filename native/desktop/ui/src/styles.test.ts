@@ -50,6 +50,67 @@ describe("schema field layout", () => {
   });
 });
 
+describe("query row", () => {
+  it("keeps the inline WHERE clipped and the popup complete", () => {
+    expect(styles).toMatch(
+      /\.query-where\s*\{[^}]*overflow:\s*hidden;[^}]*text-overflow:\s*ellipsis;[^}]*white-space:\s*nowrap;/s,
+    );
+    expect(styles).toMatch(
+      /\.where-popup\s*\{[^}]*max-height:[^}]*overflow:\s*auto;[^}]*white-space:\s*normal;/s,
+    );
+    expect(styles).toMatch(
+      /\.query-expression\s*\{[^}]*font-family:\s*ui-monospace,/s,
+    );
+  });
+
+  it("uses primary and muted theme tokens in both color schemes", () => {
+    expect(styles).toMatch(
+      /\.query-keyword,\s*\.query-empty-slot,\s*\.query-count\s*\{\s*color:\s*var\(--grid-text-faint\);/s,
+    );
+    expect(styles).toMatch(/\.query-slot\s*\{\s*color:\s*var\(--grid-text\);/s);
+    const darkRoot = styles.match(
+      /@media \(prefers-color-scheme: dark\) \{\s*:root \{([^}]*)\}/s,
+    )?.[1];
+    expect(darkRoot).toBeDefined();
+    expect(darkRoot).toMatch(/--grid-text:\s*#[0-9a-f]{6};/i);
+    expect(darkRoot).toMatch(/--grid-text-faint:\s*#[0-9a-f]{6};/i);
+  });
+});
+
+describe("filter editor actions", () => {
+  it("keeps the primary action readable on hover in both themes", () => {
+    const lightRoot = styles.match(/:root \{([^}]*)\}/s)?.[1];
+    const darkRoot = styles.match(
+      /@media \(prefers-color-scheme: dark\) \{\s*:root \{([^}]*)\}/s,
+    )?.[1];
+    expect(lightRoot).toBeDefined();
+    expect(darkRoot).toBeDefined();
+    if (lightRoot === undefined || darkRoot === undefined) {
+      throw new Error("Theme variables are missing.");
+    }
+
+    for (const root of [lightRoot, darkRoot]) {
+      const text = readColorVariable(root, "grid-selection-text");
+      const background = readColorVariable(root, "grid-selection-strong");
+      const hoverBackground = mixColors(
+        background,
+        readColorVariable(root, "grid-text"),
+        0.88,
+      );
+      expect(contrastRatio(text, hoverBackground)).toBeGreaterThan(
+        contrastRatio(text, background),
+      );
+    }
+
+    expect(styles).toMatch(
+      /\.filter-editor-actions button:not\(:last-child\):hover:not\(:disabled\)\s*\{\s*background:\s*var\(--grid-selection\);/s,
+    );
+    expect(styles).toMatch(
+      /\.filter-editor-actions button:last-child:hover:not\(:disabled\)\s*\{\s*background:\s*color-mix\(\s*in srgb,\s*var\(--grid-selection-strong\) 88%,\s*var\(--grid-text\)\s*\);/s,
+    );
+  });
+});
+
 function readColorVariable(block: string, name: string): string {
   const value = block.match(
     new RegExp(`--${name}:\\s*(#[0-9a-f]{6});`, "i"),
@@ -67,6 +128,19 @@ function contrastRatio(foreground: string, background: string): number {
   const lighter = Math.max(foregroundLuminance, backgroundLuminance);
   const darker = Math.min(foregroundLuminance, backgroundLuminance);
   return (lighter + 0.05) / (darker + 0.05);
+}
+
+function mixColors(first: string, second: string, firstWeight: number): string {
+  const channels = [1, 3, 5].map((offset) => {
+    const firstChannel = Number.parseInt(first.slice(offset, offset + 2), 16);
+    const secondChannel = Number.parseInt(second.slice(offset, offset + 2), 16);
+    return Math.round(
+      firstChannel * firstWeight + secondChannel * (1 - firstWeight),
+    )
+      .toString(16)
+      .padStart(2, "0");
+  });
+  return `#${channels.join("")}`;
 }
 
 function relativeLuminance(color: string): number {

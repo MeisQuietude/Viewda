@@ -1,5 +1,7 @@
 import { TimeUnit, Type, type DataType } from "@uwdata/flechette";
 
+import { decimalToText, timestampToText } from "./filter-query";
+
 const NESTED_PREVIEW_LIMIT = 120;
 // Every full chunk is divisible by three, so independently encoded base64
 // chunks concatenate without padding in the middle of the value.
@@ -36,18 +38,18 @@ export function formatCellValue(
   if (type.typeId === Type.Timestamp) {
     // M1 renders timezone-less Arrow timestamps as UTC for deterministic ISO output.
     // Copying remains lossless because copyData keeps the raw Arrow integer.
-    const iso = timestampToIso(value, type.unit);
+    const iso = timestampToText(value, type.unit);
     const raw = typeof value === "bigint" ? value.toString() : String(value);
     return presentation(iso, raw, false, false);
   }
 
   if (type.typeId === Type.Date) {
-    const iso = timestampToIso(value, TimeUnit.MILLISECOND).slice(0, 10);
+    const iso = timestampToText(value, TimeUnit.MILLISECOND).slice(0, 10);
     return presentation(iso, iso, false, false);
   }
 
   if (type.typeId === Type.Decimal) {
-    const decimal = formatDecimal(value, type.scale);
+    const decimal = decimalToText(value, type.scale);
     return presentation(decimal, decimal, true, false);
   }
 
@@ -121,64 +123,6 @@ function isNested(dataType: DataType): boolean {
     dataType.typeId === Type.Struct ||
     dataType.typeId === Type.Map
   );
-}
-
-function timestampToIso(value: unknown, unit: number): string {
-  if (value instanceof Date) {
-    return value.toISOString();
-  }
-  if (typeof value !== "bigint") {
-    const date = new Date(typeof value === "number" ? value : String(value));
-    return Number.isNaN(date.valueOf()) ? String(value) : date.toISOString();
-  }
-
-  const [milliseconds, submillisecond, precision] = timestampParts(value, unit);
-  const date = new Date(Number(milliseconds));
-  if (Number.isNaN(date.valueOf())) {
-    return value.toString();
-  }
-  const iso = date.toISOString();
-  return precision === 0
-    ? iso
-    : `${iso.slice(0, -1)}${submillisecond.toString().padStart(precision, "0")}Z`;
-}
-
-function timestampParts(
-  value: bigint,
-  unit: number,
-): [milliseconds: bigint, submillisecond: bigint, precision: number] {
-  if (unit === TimeUnit.SECOND) {
-    return [value * 1_000n, 0n, 0];
-  }
-  if (unit === TimeUnit.MILLISECOND) {
-    return [value, 0n, 0];
-  }
-  const divisor = unit === TimeUnit.MICROSECOND ? 1_000n : 1_000_000n;
-  const precision = unit === TimeUnit.MICROSECOND ? 3 : 6;
-  let milliseconds = value / divisor;
-  let submillisecond = value % divisor;
-  if (submillisecond < 0) {
-    milliseconds -= 1n;
-    submillisecond += divisor;
-  }
-  return [milliseconds, submillisecond, precision];
-}
-
-function formatDecimal(value: unknown, scale: number): string {
-  if (typeof value !== "bigint" && typeof value !== "number") {
-    return String(value);
-  }
-  const integer = typeof value === "bigint" ? value : BigInt(value);
-  const negative = integer < 0;
-  const digits = (negative ? -integer : integer).toString();
-
-  if (scale <= 0) {
-    return `${negative ? "-" : ""}${digits}${"0".repeat(-scale)}`;
-  }
-
-  const padded = digits.padStart(scale + 1, "0");
-  const point = padded.length - scale;
-  return `${negative ? "-" : ""}${padded.slice(0, point)}.${padded.slice(point)}`;
 }
 
 function stringifyNested(value: unknown): string {

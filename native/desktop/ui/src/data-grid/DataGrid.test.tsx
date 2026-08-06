@@ -1,4 +1,5 @@
 import {
+  CompactSelection,
   GridCellKind,
   type DataEditorProps,
   type DataEditorRef,
@@ -11,7 +12,7 @@ import {
   waitFor,
   within,
 } from "@testing-library/react";
-import { utf8 } from "@uwdata/flechette";
+import { TimeUnit, timestamp, utf8 } from "@uwdata/flechette";
 import { act } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -85,6 +86,8 @@ beforeEach(() => {
     }),
   );
   vi.spyOn(desktop, "getDataWindow").mockResolvedValue(new ArrayBuffer(0));
+  vi.spyOn(desktop, "getFilteredRowCount").mockResolvedValue(37);
+  vi.spyOn(desktop, "cancelFilteredRowCount").mockResolvedValue();
   vi.spyOn(desktop, "getColumnStatistics").mockResolvedValue({
     minimum: "1",
     maximum: "9",
@@ -139,7 +142,7 @@ describe("DataGrid window rendering", () => {
     render(<DataGrid source={source} />);
 
     await waitFor(() => expect(desktop.getDataWindow).toHaveBeenCalledOnce());
-    expect(desktop.getDataWindow).toHaveBeenLastCalledWith(7, 0, 512);
+    expect(desktop.getDataWindow).toHaveBeenLastCalledWith(7, 0, 512, []);
     await waitFor(() => expect(editorMock.updateCells).toHaveBeenCalledOnce());
 
     const nextWindow = deferred<ArrayBuffer>();
@@ -158,6 +161,7 @@ describe("DataGrid window rendering", () => {
       7,
       expect.any(Number),
       512,
+      [],
     );
 
     act(() => {
@@ -207,6 +211,361 @@ describe("DataGrid window rendering", () => {
     );
 
     expect(drawContent).toHaveBeenCalledOnce();
+  });
+
+  it("always renders the path-free query row", () => {
+    render(<DataGrid source={source} />);
+
+    const query = screen.getByLabelText("Query");
+    const expression = query.querySelector(".query-expression");
+    expect(
+      Array.from(expression?.children ?? [], (node) => node.textContent),
+    ).toEqual(["SELECT", "*", "FROM", "this", "WHERE⋯", "ORDER BY", "⋯"]);
+    expect(within(query).getByText("SELECT", { selector: "span" })).toHaveClass(
+      "query-keyword",
+    );
+    expect(within(query).getByText("this")).toBeInTheDocument();
+    expect(within(query).getByRole("button", { name: "⋯" })).toHaveClass(
+      "query-empty-slot",
+    );
+    expect(query).not.toHaveTextContent(source.displayName);
+    expect(query).toHaveTextContent("10,000 rows");
+  });
+
+  it("clamps the WHERE popup inside a narrow viewport", () => {
+    vi.stubGlobal("innerWidth", 600);
+    render(<DataGrid source={source} />);
+    const wrap = document.querySelector(".query-where-wrap");
+    vi.spyOn(wrap as HTMLDivElement, "getBoundingClientRect").mockReturnValue({
+      left: 520,
+    } as DOMRect);
+
+    fireEvent.click(screen.getByRole("button", { name: "⋯" }));
+
+    expect(
+      screen.getByRole("dialog", { name: "WHERE conditions" }),
+    ).toHaveStyle({ left: "-504px" });
+  });
+
+  it("updates SELECT from hidden-column state and clearing WHERE keeps it", async () => {
+    render(<DataGrid source={source} />);
+
+    openColumnMenu(7);
+    fireEvent.click(screen.getByRole("menuitem", { name: "Hide column" }));
+    expect(screen.getByLabelText("Query")).toHaveTextContent("[7/8 cols]");
+
+    addNumberFilter("42");
+    await waitFor(() =>
+      expect(screen.getByLabelText("Query")).toHaveTextContent(
+        '"column_0" = 42',
+      ),
+    );
+    fireEvent.click(
+      screen.getByRole("button", { name: "Clear WHERE conditions" }),
+    );
+
+    expect(screen.getByLabelText("Query")).toHaveTextContent("[7/8 cols]");
+    expect(screen.getByLabelText("Query")).not.toHaveTextContent(
+      '"column_0" = 42',
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "Show all columns" }));
+    expect(
+      screen.getByLabelText("Query").querySelector(".query-slot"),
+    ).toHaveTextContent("*");
+  });
+
+  it("knows an empty source has zero matches without loading or counting", () => {
+    render(<DataGrid source={{ ...source, rowCount: 0 }} />);
+
+    addNumberFilter("1");
+
+    expect(
+      screen.getByText("No rows match these conditions."),
+    ).toBeInTheDocument();
+    expect(screen.getByLabelText("Query")).toHaveTextContent("0 rows");
+    expect(desktop.getDataWindow).not.toHaveBeenCalled();
+    expect(desktop.getFilteredRowCount).not.toHaveBeenCalled();
+  });
+
+  it("edits and removes conditions through the full WHERE popup", async () => {
+    render(<DataGrid source={source} />);
+    addNumberFilter("-3");
+
+    await waitFor(() =>
+      expect(screen.getByLabelText("Query")).toHaveTextContent(
+        '"column_0" = -3',
+      ),
+    );
+    fireEvent.click(screen.getByRole("button", { name: '"column_0" = -3' }));
+    const popup = screen.getByRole("dialog", { name: "WHERE conditions" });
+    expect(within(popup).getByText('"column_0" = -3')).toBeInTheDocument();
+
+    fireEvent.click(within(popup).getByRole("button", { name: "Edit" }));
+    const editor = screen.getByRole("form", { name: "Filter column_0" });
+    const value = within(editor).getByRole("textbox", { name: "Value" });
+    fireEvent.change(value, { target: { value: "-7" } });
+    fireEvent.click(
+      within(editor).getByRole("button", { name: "Save condition" }),
+    );
+    expect(screen.getByLabelText("Query")).toHaveTextContent('"column_0" = -7');
+
+    fireEvent.click(screen.getByRole("button", { name: '"column_0" = -7' }));
+    fireEvent.click(
+      within(
+        screen.getByRole("dialog", { name: "WHERE conditions" }),
+      ).getByRole("button", { name: /Remove filter/ }),
+    );
+    expect(screen.getByLabelText("Query")).not.toHaveTextContent(
+      '"column_0" = -7',
+    );
+  });
+
+  it("bounds the grid to observed rows until the exact COUNT resolves", async () => {
+    const count = deferred<number>();
+    vi.mocked(desktop.getFilteredRowCount).mockReturnValueOnce(count.promise);
+    render(<DataGrid source={source} />);
+
+    addNumberFilter("1");
+
+    await waitFor(() =>
+      expect(desktop.getFilteredRowCount).toHaveBeenCalledOnce(),
+    );
+    expect(editorMock.props?.rows).toBe(512);
+    expect(screen.getByLabelText("Query")).toHaveTextContent("counting…");
+
+    await act(async () => count.resolve(37));
+
+    await waitFor(() => expect(editorMock.props?.rows).toBe(37));
+    expect(screen.getByLabelText("Query")).toHaveTextContent("37 rows");
+  });
+
+  it("uses a short first filtered window as the exact non-phantom total", async () => {
+    decodeArrowWindow.mockImplementation(
+      (_bytes: ArrayBuffer, rowOffset: number): ArrowDataWindow => ({
+        rowOffset,
+        rowCount: rowOffset === 0 ? 3 : 0,
+        table: {
+          schema: {
+            fields: Array.from({ length: 8 }, () => ({ type: utf8() })),
+          },
+          getChildAt: () => ({ at: (row: number) => `row ${row}` }),
+        } as unknown as ArrowDataWindow["table"],
+      }),
+    );
+    render(<DataGrid source={source} />);
+    await waitFor(() => expect(editorMock.props?.rows).toBe(10_000));
+
+    addNumberFilter("1");
+
+    await waitFor(() => expect(editorMock.props?.rows).toBe(3));
+    expect(desktop.getFilteredRowCount).not.toHaveBeenCalled();
+    expect(screen.getByLabelText("Query")).toHaveTextContent("3 rows");
+  });
+
+  it("cancels the previous COUNT when filters change rapidly", async () => {
+    const firstCount = deferred<number>();
+    vi.mocked(desktop.getFilteredRowCount)
+      .mockReturnValueOnce(firstCount.promise)
+      .mockResolvedValueOnce(11);
+    render(<DataGrid source={source} />);
+
+    addNumberFilter("1");
+    await waitFor(() =>
+      expect(desktop.getFilteredRowCount).toHaveBeenCalledWith(7, 1, [
+        { columnIndex: 0, operator: "equals", values: ["1"] },
+      ]),
+    );
+    addNumberFilter("2", 1);
+
+    await waitFor(() =>
+      expect(desktop.cancelFilteredRowCount).toHaveBeenCalledWith(7, 1),
+    );
+    await waitFor(() =>
+      expect(desktop.getFilteredRowCount).toHaveBeenLastCalledWith(7, 2, [
+        { columnIndex: 0, operator: "equals", values: ["1"] },
+        { columnIndex: 1, operator: "equals", values: ["2"] },
+      ]),
+    );
+    await waitFor(() =>
+      expect(screen.getByLabelText("Query")).toHaveTextContent("11 rows"),
+    );
+
+    await act(async () => firstCount.resolve(99));
+
+    expect(screen.getByLabelText("Query")).toHaveTextContent("11 rows");
+  });
+
+  it("does not apply a window returned for a stale filter revision", async () => {
+    const staleWindow = deferred<ArrayBuffer>();
+    const currentWindow = deferred<ArrayBuffer>();
+    const initialBytes = new ArrayBuffer(1);
+    const staleBytes = new ArrayBuffer(2);
+    const currentBytes = new ArrayBuffer(3);
+    vi.mocked(desktop.getDataWindow)
+      .mockResolvedValueOnce(initialBytes)
+      .mockReturnValueOnce(staleWindow.promise)
+      .mockReturnValueOnce(currentWindow.promise);
+    decodeArrowWindow.mockImplementation(
+      (bytes: ArrayBuffer, rowOffset: number): ArrowDataWindow => ({
+        rowOffset,
+        rowCount: bytes === staleBytes ? 401 : bytes === currentBytes ? 2 : 512,
+        table: {
+          schema: {
+            fields: Array.from({ length: 8 }, () => ({ type: utf8() })),
+          },
+          getChildAt: () => ({ at: (row: number) => `row ${row}` }),
+        } as unknown as ArrowDataWindow["table"],
+      }),
+    );
+    render(<DataGrid source={source} />);
+    await waitFor(() => expect(desktop.getDataWindow).toHaveBeenCalledOnce());
+
+    addNumberFilter("1");
+    await waitFor(() => expect(desktop.getDataWindow).toHaveBeenCalledTimes(2));
+    addNumberFilter("2", 1);
+    await act(async () => staleWindow.resolve(staleBytes));
+
+    await waitFor(() => expect(desktop.getDataWindow).toHaveBeenCalledTimes(3));
+    expect(editorMock.props?.rows).not.toBe(401);
+
+    await act(async () => currentWindow.resolve(currentBytes));
+    await waitFor(() => expect(editorMock.props?.rows).toBe(2));
+  });
+
+  it("interrupts an active COUNT when the grid closes", async () => {
+    const count = deferred<number>();
+    vi.mocked(desktop.getFilteredRowCount).mockReturnValueOnce(count.promise);
+    const { unmount } = render(<DataGrid source={source} />);
+    addNumberFilter("1");
+    await waitFor(() =>
+      expect(desktop.getFilteredRowCount).toHaveBeenCalledWith(7, 1, [
+        { columnIndex: 0, operator: "equals", values: ["1"] },
+      ]),
+    );
+
+    unmount();
+
+    expect(desktop.cancelFilteredRowCount).toHaveBeenCalledWith(7, 1);
+  });
+
+  it("leaves counting state on COUNT failure and retries the same revision", async () => {
+    vi.mocked(desktop.getFilteredRowCount).mockRejectedValueOnce(
+      new desktop.DataWindowCommandError("queryEngineUnavailable"),
+    );
+    render(<DataGrid source={source} />);
+    addNumberFilter("9");
+
+    const retry = await screen.findByRole("button", { name: "retry" });
+    expect(screen.getByLabelText("Query")).not.toHaveTextContent("counting…");
+
+    fireEvent.click(retry);
+
+    await waitFor(() =>
+      expect(desktop.getFilteredRowCount).toHaveBeenCalledTimes(2),
+    );
+    expect(desktop.getFilteredRowCount).toHaveBeenLastCalledWith(7, 1, [
+      { columnIndex: 0, operator: "equals", values: ["9"] },
+    ]);
+  });
+
+  it("retries an unfiltered window without changing the row count or selection", async () => {
+    vi.mocked(desktop.getDataWindow)
+      .mockRejectedValueOnce(new desktop.DataWindowCommandError("queryFailed"))
+      .mockResolvedValueOnce(new ArrayBuffer(0));
+    render(<DataGrid source={source} />);
+    const alert = await screen.findByRole("alert");
+    expect(screen.getByLabelText("Query")).toHaveTextContent("10,000 rows");
+    expect(
+      within(screen.getByLabelText("Query")).queryByRole("button", {
+        name: "retry",
+      }),
+    ).not.toBeInTheDocument();
+    const selection = {
+      columns: CompactSelection.empty(),
+      rows: CompactSelection.fromSingleSelection(4),
+    };
+    act(() => editorMock.props?.onGridSelectionChange?.(selection));
+
+    fireEvent.click(
+      within(alert).getByRole("button", { name: "Retry window" }),
+    );
+
+    await waitFor(() => expect(desktop.getDataWindow).toHaveBeenCalledTimes(2));
+    await waitFor(() =>
+      expect(editorMock.props?.gridSelection).toEqual(selection),
+    );
+  });
+
+  it("shows filter limits as guidance without discarding the AST", async () => {
+    vi.mocked(desktop.getDataWindow)
+      .mockResolvedValueOnce(new ArrayBuffer(0))
+      .mockRejectedValueOnce(
+        new desktop.DataWindowCommandError("invalidFilter"),
+      );
+    render(<DataGrid source={source} />);
+    await waitFor(() => expect(desktop.getDataWindow).toHaveBeenCalledOnce());
+
+    addNumberFilter("1");
+
+    expect(await screen.findByRole("alert")).toHaveTextContent(
+      "does not match its column type or exceeds the limits",
+    );
+    expect(screen.getByLabelText("Query")).toHaveTextContent('"column_0" = 1');
+    expect(screen.getByLabelText("Query")).toHaveTextContent(
+      "count unavailable",
+    );
+    expect(
+      screen.getByRole("button", { name: "Retry window" }),
+    ).toBeInTheDocument();
+  });
+
+  it("prefills a timestamp from its Arrow value instead of raw copy data", async () => {
+    const raw =
+      BigInt(new Date("2026-08-01T06:07:08.009Z").valueOf()) * 1_000n + 456n;
+    decodeArrowWindow.mockImplementation(
+      (_bytes: ArrayBuffer, rowOffset: number): ArrowDataWindow => ({
+        rowOffset,
+        rowCount: 1,
+        table: {
+          schema: {
+            fields: [{ type: timestamp(TimeUnit.MICROSECOND, "UTC") }],
+          },
+          getChildAt: () => ({ at: () => raw }),
+        } as unknown as ArrowDataWindow["table"],
+      }),
+    );
+    render(
+      <DataGrid
+        source={{
+          ...source,
+          rowCount: 1,
+          schema: [
+            {
+              name: "recorded_at",
+              physicalType: "INT64",
+              logicalType: "Timestamp (microseconds, UTC)",
+              children: [],
+            },
+          ],
+        }}
+      />,
+    );
+    await waitFor(() => expect(desktop.getDataWindow).toHaveBeenCalledOnce());
+
+    act(() => {
+      editorMock.props?.onCellContextMenu?.([0, 0], {
+        preventDefault: vi.fn(),
+        bounds: { x: 20, y: 20, width: 120, height: 28 },
+      } as never);
+    });
+
+    expect(
+      within(
+        screen.getByRole("form", { name: "Filter recorded_at" }),
+      ).getByRole("textbox", { name: "Value" }),
+    ).toHaveValue("2026-08-01T06:07:08.009456Z");
+    expect(screen.queryByDisplayValue(raw.toString())).not.toBeInTheDocument();
   });
 
   it("opens the nested schema without scanning until a column is selected", async () => {
@@ -510,6 +869,31 @@ describe("DataGrid window rendering", () => {
     ).toHaveAttribute("aria-pressed", "true");
   });
 });
+
+function openColumnMenu(visibleIndex: number) {
+  act(() => {
+    editorMock.props?.onHeaderMenuClick?.(visibleIndex, {
+      x: 20,
+      y: 20,
+      width: 120,
+      height: 32,
+    });
+  });
+}
+
+function addNumberFilter(value: string, visibleIndex = 0) {
+  openColumnMenu(visibleIndex);
+  fireEvent.click(screen.getByRole("menuitem", { name: "Filter…" }));
+  const editor = screen.getByRole("form", {
+    name: `Filter column_${visibleIndex}`,
+  });
+  fireEvent.change(within(editor).getByRole("textbox", { name: "Value" }), {
+    target: { value },
+  });
+  fireEvent.click(
+    within(editor).getByRole("button", { name: "Add condition" }),
+  );
+}
 
 function deferred<T>() {
   let resolvePromise!: (value: T | PromiseLike<T>) => void;

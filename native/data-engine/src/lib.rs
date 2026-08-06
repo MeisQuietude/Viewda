@@ -1,5 +1,7 @@
 //! Shell-independent data inspection and query operations for Viewda.
 
+#[cfg(feature = "query-engine")]
+mod filter;
 mod source;
 #[cfg(feature = "query-engine")]
 mod statistics;
@@ -13,13 +15,17 @@ use serde::Serialize;
 #[cfg(feature = "query-engine")]
 use thiserror::Error;
 
+#[cfg(feature = "query-engine")]
+pub use filter::{DataFilter, DataFilterOperator};
 pub use source::{SchemaField, SourceError, SourceSummary, inspect_local_source};
 #[cfg(feature = "query-engine")]
 pub use statistics::{
     ColumnStatistics, ColumnStatisticsError, ColumnStatisticsReader, StatisticsInterruptHandle,
 };
 #[cfg(feature = "query-engine")]
-pub use window::{DataWindowError, DataWindowReader};
+pub use window::{
+    DataWindowError, DataWindowReader, FilteredRowCountInterruptHandle, FilteredRowCountReader,
+};
 
 /// Describes the data engine backing the desktop shell.
 #[cfg(feature = "query-engine")]
