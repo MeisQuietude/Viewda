@@ -15,6 +15,8 @@ Backward-incompatible entries start with **Breaking:**.
 
 ### Changed
 
+- The app icon now uses a graphite plate with a gold mark and a subtle rim so
+  it stays visible on dark backgrounds.
 - Structure now uses stable, human-readable Parquet physical and logical type
   names.
 
