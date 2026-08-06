@@ -300,8 +300,10 @@ describe("App", () => {
       "aria-pressed",
       "true",
     );
-    expect(screen.getByLabelText("Data")).toHaveTextContent("Grid data");
+    const dataGrid = screen.getByLabelText("Data");
+    expect(dataGrid).toHaveTextContent("Grid data");
     fireEvent.click(screen.getByRole("button", { name: "Structure" }));
+    expect(screen.getByLabelText("Data")).toBe(dataGrid);
     expect(container.querySelector(".source-heading")).not.toHaveTextContent(
       "people.parquet",
     );
@@ -354,6 +356,7 @@ describe("App", () => {
       "aria-pressed",
       "true",
     );
+    expect(screen.getByLabelText("Data")).toBe(dataGrid);
     fireEvent.keyDown(window, { key: "2", metaKey: true });
     expect(screen.getByRole("button", { name: "Structure" })).toHaveAttribute(
       "aria-pressed",

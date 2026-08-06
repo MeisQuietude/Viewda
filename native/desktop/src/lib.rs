@@ -6,8 +6,12 @@ mod recents;
 mod updates;
 
 use std::{
+    collections::{HashMap, hash_map::Entry},
     path::PathBuf,
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
 };
 
 #[cfg(not(target_os = "macos"))]
@@ -33,8 +37,9 @@ use updates::{
     install_pending_update, open_releases_page, set_update_settings, take_post_update_state,
 };
 use viewda_data_engine::{
-    DataWindowError, DataWindowReader, EngineError, EngineStatus, SourceError, SourceSummary,
-    engine_status, inspect_local_source,
+    ColumnStatistics, ColumnStatisticsError, ColumnStatisticsReader, DataWindowError,
+    DataWindowReader, EngineError, EngineStatus, SchemaField, SourceError, SourceSummary,
+    StatisticsInterruptHandle, engine_status, inspect_local_source,
 };
 
 const OPEN_SOURCE_MENU_ID: &str = "open-local-source";
@@ -60,7 +65,37 @@ struct OpenedSourceState {
 struct OpenedSourceSession {
     generation: u64,
     path: PathBuf,
+    schema: Vec<SchemaField>,
     reader: DataWindowReader,
+    statistics_cache: HashMap<(u64, usize), ColumnStatistics>,
+}
+
+#[derive(Debug, PartialEq)]
+enum ColumnStatisticsRequest {
+    Cached(ColumnStatistics),
+    Scan { path: PathBuf, column_name: String },
+}
+
+#[derive(Default)]
+struct ColumnStatisticsJobs {
+    active: Mutex<Option<ActiveColumnStatisticsJob>>,
+}
+
+struct ActiveColumnStatisticsJob {
+    generation: u64,
+    job: Arc<ColumnStatisticsJob>,
+}
+
+struct ColumnStatisticsJob {
+    cancelled: AtomicBool,
+    interrupt: StatisticsInterruptHandle,
+}
+
+impl ColumnStatisticsJob {
+    fn cancel(&self) {
+        self.cancelled.store(true, Ordering::Release);
+        self.interrupt.interrupt();
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -83,6 +118,38 @@ enum DataWindowCommandError {
 enum DataWindowSessionError {
     NoSourceOpen,
     SourceChanged,
+}
+
+#[derive(Debug, PartialEq, Eq, Serialize)]
+#[serde(tag = "code", rename_all = "camelCase")]
+enum ColumnStatisticsCommandError {
+    NoSourceOpen,
+    SourceChanged,
+    UnsupportedColumn,
+    Cancelled,
+    NotFound,
+    PermissionDenied,
+    NotParquet,
+    CorruptSource,
+    Unsupported,
+    ResourceExhausted,
+    QueryFailed,
+    QueryEngineUnavailable,
+}
+
+impl From<ColumnStatisticsError> for ColumnStatisticsCommandError {
+    fn from(error: ColumnStatisticsError) -> Self {
+        match error {
+            ColumnStatisticsError::NotFound => Self::NotFound,
+            ColumnStatisticsError::PermissionDenied => Self::PermissionDenied,
+            ColumnStatisticsError::NotParquet => Self::NotParquet,
+            ColumnStatisticsError::CorruptSource => Self::CorruptSource,
+            ColumnStatisticsError::Unsupported => Self::Unsupported,
+            ColumnStatisticsError::ResourceExhausted => Self::ResourceExhausted,
+            ColumnStatisticsError::QueryFailed => Self::QueryFailed,
+            ColumnStatisticsError::QueryEngineUnavailable => Self::QueryEngineUnavailable,
+        }
+    }
 }
 
 impl From<DataWindowError> for DataWindowCommandError {
@@ -135,10 +202,13 @@ impl OpenedSource {
             .checked_add(1)
             .ok_or(SourceError::Unsupported)?;
         state.generation = generation;
+        let schema = summary.schema.clone();
         state.session = Some(OpenedSourceSession {
             generation,
             reader: DataWindowReader::new(path.clone()),
             path,
+            schema,
+            statistics_cache: HashMap::new(),
         });
         if intent == SourceOpenIntent::Explicit {
             state.blocks_restore = true;
@@ -214,6 +284,171 @@ fn fetch_opened_source_window(
         .reader
         .fetch(row_offset, row_count)
         .map_err(Into::into)
+}
+
+/// Computes statistics on a separate, cancellable query connection.
+#[tauri::command]
+async fn get_column_statistics(
+    generation: u64,
+    column_index: usize,
+    include_min_max: bool,
+    opened_source: tauri::State<'_, OpenedSource>,
+    statistics_jobs: tauri::State<'_, ColumnStatisticsJobs>,
+) -> Result<ColumnStatistics, ColumnStatisticsCommandError> {
+    let request = {
+        let state = opened_source
+            .state
+            .lock()
+            .map_err(|_| ColumnStatisticsCommandError::Unsupported)?;
+        statistics_request(&state, generation, column_index, include_min_max)?
+    };
+    let (path, column_name) = match request {
+        ColumnStatisticsRequest::Cached(statistics) => {
+            cancel_active_statistics_job(&statistics_jobs, generation)?;
+            return Ok(statistics);
+        }
+        ColumnStatisticsRequest::Scan { path, column_name } => (path, column_name),
+    };
+    let reader = ColumnStatisticsReader::new(path)?;
+    let job = Arc::new(ColumnStatisticsJob {
+        cancelled: AtomicBool::new(false),
+        interrupt: reader.interrupt_handle(),
+    });
+    let previous = statistics_jobs
+        .active
+        .lock()
+        .map_err(|_| ColumnStatisticsCommandError::Unsupported)?
+        .replace(ActiveColumnStatisticsJob {
+            generation,
+            job: Arc::clone(&job),
+        });
+    if let Some(previous) = previous {
+        previous.job.cancel();
+    }
+
+    let result =
+        tauri::async_runtime::spawn_blocking(move || reader.fetch(&column_name, include_min_max))
+            .await;
+    let mut active = statistics_jobs
+        .active
+        .lock()
+        .map_err(|_| ColumnStatisticsCommandError::Unsupported)?;
+    if active
+        .as_ref()
+        .is_some_and(|current| current.generation == generation && Arc::ptr_eq(&current.job, &job))
+    {
+        active.take();
+    }
+    drop(active);
+    let cancelled = job.cancelled.load(Ordering::Acquire);
+
+    if cancelled {
+        return Err(ColumnStatisticsCommandError::Cancelled);
+    }
+    let statistics = result
+        .map_err(|_| ColumnStatisticsCommandError::QueryEngineUnavailable)?
+        .map_err(ColumnStatisticsCommandError::from)?;
+    let mut state = opened_source
+        .state
+        .lock()
+        .map_err(|_| ColumnStatisticsCommandError::Unsupported)?;
+    cache_statistics(&mut state, generation, column_index, statistics.clone())?;
+    Ok(statistics)
+}
+
+fn statistics_request(
+    state: &OpenedSourceState,
+    generation: u64,
+    column_index: usize,
+    include_min_max: bool,
+) -> Result<ColumnStatisticsRequest, ColumnStatisticsCommandError> {
+    let session = state
+        .session
+        .as_ref()
+        .ok_or(ColumnStatisticsCommandError::NoSourceOpen)?;
+    if session.generation != generation {
+        return Err(ColumnStatisticsCommandError::SourceChanged);
+    }
+    if let Some(statistics) = session
+        .statistics_cache
+        .get(&(generation, column_index))
+        .filter(|statistics| !include_min_max || statistics.min_max_computed)
+    {
+        return Ok(ColumnStatisticsRequest::Cached(statistics.clone()));
+    }
+    let column_name = session
+        .schema
+        .get(column_index)
+        .ok_or(ColumnStatisticsCommandError::UnsupportedColumn)?
+        .name
+        .clone();
+    Ok(ColumnStatisticsRequest::Scan {
+        path: session.path.clone(),
+        column_name,
+    })
+}
+
+fn cache_statistics(
+    state: &mut OpenedSourceState,
+    generation: u64,
+    column_index: usize,
+    statistics: ColumnStatistics,
+) -> Result<(), ColumnStatisticsCommandError> {
+    let session = state
+        .session
+        .as_mut()
+        .ok_or(ColumnStatisticsCommandError::NoSourceOpen)?;
+    if session.generation != generation {
+        return Err(ColumnStatisticsCommandError::SourceChanged);
+    }
+    if session.schema.get(column_index).is_none() {
+        return Err(ColumnStatisticsCommandError::UnsupportedColumn);
+    }
+    match session.statistics_cache.entry((generation, column_index)) {
+        Entry::Vacant(entry) => {
+            entry.insert(statistics);
+        }
+        Entry::Occupied(mut entry)
+            if statistics.min_max_computed || !entry.get().min_max_computed =>
+        {
+            entry.insert(statistics);
+        }
+        Entry::Occupied(_) => {}
+    }
+    Ok(())
+}
+
+fn cancel_active_statistics_job(
+    statistics_jobs: &ColumnStatisticsJobs,
+    generation: u64,
+) -> Result<(), ColumnStatisticsCommandError> {
+    let active = {
+        let mut active = statistics_jobs
+            .active
+            .lock()
+            .map_err(|_| ColumnStatisticsCommandError::Unsupported)?;
+        if active
+            .as_ref()
+            .is_some_and(|active| active.generation == generation)
+        {
+            active.take()
+        } else {
+            None
+        }
+    };
+    if let Some(active) = active {
+        active.job.cancel();
+    }
+    Ok(())
+}
+
+/// Interrupts the active statistics scan for an opened-source generation.
+#[tauri::command]
+fn cancel_column_statistics(
+    generation: u64,
+    statistics_jobs: tauri::State<'_, ColumnStatisticsJobs>,
+) -> Result<(), ColumnStatisticsCommandError> {
+    cancel_active_statistics_job(&statistics_jobs, generation)
 }
 
 /// Owns the native file dialog and passes the selected path directly to data-engine.
@@ -425,6 +660,7 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
         .manage(OpenedSource::default())
+        .manage(ColumnStatisticsJobs::default())
         .manage(PendingOpenedSource::default())
         .manage(PendingUpdate::default())
         .manage(UpdateStateStore::default())
@@ -521,6 +757,8 @@ pub fn run() {
             get_default_application_status,
             set_default_application,
             get_data_window,
+            get_column_statistics,
+            cancel_column_statistics,
             get_update_settings,
             set_update_settings,
             check_for_update,
@@ -819,6 +1057,137 @@ mod tests {
             Err(DataWindowCommandError::Session(
                 DataWindowSessionError::SourceChanged,
             ))
+        );
+    }
+
+    #[test]
+    fn statistics_resolve_only_columns_from_the_matching_native_session() {
+        let opened_source = OpenedSource::default();
+        let summary = SourceSummary {
+            display_name: "source.parquet".into(),
+            size_bytes: 8,
+            row_count: 1,
+            row_group_count: 1,
+            schema: vec![SchemaField {
+                name: "trusted_name".into(),
+                physical_type: "INT64".into(),
+                logical_type: None,
+                children: Vec::new(),
+            }],
+        };
+        let opened = opened_source
+            .install(
+                None,
+                PathBuf::from("source.parquet"),
+                summary,
+                SourceOpenIntent::Explicit,
+            )
+            .expect("source state")
+            .expect("source is accepted");
+        let state = opened_source.state.lock().expect("opened source state");
+
+        assert_eq!(
+            statistics_request(&state, opened.generation, 0, true),
+            Ok(ColumnStatisticsRequest::Scan {
+                path: PathBuf::from("source.parquet"),
+                column_name: "trusted_name".to_owned(),
+            })
+        );
+        assert_eq!(
+            statistics_request(&state, opened.generation, 1, true),
+            Err(ColumnStatisticsCommandError::UnsupportedColumn)
+        );
+        assert_eq!(
+            statistics_request(&state, opened.generation + 1, 0, true),
+            Err(ColumnStatisticsCommandError::SourceChanged)
+        );
+    }
+
+    #[test]
+    fn statistics_cache_reuses_a_session_result_and_upgrades_min_max() {
+        let opened_source = OpenedSource::default();
+        let summary = SourceSummary {
+            display_name: "source.parquet".into(),
+            size_bytes: 8,
+            row_count: 1,
+            row_group_count: 1,
+            schema: vec![SchemaField {
+                name: "label".into(),
+                physical_type: "BYTE_ARRAY".into(),
+                logical_type: Some("String".into()),
+                children: Vec::new(),
+            }],
+        };
+        let opened = opened_source
+            .install(
+                None,
+                PathBuf::from("source.parquet"),
+                summary.clone(),
+                SourceOpenIntent::Explicit,
+            )
+            .expect("source state")
+            .expect("source is accepted");
+        let mut state = opened_source.state.lock().expect("opened source state");
+        let summary_statistics = ColumnStatistics {
+            minimum: None,
+            maximum: None,
+            min_max_computed: false,
+            null_share: 0.25,
+            approximate_distinct_count: 31_300_000,
+        };
+
+        cache_statistics(&mut state, opened.generation, 0, summary_statistics.clone())
+            .expect("summary statistics should be cached");
+        assert_eq!(
+            statistics_request(&state, opened.generation, 0, false),
+            Ok(ColumnStatisticsRequest::Cached(summary_statistics))
+        );
+        assert!(matches!(
+            statistics_request(&state, opened.generation, 0, true),
+            Ok(ColumnStatisticsRequest::Scan { .. })
+        ));
+
+        let full_statistics = ColumnStatistics {
+            minimum: Some("a".into()),
+            maximum: Some("z".into()),
+            min_max_computed: true,
+            null_share: 0.25,
+            approximate_distinct_count: 31_300_000,
+        };
+        cache_statistics(&mut state, opened.generation, 0, full_statistics.clone())
+            .expect("full statistics should replace the summary");
+        assert_eq!(
+            statistics_request(&state, opened.generation, 0, true),
+            Ok(ColumnStatisticsRequest::Cached(full_statistics))
+        );
+
+        drop(state);
+        let replacement = opened_source
+            .install(
+                None,
+                PathBuf::from("replacement.parquet"),
+                summary,
+                SourceOpenIntent::Explicit,
+            )
+            .expect("replacement source state")
+            .expect("replacement source is accepted");
+        let state = opened_source.state.lock().expect("opened source state");
+        assert_eq!(
+            statistics_request(&state, opened.generation, 0, false),
+            Err(ColumnStatisticsCommandError::SourceChanged)
+        );
+        assert!(matches!(
+            statistics_request(&state, replacement.generation, 0, false),
+            Ok(ColumnStatisticsRequest::Scan { .. })
+        ));
+    }
+
+    #[test]
+    fn cancelled_statistics_keep_a_stable_wire_error() {
+        assert_eq!(
+            serde_json::to_value(ColumnStatisticsCommandError::Cancelled)
+                .expect("statistics error is serializable"),
+            serde_json::json!({ "code": "cancelled" })
         );
     }
 

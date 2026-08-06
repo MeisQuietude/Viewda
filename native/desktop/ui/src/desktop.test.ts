@@ -1,6 +1,10 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
-import { takePostUpdateState } from "./desktop";
+import {
+  ColumnStatisticsCommandError,
+  getColumnStatistics,
+  takePostUpdateState,
+} from "./desktop";
 
 const { invokeMock } = vi.hoisted(() => ({ invokeMock: vi.fn() }));
 
@@ -27,4 +31,20 @@ describe("desktop seam", () => {
     });
     expect(invokeMock).toHaveBeenCalledWith("take_post_update_state");
   });
+
+  it.each(["cancelled", "resourceExhausted", "queryFailed"] as const)(
+    "keeps the %s statistics error typed",
+    async (code) => {
+      invokeMock.mockRejectedValue({ code });
+
+      await expect(getColumnStatistics(3, 2, false)).rejects.toEqual(
+        new ColumnStatisticsCommandError(code),
+      );
+      expect(invokeMock).toHaveBeenCalledWith("get_column_statistics", {
+        generation: 3,
+        columnIndex: 2,
+        includeMinMax: false,
+      });
+    },
+  );
 });
