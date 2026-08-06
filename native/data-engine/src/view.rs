@@ -1,0 +1,1775 @@
+//! Reusable filtered and sorted views backed by compact source-row positions.
+
+use std::{
+    fs::File,
+    io,
+    panic::{AssertUnwindSafe, catch_unwind},
+    path::{Path, PathBuf},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+};
+
+use arrow_array::{Int64Array, RecordBatch, UInt32Array};
+use arrow_ipc::writer::StreamWriter;
+use arrow_schema::{Schema, SchemaRef};
+use arrow_select::{concat::concat_batches, take::take};
+use duckdb::{Config, Connection, Error as DuckDbError, InterruptHandle, params_from_iter};
+use parquet::{
+    arrow::{
+        ProjectionMask,
+        arrow_reader::{
+            ArrowReaderMetadata, ArrowReaderOptions, ParquetRecordBatchReaderBuilder, RowSelection,
+        },
+    },
+    file::metadata::PageIndexPolicy,
+};
+use serde::{Deserialize, Serialize};
+use tempfile::TempDir;
+
+use crate::{
+    filter::{DataFilter, build_filter_predicate_with_names, quote_identifier},
+    source::{inspect_local_source, open_local_source},
+    window::{DataWindowError, MAX_WINDOW_ROWS, classify_query_error, set_utc_session_timezone},
+};
+
+// Sparse windows bypass DuckDB. This cap bounds only the compatibility fallback for Parquet 58
+// decoder failures; 384 MB handles its projected MAX_WINDOW_ROWS result without letting a rare
+// fallback consume the machine-relative default. A larger window budget offers no useful user
+// trade-off, so only the one-time filter and sort preparation budget is configurable.
+const WINDOW_MEMORY_LIMIT: &str = "384MB";
+const POSITION_COLUMN: &str = "__viewda_position";
+const SOURCE_POSITION_COLUMN: &str = "__viewda_source_position";
+const REQUESTED_ORDER_COLUMN: &str = "__viewda_requested_order";
+const MAX_SORT_COLUMNS: usize = 32;
+
+/// User-selected memory available to one view preparation.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum DataViewMemoryLimit {
+    /// Lowest supported budget and the default for new installations.
+    #[default]
+    Mb384,
+    /// Twice the default budget for moderate sorts.
+    Mb768,
+    /// Four times the default budget for wider or less spillable sorts.
+    Mb1536,
+    /// Eight times the default budget for machines with spare RAM.
+    Mb3072,
+}
+
+impl DataViewMemoryLimit {
+    fn duckdb_value(self) -> &'static str {
+        match self {
+            Self::Mb384 => "384MB",
+            Self::Mb768 => "768MB",
+            Self::Mb1536 => "1536MB",
+            Self::Mb3072 => "3072MB",
+        }
+    }
+
+    fn maximum_worker_threads(self) -> usize {
+        match self {
+            Self::Mb384 => 1,
+            Self::Mb768 => 2,
+            Self::Mb1536 => 4,
+            Self::Mb3072 => 8,
+        }
+    }
+
+    fn worker_threads(self) -> usize {
+        let available = std::thread::available_parallelism()
+            .map(usize::from)
+            .unwrap_or(1);
+        self.maximum_worker_threads().min(available)
+    }
+}
+
+/// One source column in the view's canonical sort order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DataSort {
+    /// Zero-based top-level column index from the source summary.
+    pub source_index: u32,
+    /// Direction applied before the stable file-order tie-break.
+    pub direction: DataSortDirection,
+}
+
+/// Direction for one source column in a prepared view.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum DataSortDirection {
+    Ascending,
+    Descending,
+}
+
+/// Stage that exhausted a prepared view's bounded resources.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum DataViewResourceOperation {
+    Preparation,
+    Window,
+}
+
+/// One sanitized sort key included in a resource failure report.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DataViewSortDiagnostic {
+    /// Parquet physical type without the source column name.
+    pub physical_type: String,
+    /// Optional Parquet logical type without values from the source.
+    pub logical_type: Option<String>,
+    /// Requested direction for this key.
+    pub direction: DataSortDirection,
+}
+
+/// Path-free context for diagnosing a bounded view preparation failure.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DataViewResourceDiagnostics {
+    /// Stage that reported the resource failure.
+    pub operation: DataViewResourceOperation,
+    /// Version reported by the packaged DuckDB library.
+    pub query_engine_version: String,
+    /// Sanitized first paragraph of the DuckDB failure.
+    pub message: String,
+    /// Effective DuckDB memory limit for the builder connection.
+    pub memory_limit: String,
+    /// Effective DuckDB limit for files in the spill directory.
+    pub max_temporary_directory_size: String,
+    /// Effective DuckDB worker count for the builder connection.
+    pub threads: i64,
+    /// Rows recorded in the source footer.
+    pub row_count: u64,
+    /// Source file size without its name or path.
+    pub source_size_bytes: u64,
+    /// Row groups recorded in the source footer.
+    pub row_group_count: usize,
+    /// Number of top-level source columns.
+    pub column_count: usize,
+    /// Number of active filter conditions, without their values.
+    pub filter_count: usize,
+    /// Sort key types and directions, without column names.
+    pub sort_columns: Vec<DataViewSortDiagnostic>,
+}
+
+/// Stable failures from preparing or reading a reusable data view.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum DataViewError {
+    /// A non-resource engine failure already covered by the window protocol.
+    #[error(transparent)]
+    Engine(#[from] DataWindowError),
+    /// DuckDB could not stay within the active operation's memory budget.
+    #[error("There is not enough memory for this data view operation.")]
+    MemoryExhausted(Box<DataViewResourceDiagnostics>),
+    /// DuckDB could not write more data to the active spill directory.
+    #[error("There is not enough temporary storage for this data view operation.")]
+    TemporaryStorageExhausted(Box<DataViewResourceDiagnostics>),
+}
+
+#[derive(Debug, Clone)]
+struct DataViewResourceSettings {
+    query_engine_version: String,
+    memory_limit: String,
+    max_temporary_directory_size: String,
+    threads: i64,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum DataViewResourceFailure {
+    Memory,
+    TemporaryStorage,
+}
+
+impl DataViewResourceFailure {
+    fn error(self, diagnostics: DataViewResourceDiagnostics) -> DataViewError {
+        match self {
+            Self::Memory => DataViewError::MemoryExhausted(Box::new(diagnostics)),
+            Self::TemporaryStorage => {
+                DataViewError::TemporaryStorageExhausted(Box::new(diagnostics))
+            }
+        }
+    }
+}
+
+/// A thread-safe handle for interrupting one in-flight view preparation.
+pub struct DataViewInterruptHandle {
+    inner: Arc<InterruptHandle>,
+    cancelled: Arc<AtomicBool>,
+}
+
+impl DataViewInterruptHandle {
+    /// Interrupts the active preparation, or does nothing after its builder is dropped.
+    pub fn interrupt(&self) {
+        self.cancelled.store(true, Ordering::Release);
+        self.inner.interrupt();
+    }
+
+    /// Reports whether the caller interrupted this preparation.
+    pub fn is_cancelled(&self) -> bool {
+        self.cancelled.load(Ordering::Acquire)
+    }
+}
+
+/// Owns the isolated, spill-enabled DuckDB connection for one view preparation.
+pub struct DataViewBuilder {
+    source_path: PathBuf,
+    filters: Vec<DataFilter>,
+    sort: Vec<DataSort>,
+    connection: Connection,
+    temporary_directory: TempDir,
+    resource_settings: DataViewResourceSettings,
+    cancelled: Arc<AtomicBool>,
+}
+
+impl DataViewBuilder {
+    /// Creates a builder whose resource controls cannot affect direct grid windows.
+    pub fn new(
+        source_path: PathBuf,
+        filters: &[DataFilter],
+        sort: &[DataSort],
+    ) -> Result<Self, DataViewError> {
+        Self::with_memory_limit(source_path, filters, sort, DataViewMemoryLimit::default())
+    }
+
+    /// Creates a builder with an explicit preparation-only memory budget.
+    pub fn with_memory_limit(
+        source_path: PathBuf,
+        filters: &[DataFilter],
+        sort: &[DataSort],
+        memory_limit: DataViewMemoryLimit,
+    ) -> Result<Self, DataViewError> {
+        let temporary_directory = create_view_temporary_directory(&source_path)?;
+        let temporary_directory_path = temporary_directory
+            .path()
+            .to_str()
+            .ok_or(DataWindowError::QueryEngineUnavailable)?;
+        let config = Config::default()
+            .max_memory(memory_limit.duckdb_value())
+            .and_then(|config| config.with("temp_directory", temporary_directory_path))
+            // External sort keeps thread-local state. Reserve roughly 384 MB of the selected
+            // budget per worker so the minimum can spill instead of exhausting ten core-local
+            // buffers before DuckDB can offload them.
+            .and_then(|config| config.with("threads", memory_limit.worker_threads().to_string()))
+            // The position index has an explicit ORDER BY with a source-row tie-break, so
+            // DuckDB may relax insertion preservation to keep large external sorts spillable.
+            .and_then(|config| config.with("preserve_insertion_order", "false"))
+            .map_err(|_| DataWindowError::QueryEngineUnavailable)?;
+        let connection = Connection::open_in_memory_with_flags(config)
+            .map_err(|_| DataWindowError::QueryEngineUnavailable)?;
+        set_utc_session_timezone(&connection)?;
+        connection
+            .execute_batch("SET parquet_metadata_cache = true")
+            .map_err(|_| DataWindowError::QueryEngineUnavailable)?;
+        let resource_settings = read_resource_settings(&connection)?;
+
+        Ok(Self {
+            source_path,
+            filters: filters.to_vec(),
+            sort: sort.to_vec(),
+            connection,
+            temporary_directory,
+            resource_settings,
+            cancelled: Arc::new(AtomicBool::new(false)),
+        })
+    }
+
+    /// Returns a handle that can interrupt this builder from another thread.
+    pub fn interrupt_handle(&self) -> DataViewInterruptHandle {
+        DataViewInterruptHandle {
+            inner: self.connection.interrupt_handle(),
+            cancelled: Arc::clone(&self.cancelled),
+        }
+    }
+
+    /// Builds one position index shared by counts and all subsequent windows.
+    pub fn build(self) -> Result<PreparedDataView, DataViewError> {
+        let summary = inspect_local_source(&self.source_path).map_err(DataWindowError::from)?;
+        self.require_active()?;
+        validate_sort(&summary.schema, &self.sort)?;
+
+        let path = self
+            .source_path
+            .to_str()
+            .ok_or(DataWindowError::Unsupported)?;
+        let source_columns = (0..summary.schema.len())
+            .map(|index| format!("__viewda_column_{index}"))
+            .collect::<Vec<_>>();
+        let source_column_names = source_columns
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>();
+        let source_position = quote_identifier(SOURCE_POSITION_COLUMN);
+        let predicate =
+            build_filter_predicate_with_names(&summary.schema, &self.filters, &source_column_names)
+                .map_err(|_| DataWindowError::InvalidFilter)?;
+        let order = build_order_clause_with_names(
+            &summary.schema,
+            &source_column_names,
+            &self.sort,
+            &source_position,
+        )?;
+        let relation_columns = source_column_names
+            .iter()
+            .copied()
+            .map(quote_identifier)
+            .collect::<Vec<_>>()
+            .join(", ");
+        let source_has_position_name = summary
+            .schema
+            .iter()
+            .any(|field| field.name == "file_row_number");
+        let relation = if source_has_position_name {
+            // POSITIONAL JOIN supplies the tie-break for this rare name collision and
+            // therefore still requires the Parquet scan to preserve its physical order.
+            self.connection
+                .execute_batch("SET preserve_insertion_order = true")
+                .map_err(|_| DataWindowError::QueryEngineUnavailable)?;
+            format!(
+                "read_parquet(?) AS {}({relation_columns}) POSITIONAL JOIN \
+                 range(?) AS {}({source_position})",
+                quote_identifier("__viewda_source"),
+                quote_identifier("__viewda_positions")
+            )
+        } else {
+            format!(
+                "read_parquet(?, file_row_number = true) AS {}(\
+                 {relation_columns}, {source_position})",
+                quote_identifier("__viewda_source")
+            )
+        };
+        let position_index = self.temporary_directory.path().join("positions.parquet");
+        let index_path = position_index
+            .to_str()
+            .ok_or(DataWindowError::Unsupported)?;
+        let where_clause = (!self.filters.is_empty()).then(|| format!(" WHERE {}", predicate.sql));
+        let query = format!(
+            "COPY (SELECT {source_position} AS {position_column} \
+             FROM {relation}{where_clause} \
+             ORDER BY {order}) TO {index_path} \
+             (FORMAT PARQUET, COMPRESSION ZSTD)",
+            position_column = quote_identifier(POSITION_COLUMN),
+            where_clause = where_clause.as_deref().unwrap_or(""),
+            index_path = quote_string_literal(index_path),
+        );
+        let mut parameters = vec![duckdb::types::Value::Text(path.to_owned())];
+        if source_has_position_name {
+            parameters.push(duckdb::types::Value::BigInt(
+                i64::try_from(summary.row_count).map_err(|_| DataWindowError::Unsupported)?,
+            ));
+        }
+        parameters.extend(predicate.parameters);
+        self.connection
+            .execute(&query, params_from_iter(parameters.iter()))
+            .map_err(|error| self.classify_prepare_error(error, &summary))?;
+        self.require_active()?;
+
+        let index_summary = inspect_local_source(&position_index).map_err(DataWindowError::from)?;
+        let (position_file, _) =
+            open_local_source(&position_index).map_err(DataWindowError::from)?;
+        let position_metadata = ArrowReaderMetadata::load(&position_file, Default::default())
+            .map_err(|_| DataWindowError::CorruptSource)?;
+        let (source_file, _) =
+            open_local_source(&self.source_path).map_err(DataWindowError::from)?;
+        let source_metadata = ArrowReaderMetadata::load(
+            &source_file,
+            ArrowReaderOptions::new().with_page_index_policy(PageIndexPolicy::Optional),
+        )
+        .ok();
+        let window_resource_settings = restore_view_window_resources(&self.connection)?;
+        let mut window_resource_diagnostics = self.resource_diagnostics("", &summary);
+        window_resource_diagnostics.operation = DataViewResourceOperation::Window;
+        window_resource_diagnostics.query_engine_version =
+            window_resource_settings.query_engine_version;
+        window_resource_diagnostics.memory_limit = window_resource_settings.memory_limit;
+        window_resource_diagnostics.max_temporary_directory_size =
+            window_resource_settings.max_temporary_directory_size;
+        window_resource_diagnostics.threads = window_resource_settings.threads;
+        Ok(PreparedDataView {
+            source_path: self.source_path,
+            source_connection: self.connection,
+            position_index,
+            position_metadata,
+            source_metadata,
+            schema: summary.schema,
+            source_columns,
+            source_row_count: summary.row_count,
+            row_count: index_summary.row_count,
+            resource_diagnostics: window_resource_diagnostics,
+            temporary_directory: self.temporary_directory,
+        })
+    }
+
+    fn require_active(&self) -> Result<(), DataWindowError> {
+        if self.cancelled.load(Ordering::Acquire) {
+            Err(DataWindowError::Cancelled)
+        } else {
+            Ok(())
+        }
+    }
+
+    fn classify_prepare_error(
+        &self,
+        error: DuckDbError,
+        summary: &crate::source::SourceSummary,
+    ) -> DataViewError {
+        if self.cancelled.load(Ordering::Acquire) {
+            return DataWindowError::Cancelled.into();
+        }
+        if let Some((failure, message)) = data_view_resource_failure(&error) {
+            return failure.error(self.resource_diagnostics(message, summary));
+        }
+        classify_query_error(error, !self.filters.is_empty()).into()
+    }
+
+    fn resource_diagnostics(
+        &self,
+        message: &str,
+        summary: &crate::source::SourceSummary,
+    ) -> DataViewResourceDiagnostics {
+        let sort_columns = self
+            .sort
+            .iter()
+            .filter_map(|sort| {
+                let field = summary.schema.get(sort.source_index as usize)?;
+                Some(DataViewSortDiagnostic {
+                    physical_type: field.physical_type.clone(),
+                    logical_type: field.logical_type.clone(),
+                    direction: sort.direction,
+                })
+            })
+            .collect();
+
+        DataViewResourceDiagnostics {
+            operation: DataViewResourceOperation::Preparation,
+            query_engine_version: self.resource_settings.query_engine_version.clone(),
+            message: sanitize_resource_message(
+                message,
+                &self.source_path,
+                self.temporary_directory.path(),
+            ),
+            memory_limit: self.resource_settings.memory_limit.clone(),
+            max_temporary_directory_size: self
+                .resource_settings
+                .max_temporary_directory_size
+                .clone(),
+            threads: self.resource_settings.threads,
+            row_count: summary.row_count,
+            source_size_bytes: summary.size_bytes,
+            row_group_count: summary.row_group_count,
+            column_count: summary.schema.len(),
+            filter_count: self.filters.len(),
+            sort_columns,
+        }
+    }
+}
+
+fn data_view_resource_failure(error: &DuckDbError) -> Option<(DataViewResourceFailure, &str)> {
+    let DuckDbError::DuckDBFailure(_, Some(message)) = error else {
+        return None;
+    };
+    let lower_message = message.to_ascii_lowercase();
+    if message.contains("max_temp_directory_size")
+        || (message.starts_with("IO Error:") && lower_message.contains("space"))
+    {
+        Some((DataViewResourceFailure::TemporaryStorage, message))
+    } else if message.starts_with("Out of Memory Error:") {
+        Some((DataViewResourceFailure::Memory, message))
+    } else {
+        None
+    }
+}
+
+fn sanitize_resource_message(message: &str, source_path: &Path, temporary_path: &Path) -> String {
+    message
+        .split("\n\n")
+        .next()
+        .unwrap_or(message)
+        .replace(source_path.to_string_lossy().as_ref(), "<source>")
+        .replace(
+            temporary_path.to_string_lossy().as_ref(),
+            "<temporary directory>",
+        )
+        .chars()
+        .take(2_048)
+        .collect()
+}
+
+fn read_resource_settings(
+    connection: &Connection,
+) -> Result<DataViewResourceSettings, DataWindowError> {
+    let query_engine_version = connection
+        .version()
+        .map_err(|_| DataWindowError::QueryEngineUnavailable)?;
+    let (memory_limit, max_temporary_directory_size, threads) = connection
+        .query_row(
+            "SELECT current_setting('memory_limit'), \
+             current_setting('max_temp_directory_size'), current_setting('threads')",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .map_err(|_| DataWindowError::QueryEngineUnavailable)?;
+    Ok(DataViewResourceSettings {
+        query_engine_version,
+        memory_limit,
+        max_temporary_directory_size,
+        threads,
+    })
+}
+
+fn restore_view_window_resources(
+    connection: &Connection,
+) -> Result<DataViewResourceSettings, DataWindowError> {
+    connection
+        .execute_batch(&format!(
+            "SET memory_limit = {}; SET threads = 1; SET preserve_insertion_order = true",
+            quote_string_literal(WINDOW_MEMORY_LIMIT),
+        ))
+        .map_err(|_| DataWindowError::QueryEngineUnavailable)?;
+    read_resource_settings(connection)
+}
+
+fn classify_view_window_error(
+    error: DuckDbError,
+    resource_diagnostics: &DataViewResourceDiagnostics,
+    source_path: &Path,
+    temporary_directory: &Path,
+) -> DataViewError {
+    if let Some((failure, message)) = data_view_resource_failure(&error) {
+        let mut diagnostics = resource_diagnostics.clone();
+        diagnostics.message = sanitize_resource_message(message, source_path, temporary_directory);
+        failure.error(diagnostics)
+    } else {
+        classify_query_error(error, false).into()
+    }
+}
+
+/// A completed view whose count and windows share the same source-position index.
+pub struct PreparedDataView {
+    source_path: PathBuf,
+    source_connection: Connection,
+    position_index: PathBuf,
+    position_metadata: ArrowReaderMetadata,
+    source_metadata: Option<ArrowReaderMetadata>,
+    schema: Vec<crate::source::SchemaField>,
+    source_columns: Vec<String>,
+    source_row_count: u64,
+    row_count: u64,
+    resource_diagnostics: DataViewResourceDiagnostics,
+    temporary_directory: TempDir,
+}
+
+impl PreparedDataView {
+    /// Returns the exact number of positions in this view.
+    pub fn row_count(&self) -> u64 {
+        self.row_count
+    }
+
+    /// Reads a bounded view window without rerunning its filter or sort.
+    pub fn fetch_window(&self, row_offset: u64, row_count: u32) -> Result<Vec<u8>, DataViewError> {
+        let source_indices = (0..self.schema.len())
+            .map(|index| u32::try_from(index).map_err(|_| DataWindowError::Unsupported))
+            .collect::<Result<Vec<_>, _>>()?;
+        self.fetch_window_columns(row_offset, row_count, &source_indices)
+    }
+
+    /// Reads selected source columns without rerunning the view's filter or sort.
+    pub fn fetch_window_columns(
+        &self,
+        row_offset: u64,
+        row_count: u32,
+        source_indices: &[u32],
+    ) -> Result<Vec<u8>, DataViewError> {
+        if row_count > MAX_WINDOW_ROWS {
+            return Err(DataWindowError::WindowTooLarge.into());
+        }
+        validate_projection(&self.schema, source_indices)?;
+        let offset = usize::try_from(row_offset).map_err(|_| DataWindowError::Unsupported)?;
+        let limit = usize::try_from(row_count).map_err(|_| DataWindowError::Unsupported)?;
+        let positions =
+            read_positions(&self.position_index, &self.position_metadata, offset, limit)?;
+        if let Some(metadata) = &self.source_metadata {
+            match read_source_positions(&self.source_path, metadata, &positions, source_indices) {
+                Ok(window) => return Ok(window),
+                Err(DataWindowError::CorruptSource) => {
+                    // TODO(Arrow 59): parquet 58 rejects some valid nested-list row groups.
+                    // Remove this full-scan DuckDB fallback after duckdb-rs shares Arrow/Parquet
+                    // 59+ and the nested compatibility fixture passes through the sparse reader.
+                }
+                Err(error) => return Err(error.into()),
+            }
+        }
+        self.fetch_window_columns_with_duckdb(row_offset, row_count, source_indices)
+    }
+
+    fn fetch_window_columns_with_duckdb(
+        &self,
+        row_offset: u64,
+        row_count: u32,
+        source_indices: &[u32],
+    ) -> Result<Vec<u8>, DataViewError> {
+        let source_path = self
+            .source_path
+            .to_str()
+            .ok_or(DataWindowError::Unsupported)?;
+        let position_index_path = self
+            .position_index
+            .to_str()
+            .ok_or(DataWindowError::Unsupported)?;
+        let query = build_window_query(
+            &self.schema,
+            &self.source_columns,
+            self.source_row_count,
+            source_path,
+            position_index_path,
+            source_indices,
+        )?;
+        fetch_view_window(
+            &self.source_path,
+            &self.source_connection,
+            &query,
+            row_offset,
+            row_count,
+            &self.resource_diagnostics,
+            self.temporary_directory.path(),
+        )
+    }
+
+    #[cfg(test)]
+    fn position_index_path(&self) -> &std::path::Path {
+        &self.position_index
+    }
+}
+
+fn validate_sort(
+    schema: &[crate::source::SchemaField],
+    sort: &[DataSort],
+) -> Result<(), DataWindowError> {
+    if sort.len() > MAX_SORT_COLUMNS {
+        return Err(DataWindowError::InvalidSort);
+    }
+    let mut seen = vec![false; schema.len()];
+    for column in sort {
+        let index =
+            usize::try_from(column.source_index).map_err(|_| DataWindowError::InvalidSort)?;
+        let Some(slot) = seen.get_mut(index) else {
+            return Err(DataWindowError::InvalidSort);
+        };
+        if std::mem::replace(slot, true) {
+            return Err(DataWindowError::InvalidSort);
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+fn build_order_clause(
+    schema: &[crate::source::SchemaField],
+    sort: &[DataSort],
+    source_position: &str,
+) -> Result<String, DataWindowError> {
+    let column_names = schema
+        .iter()
+        .map(|column| column.name.as_str())
+        .collect::<Vec<_>>();
+    build_order_clause_with_names(schema, &column_names, sort, source_position)
+}
+
+fn build_order_clause_with_names(
+    schema: &[crate::source::SchemaField],
+    column_names: &[&str],
+    sort: &[DataSort],
+    source_position: &str,
+) -> Result<String, DataWindowError> {
+    if column_names.len() != schema.len() {
+        return Err(DataWindowError::InvalidSort);
+    }
+    let mut order = Vec::with_capacity(sort.len() + 1);
+    for sort_column in sort {
+        schema
+            .get(sort_column.source_index as usize)
+            .ok_or(DataWindowError::InvalidSort)?;
+        let direction = match sort_column.direction {
+            DataSortDirection::Ascending => "ASC",
+            DataSortDirection::Descending => "DESC",
+        };
+        order.push(format!(
+            "{} {direction} NULLS LAST",
+            quote_identifier(
+                column_names
+                    .get(sort_column.source_index as usize)
+                    .ok_or(DataWindowError::InvalidSort)?,
+            )
+        ));
+    }
+    order.push(format!("{source_position} ASC"));
+    Ok(order.join(", "))
+}
+
+fn build_window_query(
+    schema: &[crate::source::SchemaField],
+    source_columns: &[String],
+    source_row_count: u64,
+    source_path: &str,
+    position_index_path: &str,
+    source_indices: &[u32],
+) -> Result<String, DataWindowError> {
+    if source_columns.len() != schema.len() {
+        return Err(DataWindowError::Unsupported);
+    }
+    validate_projection(schema, source_indices)?;
+    let requested = quote_identifier("__viewda_requested");
+    let requested_source = quote_identifier("__viewda_requested_source");
+    let source = quote_identifier("__viewda_source");
+    let position = quote_identifier(POSITION_COLUMN);
+    let requested_order = quote_identifier(REQUESTED_ORDER_COLUMN);
+    let source_position = quote_identifier(SOURCE_POSITION_COLUMN);
+    let source_path = quote_string_literal(source_path);
+    let position_index_path = quote_string_literal(position_index_path);
+    let source_column_aliases = source_columns
+        .iter()
+        .map(|column| quote_identifier(column))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let projection = source_indices
+        .iter()
+        .map(|source_index| {
+            let source_index =
+                usize::try_from(*source_index).map_err(|_| DataWindowError::Unsupported)?;
+            let field = schema
+                .get(source_index)
+                .ok_or(DataWindowError::Unsupported)?;
+            let column = source_columns
+                .get(source_index)
+                .ok_or(DataWindowError::Unsupported)?;
+            Ok(format!(
+                "{source}.{} AS {}",
+                quote_identifier(column),
+                quote_identifier(&field.name),
+            ))
+        })
+        .collect::<Result<Vec<_>, DataWindowError>>()?
+        .join(", ");
+    let requested_cte = format!(
+        "{requested} AS (\
+         SELECT {position}, {requested_order} \
+         FROM read_parquet({position_index_path}, file_row_number = true) \
+         AS {requested_source}({position}, {requested_order}) \
+         LIMIT ? OFFSET ?)"
+    );
+    if schema.iter().any(|field| field.name == "file_row_number") {
+        let raw_source = quote_identifier("__viewda_raw_source");
+        let source_positions = quote_identifier("__viewda_source_positions");
+        Ok(format!(
+            "WITH {requested_cte}, \
+             {source} AS (\
+             SELECT {raw_source}.*, {source_positions}.{source_position} \
+             FROM read_parquet({source_path}) AS {raw_source}({source_column_aliases}) \
+             POSITIONAL JOIN range({source_row_count}) \
+             AS {source_positions}({source_position})) \
+             SELECT {projection} \
+             FROM {requested} \
+             JOIN {source} \
+             ON {source}.{source_position} = {requested}.{position} \
+             ORDER BY {requested}.{requested_order}"
+        ))
+    } else {
+        let source_aliases = format!("{source_column_aliases}, {source_position}");
+        Ok(format!(
+            "WITH {requested_cte} \
+             SELECT {projection} \
+             FROM {requested} \
+             JOIN read_parquet({source_path}, file_row_number = true) \
+             AS {source}({source_aliases}) \
+             ON {source}.{source_position} = {requested}.{position} \
+             ORDER BY {requested}.{requested_order}"
+        ))
+    }
+}
+
+fn validate_projection(
+    schema: &[crate::source::SchemaField],
+    source_indices: &[u32],
+) -> Result<(), DataWindowError> {
+    if source_indices.is_empty() {
+        return Err(DataWindowError::Unsupported);
+    }
+    let mut seen = vec![false; schema.len()];
+    for source_index in source_indices {
+        let source_index =
+            usize::try_from(*source_index).map_err(|_| DataWindowError::Unsupported)?;
+        let Some(slot) = seen.get_mut(source_index) else {
+            return Err(DataWindowError::Unsupported);
+        };
+        if std::mem::replace(slot, true) {
+            return Err(DataWindowError::Unsupported);
+        }
+    }
+    Ok(())
+}
+
+fn read_positions(
+    path: &Path,
+    metadata: &ArrowReaderMetadata,
+    offset: usize,
+    limit: usize,
+) -> Result<Vec<u64>, DataWindowError> {
+    let file = File::open(path).map_err(map_io_error)?;
+    let reader = ParquetRecordBatchReaderBuilder::new_with_metadata(file, metadata.clone())
+        .with_offset(offset)
+        .with_limit(limit)
+        .with_batch_size(limit.max(1))
+        .build()
+        .map_err(|_| DataWindowError::CorruptSource)?;
+    let mut positions = Vec::with_capacity(limit);
+    for batch in reader {
+        let batch = batch.map_err(|_| DataWindowError::CorruptSource)?;
+        let values = batch
+            .column_by_name(POSITION_COLUMN)
+            .and_then(|column| column.as_any().downcast_ref::<Int64Array>())
+            .ok_or(DataWindowError::CorruptSource)?;
+        for value in values.iter() {
+            positions.push(
+                u64::try_from(value.ok_or(DataWindowError::CorruptSource)?)
+                    .map_err(|_| DataWindowError::CorruptSource)?,
+            );
+        }
+    }
+    Ok(positions)
+}
+
+fn read_source_positions(
+    path: &Path,
+    metadata: &ArrowReaderMetadata,
+    positions: &[u64],
+    source_indices: &[u32],
+) -> Result<Vec<u8>, DataWindowError> {
+    let output_schema = projected_arrow_schema(metadata.schema(), source_indices)?;
+    if positions.is_empty() {
+        return encode_empty(output_schema);
+    }
+
+    let total_rows = usize::try_from(metadata.metadata().file_metadata().num_rows())
+        .map_err(|_| DataWindowError::Unsupported)?;
+    let mut sorted_positions = positions
+        .iter()
+        .copied()
+        .enumerate()
+        .map(|(view_index, position)| {
+            usize::try_from(position)
+                .map(|position| (position, view_index))
+                .map_err(|_| DataWindowError::Unsupported)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    sorted_positions.sort_unstable_by_key(|(position, _)| *position);
+    if sorted_positions
+        .last()
+        .is_some_and(|(position, _)| *position >= total_rows)
+        || sorted_positions
+            .windows(2)
+            .any(|pair| pair[0].0 == pair[1].0)
+    {
+        return Err(DataWindowError::CorruptSource);
+    }
+
+    let mut source_order_indices = source_indices
+        .iter()
+        .map(|index| usize::try_from(*index).map_err(|_| DataWindowError::Unsupported))
+        .collect::<Result<Vec<_>, _>>()?;
+    source_order_indices.sort_unstable();
+    let selection = RowSelection::from_consecutive_ranges(
+        sorted_positions
+            .iter()
+            .map(|(position, _)| *position..*position + 1),
+        total_rows,
+    );
+    let (file, _) = open_local_source(path).map_err(DataWindowError::from)?;
+    let reader = ParquetRecordBatchReaderBuilder::new_with_metadata(file, metadata.clone())
+        .with_projection(ProjectionMask::roots(
+            metadata.metadata().file_metadata().schema_descr(),
+            source_order_indices.iter().copied(),
+        ))
+        .with_batch_size(positions.len())
+        .with_row_selection(selection)
+        .build()
+        .map_err(|_| DataWindowError::CorruptSource)?;
+    let batches = reader
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|_| DataWindowError::CorruptSource)?;
+    let source_order_schema =
+        projected_arrow_schema_from_usize(metadata.schema(), &source_order_indices)?;
+    let sorted_batch = concat_batches(&source_order_schema, &batches)
+        .map_err(|_| DataWindowError::EncodingFailed)?;
+    if sorted_batch.num_rows() != positions.len() {
+        return Err(DataWindowError::CorruptSource);
+    }
+
+    let mut row_order = vec![0_u32; positions.len()];
+    for (sorted_index, (_, view_index)) in sorted_positions.into_iter().enumerate() {
+        row_order[view_index] =
+            u32::try_from(sorted_index).map_err(|_| DataWindowError::Unsupported)?;
+    }
+    let row_order = UInt32Array::from(row_order);
+    let columns = source_indices
+        .iter()
+        .map(|source_index| {
+            let source_index =
+                usize::try_from(*source_index).map_err(|_| DataWindowError::Unsupported)?;
+            let column_offset = source_order_indices
+                .binary_search(&source_index)
+                .map_err(|_| DataWindowError::Unsupported)?;
+            take(
+                sorted_batch.column(column_offset).as_ref(),
+                &row_order,
+                None,
+            )
+            .map_err(|_| DataWindowError::EncodingFailed)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let batch = RecordBatch::try_new(output_schema, columns)
+        .map_err(|_| DataWindowError::EncodingFailed)?;
+    encode_batch(&batch)
+}
+
+fn projected_arrow_schema(
+    schema: &SchemaRef,
+    source_indices: &[u32],
+) -> Result<SchemaRef, DataWindowError> {
+    let source_indices = source_indices
+        .iter()
+        .map(|index| usize::try_from(*index).map_err(|_| DataWindowError::Unsupported))
+        .collect::<Result<Vec<_>, _>>()?;
+    projected_arrow_schema_from_usize(schema, &source_indices)
+}
+
+fn projected_arrow_schema_from_usize(
+    schema: &SchemaRef,
+    source_indices: &[usize],
+) -> Result<SchemaRef, DataWindowError> {
+    let fields = source_indices
+        .iter()
+        .map(|index| {
+            schema
+                .fields()
+                .get(*index)
+                .cloned()
+                .ok_or(DataWindowError::Unsupported)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(Arc::new(Schema::new_with_metadata(
+        fields,
+        schema.metadata().clone(),
+    )))
+}
+
+fn encode_batch(batch: &RecordBatch) -> Result<Vec<u8>, DataWindowError> {
+    let mut writer = StreamWriter::try_new(Vec::new(), batch.schema().as_ref())
+        .map_err(|_| DataWindowError::EncodingFailed)?;
+    writer
+        .write(batch)
+        .map_err(|_| DataWindowError::EncodingFailed)?;
+    writer
+        .finish()
+        .map_err(|_| DataWindowError::EncodingFailed)?;
+    writer
+        .into_inner()
+        .map_err(|_| DataWindowError::EncodingFailed)
+}
+
+fn encode_empty(schema: SchemaRef) -> Result<Vec<u8>, DataWindowError> {
+    let mut writer = StreamWriter::try_new(Vec::new(), schema.as_ref())
+        .map_err(|_| DataWindowError::EncodingFailed)?;
+    writer
+        .finish()
+        .map_err(|_| DataWindowError::EncodingFailed)?;
+    writer
+        .into_inner()
+        .map_err(|_| DataWindowError::EncodingFailed)
+}
+
+fn fetch_view_window(
+    source_path: &std::path::Path,
+    connection: &Connection,
+    query: &str,
+    row_offset: u64,
+    row_count: u32,
+    resource_diagnostics: &DataViewResourceDiagnostics,
+    temporary_directory: &Path,
+) -> Result<Vec<u8>, DataViewError> {
+    let (source, _) = open_local_source(source_path).map_err(DataWindowError::from)?;
+    drop(source);
+    let parameters = [
+        duckdb::types::Value::BigInt(i64::from(row_count)),
+        duckdb::types::Value::BigInt(
+            i64::try_from(row_offset).map_err(|_| DataWindowError::Unsupported)?,
+        ),
+    ];
+    let mut statement = connection
+        .prepare_cached(query)
+        .map_err(|_| DataWindowError::QueryEngineUnavailable)?;
+    let batches = statement
+        .stream_arrow(params_from_iter(parameters.iter()))
+        .map_err(|error| {
+            classify_view_window_error(
+                error,
+                resource_diagnostics,
+                source_path,
+                temporary_directory,
+            )
+        })?;
+    let schema = batches.get_schema();
+    let mut writer = StreamWriter::try_new(Vec::new(), schema.as_ref())
+        .map_err(|_| DataWindowError::EncodingFailed)?;
+    let encoded = catch_unwind(AssertUnwindSafe(|| {
+        for batch in batches {
+            writer
+                .write(&batch)
+                .map_err(|_| DataWindowError::EncodingFailed)?;
+        }
+        writer
+            .finish()
+            .map_err(|_| DataWindowError::EncodingFailed)?;
+        writer
+            .into_inner()
+            .map_err(|_| DataWindowError::EncodingFailed)
+    }));
+    encoded
+        .unwrap_or(Err(DataWindowError::Unsupported))
+        .map_err(Into::into)
+}
+
+fn quote_string_literal(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "''"))
+}
+
+fn map_io_error(error: io::Error) -> DataWindowError {
+    match error.kind() {
+        io::ErrorKind::NotFound => DataWindowError::NotFound,
+        io::ErrorKind::PermissionDenied => DataWindowError::PermissionDenied,
+        _ => DataWindowError::Unsupported,
+    }
+}
+
+fn create_view_temporary_directory(source_path: &Path) -> Result<TempDir, DataWindowError> {
+    if let Some(source_directory) = source_path
+        .parent()
+        .filter(|directory| !directory.as_os_str().is_empty())
+        && let Ok(directory) = tempfile::Builder::new()
+            .prefix("viewda-view-")
+            .tempdir_in(source_directory)
+    {
+        return Ok(directory);
+    }
+    tempfile::Builder::new()
+        .prefix("viewda-view-")
+        .tempdir()
+        .map_err(|_| DataWindowError::QueryEngineUnavailable)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        fs,
+        io::Cursor,
+        path::PathBuf,
+        sync::{Arc, mpsc},
+        thread,
+        time::Duration,
+    };
+
+    #[cfg(unix)]
+    use std::io::{Seek, SeekFrom, Write};
+
+    use arrow_array::{ArrayRef, Int64Array, RecordBatch, StringArray, TimestampMicrosecondArray};
+    use arrow_ipc::reader::StreamReader;
+    use arrow_schema::{DataType, Field, Schema};
+    use parquet::arrow::ArrowWriter;
+    use tempfile::NamedTempFile;
+
+    use super::*;
+
+    #[test]
+    fn stores_only_positions_and_reuses_the_index_for_repeated_windows() {
+        let source = write_fixture();
+        let view = DataViewBuilder::new(
+            source.path().to_owned(),
+            &[],
+            &[DataSort {
+                source_index: 1,
+                direction: DataSortDirection::Ascending,
+            }],
+        )
+        .expect("view builder")
+        .build()
+        .expect("prepared view");
+        let metadata_before = fs::metadata(view.position_index_path()).expect("position metadata");
+
+        let first = view.fetch_window(0, 3).expect("first window");
+        let repeated = view.fetch_window(0, 3).expect("repeated window");
+        let metadata_after = fs::metadata(view.position_index_path()).expect("position metadata");
+        let index = inspect_local_source(view.position_index_path()).expect("position index");
+
+        assert_eq!(first, repeated);
+        assert_eq!(metadata_before.len(), metadata_after.len());
+        assert_eq!(
+            metadata_before.modified().ok(),
+            metadata_after.modified().ok()
+        );
+        assert_eq!(index.schema.len(), 1);
+        assert_eq!(index.schema[0].name, POSITION_COLUMN);
+        assert!(metadata_after.len() < fs::metadata(source.path()).expect("source metadata").len());
+    }
+
+    #[test]
+    fn prepared_windows_return_only_requested_source_columns() {
+        let source = write_fixture();
+        let view = DataViewBuilder::new(
+            source.path().to_owned(),
+            &[],
+            &[DataSort {
+                source_index: 1,
+                direction: DataSortDirection::Descending,
+            }],
+        )
+        .expect("view builder")
+        .build()
+        .expect("prepared view");
+
+        let bytes = view
+            .fetch_window_columns(0, 2, &[1])
+            .expect("projected window");
+        let batches = StreamReader::try_new(Cursor::new(bytes), None)
+            .expect("Arrow stream")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("Arrow batches");
+
+        assert_eq!(batches.len(), 1);
+        assert_eq!(batches[0].num_columns(), 1);
+        assert_eq!(batches[0].schema().field(0).name(), "label");
+        assert_eq!(
+            batches[0]
+                .column(0)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .expect("label column")
+                .value(0),
+            "label-1999"
+        );
+        let reordered = view
+            .fetch_window_columns(0, 1, &[1, 0])
+            .expect("reordered projected window");
+        let reordered = StreamReader::try_new(Cursor::new(reordered), None)
+            .expect("reordered Arrow stream")
+            .next()
+            .expect("reordered Arrow batch")
+            .expect("valid reordered Arrow batch");
+        assert_eq!(reordered.schema().field(0).name(), "label");
+        assert_eq!(reordered.schema().field(1).name(), "id");
+        assert_eq!(
+            reordered
+                .column(1)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .expect("id column")
+                .value(0),
+            1_999
+        );
+        assert!(matches!(
+            view.fetch_window_columns(0, 1, &[]),
+            Err(DataViewError::Engine(DataWindowError::Unsupported))
+        ));
+        assert!(matches!(
+            view.fetch_window_columns(0, 1, &[1, 1]),
+            Err(DataViewError::Engine(DataWindowError::Unsupported))
+        ));
+        assert!(matches!(
+            view.fetch_window_columns(0, 1, &[2]),
+            Err(DataViewError::Engine(DataWindowError::Unsupported))
+        ));
+    }
+
+    #[test]
+    fn utc_timestamp_schema_is_stable_across_direct_sparse_and_fallback_windows() {
+        let source = write_utc_timestamp_fixture();
+        let mut direct_reader = crate::DataWindowReader::new(source.path().to_owned());
+        let direct = direct_reader.fetch(0, 2).expect("direct DuckDB window");
+        let direct = StreamReader::try_new(Cursor::new(direct), None)
+            .expect("direct Arrow stream")
+            .next()
+            .expect("direct Arrow batch")
+            .expect("valid direct Arrow batch");
+        let view = DataViewBuilder::new(
+            source.path().to_owned(),
+            &[],
+            &[DataSort {
+                source_index: 0,
+                direction: DataSortDirection::Ascending,
+            }],
+        )
+        .expect("view builder")
+        .build()
+        .expect("prepared view");
+        let sparse = view
+            .fetch_window_columns(0, 2, &[1])
+            .expect("sparse window");
+        let sparse = StreamReader::try_new(Cursor::new(sparse), None)
+            .expect("sparse Arrow stream")
+            .next()
+            .expect("sparse Arrow batch")
+            .expect("valid sparse Arrow batch");
+        let fallback = view
+            .fetch_window_columns_with_duckdb(0, 2, &[1])
+            .expect("DuckDB fallback window");
+        let fallback = StreamReader::try_new(Cursor::new(fallback), None)
+            .expect("fallback Arrow stream")
+            .next()
+            .expect("fallback Arrow batch")
+            .expect("valid fallback Arrow batch");
+        let expected = DataType::Timestamp(
+            arrow_schema::TimeUnit::Microsecond,
+            Some(Arc::<str>::from("UTC")),
+        );
+
+        assert_eq!(direct.schema().field(1).data_type(), &expected);
+        assert_eq!(sparse.schema().field(0).data_type(), &expected);
+        assert_eq!(fallback.schema().field(0).data_type(), &expected);
+    }
+
+    #[test]
+    fn traverses_sparse_position_row_groups_without_gaps_duplicates_or_reordering() {
+        const ROW_GROUP_ROWS: i64 = 2_048;
+        const ROW_GROUP_COUNT: i64 = 8;
+        const WINDOW_ROWS: u32 = 512;
+
+        let row_count = ROW_GROUP_ROWS * ROW_GROUP_COUNT;
+        let source = write_window_traversal_fixture(row_count);
+        let mut view = DataViewBuilder::new(
+            source.path().to_owned(),
+            &[],
+            &[DataSort {
+                source_index: 1,
+                direction: DataSortDirection::Ascending,
+            }],
+        )
+        .expect("view builder")
+        .build()
+        .expect("prepared view");
+        rewrite_position_index_with_row_groups(
+            view.position_index_path(),
+            (0..row_count).rev(),
+            ROW_GROUP_ROWS as usize,
+        );
+        let position_file = File::open(view.position_index_path()).expect("position index file");
+        view.position_metadata = ArrowReaderMetadata::load(&position_file, Default::default())
+            .expect("rewritten position metadata");
+        let index = inspect_local_source(view.position_index_path()).expect("position index");
+        assert_eq!(index.row_group_count, ROW_GROUP_COUNT as usize);
+
+        let mut actual = Vec::<i64>::with_capacity(row_count as usize);
+        for offset in (0..row_count as u64).step_by(WINDOW_ROWS as usize) {
+            let bytes = view
+                .fetch_window(offset, WINDOW_ROWS)
+                .expect("sorted window");
+            for batch in StreamReader::try_new(Cursor::new(bytes), None).expect("Arrow stream") {
+                let batch = batch.expect("Arrow batch");
+                actual.extend_from_slice(
+                    batch
+                        .column(0)
+                        .as_any()
+                        .downcast_ref::<Int64Array>()
+                        .expect("int64 id")
+                        .values(),
+                );
+            }
+        }
+
+        assert_eq!(actual.len(), row_count as usize);
+        if let Some((index, (actual, expected))) = actual
+            .iter()
+            .copied()
+            .zip((0..row_count).rev())
+            .enumerate()
+            .find(|(_, (actual, expected))| actual != expected)
+        {
+            panic!("window traversal diverged at row {index}: expected {expected}, got {actual}");
+        }
+        let preserve_insertion_order: bool = view
+            .source_connection
+            .query_row(
+                "SELECT current_setting('preserve_insertion_order')",
+                [],
+                |row| row.get(0),
+            )
+            .expect("window order setting");
+        assert!(preserve_insertion_order);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cached_parquet_metadata_survives_an_unreadable_footer() {
+        let mut source = write_fixture();
+        let view = DataViewBuilder::new(
+            source.path().to_owned(),
+            &[],
+            &[DataSort {
+                source_index: 1,
+                direction: DataSortDirection::Ascending,
+            }],
+        )
+        .expect("view builder")
+        .build()
+        .expect("prepared view");
+        let first = view.fetch_window(0, 3).expect("initial window");
+        source
+            .as_file_mut()
+            .seek(SeekFrom::End(-8))
+            .expect("footer length offset");
+        source
+            .as_file_mut()
+            .write_all(&[0xff; 4])
+            .expect("corrupt footer length");
+        source.as_file_mut().flush().expect("flush damaged footer");
+        let repeated = view.fetch_window(0, 3).expect("cached metadata window");
+
+        assert_eq!(repeated, first);
+    }
+
+    #[test]
+    fn cancellation_before_build_never_publishes_an_index() {
+        let source = write_fixture();
+        let builder = DataViewBuilder::new(source.path().to_owned(), &[], &[]).expect("builder");
+        let interrupt = builder.interrupt_handle();
+        interrupt.interrupt();
+
+        assert!(matches!(
+            builder.build(),
+            Err(DataViewError::Engine(DataWindowError::Cancelled))
+        ));
+    }
+
+    #[test]
+    fn separates_memory_and_temporary_storage_failures_with_path_free_diagnostics() {
+        let source = write_fixture();
+        let builder = DataViewBuilder::new(
+            source.path().to_owned(),
+            &[],
+            &[DataSort {
+                source_index: 1,
+                direction: DataSortDirection::Descending,
+            }],
+        )
+        .expect("view builder");
+        let summary = inspect_local_source(source.path()).expect("source summary");
+        let failure = |message: String| {
+            DuckDbError::DuckDBFailure(
+                duckdb::ffi::Error::new(duckdb::ffi::DuckDBError),
+                Some(message),
+            )
+        };
+        let source_path = source.path().to_string_lossy();
+        let temporary_directory = builder.temporary_directory.path().to_string_lossy();
+
+        let memory = builder.classify_prepare_error(
+            failure(format!(
+                "Out of Memory Error: failed while reading {source_path}\n\nPossible solutions"
+            )),
+            &summary,
+        );
+        let DataViewError::MemoryExhausted(memory) = memory else {
+            panic!("expected memory diagnostics");
+        };
+        assert_eq!(memory.operation, DataViewResourceOperation::Preparation);
+        assert_eq!(memory.row_count, 2_000);
+        assert!(memory.source_size_bytes > 0);
+        assert_eq!(memory.row_group_count, 1);
+        assert_eq!(memory.column_count, 2);
+        assert_eq!(memory.filter_count, 0);
+        assert_eq!(memory.sort_columns.len(), 1);
+        assert_eq!(memory.sort_columns[0].physical_type, "BYTE_ARRAY");
+        assert_eq!(
+            memory.sort_columns[0].logical_type.as_deref(),
+            Some("String")
+        );
+        assert_eq!(
+            memory.sort_columns[0].direction,
+            DataSortDirection::Descending
+        );
+        assert!(memory.message.contains("<source>"));
+        assert!(!memory.message.contains(source_path.as_ref()));
+        assert!(!memory.memory_limit.is_empty());
+        assert!(!memory.max_temporary_directory_size.is_empty());
+        assert!(memory.threads > 0);
+        assert!(!memory.query_engine_version.is_empty());
+
+        let storage = builder.classify_prepare_error(
+            failure(format!(
+                "Out of Memory Error: failed to offload {temporary_directory}/block; \
+                 max_temp_directory_size was reached\n\nPossible solutions"
+            )),
+            &summary,
+        );
+        let DataViewError::TemporaryStorageExhausted(storage) = storage else {
+            panic!("expected temporary storage diagnostics");
+        };
+        assert!(storage.message.contains("<temporary directory>"));
+        assert!(!storage.message.contains(temporary_directory.as_ref()));
+    }
+
+    #[test]
+    fn prepared_windows_keep_the_bounded_view_budget_and_resource_diagnostics() {
+        let source = write_fixture();
+        let builder = DataViewBuilder::with_memory_limit(
+            source.path().to_owned(),
+            &[],
+            &[DataSort {
+                source_index: 1,
+                direction: DataSortDirection::Ascending,
+            }],
+            DataViewMemoryLimit::Mb768,
+        )
+        .expect("view builder");
+        let preparation_memory = memory_size_in_bytes(&builder.resource_settings.memory_limit)
+            .expect("preparation memory");
+        assert!((preparation_memory - 768_000_000.0).abs() <= 1024.0 * 1024.0);
+        assert_eq!(
+            builder.resource_settings.threads,
+            DataViewMemoryLimit::Mb768.worker_threads() as i64
+        );
+        let view = builder.build().expect("prepared view");
+        let settings = read_resource_settings(&view.source_connection).expect("window settings");
+        let temporary_directory: String = view
+            .source_connection
+            .query_row("SELECT current_setting('temp_directory')", [], |row| {
+                row.get(0)
+            })
+            .expect("window temporary directory");
+        let preserve_insertion_order: bool = view
+            .source_connection
+            .query_row(
+                "SELECT current_setting('preserve_insertion_order')",
+                [],
+                |row| row.get(0),
+            )
+            .expect("window order setting");
+
+        let window_memory = memory_size_in_bytes(&settings.memory_limit).expect("window memory");
+        assert!((window_memory - 384_000_000.0).abs() <= 1024.0 * 1024.0);
+        assert_eq!(settings.threads, 1);
+        assert_eq!(
+            PathBuf::from(temporary_directory),
+            view.temporary_directory.path()
+        );
+        assert!(preserve_insertion_order);
+
+        let source_path = source.path().to_string_lossy();
+        let temporary_path = view.temporary_directory.path().to_string_lossy();
+        let failure = DuckDbError::DuckDBFailure(
+            duckdb::ffi::Error::new(duckdb::ffi::DuckDBError),
+            Some(format!(
+                "Out of Memory Error: reading {source_path} via {temporary_path}"
+            )),
+        );
+        let DataViewError::MemoryExhausted(diagnostics) = classify_view_window_error(
+            failure,
+            &view.resource_diagnostics,
+            source.path(),
+            view.temporary_directory.path(),
+        ) else {
+            panic!("expected window memory diagnostics");
+        };
+        assert_eq!(diagnostics.operation, DataViewResourceOperation::Window);
+        assert_eq!(diagnostics.memory_limit, settings.memory_limit);
+        assert_eq!(diagnostics.threads, settings.threads);
+        assert!(diagnostics.message.contains("<source>"));
+        assert!(diagnostics.message.contains("<temporary directory>"));
+        assert!(!diagnostics.message.contains(source_path.as_ref()));
+        assert!(!diagnostics.message.contains(temporary_path.as_ref()));
+    }
+
+    #[test]
+    fn limits_builder_memory_and_provides_a_spill_directory() {
+        let builder = DataViewBuilder::new(PathBuf::from("unused.parquet"), &[], &[])
+            .expect("view builder should start");
+        let (
+            memory_limit,
+            temporary_directory,
+            preserve_insertion_order,
+            metadata_cache_enabled,
+            max_temporary_directory_size,
+            threads,
+        ): (String, String, bool, bool, String, i64) = builder
+            .connection
+            .query_row(
+                "SELECT current_setting('memory_limit'), current_setting('temp_directory'), \
+                 current_setting('preserve_insertion_order'), current_setting('parquet_metadata_cache'), \
+                 current_setting('max_temp_directory_size'), current_setting('threads')",
+                [],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                    ))
+                },
+            )
+            .expect("view resource settings should be readable");
+
+        let memory_limit_bytes = memory_size_in_bytes(&memory_limit)
+            .expect("DuckDB memory limit should use a recognized size unit");
+        assert!(
+            (memory_limit_bytes - 384_000_000.0).abs() <= 1024.0 * 1024.0,
+            "DuckDB reported an unexpected memory limit: {memory_limit}"
+        );
+        assert_eq!(
+            PathBuf::from(temporary_directory),
+            builder.temporary_directory.path()
+        );
+        assert!(!preserve_insertion_order);
+        assert!(metadata_cache_enabled);
+        assert_eq!(
+            builder.resource_settings.max_temporary_directory_size,
+            max_temporary_directory_size
+        );
+        assert_eq!(builder.resource_settings.threads, threads);
+        assert_eq!(threads, 1);
+    }
+
+    #[test]
+    fn scales_preparation_workers_with_the_selected_memory_budget() {
+        assert_eq!(DataViewMemoryLimit::Mb384.maximum_worker_threads(), 1);
+        assert_eq!(DataViewMemoryLimit::Mb768.maximum_worker_threads(), 2);
+        assert_eq!(DataViewMemoryLimit::Mb1536.maximum_worker_threads(), 4);
+        assert_eq!(DataViewMemoryLimit::Mb3072.maximum_worker_threads(), 8);
+    }
+
+    #[test]
+    fn places_spill_directory_beside_the_source_when_writable() {
+        let source_directory = tempfile::tempdir().expect("source directory");
+        let source_path = source_directory.path().join("source.parquet");
+        let builder = DataViewBuilder::new(source_path, &[], &[]).expect("view builder");
+
+        assert_eq!(
+            builder.temporary_directory.path().parent(),
+            Some(source_directory.path())
+        );
+        assert!(
+            builder
+                .temporary_directory
+                .path()
+                .file_name()
+                .expect("spill directory name")
+                .to_string_lossy()
+                .starts_with("viewda-view-")
+        );
+    }
+
+    #[test]
+    fn interrupt_handle_stops_its_builder_connection_mid_scan() {
+        let builder = DataViewBuilder::new(PathBuf::from("unused.parquet"), &[], &[])
+            .expect("view builder should start");
+        let interrupt = builder.interrupt_handle();
+        let DataViewBuilder {
+            connection,
+            temporary_directory,
+            ..
+        } = builder;
+        let (started_sender, started_receiver) = mpsc::sync_channel(0);
+        let (finished_sender, finished_receiver) = mpsc::sync_channel(1);
+        let scan = thread::spawn(move || {
+            let _temporary_directory = temporary_directory;
+            started_sender.send(()).expect("scan start receiver");
+            let result = connection.query_row(
+                "SELECT count(*) FROM range(100000000000) AS rows(value) WHERE hash(value) = 0",
+                [],
+                |row| row.get::<_, i64>(0),
+            );
+            finished_sender
+                .send(result.is_err())
+                .expect("scan result receiver");
+        });
+
+        started_receiver.recv().expect("scan should start");
+        assert!(
+            finished_receiver
+                .recv_timeout(Duration::from_millis(50))
+                .is_err(),
+            "the scan must still be running before it is interrupted"
+        );
+        interrupt.interrupt();
+        assert_eq!(
+            finished_receiver.recv_timeout(Duration::from_secs(5)),
+            Ok(true),
+            "the builder's interrupt handle must stop its own active connection"
+        );
+        scan.join().expect("scan thread should stop");
+    }
+
+    #[test]
+    fn renders_the_engine_order_with_quoted_names_nulls_last_and_file_tie_break() {
+        let schema = vec![
+            crate::SchemaField {
+                name: "value\"quoted".to_owned(),
+                physical_type: "INT64".to_owned(),
+                logical_type: None,
+                children: Vec::new(),
+            },
+            crate::SchemaField {
+                name: "label".to_owned(),
+                physical_type: "BYTE_ARRAY".to_owned(),
+                logical_type: Some("String".to_owned()),
+                children: Vec::new(),
+            },
+        ];
+
+        assert_eq!(
+            build_order_clause(
+                &schema,
+                &[
+                    DataSort {
+                        source_index: 1,
+                        direction: DataSortDirection::Descending,
+                    },
+                    DataSort {
+                        source_index: 0,
+                        direction: DataSortDirection::Ascending,
+                    },
+                ],
+                "\"file_row_number\"",
+            ),
+            Ok(
+                "\"label\" DESC NULLS LAST, \"value\"\"quoted\" ASC NULLS LAST, \"file_row_number\" ASC"
+                    .to_owned()
+            )
+        );
+    }
+
+    fn write_fixture() -> NamedTempFile {
+        let source = NamedTempFile::new().expect("temporary source");
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("label", DataType::Utf8, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int64Array::from_iter_values(0..2_000)) as ArrayRef,
+                Arc::new(StringArray::from_iter_values(
+                    (0..2_000).map(|index| format!("label-{index:04}")),
+                )) as ArrayRef,
+            ],
+        )
+        .expect("record batch");
+        let file = source.reopen().expect("fixture file");
+        let mut writer = ArrowWriter::try_new(file, schema, None).expect("Parquet writer");
+        writer.write(&batch).expect("write batch");
+        writer.close().expect("write footer");
+        source
+    }
+
+    fn write_utc_timestamp_fixture() -> NamedTempFile {
+        let source = NamedTempFile::new().expect("temporary source");
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new(
+                "utc_at",
+                DataType::Timestamp(
+                    arrow_schema::TimeUnit::Microsecond,
+                    Some(Arc::<str>::from("UTC")),
+                ),
+                false,
+            ),
+        ]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int64Array::from_iter_values(0..3)) as ArrayRef,
+                Arc::new(
+                    TimestampMicrosecondArray::from_iter_values([
+                        1_700_000_000_000_000,
+                        1_700_000_000_000_001,
+                        1_700_000_000_000_002,
+                    ])
+                    .with_timezone("UTC"),
+                ) as ArrayRef,
+            ],
+        )
+        .expect("timestamp batch");
+        let file = source.reopen().expect("timestamp fixture file");
+        let mut writer = ArrowWriter::try_new(file, schema, None).expect("Parquet writer");
+        writer.write(&batch).expect("write timestamp batch");
+        writer.close().expect("write timestamp footer");
+        source
+    }
+
+    fn write_window_traversal_fixture(row_count: i64) -> NamedTempFile {
+        let source = NamedTempFile::new().expect("temporary source");
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("sort_key", DataType::Int64, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int64Array::from_iter_values(0..row_count)) as ArrayRef,
+                Arc::new(Int64Array::from_iter_values((0..row_count).rev())) as ArrayRef,
+            ],
+        )
+        .expect("window traversal batch");
+        let file = source.reopen().expect("fixture file");
+        let mut writer = ArrowWriter::try_new(file, schema, None).expect("Parquet writer");
+        writer.write(&batch).expect("write batch");
+        writer.close().expect("write footer");
+        source
+    }
+
+    fn rewrite_position_index_with_row_groups(
+        path: &Path,
+        positions: impl Iterator<Item = i64>,
+        row_group_rows: usize,
+    ) {
+        let positions = positions.collect::<Vec<_>>();
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            POSITION_COLUMN,
+            DataType::Int64,
+            false,
+        )]));
+        let file = fs::File::create(path).expect("replace position index");
+        let mut writer =
+            ArrowWriter::try_new(file, Arc::clone(&schema), None).expect("position index writer");
+        for row_group in positions.chunks(row_group_rows) {
+            let batch = RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![Arc::new(Int64Array::from_iter_values(row_group.iter().copied())) as ArrayRef],
+            )
+            .expect("position row group");
+            writer.write(&batch).expect("write position row group");
+            writer.flush().expect("flush position row group");
+        }
+        writer.close().expect("write position index footer");
+    }
+
+    fn memory_size_in_bytes(value: &str) -> Option<f64> {
+        let amount_end = value
+            .char_indices()
+            .find_map(|(index, character)| {
+                (!character.is_ascii_digit() && character != '.').then_some(index)
+            })
+            .unwrap_or(value.len());
+        let amount = value[..amount_end].parse::<f64>().ok()?;
+        let multiplier = match value[amount_end..].trim() {
+            "B" => 1.0,
+            "KB" => 1_000.0,
+            "MB" => 1_000_000.0,
+            "GB" => 1_000_000_000.0,
+            "KiB" => 1024.0,
+            "MiB" => 1024.0 * 1024.0,
+            "GiB" => 1024.0 * 1024.0 * 1024.0,
+            _ => return None,
+        };
+        Some(amount * multiplier)
+    }
+}

@@ -56,6 +56,42 @@ export interface DataFilter {
   values: string[];
 }
 
+export type SortDirection = "ascending" | "descending";
+
+export interface SortColumn {
+  sourceIndex: number;
+  direction: SortDirection;
+}
+
+export interface DataViewStatus {
+  revision: number;
+  rowCount: number;
+}
+
+export interface DataViewSortDiagnostic {
+  physicalType: string;
+  logicalType: string | null;
+  direction: SortDirection;
+}
+
+export interface DataViewResourceDiagnostics {
+  operation: "preparation" | "window";
+  applicationVersion: string;
+  operatingSystem: string;
+  architecture: string;
+  queryEngineVersion: string;
+  message: string;
+  memoryLimit: string;
+  maxTemporaryDirectorySize: string;
+  threads: number;
+  rowCount: number;
+  sourceSizeBytes: number;
+  rowGroupCount: number;
+  columnCount: number;
+  filterCount: number;
+  sortColumns: DataViewSortDiagnostic[];
+}
+
 export interface ColumnStatistics {
   minimum: string | null;
   maximum: string | null;
@@ -69,6 +105,12 @@ export type UpdateChannel = "stable" | "latest";
 export interface UpdateSettings {
   channel: UpdateChannel;
   automaticChecks: boolean;
+}
+
+export type DataViewMemoryLimit = "mb384" | "mb768" | "mb1536" | "mb3072";
+
+export interface DataViewSettings {
+  memoryLimit: DataViewMemoryLimit;
 }
 
 export interface UpdateInfo {
@@ -131,6 +173,7 @@ export type SourceErrorCode =
 export type DataWindowErrorCode =
   | "noSourceOpen"
   | "sourceChanged"
+  | "viewChanged"
   | "cancelled"
   | "notFound"
   | "permissionDenied"
@@ -139,7 +182,10 @@ export type DataWindowErrorCode =
   | "unsupported"
   | "windowTooLarge"
   | "invalidFilter"
+  | "invalidSort"
   | "resourceExhausted"
+  | "memoryExhausted"
+  | "temporaryStorageExhausted"
   | "queryFailed"
   | "queryEngineUnavailable"
   | "encodingFailed";
@@ -169,7 +215,10 @@ export class OpenSourceError extends Error {
 }
 
 export class DataWindowCommandError extends Error {
-  constructor(readonly code: DataWindowErrorCode) {
+  constructor(
+    readonly code: DataWindowErrorCode,
+    readonly diagnostics?: DataViewResourceDiagnostics,
+  ) {
     super(code);
     this.name = "DataWindowCommandError";
   }
@@ -199,6 +248,14 @@ export function getUpdateSettings(): Promise<UpdateSettings> {
 
 export function setUpdateSettings(settings: UpdateSettings): Promise<void> {
   return invoke("set_update_settings", { settings });
+}
+
+export function getDataViewSettings(): Promise<DataViewSettings> {
+  return invoke<DataViewSettings>("get_data_view_settings");
+}
+
+export function setDataViewSettings(settings: DataViewSettings): Promise<void> {
+  return invoke("set_data_view_settings", { settings });
 }
 
 export function getThemePreference(): Promise<ThemePreference> {
@@ -296,46 +353,62 @@ async function invokeSource<T>(
 
 export async function getDataWindow(
   generation: number,
+  viewRevision: number,
   rowOffset: number,
   rowCount: number,
-  filters: DataFilter[] = [],
+  sourceIndices: readonly number[],
 ): Promise<ArrayBuffer> {
   try {
     return await invoke<ArrayBuffer>("get_data_window", {
       generation,
+      viewRevision,
       rowOffset,
       rowCount,
-      filters,
+      sourceIndices,
     });
   } catch (error) {
-    throw new DataWindowCommandError(readDataWindowErrorCode(error));
+    throw readDataWindowCommandError(error);
   }
 }
 
-export async function getFilteredRowCount(
+export async function prepareDataView(
   generation: number,
-  filterRevision: number,
+  viewRevision: number,
   filters: DataFilter[],
-): Promise<number> {
+  sort: SortColumn[],
+  settings: DataViewSettings,
+): Promise<DataViewStatus> {
   try {
-    return await invoke<number>("get_filtered_row_count", {
+    return await invoke<DataViewStatus>("prepare_data_view", {
       generation,
-      filterRevision,
+      viewRevision,
       filters,
+      sort,
+      settings,
     });
   } catch (error) {
-    throw new DataWindowCommandError(readDataWindowErrorCode(error));
+    throw readDataWindowCommandError(error);
   }
 }
 
-export async function cancelFilteredRowCount(
+export async function getDataViewStatus(
   generation: number,
-  filterRevision: number,
+): Promise<DataViewStatus> {
+  try {
+    return await invoke<DataViewStatus>("get_data_view_status", { generation });
+  } catch (error) {
+    throw readDataWindowCommandError(error);
+  }
+}
+
+export async function cancelDataView(
+  generation: number,
+  viewRevision: number,
 ): Promise<void> {
   try {
-    await invoke("cancel_filtered_row_count", { generation, filterRevision });
+    await invoke("cancel_data_view", { generation, viewRevision });
   } catch (error) {
-    throw new DataWindowCommandError(readDataWindowErrorCode(error));
+    throw readDataWindowCommandError(error);
   }
 }
 
@@ -408,6 +481,7 @@ function readDataWindowErrorCode(error: unknown): DataWindowErrorCode {
     if (
       code === "noSourceOpen" ||
       code === "sourceChanged" ||
+      code === "viewChanged" ||
       code === "cancelled" ||
       code === "notFound" ||
       code === "permissionDenied" ||
@@ -416,7 +490,10 @@ function readDataWindowErrorCode(error: unknown): DataWindowErrorCode {
       code === "unsupported" ||
       code === "windowTooLarge" ||
       code === "invalidFilter" ||
+      code === "invalidSort" ||
       code === "resourceExhausted" ||
+      code === "memoryExhausted" ||
+      code === "temporaryStorageExhausted" ||
       code === "queryFailed" ||
       code === "queryEngineUnavailable" ||
       code === "encodingFailed"
@@ -426,6 +503,106 @@ function readDataWindowErrorCode(error: unknown): DataWindowErrorCode {
   }
 
   return "unsupported";
+}
+
+function readDataWindowCommandError(error: unknown): DataWindowCommandError {
+  const code = readDataWindowErrorCode(error);
+  const diagnostics =
+    code === "memoryExhausted" || code === "temporaryStorageExhausted"
+      ? readDataViewResourceDiagnostics(error)
+      : undefined;
+  return new DataWindowCommandError(code, diagnostics);
+}
+
+function readDataViewResourceDiagnostics(
+  error: unknown,
+): DataViewResourceDiagnostics | undefined {
+  if (
+    typeof error !== "object" ||
+    error === null ||
+    !("diagnostics" in error) ||
+    typeof error.diagnostics !== "object" ||
+    error.diagnostics === null
+  ) {
+    return undefined;
+  }
+  const diagnostics = error.diagnostics as Record<string, unknown>;
+  const {
+    operation,
+    applicationVersion,
+    operatingSystem,
+    architecture,
+    queryEngineVersion,
+    message,
+    memoryLimit,
+    maxTemporaryDirectorySize,
+    threads,
+    rowCount,
+    sourceSizeBytes,
+    rowGroupCount,
+    columnCount,
+    filterCount,
+    sortColumns: nativeSortColumns,
+  } = diagnostics;
+  if (
+    (operation !== "preparation" && operation !== "window") ||
+    typeof applicationVersion !== "string" ||
+    typeof operatingSystem !== "string" ||
+    typeof architecture !== "string" ||
+    typeof queryEngineVersion !== "string" ||
+    typeof message !== "string" ||
+    typeof memoryLimit !== "string" ||
+    typeof maxTemporaryDirectorySize !== "string" ||
+    !isNonNegativeSafeInteger(threads) ||
+    !isNonNegativeSafeInteger(rowCount) ||
+    !isNonNegativeSafeInteger(sourceSizeBytes) ||
+    !isNonNegativeSafeInteger(rowGroupCount) ||
+    !isNonNegativeSafeInteger(columnCount) ||
+    !isNonNegativeSafeInteger(filterCount) ||
+    !Array.isArray(nativeSortColumns)
+  ) {
+    return undefined;
+  }
+  const sortColumns: DataViewSortDiagnostic[] = [];
+  for (const column of nativeSortColumns) {
+    if (typeof column !== "object" || column === null) {
+      return undefined;
+    }
+    const { physicalType, logicalType, direction } = column as Record<
+      string,
+      unknown
+    >;
+    if (
+      typeof physicalType !== "string" ||
+      (logicalType !== null && typeof logicalType !== "string") ||
+      (direction !== "ascending" && direction !== "descending")
+    ) {
+      return undefined;
+    }
+    sortColumns.push({ physicalType, logicalType, direction });
+  }
+
+  return {
+    operation,
+    applicationVersion,
+    operatingSystem,
+    architecture,
+    queryEngineVersion,
+    message,
+    memoryLimit,
+    maxTemporaryDirectorySize,
+    threads,
+    rowCount,
+    sourceSizeBytes,
+    rowGroupCount,
+    columnCount,
+    filterCount,
+    sortColumns,
+  };
+}
+
+function isNonNegativeSafeInteger(value: unknown): value is number {
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
 }
 
 function readColumnStatisticsErrorCode(

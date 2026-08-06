@@ -1,6 +1,6 @@
 import { TimeUnit, Type, type DataType } from "@uwdata/flechette";
 
-import type { DataFilter, SchemaField } from "../desktop";
+import type { DataFilter, SchemaField, SortColumn } from "../desktop";
 
 export type ColumnFilterKind =
   "boolean" | "number" | "text" | "temporal" | "nullOnly";
@@ -73,6 +73,23 @@ export function formatWhereClause(
     })
     .filter((condition) => condition.length > 0)
     .join(" AND ");
+}
+
+export function formatOrderByClause(
+  sort: readonly SortColumn[],
+  schema: readonly SchemaField[],
+): string {
+  return sort
+    .map((column) => {
+      const field = schema[column.sourceIndex];
+      if (field === undefined) {
+        return "";
+      }
+      const direction = column.direction === "ascending" ? "ASC" : "DESC";
+      return `${quoteIdentifier(field.name)} ${direction}`;
+    })
+    .filter((condition) => condition.length > 0)
+    .join(", ");
 }
 
 export function formatFilterCondition(

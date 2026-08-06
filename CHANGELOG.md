@@ -16,6 +16,9 @@ Backward-incompatible entries start with **Breaking:**.
   comparisons and Float16 support, in a query bar with structured condition
   editing, type-aware value validation, and a cancellable exact match count.
 - UUID columns now support equals, not-equals, one-of, and contains filters.
+- The Data view now supports multi-column sorting with a visible ORDER BY
+  clause. It keeps current rows visible while changes prepare and lets users
+  raise the preparation memory limit in Settings.
 - The Data view now has a toggleable schema sidebar with the full nested field
   tree and cancellable, on-demand statistics for the selected column.
 

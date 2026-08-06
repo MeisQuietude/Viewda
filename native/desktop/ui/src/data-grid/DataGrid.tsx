@@ -9,17 +9,22 @@ import {
   type GridColumn,
   type GridSelection,
   type Rectangle,
+  type SpriteMap,
   type Theme,
 } from "@glideapps/glide-data-grid";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import {
-  cancelFilteredRowCount,
+  cancelDataView,
   DataWindowCommandError,
   getDataWindow,
-  getFilteredRowCount,
+  getDataViewStatus,
+  prepareDataView,
   shortcutModifier,
   type DataFilter,
+  type DataViewSettings,
+  type DataViewResourceDiagnostics,
+  type SortColumn,
   type SourceSummary,
 } from "../desktop";
 import { THEME_CHANGED_EVENT } from "../theme";
@@ -31,6 +36,7 @@ import {
   type ArrowDataWindow,
 } from "./arrow-window";
 import { copyRowLimit } from "./copy-limit";
+import { projectedSourceIndices, projectionContains } from "./column-window";
 import { formatCellValue, usesMonospaceCells } from "./format-cell";
 import {
   defaultFilterOperator,
@@ -41,9 +47,11 @@ import {
   columnFilterKind,
   filterInputFromCell,
   formatFilterCondition,
+  formatOrderByClause,
   formatWhereClause,
 } from "./filter-query";
 import {
+  clampedVisibleStart,
   nextScrollState,
   requestContainsVisibleRows,
   requestSatisfiesRequest,
@@ -53,14 +61,19 @@ import {
   type ScrollState,
 } from "./row-window";
 import { SchemaSidebar } from "./SchemaSidebar";
+import { nextSort, sortedColumnIcon } from "./sort";
 
 import "@glideapps/glide-data-grid/dist/index.css";
 
 const ROW_HEIGHT = 28;
 const HEADER_HEIGHT = 32;
 const INITIAL_ROWS = 64;
+const INITIAL_COLUMNS = 8;
 const COPY_CHUNK_ROWS = 512;
 const MAX_CACHED_CELLS = 20_000;
+const MIN_COLUMN_WIDTH = 112;
+const SORT_HEADER_HITBOX_START = 4;
+const SORT_HEADER_HITBOX_END = 32;
 const WHERE_POPUP_MARGIN = 16;
 const WHERE_POPUP_MAX_WIDTH = 680;
 const WHERE_POPUP_OFFSET = -42;
@@ -68,11 +81,47 @@ const GRID_HEADER_FONT_STYLE = "600 12px";
 const UI_FONT_FAMILY =
   'Inter, ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif';
 const MONOSPACE_FONT = 'ui-monospace, "SFMono-Regular", Consolas, monospace';
+const DEFAULT_DATA_VIEW_SETTINGS: DataViewSettings = { memoryLimit: "mb384" };
 
 const drawGridHeader: DrawHeaderCallback = ({ ctx }, drawContent) => {
   ctx.font = `${GRID_HEADER_FONT_STYLE} ${UI_FONT_FAMILY}`;
   drawContent();
 };
+
+function sortHeaderSprite(
+  direction: "neutral" | "ascending" | "descending",
+  priority?: number,
+): SpriteMap[string] {
+  return ({ bgColor, fgColor }) => {
+    const arrow =
+      direction === "neutral"
+        ? '<path d="M7 7l3-3 3 3M10 4v12M7 13l3 3 3-3"/>'
+        : direction === "ascending"
+          ? '<path d="M6.5 9.5 10 6l3.5 3.5M10 6v9"/>'
+          : '<path d="M6.5 10.5 10 14l3.5-3.5M10 5v9"/>';
+    const badge =
+      priority === undefined
+        ? ""
+        : `<circle cx="15.5" cy="15.5" r="4" fill="${bgColor}" stroke="none"/><text x="15.5" y="17.4" fill="${fgColor}" stroke="none" text-anchor="middle" font-family="sans-serif" font-size="${priority >= 10 ? 5 : 6}" font-weight="700">${priority}</text>`;
+    return `<svg width="20" height="20" viewBox="0 0 20 20" fill="none" xmlns="http://www.w3.org/2000/svg"><g stroke="${bgColor}" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">${arrow}</g>${badge}</svg>`;
+  };
+}
+
+const sortHeaderIcons: SpriteMap = {
+  "viewda-sort-neutral": sortHeaderSprite("neutral"),
+  "viewda-sort-ascending": sortHeaderSprite("ascending"),
+  "viewda-sort-descending": sortHeaderSprite("descending"),
+};
+for (let priority = 1; priority <= 32; priority += 1) {
+  sortHeaderIcons[`viewda-sort-ascending-${priority}`] = sortHeaderSprite(
+    "ascending",
+    priority,
+  );
+  sortHeaderIcons[`viewda-sort-descending-${priority}`] = sortHeaderSprite(
+    "descending",
+    priority,
+  );
+}
 
 interface ColumnState {
   sourceIndex: number;
@@ -91,17 +140,167 @@ interface HeaderMenu {
 interface VersionedRowRequest {
   rows: RowRequest;
   revision: number;
-  filters: DataFilter[];
+  sourceIndices: readonly number[];
 }
 
-type CountState = "ready" | "counting" | "error" | "unavailable";
+interface ActiveView {
+  revision: number;
+  filters: DataFilter[];
+  sort: SortColumn[];
+  rowCount: number;
+}
 
-export function DataGrid({ source }: { source: SourceSummary }) {
+interface PendingView {
+  revision: number;
+  filters: DataFilter[];
+  sort: SortColumn[];
+}
+
+interface ViewErrorState {
+  message: string;
+  diagnostics?: string;
+}
+
+function requestSatisfiesWindow(
+  candidate: VersionedRowRequest,
+  requested: VersionedRowRequest,
+): boolean {
+  return (
+    candidate.revision === requested.revision &&
+    requestSatisfiesRequest(candidate.rows, requested.rows) &&
+    projectionContains(candidate.sourceIndices, requested.sourceIndices)
+  );
+}
+
+function requestContainsVisibleWindow(
+  candidate: VersionedRowRequest,
+  requested: VersionedRowRequest,
+): boolean {
+  return (
+    candidate.revision === requested.revision &&
+    requestContainsVisibleRows(candidate.rows, requested.rows) &&
+    projectionContains(candidate.sourceIndices, requested.sourceIndices)
+  );
+}
+
+function viewDefinitionEquals(
+  current: Pick<ActiveView, "filters" | "sort">,
+  filters: readonly DataFilter[],
+  sort: readonly SortColumn[],
+): boolean {
+  return (
+    current.filters.length === filters.length &&
+    current.filters.every((filter, index) => {
+      const next = filters[index];
+      return (
+        next !== undefined &&
+        filter.columnIndex === next.columnIndex &&
+        filter.operator === next.operator &&
+        filter.values.length === next.values.length &&
+        filter.values.every(
+          (value, valueIndex) => value === next.values[valueIndex],
+        )
+      );
+    }) &&
+    current.sort.length === sort.length &&
+    current.sort.every((column, index) => {
+      const next = sort[index];
+      return (
+        next !== undefined &&
+        column.sourceIndex === next.sourceIndex &&
+        column.direction === next.direction
+      );
+    })
+  );
+}
+
+function ViewErrorAlert({
+  error,
+  onDismiss,
+  onRetry,
+  dismissLabel = "Dismiss view error",
+}: {
+  error: ViewErrorState;
+  onDismiss: () => void;
+  onRetry?: () => void;
+  dismissLabel?: string;
+}) {
+  const [copyState, setCopyState] = useState<"idle" | "copied" | "failed">(
+    "idle",
+  );
+  const copyDiagnostics = () => {
+    if (error.diagnostics === undefined || navigator.clipboard === undefined) {
+      setCopyState("failed");
+      return;
+    }
+    try {
+      void navigator.clipboard.writeText(error.diagnostics).then(
+        () => setCopyState("copied"),
+        () => setCopyState("failed"),
+      );
+    } catch {
+      setCopyState("failed");
+    }
+  };
+
+  return (
+    <section className="grid-error view-error" role="alert">
+      <div className="view-error-content">
+        <span>{error.message}</span>
+        {error.diagnostics !== undefined && (
+          <details className="view-error-details">
+            <summary>
+              <span className="view-error-details-show">Show details</span>
+              <span className="view-error-details-hide">Hide details</span>
+            </summary>
+            <pre>{error.diagnostics}</pre>
+            <div className="view-error-details-actions">
+              <button type="button" onClick={copyDiagnostics}>
+                Copy diagnostics
+              </button>
+              <span aria-live="polite">
+                {copyState === "copied"
+                  ? "Copied"
+                  : copyState === "failed"
+                    ? "Copy failed"
+                    : ""}
+              </span>
+            </div>
+          </details>
+        )}
+      </div>
+      {onRetry !== undefined && (
+        <button type="button" onClick={onRetry}>
+          Retry window
+        </button>
+      )}
+      <button
+        type="button"
+        aria-label={dismissLabel}
+        title="Dismiss"
+        onClick={onDismiss}
+      >
+        ×
+      </button>
+    </section>
+  );
+}
+
+export function DataGrid({
+  source,
+  viewSettings = DEFAULT_DATA_VIEW_SETTINGS,
+}: {
+  source: SourceSummary;
+  viewSettings?: DataViewSettings;
+}) {
   const [columnStates, setColumnStates] = useState<ColumnState[]>(() =>
     source.schema.map((field, sourceIndex) => ({
       sourceIndex,
       title: field.name,
-      width: Math.min(280, Math.max(120, field.name.length * 8 + 48)),
+      width: Math.min(
+        280,
+        Math.max(MIN_COLUMN_WIDTH, field.name.length * 8 + 48),
+      ),
       pinned: false,
       hidden: false,
     })),
@@ -109,7 +308,8 @@ export function DataGrid({ source }: { source: SourceSummary }) {
   const [monospaceColumns, setMonospaceColumns] = useState<ReadonlySet<number>>(
     () => new Set(),
   );
-  const [loadError, setLoadError] = useState<string | null>(null);
+  const [loadError, setLoadError] = useState<ViewErrorState | null>(null);
+  const [viewError, setViewError] = useState<ViewErrorState | null>(null);
   const [selection, setSelection] = useState<GridSelection>(() =>
     emptySelection(),
   );
@@ -118,14 +318,18 @@ export function DataGrid({ source }: { source: SourceSummary }) {
   const [filterEditor, setFilterEditor] = useState<FilterEditorRequest | null>(
     null,
   );
-  const [filters, setFilters] = useState<DataFilter[]>([]);
-  const [matchCount, setMatchCount] = useState<number | null>(source.rowCount);
-  const [countState, setCountState] = useState<CountState>("ready");
-  const [provisionalRowCount, setProvisionalRowCount] = useState<number | null>(
-    source.rowCount,
-  );
+  const [activeView, setActiveView] = useState<ActiveView>(() => ({
+    revision: 0,
+    filters: [],
+    sort: [],
+    rowCount: source.rowCount,
+  }));
+  const [gridInstanceKey, setGridInstanceKey] = useState(0);
+  const [pendingView, setPendingView] = useState<PendingView | null>(null);
   const [wherePopupOpen, setWherePopupOpen] = useState(false);
   const [wherePopupLeft, setWherePopupLeft] = useState(WHERE_POPUP_OFFSET);
+  const [sortPopupOpen, setSortPopupOpen] = useState(false);
+  const [sortDraft, setSortDraft] = useState<SortColumn[]>([]);
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const [selectedSchemaColumn, setSelectedSchemaColumn] = useState<
     number | null
@@ -138,17 +342,18 @@ export function DataGrid({ source }: { source: SourceSummary }) {
   const visibleRegionsRef = useRef<readonly Rectangle[]>([]);
   const cellCacheRef = useRef(new Map<number, GridCell>());
   const copyTailRef = useRef<Promise<void>>(Promise.resolve());
-  const copyWindowsRef = useRef(new Map<number, Promise<ArrowDataWindow>>());
+  const copyWindowsRef = useRef(new Map<string, Promise<ArrowDataWindow>>());
   const pendingRequestRef = useRef<VersionedRowRequest | null>(null);
   const activeRequestRef = useRef<VersionedRowRequest | null>(null);
   const failedRequestRef = useRef<VersionedRowRequest | null>(null);
-  const filterRevisionRef = useRef(0);
-  const countRequestedRevisionRef = useRef<number | null>(null);
+  const activeViewRef = useRef(activeView);
+  const pendingViewRef = useRef<PendingView | null>(null);
+  const nextViewRevisionRef = useRef(0);
   const scrollStateRef = useRef<ScrollState>({ direction: 0, boundary: 0 });
   const aliveRef = useRef(true);
-  const schemaLoadedRef = useRef(false);
   const menuRef = useRef<HTMLDivElement>(null);
   const wherePopupRef = useRef<HTMLDivElement>(null);
+  const sortPopupRef = useRef<HTMLDivElement>(null);
 
   const visibleColumnStates = useMemo(
     () => [
@@ -157,20 +362,28 @@ export function DataGrid({ source }: { source: SourceSummary }) {
     ],
     [columnStates],
   );
+  const allSourceIndices = useMemo(
+    () => source.schema.map((_field, sourceIndex) => sourceIndex),
+    [source.schema],
+  );
   visibleColumnStatesRef.current = visibleColumnStates;
   const hiddenCount = columnStates.length - visibleColumnStates.length;
   const pinnedCount = visibleColumnStates.filter(
     (column) => column.pinned,
   ).length;
   const gridTheme = useGridTheme();
-  const filteredRowCount = filters.length === 0 ? source.rowCount : matchCount;
-  const gridRowCount =
-    filters.length === 0
-      ? source.rowCount
-      : (matchCount ?? provisionalRowCount ?? 0);
+  activeViewRef.current = activeView;
+  pendingViewRef.current = pendingView;
+  const filters = activeView.filters;
+  const sort = activeView.sort;
+  const gridRowCount = activeView.rowCount;
   const whereClause = useMemo(
     () => formatWhereClause(filters, source.schema),
     [filters, source.schema],
+  );
+  const orderByClause = useMemo(
+    () => formatOrderByClause(sort, source.schema),
+    [sort, source.schema],
   );
 
   const columns = useMemo<GridColumn[]>(
@@ -179,6 +392,7 @@ export function DataGrid({ source }: { source: SourceSummary }) {
         return {
           id: String(column.sourceIndex),
           title: column.title,
+          icon: sortedColumnIcon(sort, column.sourceIndex),
           width: column.width,
           hasMenu: true,
           themeOverride: monospaceColumns.has(column.sourceIndex)
@@ -186,7 +400,7 @@ export function DataGrid({ source }: { source: SourceSummary }) {
             : undefined,
         };
       }),
-    [monospaceColumns, visibleColumnStates],
+    [monospaceColumns, sort, visibleColumnStates],
   );
 
   const readCell = useCallback(
@@ -247,34 +461,45 @@ export function DataGrid({ source }: { source: SourceSummary }) {
     [readCell, source.schema.length, visibleColumnStates],
   );
 
-  const requestFilteredCount = useCallback(
-    (revision: number, queryFilters: DataFilter[]) => {
-      if (countRequestedRevisionRef.current === revision) {
-        return;
+  const promoteView = useCallback(
+    (
+      revision: number,
+      rowCount: number,
+      filters: DataFilter[],
+      sort: SortColumn[],
+    ) => {
+      const next = { revision, rowCount, filters, sort };
+      const visible = visibleRegionsRef.current[0];
+      if (
+        visible !== undefined &&
+        clampedVisibleStart(rowCount, visible.y, visible.height) !== visible.y
+      ) {
+        // Glide's virtual scroller retains its logical offset when rows shrink below the
+        // current viewport. Remount only in that case so the canvas can reach the clamped row.
+        setGridInstanceKey((current) => current + 1);
       }
-      countRequestedRevisionRef.current = revision;
-      setCountState("counting");
-      void getFilteredRowCount(source.generation, revision, queryFilters).then(
-        (count) => {
-          if (aliveRef.current && filterRevisionRef.current === revision) {
-            setMatchCount(count);
-            setCountState("ready");
-          }
-        },
-        (error: unknown) => {
-          if (
-            error instanceof DataWindowCommandError &&
-            error.code === "cancelled"
-          ) {
-            return;
-          }
-          if (aliveRef.current && filterRevisionRef.current === revision) {
-            setCountState("error");
-          }
-        },
+      nextViewRevisionRef.current = Math.max(
+        nextViewRevisionRef.current,
+        revision,
+      );
+      activeViewRef.current = next;
+      setActiveView(next);
+      pendingViewRef.current = null;
+      setPendingView(null);
+      setLoadError(null);
+      setViewError(null);
+      pendingRequestRef.current = null;
+      failedRequestRef.current = null;
+      dataWindowRef.current = null;
+      cellCacheRef.current.clear();
+      copyWindowsRef.current.clear();
+      setSelection(emptySelection());
+      setCopyLimit(null);
+      gridRef.current?.updateCells(
+        visibleRegionDamage(visibleRegionsRef.current),
       );
     },
-    [source.generation],
+    [],
   );
 
   const drainRequests = useCallback(async () => {
@@ -289,42 +514,41 @@ export function DataGrid({ source }: { source: SourceSummary }) {
       try {
         const bytes = await getDataWindow(
           source.generation,
+          request.revision,
           request.rows.offset,
           request.rows.count,
-          request.filters,
+          request.sourceIndices,
         );
-        const decoded = decodeArrowWindow(bytes, request.rows.offset);
+        const decoded = decodeArrowWindow(
+          bytes,
+          request.rows.offset,
+          request.sourceIndices,
+        );
         if (
           !aliveRef.current ||
-          request.revision !== filterRevisionRef.current
+          request.revision !== activeViewRef.current.revision
         ) {
           continue;
         }
-        if (!schemaLoadedRef.current) {
-          schemaLoadedRef.current = true;
-          setMonospaceColumns(
-            new Set(
-              decoded.table.schema.fields
-                .map((field, index) =>
-                  usesMonospaceCells(field.type) ? index : undefined,
-                )
-                .filter((index): index is number => index !== undefined),
-            ),
-          );
-        }
-        const pending = readAfterAwait(pendingRequestRef);
-        if (
-          pending !== null &&
-          pending.revision === request.revision &&
-          requestSatisfiesRequest(request.rows, pending.rows)
-        ) {
+        setMonospaceColumns((current) => {
+          const next = new Set(current);
+          decoded.table.schema.fields.forEach((field, columnOffset) => {
+            const sourceIndex = decoded.sourceIndices[columnOffset];
+            if (sourceIndex !== undefined && usesMonospaceCells(field.type)) {
+              next.add(sourceIndex);
+            }
+          });
+          return next.size === current.size ? current : next;
+        });
+        const pending = pendingRequestRef.current as VersionedRowRequest | null;
+        if (pending !== null && requestSatisfiesWindow(request, pending)) {
           pendingRequestRef.current = null;
         }
-        const latest = readAfterAwait(pendingRequestRef);
+        const latest = pendingRequestRef.current as VersionedRowRequest | null;
         if (
           latest === null ||
           latest.revision !== request.revision ||
-          requestContainsVisibleRows(request.rows, latest.rows)
+          requestContainsVisibleWindow(request, latest)
         ) {
           dataWindowRef.current = decoded;
           failedRequestRef.current = null;
@@ -333,45 +557,59 @@ export function DataGrid({ source }: { source: SourceSummary }) {
             loadedWindowDamage(decoded, visibleRegionsRef.current),
           );
           setLoadError(null);
-          if (request.filters.length > 0 && request.rows.offset === 0) {
-            setProvisionalRowCount(decoded.rowCount);
-            if (
-              decoded.rowCount < request.rows.count ||
-              request.rows.count >= source.rowCount
-            ) {
-              setMatchCount(decoded.rowCount);
-              setCountState("ready");
-            } else {
-              requestFilteredCount(request.revision, request.filters);
-            }
-          }
         }
       } catch (error) {
         if (
           aliveRef.current &&
-          request.revision === filterRevisionRef.current &&
+          error instanceof DataWindowCommandError &&
+          error.code === "viewChanged"
+        ) {
+          try {
+            const status = await getDataViewStatus(source.generation);
+            const pending = pendingViewRef.current;
+            const active = activeViewRef.current;
+            if (pending?.revision === status.revision) {
+              promoteView(
+                status.revision,
+                status.rowCount,
+                pending.filters,
+                pending.sort,
+              );
+            } else if (active.revision === status.revision) {
+              pendingRequestRef.current = {
+                rows: request.rows,
+                revision: active.revision,
+                sourceIndices: request.sourceIndices,
+              };
+            } else {
+              setLoadError({
+                message: "The active data view could not be synchronized.",
+              });
+            }
+          } catch (statusError) {
+            setLoadError(dataViewErrorState(statusError));
+          }
+          continue;
+        }
+        if (
+          aliveRef.current &&
+          request.revision === activeViewRef.current.revision &&
           pendingRequestRef.current === null
         ) {
           failedRequestRef.current = request;
-          if (
-            request.filters.length > 0 &&
-            countRequestedRevisionRef.current !== request.revision
-          ) {
-            setCountState("unavailable");
-          }
-          setLoadError(dataWindowErrorMessage(error));
+          setLoadError(dataViewErrorState(error));
         }
       } finally {
         activeRequestRef.current = null;
       }
     }
-  }, [requestFilteredCount, source.generation, source.rowCount]);
+  }, [promoteView, source.generation]);
 
   const requestRows = useCallback(
     (
       visibleStart: number,
       visibleCount: number,
-      planningRowCount = gridRowCount,
+      planningRowCount = activeViewRef.current.rowCount,
     ) => {
       const scrollState = nextScrollState(scrollStateRef.current, visibleStart);
       scrollStateRef.current = scrollState;
@@ -381,64 +619,98 @@ export function DataGrid({ source }: { source: SourceSummary }) {
         visibleCount,
         scrollState.direction,
       );
+      const activeView = activeViewRef.current;
+      const sourceIndices =
+        activeView.filters.length === 0 && activeView.sort.length === 0
+          ? allSourceIndices
+          : projectedSourceIndices(
+              visibleColumnStatesRef.current,
+              visibleRegionsRef.current,
+              INITIAL_COLUMNS,
+            );
+      if (sourceIndices.length === 0) {
+        return;
+      }
+      const requestedWindow: VersionedRowRequest = {
+        rows: request,
+        revision: activeView.revision,
+        sourceIndices,
+      };
       const current = dataWindowRef.current;
       if (
         current !== null &&
-        windowSatisfiesRequest(current.rowOffset, current.rowCount, request)
+        windowSatisfiesRequest(current.rowOffset, current.rowCount, request) &&
+        projectionContains(current.sourceIndices, sourceIndices)
       ) {
         return;
       }
       const pending = pendingRequestRef.current;
-      const revision = filterRevisionRef.current;
       if (
         pending !== null &&
-        pending.revision === revision &&
-        requestSatisfiesRequest(pending.rows, request)
+        requestSatisfiesWindow(pending, requestedWindow)
       ) {
         return;
       }
       const active = activeRequestRef.current;
-      if (
-        active !== null &&
-        active.revision === revision &&
-        requestSatisfiesRequest(active.rows, request)
-      ) {
+      if (active !== null && requestSatisfiesWindow(active, requestedWindow)) {
         return;
       }
-      pendingRequestRef.current = { rows: request, revision, filters };
+      pendingRequestRef.current = requestedWindow;
       void drainRequests();
     },
-    [drainRequests, filters, gridRowCount],
+    [allSourceIndices, drainRequests],
   );
 
   const retryWindow = useCallback(() => {
     const failed = failedRequestRef.current;
-    if (failed === null || failed.revision !== filterRevisionRef.current) {
+    if (failed === null || failed.revision !== activeViewRef.current.revision) {
       return;
     }
     failedRequestRef.current = null;
     pendingRequestRef.current = failed;
     setLoadError(null);
-    if (
-      failed.filters.length > 0 &&
-      countRequestedRevisionRef.current !== failed.revision
-    ) {
-      setCountState("counting");
-    }
     void drainRequests();
   }, [drainRequests]);
 
+  const reloadActiveWindow = useCallback(() => {
+    const active = activeViewRef.current;
+    failedRequestRef.current = null;
+    pendingRequestRef.current = null;
+    dataWindowRef.current = null;
+    cellCacheRef.current.clear();
+    if (active.rowCount === 0) {
+      return;
+    }
+    const visible = visibleRegionsRef.current[0];
+    requestRows(
+      visible?.y ?? 0,
+      visible?.height ?? Math.min(INITIAL_ROWS, active.rowCount),
+    );
+  }, [requestRows]);
+
   useEffect(() => {
     aliveRef.current = true;
-    if (
-      filters.length > 0 &&
-      matchCount === null &&
-      provisionalRowCount === null &&
-      source.rowCount > 0
-    ) {
-      requestRows(0, INITIAL_ROWS, Math.min(COPY_CHUNK_ROWS, source.rowCount));
-    } else if (gridRowCount > 0) {
-      requestRows(0, Math.min(INITIAL_ROWS, gridRowCount));
+    if (activeView.rowCount > 0) {
+      const visible = visibleRegionsRef.current[0];
+      const visibleCount =
+        visible?.height ?? Math.min(INITIAL_ROWS, activeView.rowCount);
+      const visibleStart = clampedVisibleStart(
+        activeView.rowCount,
+        visible?.y ?? 0,
+        visibleCount,
+      );
+      if (visible !== undefined && visibleStart !== visible.y) {
+        visibleRegionsRef.current = visibleRegionsRef.current.map((region) => ({
+          ...region,
+          y: visibleStart,
+          height: Math.min(region.height, activeView.rowCount - visibleStart),
+        }));
+        scrollStateRef.current = { direction: 0, boundary: visibleStart };
+        gridRef.current?.scrollTo(0, visibleStart, "vertical", 0, 0, {
+          vAlign: "start",
+        });
+      }
+      requestRows(visibleStart, visibleCount);
     }
     return () => {
       aliveRef.current = false;
@@ -446,19 +718,17 @@ export function DataGrid({ source }: { source: SourceSummary }) {
       failedRequestRef.current = null;
     };
   }, [
-    filters.length,
-    gridRowCount,
-    matchCount,
-    provisionalRowCount,
+    activeView.revision,
+    activeView.rowCount,
     requestRows,
-    source.rowCount,
+    visibleColumnStates,
   ]);
 
   useEffect(
     () => () => {
-      const revision = filterRevisionRef.current;
-      if (countRequestedRevisionRef.current === revision) {
-        void cancelFilteredRowCount(source.generation, revision).catch(
+      const pending = pendingViewRef.current;
+      if (pending !== null) {
+        void cancelDataView(source.generation, pending.revision).catch(
           () => undefined,
         );
       }
@@ -512,6 +782,33 @@ export function DataGrid({ source }: { source: SourceSummary }) {
   }, [wherePopupOpen]);
 
   useEffect(() => {
+    if (!sortPopupOpen) {
+      return;
+    }
+    sortPopupRef.current
+      ?.querySelector<HTMLElement>(
+        ".sort-popup button:not(:disabled), .sort-popup select:not(:disabled)",
+      )
+      ?.focus();
+    const closePopup = (event: PointerEvent) => {
+      if (!sortPopupRef.current?.contains(event.target as Node)) {
+        setSortPopupOpen(false);
+      }
+    };
+    const closeOnEscape = (event: globalThis.KeyboardEvent) => {
+      if (event.key === "Escape") {
+        setSortPopupOpen(false);
+      }
+    };
+    document.addEventListener("pointerdown", closePopup);
+    document.addEventListener("keydown", closeOnEscape);
+    return () => {
+      document.removeEventListener("pointerdown", closePopup);
+      document.removeEventListener("keydown", closeOnEscape);
+    };
+  }, [sortPopupOpen]);
+
+  useEffect(() => {
     const toggleSidebar = (event: globalThis.KeyboardEvent) => {
       if (
         !(event.metaKey || event.ctrlKey) ||
@@ -546,96 +843,232 @@ export function DataGrid({ source }: { source: SourceSummary }) {
     });
   }, [schemaFocusRequest]);
 
-  const changeFilters = useCallback(
-    (nextFilters: DataFilter[]) => {
-      const previousRevision = filterRevisionRef.current;
-      if (countRequestedRevisionRef.current === previousRevision) {
-        void cancelFilteredRowCount(source.generation, previousRevision).catch(
+  const applyView = useCallback(
+    (nextFilters: DataFilter[], nextSort: SortColumn[]) => {
+      const current = pendingViewRef.current ?? activeViewRef.current;
+      if (viewDefinitionEquals(current, nextFilters, nextSort)) {
+        setHeaderMenu(null);
+        setFilterEditor(null);
+        setWherePopupOpen(false);
+        setSortPopupOpen(false);
+        return;
+      }
+      const previous = pendingViewRef.current;
+      if (previous !== null) {
+        void cancelDataView(source.generation, previous.revision).catch(
           () => undefined,
         );
       }
-      filterRevisionRef.current += 1;
-      countRequestedRevisionRef.current = null;
-      pendingRequestRef.current = null;
+      if (source.rowCount === 0) {
+        promoteView(activeViewRef.current.revision, 0, nextFilters, nextSort);
+        setLoadError(null);
+        setHeaderMenu(null);
+        setFilterEditor(null);
+        setWherePopupOpen(false);
+        setSortPopupOpen(false);
+        return;
+      }
+      const revision = nextViewRevisionRef.current + 1;
+      nextViewRevisionRef.current = revision;
+      const request = { revision, filters: nextFilters, sort: nextSort };
+      pendingViewRef.current = request;
+      setPendingView(request);
       failedRequestRef.current = null;
-      dataWindowRef.current = null;
-      cellCacheRef.current.clear();
-      copyWindowsRef.current.clear();
-      scrollStateRef.current = { direction: 0, boundary: 0 };
-      setFilters(nextFilters);
-      setMatchCount(
-        nextFilters.length === 0 || source.rowCount === 0
-          ? source.rowCount
-          : null,
-      );
-      setCountState(
-        nextFilters.length === 0 || source.rowCount === 0
-          ? "ready"
-          : "counting",
-      );
-      setProvisionalRowCount(
-        nextFilters.length === 0
-          ? source.rowCount
-          : source.rowCount === 0
-            ? 0
-            : null,
-      );
       setSelection(emptySelection());
       setCopyLimit(null);
       setLoadError(null);
+      setViewError(null);
       setHeaderMenu(null);
       setFilterEditor(null);
       setWherePopupOpen(false);
-      gridRef.current?.updateCells(
-        visibleRegionDamage(visibleRegionsRef.current),
+      setSortPopupOpen(false);
+
+      void prepareDataView(
+        source.generation,
+        revision,
+        nextFilters,
+        nextSort,
+        viewSettings,
+      ).then(
+        (status) => {
+          if (
+            aliveRef.current &&
+            pendingViewRef.current?.revision === revision
+          ) {
+            promoteView(
+              status.revision,
+              status.rowCount,
+              nextFilters,
+              nextSort,
+            );
+          }
+        },
+        async (error: unknown) => {
+          if (
+            !aliveRef.current ||
+            pendingViewRef.current?.revision !== revision
+          ) {
+            return;
+          }
+          try {
+            const status = await getDataViewStatus(source.generation);
+            if (
+              !aliveRef.current ||
+              pendingViewRef.current?.revision !== revision
+            ) {
+              return;
+            }
+            if (status.revision === revision) {
+              promoteView(
+                status.revision,
+                status.rowCount,
+                nextFilters,
+                nextSort,
+              );
+              return;
+            }
+            if (status.revision === activeViewRef.current.revision) {
+              reloadActiveWindow();
+            }
+          } catch (statusError) {
+            if (
+              !aliveRef.current ||
+              pendingViewRef.current?.revision !== revision
+            ) {
+              return;
+            }
+            setViewError(dataViewErrorState(statusError));
+          }
+          if (
+            !aliveRef.current ||
+            pendingViewRef.current?.revision !== revision
+          ) {
+            return;
+          }
+          pendingViewRef.current = null;
+          setPendingView(null);
+          if (
+            !(error instanceof DataWindowCommandError) ||
+            error.code !== "cancelled"
+          ) {
+            setViewError(dataViewErrorState(error));
+          }
+        },
       );
     },
-    [source.generation, source.rowCount],
+    [
+      promoteView,
+      reloadActiveWindow,
+      source.generation,
+      source.rowCount,
+      viewSettings,
+    ],
   );
 
-  const retryFilteredCount = useCallback(() => {
-    const revision = filterRevisionRef.current;
-    countRequestedRevisionRef.current = null;
-    requestFilteredCount(revision, filters);
-  }, [filters, requestFilteredCount]);
+  const changeFilters = useCallback(
+    (nextFilters: DataFilter[]) =>
+      applyView(
+        nextFilters,
+        pendingViewRef.current?.sort ?? activeViewRef.current.sort,
+      ),
+    [applyView],
+  );
+
+  const changeSort = useCallback(
+    (nextSort: SortColumn[]) =>
+      applyView(
+        pendingViewRef.current?.filters ?? activeViewRef.current.filters,
+        nextSort,
+      ),
+    [applyView],
+  );
+
+  const cancelPendingView = useCallback(() => {
+    const pending = pendingViewRef.current;
+    if (pending === null) {
+      return;
+    }
+    void (async () => {
+      try {
+        await cancelDataView(source.generation, pending.revision);
+        if (pendingViewRef.current?.revision !== pending.revision) {
+          return;
+        }
+        const status = await getDataViewStatus(source.generation);
+        if (pendingViewRef.current?.revision !== pending.revision) {
+          return;
+        }
+        if (status.revision === pending.revision) {
+          promoteView(
+            status.revision,
+            status.rowCount,
+            pending.filters,
+            pending.sort,
+          );
+        } else if (status.revision === activeViewRef.current.revision) {
+          reloadActiveWindow();
+        }
+      } catch (error: unknown) {
+        if (pendingViewRef.current?.revision === pending.revision) {
+          setViewError(dataViewErrorState(error));
+        }
+      } finally {
+        if (pendingViewRef.current?.revision === pending.revision) {
+          pendingViewRef.current = null;
+          setPendingView(null);
+        }
+      }
+    })();
+  }, [promoteView, reloadActiveWindow, source.generation]);
 
   const loadCopyWindow = useCallback(
-    (row: number, abortSignal: AbortSignal): Promise<ArrowDataWindow> => {
+    (
+      row: number,
+      selectedSourceIndices: readonly number[],
+      abortSignal: AbortSignal,
+    ): Promise<ArrowDataWindow> => {
       const offset = Math.floor(row / COPY_CHUNK_ROWS) * COPY_CHUNK_ROWS;
-      const existing = copyWindowsRef.current.get(offset);
+      const view = activeViewRef.current;
+      const sourceIndices =
+        view.filters.length === 0 && view.sort.length === 0
+          ? allSourceIndices
+          : [...selectedSourceIndices].sort((left, right) => left - right);
+      const key = `${view.revision}:${offset}:${sourceIndices.join(",")}`;
+      const existing = copyWindowsRef.current.get(key);
       if (existing !== undefined) {
         return existing;
       }
 
-      const count = Math.min(COPY_CHUNK_ROWS, gridRowCount - offset);
+      const count = Math.min(COPY_CHUNK_ROWS, view.rowCount - offset);
       const request = copyTailRef.current.then(async () => {
         if (abortSignal.aborted) {
           throw new DOMException("Copy was cancelled.", "AbortError");
         }
         const bytes = await getDataWindow(
           source.generation,
+          view.revision,
           offset,
           count,
-          filters,
+          sourceIndices,
         );
-        return decodeArrowWindow(bytes, offset);
+        return decodeArrowWindow(bytes, offset, sourceIndices);
       });
       copyTailRef.current = request.then(
         () => undefined,
         () => undefined,
       );
-      copyWindowsRef.current.set(offset, request);
+      copyWindowsRef.current.set(key, request);
       const release = () => {
         queueMicrotask(() => {
-          if (copyWindowsRef.current.get(offset) === request) {
-            copyWindowsRef.current.delete(offset);
+          if (copyWindowsRef.current.get(key) === request) {
+            copyWindowsRef.current.delete(key);
           }
         });
       };
       void request.then(release, release);
       return request;
     },
-    [filters, gridRowCount, source.generation],
+    [allSourceIndices, source.generation],
   );
 
   const getCellsForSelection = useCallback(
@@ -643,6 +1076,9 @@ export function DataGrid({ source }: { source: SourceSummary }) {
       const selectedColumns = visibleColumnStates.slice(
         rectangle.x,
         rectangle.x + rectangle.width,
+      );
+      const selectedSourceIndices = selectedColumns.map(
+        (column) => column.sourceIndex,
       );
       const rows: GridCell[][] = [];
       const rowLimit = copyRowLimit(
@@ -663,7 +1099,11 @@ export function DataGrid({ source }: { source: SourceSummary }) {
         if (abortSignal.aborted) {
           return [];
         }
-        const window = await loadCopyWindow(offset, abortSignal);
+        const window = await loadCopyWindow(
+          offset,
+          selectedSourceIndices,
+          abortSignal,
+        );
         const windowEnd = Math.min(end, window.rowOffset + window.rowCount);
         for (let row = offset; row < windowEnd; row += 1) {
           rows.push(
@@ -894,29 +1334,157 @@ export function DataGrid({ source }: { source: SourceSummary }) {
               </div>
             )}
           </div>
-          <span className="query-keyword">ORDER BY</span>
-          <span className="query-empty-slot">⋯</span>
+          <div ref={sortPopupRef} className="query-order-wrap">
+            <span className="query-keyword">ORDER BY</span>
+            <button
+              className={`query-order ${orderByClause.length === 0 ? "query-empty-slot" : ""}`}
+              type="button"
+              aria-expanded={sortPopupOpen}
+              onClick={() => {
+                setSortDraft([
+                  ...(pendingViewRef.current?.sort ??
+                    activeViewRef.current.sort),
+                ]);
+                setSortPopupOpen((open) => !open);
+              }}
+            >
+              {orderByClause || "⋯"}
+            </button>
+            {sortPopupOpen && (
+              <div
+                className="sort-popup"
+                role="dialog"
+                aria-label="ORDER BY columns"
+              >
+                {sortDraft.length === 0 ? (
+                  <p>No ORDER BY columns.</p>
+                ) : (
+                  <ol>
+                    {sortDraft.map((column, index) => (
+                      <li key={column.sourceIndex}>
+                        <code>{source.schema[column.sourceIndex]?.name}</code>
+                        <select
+                          aria-label={`Direction for ${source.schema[column.sourceIndex]?.name}`}
+                          value={column.direction}
+                          onChange={(event) =>
+                            setSortDraft((current) =>
+                              current.map((item, itemIndex) =>
+                                itemIndex === index
+                                  ? {
+                                      ...item,
+                                      direction: event.target.value as
+                                        "ascending" | "descending",
+                                    }
+                                  : item,
+                              ),
+                            )
+                          }
+                        >
+                          <option value="ascending">ASC</option>
+                          <option value="descending">DESC</option>
+                        </select>
+                        <button
+                          type="button"
+                          aria-label={`Move ${source.schema[column.sourceIndex]?.name} earlier`}
+                          disabled={index === 0}
+                          onClick={() =>
+                            setSortDraft((current) =>
+                              moveSortColumn(current, index, index - 1),
+                            )
+                          }
+                        >
+                          ↑
+                        </button>
+                        <button
+                          type="button"
+                          aria-label={`Move ${source.schema[column.sourceIndex]?.name} later`}
+                          disabled={index === sortDraft.length - 1}
+                          onClick={() =>
+                            setSortDraft((current) =>
+                              moveSortColumn(current, index, index + 1),
+                            )
+                          }
+                        >
+                          ↓
+                        </button>
+                        <button
+                          type="button"
+                          aria-label={`Remove sort ${source.schema[column.sourceIndex]?.name}`}
+                          onClick={() =>
+                            setSortDraft((current) =>
+                              current.filter(
+                                (_item, itemIndex) => itemIndex !== index,
+                              ),
+                            )
+                          }
+                        >
+                          Remove
+                        </button>
+                      </li>
+                    ))}
+                  </ol>
+                )}
+                <label>
+                  Add column
+                  <select
+                    value=""
+                    onChange={(event) => {
+                      const sourceIndex = Number(event.target.value);
+                      if (Number.isInteger(sourceIndex)) {
+                        setSortDraft((current) => [
+                          ...current,
+                          { sourceIndex, direction: "ascending" },
+                        ]);
+                      }
+                    }}
+                  >
+                    <option value="" disabled>
+                      Select…
+                    </option>
+                    {source.schema.map((field, sourceIndex) => (
+                      <option
+                        key={sourceIndex}
+                        value={sourceIndex}
+                        disabled={sortDraft.some(
+                          (column) => column.sourceIndex === sourceIndex,
+                        )}
+                      >
+                        {field.name}
+                      </option>
+                    ))}
+                  </select>
+                </label>
+                <div className="sort-popup-actions">
+                  <button type="button" onClick={() => setSortPopupOpen(false)}>
+                    Cancel
+                  </button>
+                  <button type="button" onClick={() => changeSort(sortDraft)}>
+                    Apply
+                  </button>
+                </div>
+              </div>
+            )}
+          </div>
         </div>
         <span className="query-count" role="status">
-          {countState === "error" ? (
-            <button type="button" onClick={retryFilteredCount}>
-              retry
-            </button>
-          ) : countState === "counting" ? (
-            "counting…"
-          ) : countState === "unavailable" ? (
-            "count unavailable"
+          {pendingView !== null ? (
+            <>
+              preparing view…{" "}
+              <button type="button" onClick={cancelPendingView}>
+                cancel
+              </button>
+            </>
           ) : (
-            `${(matchCount ?? source.rowCount).toLocaleString("en-US")} rows`
+            `${activeView.rowCount.toLocaleString("en-US")} rows`
           )}
         </span>
         <button
           className="query-clear"
           type="button"
-          aria-label="Clear WHERE conditions"
-          title="Clear WHERE conditions"
-          disabled={filters.length === 0}
-          onClick={() => changeFilters([])}
+          aria-label="Clear WHERE and ORDER BY"
+          title="Clear WHERE and ORDER BY"
+          disabled={filters.length === 0 && sort.length === 0}
+          onClick={() => applyView([], [])}
         >
           ×
         </button>
@@ -947,12 +1515,23 @@ export function DataGrid({ source }: { source: SourceSummary }) {
         </div>
       )}
       {loadError !== null && (
-        <p className="grid-error" role="alert">
-          <span>{loadError}</span>
-          <button type="button" onClick={retryWindow}>
-            Retry window
-          </button>
-        </p>
+        <ViewErrorAlert
+          key={loadError.diagnostics ?? loadError.message}
+          error={loadError}
+          dismissLabel="Dismiss window error"
+          onRetry={failedRequestRef.current === null ? undefined : retryWindow}
+          onDismiss={() => {
+            failedRequestRef.current = null;
+            setLoadError(null);
+          }}
+        />
+      )}
+      {viewError !== null && (
+        <ViewErrorAlert
+          key={viewError.diagnostics ?? viewError.message}
+          error={viewError}
+          onDismiss={() => setViewError(null)}
+        />
       )}
       <div className="data-grid-layout">
         <SchemaSidebar
@@ -961,22 +1540,21 @@ export function DataGrid({ source }: { source: SourceSummary }) {
           source={source}
           onSelectColumn={selectSchemaColumn}
         />
-        {filters.length > 0 && filteredRowCount === 0 ? (
+        {gridRowCount === 0 && filters.length > 0 ? (
           <div className="filtered-empty-state">
             <p>No rows match these conditions.</p>
-            <button type="button" onClick={() => changeFilters([])}>
+            <button type="button" onClick={() => applyView([], sort)}>
               Clear filters
             </button>
           </div>
-        ) : filters.length > 0 && gridRowCount === 0 ? (
-          <p className="data-grid-loading" role="status">
-            {loadError === null
-              ? "Loading matching rows…"
-              : "Matching rows could not be loaded."}
-          </p>
+        ) : gridRowCount === 0 ? (
+          <div className="filtered-empty-state">
+            <p>This file has no rows.</p>
+          </div>
         ) : (
           <div className="grid-canvas">
             <DataEditor
+              key={gridInstanceKey}
               ref={gridRef}
               columns={columns}
               rows={gridRowCount}
@@ -993,6 +1571,7 @@ export function DataGrid({ source }: { source: SourceSummary }) {
               getCellContent={getCellContent}
               getCellsForSelection={getCellsForSelection}
               drawHeader={drawGridHeader}
+              headerIcons={sortHeaderIcons}
               copyHeaders={false}
               freezeColumns={pinnedCount}
               fixedShadowX={false}
@@ -1006,6 +1585,28 @@ export function DataGrid({ source }: { source: SourceSummary }) {
               onCellContextMenu={(cell, event) => {
                 event.preventDefault();
                 openFilterForCell(cell, event.bounds);
+              }}
+              onHeaderClicked={(visibleIndex, event) => {
+                if (
+                  event.isEdge ||
+                  event.localEventX < SORT_HEADER_HITBOX_START ||
+                  event.localEventX >= SORT_HEADER_HITBOX_END
+                ) {
+                  return;
+                }
+                const sourceIndex =
+                  visibleColumnStates[visibleIndex]?.sourceIndex;
+                if (sourceIndex !== undefined) {
+                  const currentSort =
+                    pendingViewRef.current?.sort ?? activeViewRef.current.sort;
+                  changeSort(
+                    nextSort(
+                      currentSort,
+                      sourceIndex,
+                      event.shiftKey || event.metaKey || event.ctrlKey,
+                    ),
+                  );
+                }
               }}
               onVisibleRegionChanged={(range, _tx, _ty, extras) => {
                 visibleRegionsRef.current = [
@@ -1021,7 +1622,10 @@ export function DataGrid({ source }: { source: SourceSummary }) {
                   setColumnStates((current) =>
                     current.map((column) =>
                       column.sourceIndex === sourceIndex
-                        ? { ...column, width }
+                        ? {
+                            ...column,
+                            width: Math.max(MIN_COLUMN_WIDTH, width),
+                          }
                         : column,
                     ),
                   );
@@ -1135,10 +1739,26 @@ function isTypingTarget(target: EventTarget | null): boolean {
   );
 }
 
-// TypeScript keeps the pre-await narrowing of ref.current, but scroll callbacks
-// can replace this value while a native window request is pending.
-function readAfterAwait<T>(ref: { readonly current: T }): T {
-  return ref.current;
+function moveSortColumn(
+  sort: readonly SortColumn[],
+  from: number,
+  to: number,
+): SortColumn[] {
+  if (
+    from === to ||
+    from < 0 ||
+    to < 0 ||
+    from >= sort.length ||
+    to >= sort.length
+  ) {
+    return [...sort];
+  }
+  const next = [...sort];
+  const [column] = next.splice(from, 1);
+  if (column !== undefined) {
+    next.splice(to, 0, column);
+  }
+  return next;
 }
 
 function emptySelection(): GridSelection {
@@ -1227,13 +1847,75 @@ function dataWindowErrorMessage(error: unknown): string {
       return "This condition does not match its column type or exceeds the limits of 32 conditions, 100 list values, and 4 KB per value.";
     }
     if (error.code === "resourceExhausted") {
-      return "There is not enough memory to complete this query.";
+      return "There is not enough memory or temporary disk space to prepare this view.";
+    }
+    if (error.code === "memoryExhausted") {
+      return error.diagnostics?.operation === "window"
+        ? "There is not enough memory to load this window."
+        : "There is not enough memory to prepare this view.";
+    }
+    if (error.code === "temporaryStorageExhausted") {
+      return error.diagnostics?.operation === "window"
+        ? "There is not enough temporary disk space to load this window."
+        : "There is not enough temporary disk space to prepare this view.";
     }
     if (error.code === "queryFailed") {
       return "The query engine could not read this data.";
     }
+    if (error.code === "invalidSort") {
+      return "This sort order is invalid. Use each column once and at most 32 columns.";
+    }
   }
   return "This data window could not be loaded.";
+}
+
+function dataViewErrorState(error: unknown): ViewErrorState {
+  const message = dataWindowErrorMessage(error);
+  if (
+    !(error instanceof DataWindowCommandError) ||
+    error.diagnostics === undefined ||
+    (error.code !== "memoryExhausted" &&
+      error.code !== "temporaryStorageExhausted")
+  ) {
+    return { message };
+  }
+  return {
+    message,
+    diagnostics: formatDataViewResourceDiagnostics(
+      error.code,
+      error.diagnostics,
+    ),
+  };
+}
+
+function formatDataViewResourceDiagnostics(
+  code: "memoryExhausted" | "temporaryStorageExhausted",
+  diagnostics: DataViewResourceDiagnostics,
+): string {
+  const sortColumns = diagnostics.sortColumns
+    .map((column) => {
+      const logicalType =
+        column.logicalType === null ? "" : ` · ${column.logicalType}`;
+      return `${column.physicalType}${logicalType} ${column.direction.toUpperCase()}`;
+    })
+    .join(", ");
+  return [
+    `Viewda: ${diagnostics.applicationVersion}`,
+    `Platform: ${diagnostics.operatingSystem} ${diagnostics.architecture}`,
+    `DuckDB: ${diagnostics.queryEngineVersion}`,
+    `Operation: ${diagnostics.operation}`,
+    `Failure: ${code === "memoryExhausted" ? "memory" : "temporary storage"}`,
+    `DuckDB message: ${diagnostics.message}`,
+    `Memory limit: ${diagnostics.memoryLimit}`,
+    `Temporary storage limit: ${diagnostics.maxTemporaryDirectorySize}`,
+    `Threads: ${diagnostics.threads}`,
+    `Source size: ${diagnostics.sourceSizeBytes} bytes`,
+    `Rows: ${diagnostics.rowCount}`,
+    `Row groups: ${diagnostics.rowGroupCount}`,
+    `Columns: ${diagnostics.columnCount}`,
+    `Filters: ${diagnostics.filterCount}`,
+    `Sort: ${sortColumns.length === 0 ? "none" : sortColumns}`,
+  ].join("\n");
 }
 
 function clampedPopupLeft(anchorLeft: number, viewportWidth: number): number {

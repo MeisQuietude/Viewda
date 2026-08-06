@@ -60,10 +60,26 @@ enum ColumnFilterKind {
     NullOnly,
 }
 
+#[cfg(test)]
 pub(crate) fn build_filter_predicate(
     schema: &[SchemaField],
     filters: &[DataFilter],
 ) -> Result<FilterPredicate, FilterBuildError> {
+    let column_names = schema
+        .iter()
+        .map(|column| column.name.as_str())
+        .collect::<Vec<_>>();
+    build_filter_predicate_with_names(schema, filters, &column_names)
+}
+
+pub(crate) fn build_filter_predicate_with_names(
+    schema: &[SchemaField],
+    filters: &[DataFilter],
+    column_names: &[&str],
+) -> Result<FilterPredicate, FilterBuildError> {
+    if column_names.len() != schema.len() {
+        return Err(FilterBuildError::Invalid);
+    }
     if filters.len() > MAX_FILTERS {
         return Err(FilterBuildError::Invalid);
     }
@@ -75,7 +91,11 @@ pub(crate) fn build_filter_predicate(
             .get(filter.column_index as usize)
             .ok_or(FilterBuildError::Invalid)?;
         validate_filter(filter, column_filter_kind(column))?;
-        let identifier = quote_identifier(&column.name);
+        let identifier = quote_identifier(
+            column_names
+                .get(filter.column_index as usize)
+                .ok_or(FilterBuildError::Invalid)?,
+        );
         let clause = match filter.operator {
             DataFilterOperator::Equals => {
                 parameters.push(Value::Text(filter.values[0].clone()));
@@ -226,7 +246,7 @@ fn validate_filter(filter: &DataFilter, kind: ColumnFilterKind) -> Result<(), Fi
     Ok(())
 }
 
-fn quote_identifier(identifier: &str) -> String {
+pub(crate) fn quote_identifier(identifier: &str) -> String {
     format!("\"{}\"", identifier.replace('"', "\"\""))
 }
 

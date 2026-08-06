@@ -7,11 +7,12 @@ import {
 } from "@uwdata/flechette";
 import { describe, expect, it } from "vitest";
 
-import type { DataFilter, SchemaField } from "../desktop";
+import type { DataFilter, SchemaField, SortColumn } from "../desktop";
 import {
   columnFilterKind,
   filterInputFromCell,
   formatFilterCondition,
+  formatOrderByClause,
   formatWhereClause,
 } from "./filter-query";
 
@@ -148,6 +149,21 @@ describe("canonical filter query formatting", () => {
       expect(formatFilterCondition(filter, schemaField)).toBe(expected);
     },
   );
+
+  it("renders ORDER BY with the same identifier quoting as the engine", () => {
+    const schema = [
+      field('value"quoted', "INT64", null),
+      field("label", "BYTE_ARRAY", "String"),
+    ];
+    const sort: SortColumn[] = [
+      { sourceIndex: 1, direction: "descending" },
+      { sourceIndex: 0, direction: "ascending" },
+    ];
+
+    expect(formatOrderByClause(sort, schema)).toBe(
+      '"label" DESC, "value""quoted" ASC',
+    );
+  });
 });
 
 describe("filter prefill", () => {

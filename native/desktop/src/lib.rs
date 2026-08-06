@@ -5,6 +5,7 @@ mod launch;
 mod recents;
 mod theme;
 mod updates;
+mod view_settings;
 
 use std::{
     collections::{HashMap, hash_map::Entry},
@@ -38,11 +39,12 @@ use updates::{
     check_for_update_with_state, discard_pending_update, get_update_settings,
     install_pending_update, open_releases_page, set_update_settings, take_post_update_state,
 };
+use view_settings::{DataViewSettings, get_data_view_settings, set_data_view_settings};
 use viewda_data_engine::{
-    ColumnStatistics, ColumnStatisticsError, ColumnStatisticsReader, DataFilter, DataWindowError,
-    DataWindowReader, EngineError, EngineStatus, FilteredRowCountInterruptHandle,
-    FilteredRowCountReader, SchemaField, SourceError, SourceSummary, StatisticsInterruptHandle,
-    engine_status, inspect_local_source,
+    ColumnStatistics, ColumnStatisticsError, ColumnStatisticsReader, DataFilter, DataSort,
+    DataViewBuilder, DataViewError, DataViewInterruptHandle, DataViewResourceDiagnostics,
+    DataWindowError, DataWindowReader, EngineError, EngineStatus, PreparedDataView, SchemaField,
+    SourceError, SourceSummary, StatisticsInterruptHandle, engine_status, inspect_local_source,
 };
 
 const OPEN_SOURCE_MENU_ID: &str = "open-local-source";
@@ -56,7 +58,7 @@ const UPDATE_AVAILABLE_EVENT: &str = "update-available";
 pub(crate) struct OpenedSource {
     state: Arc<Mutex<OpenedSourceState>>,
     recents: RecentSourcesStore,
-    filtered_counts: FilteredRowCountJobs,
+    data_views: DataViewJobs,
 }
 
 #[derive(Default)]
@@ -70,80 +72,85 @@ struct OpenedSourceSession {
     generation: u64,
     path: PathBuf,
     schema: Vec<SchemaField>,
+    source_row_count: u64,
+    view_revision: u64,
+    view: Option<PreparedDataView>,
     reader: DataWindowReader,
     statistics_cache: HashMap<(u64, usize), ColumnStatistics>,
 }
 
 #[derive(Default)]
-struct FilteredRowCountJobs {
-    state: Mutex<FilteredRowCountJobsState>,
+struct DataViewJobs {
+    state: Mutex<DataViewJobsState>,
 }
 
 #[derive(Default)]
-struct FilteredRowCountJobsState {
+struct DataViewJobsState {
     watermark: Option<(u64, u64)>,
-    active: Option<ActiveFilteredRowCountJob>,
+    active: Option<ActiveDataViewJob>,
 }
 
-struct ActiveFilteredRowCountJob {
+struct ActiveDataViewJob {
     generation: u64,
-    filter_revision: u64,
-    interrupt: Arc<FilteredRowCountInterruptHandle>,
+    view_revision: u64,
+    interrupt: Arc<DataViewInterruptHandle>,
 }
 
-impl ActiveFilteredRowCountJob {
+impl ActiveDataViewJob {
     fn cancel(&self) {
         self.interrupt.interrupt();
     }
 }
 
-fn register_filtered_count_job(
-    jobs: &mut FilteredRowCountJobsState,
-    next: ActiveFilteredRowCountJob,
+fn register_data_view_job(
+    jobs: &mut DataViewJobsState,
+    next: ActiveDataViewJob,
 ) -> Result<(), DataWindowError> {
     if jobs.watermark.is_some_and(|(generation, revision)| {
-        generation == next.generation && next.filter_revision <= revision
+        generation == next.generation && next.view_revision <= revision
     }) {
         next.cancel();
         return Err(DataWindowError::Cancelled);
     }
-    jobs.watermark = Some((next.generation, next.filter_revision));
+    jobs.watermark = Some((next.generation, next.view_revision));
     if let Some(previous) = jobs.active.replace(next) {
         previous.cancel();
     }
     Ok(())
 }
 
-fn finish_filtered_count_job(
-    jobs: &mut FilteredRowCountJobsState,
+fn finish_data_view_job(
+    jobs: &mut DataViewJobsState,
     generation: u64,
-    filter_revision: u64,
-) {
-    if jobs.active.as_ref().is_some_and(|active| {
-        active.generation == generation && active.filter_revision == filter_revision
-    }) {
+    view_revision: u64,
+    interrupt: &Arc<DataViewInterruptHandle>,
+) -> bool {
+    let is_current = jobs.active.as_ref().is_some_and(|active| {
+        active.generation == generation
+            && active.view_revision == view_revision
+            && Arc::ptr_eq(&active.interrupt, interrupt)
+    }) && jobs.watermark == Some((generation, view_revision));
+    if is_current {
         jobs.active.take();
-        if jobs.watermark == Some((generation, filter_revision)) {
-            jobs.watermark = None;
-        }
     }
+    is_current
 }
 
-fn cancel_filtered_count_job(
-    jobs: &mut FilteredRowCountJobsState,
+fn cancel_data_view_job(
+    jobs: &mut DataViewJobsState,
     generation: u64,
-    filter_revision: u64,
-) -> Option<ActiveFilteredRowCountJob> {
+    view_revision: u64,
+) -> Option<ActiveDataViewJob> {
     if !jobs
         .watermark
         .is_some_and(|(watermark_generation, revision)| {
-            watermark_generation == generation && revision >= filter_revision
+            watermark_generation == generation && revision >= view_revision
         })
     {
-        jobs.watermark = Some((generation, filter_revision));
+        jobs.watermark = Some((generation, view_revision));
     }
     if jobs.active.as_ref().is_some_and(|active| {
-        active.generation == generation && active.filter_revision == filter_revision
+        active.generation == generation && active.view_revision == view_revision
     }) {
         jobs.active.take()
     } else {
@@ -187,11 +194,51 @@ pub(crate) struct OpenedSourceInfo {
     summary: SourceSummary,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DataViewStatus {
+    revision: u64,
+    row_count: u64,
+}
+
+#[derive(Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DataViewResourceCommandDiagnostics {
+    application_version: &'static str,
+    operating_system: &'static str,
+    architecture: &'static str,
+    #[serde(flatten)]
+    engine: DataViewResourceDiagnostics,
+}
+
+impl From<DataViewResourceDiagnostics> for DataViewResourceCommandDiagnostics {
+    fn from(engine: DataViewResourceDiagnostics) -> Self {
+        Self {
+            application_version: env!("CARGO_PKG_VERSION"),
+            operating_system: std::env::consts::OS,
+            architecture: std::env::consts::ARCH,
+            engine,
+        }
+    }
+}
+
+#[derive(Debug, PartialEq, Eq, Serialize)]
+#[serde(tag = "code", rename_all = "camelCase")]
+enum DataViewResourceCommandError {
+    MemoryExhausted {
+        diagnostics: DataViewResourceCommandDiagnostics,
+    },
+    TemporaryStorageExhausted {
+        diagnostics: DataViewResourceCommandDiagnostics,
+    },
+}
+
 #[derive(Debug, PartialEq, Eq, Serialize)]
 #[serde(untagged)]
 enum DataWindowCommandError {
     Session(DataWindowSessionError),
     Engine(DataWindowError),
+    ViewResource(Box<DataViewResourceCommandError>),
 }
 
 #[derive(Debug, PartialEq, Eq, Serialize)]
@@ -199,6 +246,7 @@ enum DataWindowCommandError {
 enum DataWindowSessionError {
     NoSourceOpen,
     SourceChanged,
+    ViewChanged,
 }
 
 #[derive(Debug, PartialEq, Eq, Serialize)]
@@ -236,6 +284,24 @@ impl From<ColumnStatisticsError> for ColumnStatisticsCommandError {
 impl From<DataWindowError> for DataWindowCommandError {
     fn from(error: DataWindowError) -> Self {
         Self::Engine(error)
+    }
+}
+
+impl From<DataViewError> for DataWindowCommandError {
+    fn from(error: DataViewError) -> Self {
+        match error {
+            DataViewError::Engine(error) => Self::Engine(error),
+            DataViewError::MemoryExhausted(diagnostics) => {
+                Self::ViewResource(Box::new(DataViewResourceCommandError::MemoryExhausted {
+                    diagnostics: (*diagnostics).into(),
+                }))
+            }
+            DataViewError::TemporaryStorageExhausted(diagnostics) => Self::ViewResource(Box::new(
+                DataViewResourceCommandError::TemporaryStorageExhausted {
+                    diagnostics: (*diagnostics).into(),
+                },
+            )),
+        }
     }
 }
 
@@ -278,7 +344,7 @@ impl OpenedSource {
         if intent == SourceOpenIntent::Restore && state.blocks_restore {
             return Ok(None);
         }
-        self.cancel_filtered_counts()?;
+        self.cancel_data_views()?;
         let generation = state
             .generation
             .checked_add(1)
@@ -290,6 +356,9 @@ impl OpenedSource {
             reader: DataWindowReader::new(path.clone()),
             path,
             schema,
+            source_row_count: summary.row_count,
+            view_revision: 0,
+            view: None,
             statistics_cache: HashMap::new(),
         });
         if intent == SourceOpenIntent::Explicit {
@@ -319,9 +388,9 @@ impl OpenedSource {
         Ok(self.lock_state()?.blocks_restore)
     }
 
-    fn cancel_filtered_counts(&self) -> Result<(), OpenSourceError> {
+    fn cancel_data_views(&self) -> Result<(), OpenSourceError> {
         let mut jobs = self
-            .filtered_counts
+            .data_views
             .state
             .lock()
             .map_err(|_| RecentSourceError::Storage)?;
@@ -345,15 +414,23 @@ fn get_engine_status() -> Result<EngineStatus, EngineError> {
 #[tauri::command]
 async fn get_data_window(
     generation: u64,
+    view_revision: u64,
     row_offset: u64,
     row_count: u32,
-    filters: Vec<DataFilter>,
+    source_indices: Vec<u32>,
     opened_source: tauri::State<'_, OpenedSource>,
 ) -> Result<tauri::ipc::Response, DataWindowCommandError> {
     let state = Arc::clone(&opened_source.state);
     let bytes = tauri::async_runtime::spawn_blocking(move || {
         let mut state = state.lock().map_err(|_| DataWindowError::Unsupported)?;
-        fetch_opened_source_window(&mut state, generation, row_offset, row_count, &filters)
+        fetch_opened_source_window(
+            &mut state,
+            generation,
+            view_revision,
+            row_offset,
+            row_count,
+            &source_indices,
+        )
     })
     .await
     .map_err(|_| DataWindowError::QueryEngineUnavailable)??;
@@ -364,9 +441,10 @@ async fn get_data_window(
 fn fetch_opened_source_window(
     state: &mut OpenedSourceState,
     generation: u64,
+    view_revision: u64,
     row_offset: u64,
     row_count: u32,
-    filters: &[DataFilter],
+    source_indices: &[u32],
 ) -> Result<Vec<u8>, DataWindowCommandError> {
     let session = state
         .session
@@ -379,20 +457,45 @@ fn fetch_opened_source_window(
             DataWindowSessionError::SourceChanged,
         ));
     }
-    session
-        .reader
-        .fetch_filtered(row_offset, row_count, filters)
-        .map_err(Into::into)
+    if session.view_revision != view_revision {
+        return Err(DataWindowCommandError::Session(
+            DataWindowSessionError::ViewChanged,
+        ));
+    }
+    match &session.view {
+        Some(view) => view
+            .fetch_window_columns(row_offset, row_count, source_indices)
+            .map_err(Into::into),
+        None => {
+            let identity_projection = source_indices.len() == session.schema.len()
+                && source_indices
+                    .iter()
+                    .enumerate()
+                    .all(|(index, source_index)| usize::try_from(*source_index) == Ok(index));
+            if !identity_projection {
+                return Err(DataWindowError::Unsupported.into());
+            }
+            session
+                .reader
+                .fetch(row_offset, row_count)
+                .map_err(Into::into)
+        }
+    }
 }
 
-/// Counts filtered rows on an isolated connection so grid windows stay responsive.
+/// Prepares one filtered and sorted position index, then atomically publishes it.
 #[tauri::command]
-async fn get_filtered_row_count(
+async fn prepare_data_view(
     generation: u64,
-    filter_revision: u64,
+    view_revision: u64,
     filters: Vec<DataFilter>,
+    sort: Vec<DataSort>,
+    settings: DataViewSettings,
     opened_source: tauri::State<'_, OpenedSource>,
-) -> Result<u64, DataWindowCommandError> {
+) -> Result<DataViewStatus, DataWindowCommandError> {
+    if filters.is_empty() && sort.is_empty() {
+        return activate_direct_data_view(&opened_source, generation, view_revision);
+    }
     let path = {
         let state = opened_source
             .state
@@ -411,12 +514,12 @@ async fn get_filtered_row_count(
         }
         session.path.clone()
     };
-    let reader = FilteredRowCountReader::new(path, &filters)?;
-    let interrupt = Arc::new(reader.interrupt_handle());
+    let builder = DataViewBuilder::with_memory_limit(path, &filters, &sort, settings.memory_limit)?;
+    let interrupt = Arc::new(builder.interrupt_handle());
     {
-        // Registration shares the source -> count lock order with source replacement.
+        // Registration shares the source -> view lock order with source replacement.
         // A replacement therefore either sees and cancels this job, or wins first and
-        // makes this generation stale before the scan can start.
+        // makes this generation stale before preparation can start.
         let state = opened_source
             .state
             .lock()
@@ -433,44 +536,144 @@ async fn get_filtered_row_count(
             ));
         }
         let mut jobs = opened_source
-            .filtered_counts
+            .data_views
             .state
             .lock()
             .map_err(|_| DataWindowError::Unsupported)?;
-        register_filtered_count_job(
+        register_data_view_job(
             &mut jobs,
-            ActiveFilteredRowCountJob {
+            ActiveDataViewJob {
                 generation,
-                filter_revision,
                 interrupt: Arc::clone(&interrupt),
+                view_revision,
             },
         )?;
     }
 
-    let result = tauri::async_runtime::spawn_blocking(move || reader.fetch()).await;
+    let result = tauri::async_runtime::spawn_blocking(move || builder.build()).await;
     let cancelled = interrupt.is_cancelled();
-    let mut jobs = opened_source
-        .filtered_counts
+    let mut state = opened_source
         .state
         .lock()
         .map_err(|_| DataWindowError::Unsupported)?;
-    finish_filtered_count_job(&mut jobs, generation, filter_revision);
+    let mut jobs = opened_source
+        .data_views
+        .state
+        .lock()
+        .map_err(|_| DataWindowError::Unsupported)?;
+    let is_current = finish_data_view_job(&mut jobs, generation, view_revision, &interrupt);
     drop(jobs);
-
-    if cancelled {
-        Err(DataWindowError::Cancelled.into())
-    } else {
-        result
-            .map_err(|_| DataWindowError::QueryEngineUnavailable)?
-            .map_err(Into::into)
+    if cancelled || !is_current {
+        return Err(DataWindowError::Cancelled.into());
     }
+    let view = result.map_err(|_| DataWindowError::QueryEngineUnavailable)??;
+    let session = state
+        .session
+        .as_mut()
+        .ok_or(DataWindowCommandError::Session(
+            DataWindowSessionError::NoSourceOpen,
+        ))?;
+    if session.generation != generation {
+        return Err(DataWindowCommandError::Session(
+            DataWindowSessionError::SourceChanged,
+        ));
+    }
+    if view_revision <= session.view_revision {
+        return Err(DataWindowError::Cancelled.into());
+    }
+    let status = DataViewStatus {
+        revision: view_revision,
+        row_count: view.row_count(),
+    };
+    session.view_revision = view_revision;
+    session.view = Some(view);
+    Ok(status)
 }
 
-/// Interrupts one count revision without touching a newer request.
-#[tauri::command]
-fn cancel_filtered_row_count(
+fn activate_direct_data_view(
+    opened_source: &OpenedSource,
     generation: u64,
-    filter_revision: u64,
+    view_revision: u64,
+) -> Result<DataViewStatus, DataWindowCommandError> {
+    let mut state = opened_source
+        .state
+        .lock()
+        .map_err(|_| DataWindowError::Unsupported)?;
+    let session = state
+        .session
+        .as_mut()
+        .ok_or(DataWindowCommandError::Session(
+            DataWindowSessionError::NoSourceOpen,
+        ))?;
+    if session.generation != generation {
+        return Err(DataWindowCommandError::Session(
+            DataWindowSessionError::SourceChanged,
+        ));
+    }
+    if view_revision <= session.view_revision {
+        return Err(DataWindowError::Cancelled.into());
+    }
+    let mut jobs = opened_source
+        .data_views
+        .state
+        .lock()
+        .map_err(|_| DataWindowError::Unsupported)?;
+    if jobs
+        .watermark
+        .is_some_and(|(watermark_generation, revision)| {
+            watermark_generation == generation && view_revision <= revision
+        })
+    {
+        return Err(DataWindowError::Cancelled.into());
+    }
+    jobs.watermark = Some((generation, view_revision));
+    if let Some(active) = jobs.active.take() {
+        active.cancel();
+    }
+    let status = DataViewStatus {
+        revision: view_revision,
+        row_count: session.source_row_count,
+    };
+    session.view_revision = view_revision;
+    session.view = None;
+    Ok(status)
+}
+
+/// Returns the native view revision and count used by current grid windows.
+#[tauri::command]
+fn get_data_view_status(
+    generation: u64,
+    opened_source: tauri::State<'_, OpenedSource>,
+) -> Result<DataViewStatus, DataWindowCommandError> {
+    let state = opened_source
+        .state
+        .lock()
+        .map_err(|_| DataWindowError::Unsupported)?;
+    let session = state
+        .session
+        .as_ref()
+        .ok_or(DataWindowCommandError::Session(
+            DataWindowSessionError::NoSourceOpen,
+        ))?;
+    if session.generation != generation {
+        return Err(DataWindowCommandError::Session(
+            DataWindowSessionError::SourceChanged,
+        ));
+    }
+    Ok(DataViewStatus {
+        revision: session.view_revision,
+        row_count: session
+            .view
+            .as_ref()
+            .map_or(session.source_row_count, PreparedDataView::row_count),
+    })
+}
+
+/// Interrupts one preparation revision without touching a newer request.
+#[tauri::command]
+fn cancel_data_view(
+    generation: u64,
+    view_revision: u64,
     opened_source: tauri::State<'_, OpenedSource>,
 ) -> Result<(), DataWindowCommandError> {
     let active = {
@@ -486,11 +689,11 @@ fn cancel_filtered_row_count(
             return Ok(());
         }
         let mut jobs = opened_source
-            .filtered_counts
+            .data_views
             .state
             .lock()
             .map_err(|_| DataWindowError::Unsupported)?;
-        cancel_filtered_count_job(&mut jobs, generation, filter_revision)
+        cancel_data_view_job(&mut jobs, generation, view_revision)
     };
     if let Some(active) = active {
         active.cancel();
@@ -970,12 +1173,15 @@ pub fn run() {
             get_default_application_status,
             set_default_application,
             get_data_window,
-            get_filtered_row_count,
-            cancel_filtered_row_count,
+            prepare_data_view,
+            get_data_view_status,
+            cancel_data_view,
             get_column_statistics,
             cancel_column_statistics,
             get_update_settings,
             set_update_settings,
+            get_data_view_settings,
+            set_data_view_settings,
             get_theme_preference,
             set_theme_preference,
             sync_system_theme,
@@ -992,7 +1198,7 @@ pub fn run() {
                 &event,
                 tauri::RunEvent::ExitRequested { .. } | tauri::RunEvent::Exit
             ) {
-                let _ = app.state::<OpenedSource>().cancel_filtered_counts();
+                let _ = app.state::<OpenedSource>().cancel_data_views();
             }
             #[cfg(target_os = "macos")]
             if let tauri::RunEvent::Opened { urls } = event
@@ -1017,6 +1223,49 @@ mod tests {
 
         assert_eq!(status.name, "Viewda data engine");
         assert_eq!(status.version, env!("CARGO_PKG_VERSION"));
+    }
+
+    #[test]
+    fn view_resource_failures_serialize_safe_support_diagnostics() {
+        let error = DataWindowCommandError::from(DataViewError::MemoryExhausted(Box::new(
+            DataViewResourceDiagnostics {
+                operation: viewda_data_engine::DataViewResourceOperation::Preparation,
+                query_engine_version: "v1.5.5".into(),
+                message: "Out of Memory Error: allocation failed".into(),
+                memory_limit: "366.2 MiB".into(),
+                max_temporary_directory_size: "45.0 GiB".into(),
+                threads: 10,
+                row_count: 3_514_000,
+                source_size_bytes: 1_000_000_000,
+                row_group_count: 29,
+                column_count: 43,
+                filter_count: 0,
+                sort_columns: vec![viewda_data_engine::DataViewSortDiagnostic {
+                    physical_type: "INT32".into(),
+                    logical_type: Some("UInt16".into()),
+                    direction: viewda_data_engine::DataSortDirection::Ascending,
+                }],
+            },
+        )));
+
+        let value = serde_json::to_value(error).expect("serialized view error");
+
+        assert_eq!(value["code"], "memoryExhausted");
+        assert_eq!(value["diagnostics"]["operation"], "preparation");
+        assert_eq!(
+            value["diagnostics"]["applicationVersion"],
+            env!("CARGO_PKG_VERSION")
+        );
+        assert_eq!(
+            value["diagnostics"]["operatingSystem"],
+            std::env::consts::OS
+        );
+        assert_eq!(value["diagnostics"]["architecture"], std::env::consts::ARCH);
+        assert_eq!(
+            value["diagnostics"]["sortColumns"][0]["logicalType"],
+            "UInt16"
+        );
+        assert!(!value.to_string().contains("source.parquet"));
     }
 
     #[test]
@@ -1277,7 +1526,7 @@ mod tests {
 
         assert!(second.generation > first.generation);
         assert_eq!(
-            fetch_opened_source_window(&mut state, first.generation, 0, 1, &[]),
+            fetch_opened_source_window(&mut state, first.generation, 0, 0, 1, &[]),
             Err(DataWindowCommandError::Session(
                 DataWindowSessionError::SourceChanged,
             ))
@@ -1285,20 +1534,51 @@ mod tests {
     }
 
     #[test]
-    fn replacing_the_source_interrupts_the_active_filtered_count() {
+    fn direct_windows_require_the_full_identity_projection() {
         let opened_source = OpenedSource::default();
-        let reader =
-            FilteredRowCountReader::new(PathBuf::from("count.parquet"), &[]).expect("count reader");
-        let interrupt = Arc::new(reader.interrupt_handle());
+        let opened = opened_source
+            .install(
+                None,
+                PathBuf::from("source.parquet"),
+                SourceSummary {
+                    display_name: "source.parquet".into(),
+                    size_bytes: 8,
+                    row_count: 1,
+                    row_group_count: 1,
+                    schema: vec![SchemaField {
+                        name: "value".into(),
+                        physical_type: "INT64".into(),
+                        logical_type: None,
+                        children: Vec::new(),
+                    }],
+                },
+                SourceOpenIntent::Explicit,
+            )
+            .expect("source state")
+            .expect("source is accepted");
+        let mut state = opened_source.state.lock().expect("opened source state");
+
+        assert_eq!(
+            fetch_opened_source_window(&mut state, opened.generation, 0, 0, 1, &[]),
+            Err(DataWindowCommandError::Engine(DataWindowError::Unsupported))
+        );
+    }
+
+    #[test]
+    fn replacing_the_source_interrupts_the_active_view_preparation() {
+        let opened_source = OpenedSource::default();
+        let builder =
+            DataViewBuilder::new(PathBuf::from("view.parquet"), &[], &[]).expect("view builder");
+        let interrupt = Arc::new(builder.interrupt_handle());
         opened_source
-            .filtered_counts
+            .data_views
             .state
             .lock()
-            .expect("count jobs")
+            .expect("view jobs")
             .active
-            .replace(ActiveFilteredRowCountJob {
+            .replace(ActiveDataViewJob {
                 generation: 1,
-                filter_revision: 3,
+                view_revision: 3,
                 interrupt: Arc::clone(&interrupt),
             });
 
@@ -1321,42 +1601,42 @@ mod tests {
         assert!(interrupt.is_cancelled());
         assert!(
             opened_source
-                .filtered_counts
+                .data_views
                 .state
                 .lock()
-                .expect("count jobs")
+                .expect("view jobs")
                 .active
                 .is_none()
         );
     }
 
     #[test]
-    fn count_revision_watermark_rejects_late_scans_and_replaces_one_active_job() {
+    fn view_revision_watermark_rejects_late_builds_and_replaces_one_active_job() {
         let make_interrupt = || {
-            let reader = FilteredRowCountReader::new(PathBuf::from("count.parquet"), &[])
-                .expect("count reader");
-            Arc::new(reader.interrupt_handle())
+            let builder = DataViewBuilder::new(PathBuf::from("view.parquet"), &[], &[])
+                .expect("view builder");
+            Arc::new(builder.interrupt_handle())
         };
         let current = make_interrupt();
         let stale = make_interrupt();
         let next = make_interrupt();
-        let mut jobs = FilteredRowCountJobsState::default();
+        let mut jobs = DataViewJobsState::default();
 
-        register_filtered_count_job(
+        register_data_view_job(
             &mut jobs,
-            ActiveFilteredRowCountJob {
+            ActiveDataViewJob {
                 generation: 7,
-                filter_revision: 2,
+                view_revision: 2,
                 interrupt: Arc::clone(&current),
             },
         )
         .expect("current revision");
         assert_eq!(
-            register_filtered_count_job(
+            register_data_view_job(
                 &mut jobs,
-                ActiveFilteredRowCountJob {
+                ActiveDataViewJob {
                     generation: 7,
-                    filter_revision: 1,
+                    view_revision: 1,
                     interrupt: Arc::clone(&stale),
                 },
             ),
@@ -1365,11 +1645,11 @@ mod tests {
         assert!(stale.is_cancelled());
         assert!(!current.is_cancelled());
 
-        register_filtered_count_job(
+        register_data_view_job(
             &mut jobs,
-            ActiveFilteredRowCountJob {
+            ActiveDataViewJob {
                 generation: 7,
-                filter_revision: 3,
+                view_revision: 3,
                 interrupt: Arc::clone(&next),
             },
         )
@@ -1380,61 +1660,114 @@ mod tests {
         assert!(
             jobs.active
                 .as_ref()
-                .is_some_and(|active| active.filter_revision == 3)
+                .is_some_and(|active| active.view_revision == 3)
         );
     }
 
     #[test]
-    fn completed_count_revision_can_be_retried_after_a_transient_failure() {
-        let reader =
-            FilteredRowCountReader::new(PathBuf::from("count.parquet"), &[]).expect("count reader");
-        let interrupt = Arc::new(reader.interrupt_handle());
-        let mut jobs = FilteredRowCountJobsState::default();
-        register_filtered_count_job(
+    fn completed_view_revision_keeps_the_monotonic_watermark() {
+        let builder =
+            DataViewBuilder::new(PathBuf::from("view.parquet"), &[], &[]).expect("view builder");
+        let interrupt = Arc::new(builder.interrupt_handle());
+        let mut jobs = DataViewJobsState::default();
+        register_data_view_job(
             &mut jobs,
-            ActiveFilteredRowCountJob {
+            ActiveDataViewJob {
                 generation: 7,
-                filter_revision: 3,
-                interrupt,
+                view_revision: 3,
+                interrupt: Arc::clone(&interrupt),
             },
         )
         .expect("initial revision");
 
-        finish_filtered_count_job(&mut jobs, 7, 3);
+        assert!(finish_data_view_job(&mut jobs, 7, 3, &interrupt));
 
-        assert_eq!(jobs.watermark, None);
+        assert_eq!(jobs.watermark, Some((7, 3)));
         assert!(jobs.active.is_none());
-        let retry = FilteredRowCountReader::new(PathBuf::from("count.parquet"), &[])
-            .expect("retry reader")
-            .interrupt_handle();
-        let retry = Arc::new(retry);
-        register_filtered_count_job(
+        for revision in [2, 3] {
+            let late = DataViewBuilder::new(PathBuf::from("view.parquet"), &[], &[])
+                .expect("late builder");
+            let late = Arc::new(late.interrupt_handle());
+            assert_eq!(
+                register_data_view_job(
+                    &mut jobs,
+                    ActiveDataViewJob {
+                        generation: 7,
+                        view_revision: revision,
+                        interrupt: Arc::clone(&late),
+                    },
+                ),
+                Err(DataWindowError::Cancelled)
+            );
+            assert!(late.is_cancelled());
+        }
+
+        let next =
+            DataViewBuilder::new(PathBuf::from("view.parquet"), &[], &[]).expect("next builder");
+        let next = Arc::new(next.interrupt_handle());
+        register_data_view_job(
             &mut jobs,
-            ActiveFilteredRowCountJob {
+            ActiveDataViewJob {
                 generation: 7,
-                filter_revision: 3,
-                interrupt: Arc::clone(&retry),
+                view_revision: 4,
+                interrupt: Arc::clone(&next),
             },
         )
-        .expect("same revision retry");
-        assert!(!retry.is_cancelled());
+        .expect("newer revision");
+        assert!(!next.is_cancelled());
+    }
+
+    #[test]
+    fn published_view_revision_never_moves_backwards_without_a_watermark() {
+        let opened_source = OpenedSource::default();
+        let opened = opened_source
+            .install(
+                None,
+                PathBuf::from("source.parquet"),
+                SourceSummary {
+                    display_name: "source.parquet".into(),
+                    size_bytes: 8,
+                    row_count: 1,
+                    row_group_count: 1,
+                    schema: Vec::new(),
+                },
+                SourceOpenIntent::Explicit,
+            )
+            .expect("source state")
+            .expect("source is accepted");
+
+        activate_direct_data_view(&opened_source, opened.generation, 5).expect("newer direct view");
+        opened_source
+            .data_views
+            .state
+            .lock()
+            .expect("view jobs")
+            .watermark = None;
+
+        assert_eq!(
+            activate_direct_data_view(&opened_source, opened.generation, 4),
+            Err(DataWindowCommandError::Engine(DataWindowError::Cancelled))
+        );
+        let state = opened_source.state.lock().expect("opened source state");
+        let session = state.session.as_ref().expect("opened source session");
+        assert_eq!(session.view_revision, 5);
+        assert!(session.view.is_none());
     }
 
     #[test]
     fn cancellation_watermark_covers_cancel_before_registration() {
-        let mut jobs = FilteredRowCountJobsState::default();
+        let mut jobs = DataViewJobsState::default();
 
-        assert!(cancel_filtered_count_job(&mut jobs, 7, 3).is_none());
-        let late = FilteredRowCountReader::new(PathBuf::from("count.parquet"), &[])
-            .expect("late reader")
-            .interrupt_handle();
-        let late = Arc::new(late);
+        assert!(cancel_data_view_job(&mut jobs, 7, 3).is_none());
+        let late =
+            DataViewBuilder::new(PathBuf::from("view.parquet"), &[], &[]).expect("late builder");
+        let late = Arc::new(late.interrupt_handle());
         assert_eq!(
-            register_filtered_count_job(
+            register_data_view_job(
                 &mut jobs,
-                ActiveFilteredRowCountJob {
+                ActiveDataViewJob {
                     generation: 7,
-                    filter_revision: 3,
+                    view_revision: 3,
                     interrupt: Arc::clone(&late),
                 },
             ),
@@ -1442,20 +1775,19 @@ mod tests {
         );
         assert!(late.is_cancelled());
 
-        let current = FilteredRowCountReader::new(PathBuf::from("count.parquet"), &[])
-            .expect("current reader")
-            .interrupt_handle();
-        let current = Arc::new(current);
-        register_filtered_count_job(
+        let current =
+            DataViewBuilder::new(PathBuf::from("view.parquet"), &[], &[]).expect("current builder");
+        let current = Arc::new(current.interrupt_handle());
+        register_data_view_job(
             &mut jobs,
-            ActiveFilteredRowCountJob {
+            ActiveDataViewJob {
                 generation: 7,
-                filter_revision: 4,
+                view_revision: 4,
                 interrupt: Arc::clone(&current),
             },
         )
         .expect("newer revision");
-        cancel_filtered_count_job(&mut jobs, 7, 4)
+        cancel_data_view_job(&mut jobs, 7, 4)
             .expect("active revision")
             .cancel();
         assert!(current.is_cancelled());

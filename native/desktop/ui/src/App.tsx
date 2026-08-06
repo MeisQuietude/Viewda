@@ -14,6 +14,7 @@ import {
   checkForUpdate,
   discardPendingUpdate,
   getDefaultApplicationStatus,
+  getDataViewSettings,
   getEngineStatus,
   getRecentSources,
   getUpdateSettings,
@@ -27,6 +28,7 @@ import {
   openReleasesPage,
   OpenSourceError,
   setThemePreference as persistThemePreference,
+  setDataViewSettings as persistDataViewSettings,
   setUpdateSettings as persistUpdateSettings,
   setDefaultApplication,
   shortcutModifier,
@@ -34,6 +36,8 @@ import {
   takePostUpdateState,
   takeOpenedSource,
   type DefaultApplicationStatus,
+  type DataViewMemoryLimit,
+  type DataViewSettings,
   type EngineStatus,
   type RecentSource,
   type SourceErrorCode,
@@ -92,6 +96,12 @@ export function App({
   const [updateSettings, setUpdateSettings] = useState<UpdateSettings | null>(
     null,
   );
+  const [dataViewSettings, setDataViewSettings] = useState<DataViewSettings>({
+    memoryLimit: "mb384",
+  });
+  const [dataViewSettingsMessage, setDataViewSettingsMessage] = useState<
+    string | null
+  >(null);
   const [themePreference, setThemePreference] =
     useState<ThemePreference>(initialTheme);
   const [themeMessage, setThemeMessage] = useState<string | null>(null);
@@ -401,6 +411,16 @@ export function App({
         // Automatic checks are best-effort and never replace local work.
       });
 
+    getDataViewSettings()
+      .then((settings) => {
+        if (active) {
+          setDataViewSettings(settings);
+        }
+      })
+      .catch(() => {
+        // The minimum resource budget remains safe if settings cannot be read.
+      });
+
     return () => {
       active = false;
     };
@@ -557,6 +577,27 @@ export function App({
       }
     },
     [updateSettings],
+  );
+
+  const changeDataViewMemory = useCallback(
+    async (memoryLimit: DataViewMemoryLimit) => {
+      if (memoryLimit === dataViewSettings.memoryLimit) {
+        return;
+      }
+      const previous = dataViewSettings;
+      const next = { memoryLimit };
+      setDataViewSettings(next);
+      setDataViewSettingsMessage(null);
+      try {
+        await persistDataViewSettings(next);
+      } catch {
+        setDataViewSettings(previous);
+        setDataViewSettingsMessage(
+          "Could not save the filter and sort memory limit.",
+        );
+      }
+    },
+    [dataViewSettings],
   );
 
   const installAvailableUpdate = useCallback(async () => {
@@ -717,7 +758,11 @@ export function App({
                     </p>
                   }
                 >
-                  <DataGrid key={source.generation} source={source} />
+                  <DataGrid
+                    key={source.generation}
+                    source={source}
+                    viewSettings={dataViewSettings}
+                  />
                 </Suspense>
               </div>
             </div>
@@ -741,12 +786,15 @@ export function App({
           defaultApplication={defaultApplication}
           defaultApplicationMessage={defaultApplicationMessage}
           settings={updateSettings}
+          dataViewSettings={dataViewSettings}
+          dataViewSettingsMessage={dataViewSettingsMessage}
           themePreference={themePreference}
           themeMessage={themeMessage}
           engine={readiness.kind === "ready" ? readiness.engine : null}
           checking={checkingUpdates}
           message={updateMessage}
           onAutomaticChecks={changeAutomaticChecks}
+          onDataViewMemory={changeDataViewMemory}
           onChannel={changeUpdateChannel}
           onTheme={changeThemePreference}
           onCheck={runUpdateCheck}
@@ -921,12 +969,15 @@ function SettingsDialog({
   defaultApplication,
   defaultApplicationMessage,
   settings,
+  dataViewSettings,
+  dataViewSettingsMessage,
   themePreference,
   themeMessage,
   engine,
   checking,
   message,
   onAutomaticChecks,
+  onDataViewMemory,
   onChannel,
   onTheme,
   onCheck,
@@ -938,12 +989,15 @@ function SettingsDialog({
   defaultApplication: DefaultApplicationStatus | null;
   defaultApplicationMessage: string | null;
   settings: UpdateSettings;
+  dataViewSettings: DataViewSettings;
+  dataViewSettingsMessage: string | null;
   themePreference: ThemePreference;
   themeMessage: string | null;
   engine: EngineStatus | null;
   checking: boolean;
   message: string | null;
   onAutomaticChecks: (enabled: boolean) => Promise<void>;
+  onDataViewMemory: (memoryLimit: DataViewMemoryLimit) => Promise<void>;
   onChannel: (channel: UpdateChannel) => Promise<void>;
   onTheme: (preference: ThemePreference) => Promise<void>;
   onCheck: () => Promise<void>;
@@ -1001,6 +1055,52 @@ function SettingsDialog({
         {themeMessage !== null && (
           <p className="theme-message" role="status">
             {themeMessage}
+          </p>
+        )}
+      </section>
+      <section className="settings-section" aria-labelledby="performance-title">
+        <p id="performance-title" className="eyebrow">
+          Performance
+        </p>
+        <div className="settings-row">
+          <span className="settings-row-copy">
+            <label className="settings-row-label" htmlFor="sorting-memory">
+              Preparation memory
+            </label>
+            <span className="settings-note">
+              Used while applying filters or sorting.
+            </span>
+          </span>
+          <select
+            id="sorting-memory"
+            value={dataViewSettings.memoryLimit}
+            onChange={(event) =>
+              void onDataViewMemory(event.target.value as DataViewMemoryLimit)
+            }
+          >
+            <option value="mb384">384 MB</option>
+            <option value="mb768">768 MB</option>
+            <option value="mb1536">1.5 GB</option>
+            <option value="mb3072">3 GB</option>
+          </select>
+        </div>
+        <details className="performance-help">
+          <summary>How memory and temporary disk work</summary>
+          <p>
+            Keep 384 MB unless a large filter or sort runs out of memory or is
+            too slow. The four limits allow up to 1, 2, 4, or 8 workers. Higher
+            limits can finish sooner, but let Viewda use more RAM. Grid windows
+            are not affected.
+          </p>
+          <p>
+            Data that does not fit in RAM spills beside the source file when
+            possible. Viewda can use up to 90% of the drive&apos;s currently
+            free space and stops before exceeding that limit.
+          </p>
+        </details>
+        {dataViewSettingsMessage !== null && (
+          <p className="theme-message" role="status">
+            {dataViewSettingsMessage}
           </p>
         )}
       </section>
