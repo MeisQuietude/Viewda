@@ -1,8 +1,8 @@
 use std::{fs, io::Cursor, sync::Arc};
 
 use arrow_array::{
-    Array, ArrayRef, Int32Array, Int64Array, ListArray, RecordBatch, StringArray, StructArray,
-    types::Int32Type,
+    Array, ArrayRef, Decimal128Array, Int32Array, Int64Array, ListArray, RecordBatch, StringArray,
+    StructArray, types::Int32Type,
 };
 use arrow_ipc::reader::StreamReader;
 use arrow_schema::{DataType, Field, Fields, Schema};
@@ -77,6 +77,26 @@ fn preserves_nested_values_in_the_arrow_window() {
 
     assert_eq!(city.value(0), "Kyoto");
     assert_eq!(tag_values, vec![3, 5]);
+}
+
+#[test]
+fn preserves_decimal128_integer_digits_across_the_arrow_window() {
+    let source = write_decimal128_parquet();
+    let mut reader = DataWindowReader::new(source.path().to_owned());
+
+    let batches = decode(reader.fetch(0, 4).expect("decimal128 window"));
+    let values = batches[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<Decimal128Array>()
+        .expect("decimal128 column");
+    let two_to_64 = 1_i128 << 64;
+
+    assert_eq!(values.data_type(), &DataType::Decimal128(38, 0));
+    assert_eq!(
+        values.values(),
+        &[two_to_64 - 1, two_to_64, two_to_64 + 1, 10_i128.pow(38) - 1,]
+    );
 }
 
 #[test]
@@ -201,6 +221,28 @@ fn write_nested_parquet() -> NamedTempFile {
         vec![Arc::new(profile) as ArrayRef, Arc::new(tags) as ArrayRef],
     )
     .expect("nested record batch");
+    write_batch(&source, schema, &batch);
+    source
+}
+
+fn write_decimal128_parquet() -> NamedTempFile {
+    let source = NamedTempFile::new().expect("temporary source");
+    let two_to_64 = 1_i128 << 64;
+    let values = Decimal128Array::from(vec![
+        two_to_64 - 1,
+        two_to_64,
+        two_to_64 + 1,
+        10_i128.pow(38) - 1,
+    ])
+    .with_precision_and_scale(38, 0)
+    .expect("decimal128 fixture precision");
+    let schema = Arc::new(Schema::new(vec![Field::new(
+        "wide_integer",
+        DataType::Decimal128(38, 0),
+        false,
+    )]));
+    let batch = RecordBatch::try_new(Arc::clone(&schema), vec![Arc::new(values) as ArrayRef])
+        .expect("decimal128 record batch");
     write_batch(&source, schema, &batch);
     source
 }
