@@ -8,6 +8,11 @@ Backward-incompatible entries start with **Breaking:**.
 
 ## Unreleased
 
+### Changed
+
+- Structure now uses stable, human-readable Parquet physical and logical type
+  names.
+
 ## 0.1.0-alpha.2 — 2026-08-02
 
 ### Added
