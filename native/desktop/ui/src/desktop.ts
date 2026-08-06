@@ -35,6 +35,14 @@ export interface SchemaField {
   children: SchemaField[];
 }
 
+export interface ColumnStatistics {
+  minimum: string | null;
+  maximum: string | null;
+  minMaxComputed: boolean;
+  nullShare: number;
+  approximateDistinctCount: number;
+}
+
 export type UpdateChannel = "stable" | "latest";
 
 export interface UpdateSettings {
@@ -111,6 +119,20 @@ export type DataWindowErrorCode =
   | "queryEngineUnavailable"
   | "encodingFailed";
 
+export type ColumnStatisticsErrorCode =
+  | "noSourceOpen"
+  | "sourceChanged"
+  | "unsupportedColumn"
+  | "cancelled"
+  | "notFound"
+  | "permissionDenied"
+  | "notParquet"
+  | "corruptSource"
+  | "unsupported"
+  | "resourceExhausted"
+  | "queryFailed"
+  | "queryEngineUnavailable";
+
 export type UpdateErrorCode =
   "unavailable" | "storage" | "noPendingUpdate" | "manualInstall";
 
@@ -125,6 +147,13 @@ export class DataWindowCommandError extends Error {
   constructor(readonly code: DataWindowErrorCode) {
     super(code);
     this.name = "DataWindowCommandError";
+  }
+}
+
+export class ColumnStatisticsCommandError extends Error {
+  constructor(readonly code: ColumnStatisticsErrorCode) {
+    super(code);
+    this.name = "ColumnStatisticsCommandError";
   }
 }
 
@@ -244,6 +273,28 @@ export async function getDataWindow(
   }
 }
 
+export async function getColumnStatistics(
+  generation: number,
+  columnIndex: number,
+  includeMinMax: boolean,
+): Promise<ColumnStatistics> {
+  try {
+    return await invoke<ColumnStatistics>("get_column_statistics", {
+      generation,
+      columnIndex,
+      includeMinMax,
+    });
+  } catch (error) {
+    throw new ColumnStatisticsCommandError(
+      readColumnStatisticsErrorCode(error),
+    );
+  }
+}
+
+export function cancelColumnStatistics(generation: number): Promise<void> {
+  return invoke("cancel_column_statistics", { generation });
+}
+
 export function onOpenSourceRequested(
   handler: () => void,
 ): Promise<UnlistenFn> {
@@ -299,6 +350,32 @@ function readDataWindowErrorCode(error: unknown): DataWindowErrorCode {
       code === "windowTooLarge" ||
       code === "queryEngineUnavailable" ||
       code === "encodingFailed"
+    ) {
+      return code;
+    }
+  }
+
+  return "unsupported";
+}
+
+function readColumnStatisticsErrorCode(
+  error: unknown,
+): ColumnStatisticsErrorCode {
+  if (typeof error === "object" && error !== null && "code" in error) {
+    const code = error.code;
+    if (
+      code === "noSourceOpen" ||
+      code === "sourceChanged" ||
+      code === "unsupportedColumn" ||
+      code === "cancelled" ||
+      code === "notFound" ||
+      code === "permissionDenied" ||
+      code === "notParquet" ||
+      code === "corruptSource" ||
+      code === "unsupported" ||
+      code === "resourceExhausted" ||
+      code === "queryFailed" ||
+      code === "queryEngineUnavailable"
     ) {
       return code;
     }

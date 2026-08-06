@@ -16,6 +16,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   DataWindowCommandError,
   getDataWindow,
+  shortcutModifier,
   type SourceSummary,
 } from "../desktop";
 import {
@@ -27,6 +28,7 @@ import {
 } from "./arrow-window";
 import { copyRowLimit } from "./copy-limit";
 import { formatCellValue, usesMonospaceCells } from "./format-cell";
+import { SchemaSidebar } from "./SchemaSidebar";
 import {
   nextScrollState,
   requestContainsVisibleRows,
@@ -87,7 +89,14 @@ export function DataGrid({ source }: { source: SourceSummary }) {
   );
   const [copyLimit, setCopyLimit] = useState<number | null>(null);
   const [headerMenu, setHeaderMenu] = useState<HeaderMenu | null>(null);
+  const [sidebarOpen, setSidebarOpen] = useState(false);
+  const [selectedSchemaColumn, setSelectedSchemaColumn] = useState<
+    number | null
+  >(null);
+  const [schemaFocusRequest, setSchemaFocusRequest] = useState(0);
   const gridRef = useRef<DataEditorRef>(null);
+  const schemaFocusColumnRef = useRef<number | null>(null);
+  const visibleColumnStatesRef = useRef<readonly ColumnState[]>([]);
   const dataWindowRef = useRef<ArrowDataWindow | null>(null);
   const visibleRegionsRef = useRef<readonly Rectangle[]>([]);
   const cellCacheRef = useRef(new Map<number, GridCell>());
@@ -107,6 +116,7 @@ export function DataGrid({ source }: { source: SourceSummary }) {
     ],
     [columnStates],
   );
+  visibleColumnStatesRef.current = visibleColumnStates;
   const hiddenCount = columnStates.length - visibleColumnStates.length;
   const pinnedCount = visibleColumnStates.filter(
     (column) => column.pinned,
@@ -304,6 +314,41 @@ export function DataGrid({ source }: { source: SourceSummary }) {
     };
   }, [headerMenu]);
 
+  useEffect(() => {
+    const toggleSidebar = (event: globalThis.KeyboardEvent) => {
+      if (
+        !(event.metaKey || event.ctrlKey) ||
+        event.altKey ||
+        event.key.toLowerCase() !== "b" ||
+        isTypingTarget(event.target)
+      ) {
+        return;
+      }
+      event.preventDefault();
+      setSidebarOpen((open) => !open);
+    };
+    window.addEventListener("keydown", toggleSidebar);
+    return () => window.removeEventListener("keydown", toggleSidebar);
+  }, []);
+
+  useEffect(() => {
+    const sourceIndex = schemaFocusColumnRef.current;
+    if (sourceIndex === null) {
+      return;
+    }
+    const visibleIndex = visibleColumnStatesRef.current.findIndex(
+      (column) => column.sourceIndex === sourceIndex,
+    );
+    if (visibleIndex < 0) {
+      return;
+    }
+    gridRef.current?.scrollTo(visibleIndex, 0, "horizontal", 16);
+    setSelection({
+      columns: CompactSelection.fromSingleSelection(visibleIndex),
+      rows: CompactSelection.empty(),
+    });
+  }, [schemaFocusRequest]);
+
   const loadCopyWindow = useCallback(
     (row: number, abortSignal: AbortSignal): Promise<ArrowDataWindow> => {
       const offset = Math.floor(row / COPY_CHUNK_ROWS) * COPY_CHUNK_ROWS;
@@ -418,6 +463,19 @@ export function DataGrid({ source }: { source: SourceSummary }) {
     [],
   );
 
+  const selectSchemaColumn = useCallback((sourceIndex: number) => {
+    schemaFocusColumnRef.current = sourceIndex;
+    setSelectedSchemaColumn(sourceIndex);
+    setColumnStates((current) =>
+      current.map((column) =>
+        column.sourceIndex === sourceIndex
+          ? { ...column, hidden: false }
+          : column,
+      ),
+    );
+    setSchemaFocusRequest((request) => request + 1);
+  }, []);
+
   const menuColumn =
     headerMenu === null
       ? undefined
@@ -427,97 +485,122 @@ export function DataGrid({ source }: { source: SourceSummary }) {
 
   return (
     <section className="data-grid-view" aria-label="Data">
-      {(hiddenCount > 0 || copyLimit !== null) && (
-        <div className="grid-controls">
-          {copyLimit !== null && (
-            <span role="status">
-              {`This operation is limited to the first ${copyLimit.toLocaleString()} rows of the selection.`}
-            </span>
-          )}
-          {hiddenCount > 0 && (
-            <>
-              <span>{hiddenCount} hidden</span>
-              <button
-                type="button"
-                onClick={() => {
-                  setColumnStates((current) =>
-                    current.map((column) => ({ ...column, hidden: false })),
-                  );
-                  setSelection(emptySelection());
-                }}
-              >
-                Show all columns
-              </button>
-            </>
-          )}
-        </div>
-      )}
+      <div className="grid-controls">
+        <button
+          className="schema-sidebar-toggle"
+          type="button"
+          aria-controls="schema-sidebar"
+          aria-pressed={sidebarOpen}
+          title={`Schema sidebar (${shortcutModifier}B)`}
+          onClick={() => setSidebarOpen((open) => !open)}
+        >
+          Schema
+        </button>
+        {(hiddenCount > 0 || copyLimit !== null) && (
+          <div className="grid-statuses">
+            {copyLimit !== null && (
+              <span role="status">
+                {`This operation is limited to the first ${copyLimit.toLocaleString()} rows of the selection.`}
+              </span>
+            )}
+            {hiddenCount > 0 && (
+              <>
+                <span>{hiddenCount} hidden</span>
+                <button
+                  type="button"
+                  onClick={() => {
+                    setColumnStates((current) =>
+                      current.map((column) => ({ ...column, hidden: false })),
+                    );
+                    setSelection(emptySelection());
+                  }}
+                >
+                  Show all columns
+                </button>
+              </>
+            )}
+          </div>
+        )}
+      </div>
       {loadError !== null && (
         <p className="grid-error" role="alert">
           {loadError}
         </p>
       )}
-      <div className="grid-canvas">
-        <DataEditor
-          ref={gridRef}
-          columns={columns}
-          rows={source.rowCount}
-          width="100%"
-          height="100%"
-          rowHeight={ROW_HEIGHT}
-          headerHeight={HEADER_HEIGHT}
-          rowMarkers={{ kind: "clickable-number", startIndex: 1 }}
-          rangeSelect="multi-rect"
-          rowSelect="multi"
-          columnSelect="multi"
-          gridSelection={selection}
-          onGridSelectionChange={updateSelection}
-          getCellContent={getCellContent}
-          getCellsForSelection={getCellsForSelection}
-          drawHeader={drawGridHeader}
-          copyHeaders={false}
-          freezeColumns={pinnedCount}
-          fixedShadowX={false}
-          fixedShadowY={false}
-          overscrollX={0}
-          overscrollY={0}
-          preventDiagonalScrolling
-          smoothScrollX
-          smoothScrollY={false}
-          theme={gridTheme}
-          onVisibleRegionChanged={(range, _tx, _ty, extras) => {
-            visibleRegionsRef.current = [
-              range,
-              ...(extras.freezeRegions ?? []),
-            ];
-            requestRows(range.y, range.height);
-          }}
-          onColumnResizeEnd={(_column, width, visibleIndex) => {
-            const sourceIndex = visibleColumnStates[visibleIndex]?.sourceIndex;
-            if (sourceIndex !== undefined) {
-              setColumnStates((current) =>
-                current.map((column) =>
-                  column.sourceIndex === sourceIndex
-                    ? { ...column, width }
-                    : column,
-                ),
-              );
-            }
-          }}
-          onHeaderMenuClick={(visibleIndex, bounds) => {
-            const sourceIndex = visibleColumnStates[visibleIndex]?.sourceIndex;
-            if (sourceIndex !== undefined) {
-              setHeaderMenu({
-                sourceIndex,
-                left: Math.max(4, Math.min(bounds.x, window.innerWidth - 164)),
-                top: Math.max(
-                  4,
-                  Math.min(bounds.y + bounds.height, window.innerHeight - 76),
-                ),
-              });
-            }
-          }}
+      <div className="data-grid-layout">
+        <SchemaSidebar
+          open={sidebarOpen}
+          selectedColumn={selectedSchemaColumn}
+          source={source}
+          onSelectColumn={selectSchemaColumn}
         />
+        <div className="grid-canvas">
+          <DataEditor
+            ref={gridRef}
+            columns={columns}
+            rows={source.rowCount}
+            width="100%"
+            height="100%"
+            rowHeight={ROW_HEIGHT}
+            headerHeight={HEADER_HEIGHT}
+            rowMarkers={{ kind: "clickable-number", startIndex: 1 }}
+            rangeSelect="multi-rect"
+            rowSelect="multi"
+            columnSelect="multi"
+            gridSelection={selection}
+            onGridSelectionChange={updateSelection}
+            getCellContent={getCellContent}
+            getCellsForSelection={getCellsForSelection}
+            drawHeader={drawGridHeader}
+            copyHeaders={false}
+            freezeColumns={pinnedCount}
+            fixedShadowX={false}
+            fixedShadowY={false}
+            overscrollX={0}
+            overscrollY={0}
+            preventDiagonalScrolling
+            smoothScrollX
+            smoothScrollY={false}
+            theme={gridTheme}
+            onVisibleRegionChanged={(range, _tx, _ty, extras) => {
+              visibleRegionsRef.current = [
+                range,
+                ...(extras.freezeRegions ?? []),
+              ];
+              requestRows(range.y, range.height);
+            }}
+            onColumnResizeEnd={(_column, width, visibleIndex) => {
+              const sourceIndex =
+                visibleColumnStates[visibleIndex]?.sourceIndex;
+              if (sourceIndex !== undefined) {
+                setColumnStates((current) =>
+                  current.map((column) =>
+                    column.sourceIndex === sourceIndex
+                      ? { ...column, width }
+                      : column,
+                  ),
+                );
+              }
+            }}
+            onHeaderMenuClick={(visibleIndex, bounds) => {
+              const sourceIndex =
+                visibleColumnStates[visibleIndex]?.sourceIndex;
+              if (sourceIndex !== undefined) {
+                setHeaderMenu({
+                  sourceIndex,
+                  left: Math.max(
+                    4,
+                    Math.min(bounds.x, window.innerWidth - 164),
+                  ),
+                  top: Math.max(
+                    4,
+                    Math.min(bounds.y + bounds.height, window.innerHeight - 76),
+                  ),
+                });
+              }
+            }}
+          />
+        </div>
       </div>
       {headerMenu !== null && menuColumn !== undefined && (
         <div
@@ -554,6 +637,16 @@ export function DataGrid({ source }: { source: SourceSummary }) {
         </div>
       )}
     </section>
+  );
+}
+
+function isTypingTarget(target: EventTarget | null): boolean {
+  return (
+    target instanceof HTMLElement &&
+    (target.isContentEditable ||
+      target instanceof HTMLInputElement ||
+      target instanceof HTMLSelectElement ||
+      target instanceof HTMLTextAreaElement)
   );
 }
 

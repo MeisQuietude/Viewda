@@ -33,7 +33,6 @@ import {
   type DefaultApplicationStatus,
   type EngineStatus,
   type RecentSource,
-  type SchemaField,
   type SourceErrorCode,
   type SourceSummary,
   type UpdateChannel,
@@ -41,6 +40,7 @@ import {
   type UpdateSettings,
   UpdateCommandError,
 } from "./desktop";
+import { SchemaTreeNode } from "./SchemaTree";
 
 const DataGrid = lazy(async () => {
   const { DataGrid: Grid } = await import("./data-grid/DataGrid");
@@ -1246,11 +1246,8 @@ function SourceDetails({
       <div className="schema-card">
         <h2>Schema</h2>
         <ul className="schema-tree">
-          {source.schema.map((field) => (
-            <SchemaNode
-              key={`${field.name}-${field.physicalType}`}
-              field={field}
-            />
+          {source.schema.map((field, fieldIndex) => (
+            <SchemaTreeNode key={fieldIndex} field={field} />
           ))}
         </ul>
       </div>
@@ -1274,32 +1271,6 @@ function Fact({
         {value}
       </dd>
     </div>
-  );
-}
-
-// Physical wrapper nodes are part of the inspected Parquet schema. Keep them
-// visible instead of collapsing the tree into a lossy notation such as List<T>.
-function SchemaNode({ field }: { field: SchemaField }) {
-  return (
-    <li>
-      <div className="schema-field">
-        <span className="schema-name">{field.name}</span>
-        <span className="schema-type">
-          {field.physicalType}
-          {field.logicalType !== null && ` · ${field.logicalType}`}
-        </span>
-      </div>
-      {field.children.length > 0 && (
-        <ul>
-          {field.children.map((child) => (
-            <SchemaNode
-              key={`${child.name}-${child.physicalType}`}
-              field={child}
-            />
-          ))}
-        </ul>
-      )}
-    </li>
   );
 }
 

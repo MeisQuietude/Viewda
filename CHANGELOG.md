@@ -8,10 +8,19 @@ Backward-incompatible entries start with **Breaking:**.
 
 ## Unreleased
 
+### Added
+
+- The Data view now has a toggleable schema sidebar with the full nested field
+  tree and cancellable, on-demand statistics for the selected column.
+
 ### Changed
 
 - Structure now uses stable, human-readable Parquet physical and logical type
   names.
+
+### Fixed
+
+- Long Parquet type labels in Structure now stay within their column.
 
 ## 0.1.0-alpha.2 — 2026-08-02
 
