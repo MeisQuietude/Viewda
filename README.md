@@ -74,55 +74,16 @@ arrow-rs) — and streams Arrow columns to a thin React UI on a canvas grid,
 in a Tauri shell. Between them sits one transport-agnostic engine protocol:
 shell, engine and UI can each be swapped without rewriting the rest.
 
-## Development
+## Contributing
 
-Install [rustup](https://rustup.rs/). On Linux, install the native dependencies
-first:
+Bug reports and ideas are welcome at any time; code once the change is agreed
+in an issue. [CONTRIBUTING.md](.github/CONTRIBUTING.md) has the rest: the
+toolchain, the one command that gates every change, and what a pull request is
+expected to carry. Everyone taking part follows the
+[Code of Conduct](.github/CODE_OF_CONDUCT.md).
 
-```sh
-scripts/install-tauri-deps.sh # Linux only
-scripts/run.sh setup
-scripts/run.sh check
-```
-
-Windows development uses Git Bash and requires the
-[Microsoft C++ Build Tools and WebView2](https://v2.tauri.app/start/prerequisites/#windows).
-
-`scripts/run.sh check` is the canonical local and CI gate. Other commands are
-`test`, `fmt`, `dev`, `bundle` and `doctor`; an optional Justfile exposes the
-same names. The scripts provision pinned Node.js and DuckDB dependencies, while
-rustup reads the pinned toolchain from `native/rust-toolchain.toml`.
-
-CI verifies native Linux x64 AppImage and Debian packages, macOS Apple silicon
-and Intel installers, Universal macOS, and Windows x64. Each directly
-installable format has its own Actions archive with the full commit SHA.
-Updater companions are archived only for release tags; release files use the
-release version instead.
-
-## Releasing
-
-Prepare and verify the version on a branch:
-
-```sh
-scripts/release.sh prepare 0.1.0-alpha.2
-# Move Unreleased entries under a dated version heading.
-scripts/run.sh check
-```
-
-Commit the version and changelog together. After that commit reaches `main`,
-create and push a signed annotated tag:
-
-```sh
-git tag --sign --annotate v0.1.0-alpha.2 --message "Viewda 0.1.0-alpha.2"
-git push origin v0.1.0-alpha.2
-```
-
-The tag workflow requires a GitHub-verified tag on `main` and the
-`TAURI_SIGNING_PRIVATE_KEY` repository secret. It builds and verifies every
-installer, embeds update signatures in the updater manifest, and creates a
-draft release. Smoke-test its assets on physical target machines before
-publishing it. Publishing refreshes the Stable and Latest update channels on
-GitHub Pages.
+Report a vulnerability privately, the way
+[SECURITY.md](.github/SECURITY.md) describes, never in a public issue.
 
 ## License
 

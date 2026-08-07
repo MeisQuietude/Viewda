@@ -1,0 +1,69 @@
+name: Bug report
+description: Something in Viewda behaves wrong, crashes or is unexpectedly slow
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Never report a security vulnerability here — follow
+        [SECURITY.md](https://github.com/MeisQuietude/Viewda/blob/main/.github/SECURITY.md).
+  - type: input
+    id: version
+    attributes:
+      label: Viewda version
+      description: The version shown in Settings → Version.
+    validations:
+      required: true
+  - type: dropdown
+    id: platform
+    attributes:
+      label: Platform
+      options:
+        - macOS (Apple silicon)
+        - macOS (Intel)
+        - Windows x64
+        - Linux x64
+    validations:
+      required: true
+  - type: dropdown
+    id: package
+    attributes:
+      label: How you installed it
+      options:
+        - macOS DMG
+        - Windows .exe
+        - Linux AppImage
+        - Linux .deb
+        - Built from source
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      placeholder: |
+        1. Open the file from the file manager
+        2. Scroll to row 2,000,000
+        3. …
+    validations:
+      required: true
+  - type: textarea
+    id: behavior
+    attributes:
+      label: What happened, and what you expected instead
+    validations:
+      required: true
+  - type: textarea
+    id: file
+    attributes:
+      label: The file
+      description: >-
+        Describe it even when you cannot share it: size on disk, rows and row
+        groups, compression, nested or unusual types, how it was written, and
+        whether other tools open it. For slowness, add how long it took and
+        what you expected.
+  - type: textarea
+    id: extra
+    attributes:
+      label: Anything else
+      description: Screenshots, error text, or what you were doing before it broke.

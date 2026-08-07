@@ -1,0 +1,8 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Security vulnerability
+    url: https://github.com/MeisQuietude/Viewda/security/advisories/new
+    about: Report privately. Never open a public issue for a vulnerability.
+  - name: Builds and release notes
+    url: https://github.com/MeisQuietude/Viewda/releases
+    about: Check the latest release before reporting — it may already be fixed.
