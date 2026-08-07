@@ -23,6 +23,10 @@ Backward-incompatible entries start with **Breaking:**.
 - The Data view now supports multi-column sorting with a visible ORDER BY
   clause. It keeps current rows visible while changes prepare and lets users
   raise the preparation memory limit in Settings.
+- The Data view SELECT clause now opens a searchable, virtualized column picker
+  with high-contrast selection, space-efficient type labels, and Show all and
+  Hide all actions. It reloads row windows with the selected projection without
+  rebuilding the filtered and sorted view.
 - The Data view now has a toggleable schema sidebar with the full nested field
   tree and cancellable, on-demand statistics for the selected column.
 

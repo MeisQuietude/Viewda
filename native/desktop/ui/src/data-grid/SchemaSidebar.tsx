@@ -151,24 +151,28 @@ export function SchemaSidebar({
       aria-label="Schema sidebar"
       hidden={!open}
     >
-      <div className="schema-sidebar-heading">
-        <span>{formatColumnCount(source.schema.length)}</span>
-      </div>
-      <ul className="sidebar-schema-tree">
-        {source.schema.map((field, columnIndex) => (
-          <SchemaTreeNode
-            key={columnIndex}
-            field={field}
-            selected={selectedColumn === columnIndex}
-            onSelect={() => void selectColumn(columnIndex)}
+      {open && (
+        <>
+          <div className="schema-sidebar-heading">
+            <span>{formatColumnCount(source.schema.length)}</span>
+          </div>
+          <ul className="sidebar-schema-tree">
+            {source.schema.map((field, columnIndex) => (
+              <SchemaTreeNode
+                key={columnIndex}
+                field={field}
+                selected={selectedColumn === columnIndex}
+                onSelect={() => void selectColumn(columnIndex)}
+              />
+            ))}
+          </ul>
+          <StatisticsPanel
+            state={statistics}
+            onCancel={() => void cancelStatistics()}
+            onComputeMinMax={computeMinMax}
           />
-        ))}
-      </ul>
-      <StatisticsPanel
-        state={statistics}
-        onCancel={() => void cancelStatistics()}
-        onComputeMinMax={computeMinMax}
-      />
+        </>
+      )}
     </aside>
   );
 }

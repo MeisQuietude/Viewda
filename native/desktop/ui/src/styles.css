@@ -239,8 +239,10 @@ button {
   color: var(--grid-text-faint);
 }
 
-.query-slot {
-  color: var(--grid-text);
+.query-select-wrap {
+  position: relative;
+  display: flex;
+  min-width: 0;
 }
 
 .query-where-wrap {
@@ -262,7 +264,8 @@ button {
 }
 
 .query-where,
-.query-order {
+.query-order,
+.query-select {
   min-width: 18px;
   overflow: hidden;
   padding: 1px 2px;
@@ -280,13 +283,142 @@ button {
 .query-where:hover,
 .query-where[aria-expanded="true"],
 .query-order:hover,
-.query-order[aria-expanded="true"] {
+.query-order[aria-expanded="true"],
+.query-select:hover,
+.query-select[aria-expanded="true"] {
   background: var(--grid-selection);
 }
 
 .query-where.query-empty-slot,
 .query-order.query-empty-slot {
   color: var(--grid-text-faint);
+}
+
+.column-picker {
+  position: absolute;
+  z-index: 24;
+  top: calc(100% + 8px);
+  left: 0;
+  display: grid;
+  width: min(520px, calc(100vw - 32px));
+  padding: 8px;
+  border: 1px solid var(--grid-border);
+  border-radius: 8px;
+  color: var(--grid-text);
+  background: var(--grid-header);
+  box-shadow: 0 8px 24px rgb(27 29 30 / 14%);
+  gap: 7px;
+  white-space: normal;
+}
+
+.column-picker-toolbar {
+  display: flex;
+  min-width: 0;
+  gap: 6px;
+}
+
+.column-picker-toolbar input {
+  min-width: 0;
+  min-height: 28px;
+  padding: 0 8px;
+  border: 1px solid var(--grid-border);
+  border-radius: 5px;
+  color: var(--grid-text);
+  background: var(--grid-cell);
+  flex: 1;
+  font: inherit;
+}
+
+.column-picker-toolbar button {
+  min-height: 28px;
+  padding: 0 8px;
+  border: 1px solid var(--grid-border);
+  border-radius: 5px;
+  color: var(--grid-text);
+  background: var(--grid-header);
+  font: inherit;
+  cursor: pointer;
+}
+
+.column-picker-toolbar button:hover:not(:disabled) {
+  background: var(--grid-selection);
+}
+
+.column-picker-toolbar button:disabled {
+  color: var(--grid-text-faint);
+  cursor: default;
+}
+
+.column-picker-list {
+  position: relative;
+  overflow: auto;
+  border: 1px solid var(--grid-border-soft);
+  border-radius: 5px;
+  background: var(--grid-cell);
+  overscroll-behavior: contain;
+}
+
+.column-picker-list > p {
+  margin: 0;
+  padding: 12px;
+  color: var(--grid-text-faint);
+}
+
+.column-picker-list-content {
+  position: relative;
+}
+
+.column-picker-row {
+  position: absolute;
+  top: 0;
+  right: 0;
+  left: 0;
+  display: grid;
+  box-sizing: border-box;
+  grid-template-columns: auto 1fr minmax(0, auto);
+  align-items: center;
+  gap: 8px;
+  padding: 0 8px;
+  cursor: pointer;
+}
+
+.column-picker-row:hover {
+  background: var(--grid-selection);
+}
+
+.column-picker-row input {
+  width: 16px;
+  height: 16px;
+  margin: 0;
+  accent-color: var(--update-accent);
+}
+
+.column-picker-name,
+.column-picker-type {
+  min-width: 0;
+  white-space: nowrap;
+}
+
+.column-picker-name {
+  overflow: hidden;
+  color: var(--grid-text);
+  text-overflow: ellipsis;
+}
+
+.column-picker-type,
+.column-picker-count {
+  color: var(--grid-text-faint);
+}
+
+.column-picker-type {
+  overflow: hidden;
+  text-align: left;
+  text-overflow: ellipsis;
+}
+
+.column-picker-count {
+  padding: 0 2px;
+  font-size: 10px;
 }
 
 .query-count {
@@ -709,6 +841,8 @@ button {
 .filter-editor input:focus-visible,
 .filter-editor select:focus-visible,
 .filter-editor textarea:focus-visible,
+.column-picker button:focus-visible,
+.column-picker input:focus-visible,
 .query-row button:focus-visible {
   outline: 2px solid var(--grid-selection-strong);
   outline-offset: 1px;
