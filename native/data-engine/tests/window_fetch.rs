@@ -122,6 +122,87 @@ fn fetches_a_row_from_a_ten_thousand_column_source() {
 }
 
 #[test]
+fn projects_five_columns_from_a_ten_thousand_column_source_in_requested_order() {
+    let source = write_wide_parquet(10_000);
+    let mut reader = DataWindowReader::new(source.path().to_owned());
+
+    let batches = decode(
+        reader
+            .fetch_columns(1, 1, &[9_999, 0, 5_000, 42, 7_000])
+            .expect("projected wide window"),
+    );
+    let batch = &batches[0];
+
+    assert_eq!(batch.num_columns(), 5);
+    assert_eq!(
+        batch
+            .schema()
+            .fields()
+            .iter()
+            .map(|field| field.name().as_str())
+            .collect::<Vec<_>>(),
+        ["c09999", "c00000", "c05000", "c00042", "c07000"]
+    );
+    assert_eq!(
+        (0..batch.num_columns())
+            .map(|column| int32_value(batch, column))
+            .collect::<Vec<_>>(),
+        [10_000, 1, 5_001, 43, 7_001]
+    );
+}
+
+#[test]
+fn projected_direct_windows_preserve_deep_file_order_and_unusual_names() {
+    let source = write_basic_parquet();
+    let mut reader = DataWindowReader::new(source.path().to_owned());
+
+    let full = decode(reader.fetch(6, 2).expect("full deep window"));
+    let projected = decode(
+        reader
+            .fetch_columns(6, 2, &[1, 0])
+            .expect("projected deep window"),
+    );
+    let projected = &projected[0];
+
+    assert_eq!(projected.schema().field(0).name(), "select");
+    assert_eq!(projected.schema().field(1).name(), "id\"quoted");
+    assert_eq!(string_values(projected, 0), string_values(&full[0], 1));
+    assert_eq!(int64_values(projected, 1), int64_values(&full[0], 0));
+}
+
+#[test]
+fn identity_projection_keeps_the_direct_window_wire_format() {
+    let source = write_basic_parquet();
+    let mut reader = DataWindowReader::new(source.path().to_owned());
+
+    let full = reader.fetch(2, 3).expect("full window");
+    let identity = reader
+        .fetch_columns(2, 3, &[0, 1, 2, 3, 4])
+        .expect("identity-projected window");
+
+    assert_eq!(identity, full);
+}
+
+#[test]
+fn rejects_invalid_direct_projections() {
+    let source = write_basic_parquet();
+    let mut reader = DataWindowReader::new(source.path().to_owned());
+
+    assert_eq!(
+        reader.fetch_columns(0, 1, &[]),
+        Err(DataWindowError::Unsupported)
+    );
+    assert_eq!(
+        reader.fetch_columns(0, 1, &[1, 1]),
+        Err(DataWindowError::Unsupported)
+    );
+    assert_eq!(
+        reader.fetch_columns(0, 1, &[5]),
+        Err(DataWindowError::Unsupported)
+    );
+}
+
+#[test]
 fn maps_a_damaged_parquet_source_to_a_typed_error() {
     let source = write_basic_parquet();
     fs::write(source.path(), b"PAR1broken footerPAR1").expect("corrupt fixture");
@@ -144,6 +225,10 @@ fn rejects_an_unbounded_window_before_querying_duckdb() {
     let mut reader = DataWindowReader::new(source.path().to_owned());
 
     assert_eq!(reader.fetch(0, 513), Err(DataWindowError::WindowTooLarge));
+    assert_eq!(
+        reader.fetch_columns(0, 513, &[0]),
+        Err(DataWindowError::WindowTooLarge)
+    );
 }
 
 #[test]
@@ -804,7 +889,7 @@ fn write_basic_parquet() -> NamedTempFile {
     let source = NamedTempFile::new().expect("temporary source");
     let schema = Arc::new(Schema::new(vec![
         Field::new("id\"quoted", DataType::Int64, false),
-        Field::new("label", DataType::Utf8, true),
+        Field::new("select", DataType::Utf8, true),
         Field::new("active", DataType::Boolean, true),
         Field::new("day", DataType::Date32, true),
         Field::new("score", DataType::Int64, true),

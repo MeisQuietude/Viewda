@@ -8,7 +8,10 @@ use duckdb::{Config, Connection, Error as DuckDbError, types::Value};
 use serde::Serialize;
 use thiserror::Error;
 
-use crate::source::{SourceError, open_local_source};
+use crate::{
+    filter::quote_identifier,
+    source::{SchemaField, SourceError, inspect_local_source, open_local_source},
+};
 
 // Keep in sync with DataGrid.tsx's MAX_WINDOW_ROWS; this is the authoritative IPC guard.
 pub(crate) const MAX_WINDOW_ROWS: u32 = 512;
@@ -62,6 +65,7 @@ pub enum DataWindowError {
 pub struct DataWindowReader {
     source_path: PathBuf,
     connection: Option<Connection>,
+    schema: Option<Vec<SchemaField>>,
 }
 
 impl DataWindowReader {
@@ -70,15 +74,57 @@ impl DataWindowReader {
         Self {
             source_path,
             connection: None,
+            schema: None,
         }
     }
 
     /// Reads a bounded file-order window and encodes it as Arrow IPC.
     pub fn fetch(&mut self, row_offset: u64, row_count: u32) -> Result<Vec<u8>, DataWindowError> {
-        if row_count > MAX_WINDOW_ROWS {
-            return Err(DataWindowError::WindowTooLarge);
-        }
+        validate_window_size(row_count)?;
+        self.fetch_projection(row_offset, row_count, None)
+    }
 
+    /// Reads selected source columns in the requested order without changing file order.
+    pub fn fetch_columns(
+        &mut self,
+        row_offset: u64,
+        row_count: u32,
+        source_indices: &[u32],
+    ) -> Result<Vec<u8>, DataWindowError> {
+        validate_window_size(row_count)?;
+        if source_indices.is_empty() {
+            return Err(DataWindowError::Unsupported);
+        }
+        let projection = {
+            let schema = match &self.schema {
+                Some(schema) => schema,
+                None => self.schema.insert(
+                    inspect_local_source(&self.source_path)
+                        .map_err(DataWindowError::from)?
+                        .schema,
+                ),
+            };
+            let source_indices = validate_projection(schema, source_indices)?;
+            let identity_projection = source_indices.len() == schema.len()
+                && source_indices.iter().copied().eq(0..schema.len());
+            (!identity_projection).then(|| {
+                source_indices
+                    .iter()
+                    .map(|source_index| quote_identifier(&schema[*source_index].name))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            })
+        };
+
+        self.fetch_projection(row_offset, row_count, projection.as_deref())
+    }
+
+    fn fetch_projection(
+        &mut self,
+        row_offset: u64,
+        row_count: u32,
+        projection: Option<&str>,
+    ) -> Result<Vec<u8>, DataWindowError> {
         // Keep the preflight to two four-byte reads. Parsing the footer for every
         // scroll window would duplicate DuckDB work and make latency scale with metadata size.
         let (source, _) = open_local_source(&self.source_path).map_err(DataWindowError::from)?;
@@ -96,14 +142,17 @@ impl DataWindowReader {
             .connection
             .as_ref()
             .ok_or(DataWindowError::QueryEngineUnavailable)?;
-        let sql = "SELECT * FROM read_parquet(?) LIMIT ? OFFSET ?";
+        let sql = projection.map_or_else(
+            || "SELECT * FROM read_parquet(?) LIMIT ? OFFSET ?".to_owned(),
+            |projection| format!("SELECT {projection} FROM read_parquet(?) LIMIT ? OFFSET ?"),
+        );
         let parameters = [
             Value::Text(path.to_owned()),
             Value::BigInt(i64::from(row_count)),
             Value::BigInt(row_offset),
         ];
         let mut statement = connection
-            .prepare_cached(sql)
+            .prepare_cached(&sql)
             .map_err(|_| DataWindowError::QueryEngineUnavailable)?;
         let batches = statement
             .stream_arrow(duckdb::params_from_iter(parameters.iter()))
@@ -128,6 +177,37 @@ impl DataWindowReader {
 
         encoded.unwrap_or(Err(DataWindowError::Unsupported))
     }
+}
+
+fn validate_window_size(row_count: u32) -> Result<(), DataWindowError> {
+    if row_count > MAX_WINDOW_ROWS {
+        Err(DataWindowError::WindowTooLarge)
+    } else {
+        Ok(())
+    }
+}
+
+pub(crate) fn validate_projection(
+    schema: &[SchemaField],
+    source_indices: &[u32],
+) -> Result<Vec<usize>, DataWindowError> {
+    if source_indices.is_empty() {
+        return Err(DataWindowError::Unsupported);
+    }
+    let mut seen = vec![false; schema.len()];
+    let mut validated = Vec::with_capacity(source_indices.len());
+    for source_index in source_indices {
+        let source_index =
+            usize::try_from(*source_index).map_err(|_| DataWindowError::Unsupported)?;
+        let Some(slot) = seen.get_mut(source_index) else {
+            return Err(DataWindowError::Unsupported);
+        };
+        if std::mem::replace(slot, true) {
+            return Err(DataWindowError::Unsupported);
+        }
+        validated.push(source_index);
+    }
+    Ok(validated)
 }
 
 pub(crate) fn classify_query_error(error: DuckDbError, has_filters: bool) -> DataWindowError {
