@@ -511,8 +511,181 @@ describe("DataGrid window rendering", () => {
 
     fireEvent.click(screen.getByRole("button", { name: "Show all columns" }));
     expect(
-      screen.getByLabelText("Query").querySelector(".query-slot"),
+      screen.getByLabelText("Query").querySelector(".query-select"),
     ).toHaveTextContent("*");
+  });
+
+  it("keeps the SELECT picker and grid column menu on one visibility state", async () => {
+    render(<DataGrid source={source} />);
+    await waitFor(() => expect(desktop.getDataWindow).toHaveBeenCalledOnce());
+
+    openColumnMenu(7);
+    fireEvent.click(screen.getByRole("menuitem", { name: "Hide column" }));
+    const picker = openSelectPicker();
+    const lastColumn = within(picker).getByRole("checkbox", {
+      name: "Show column_7",
+    });
+    expect(lastColumn).not.toBeChecked();
+    expect(screen.getByLabelText("Query")).toHaveTextContent("[7/8 cols]");
+    await waitFor(() =>
+      expect(desktop.getDataWindow).toHaveBeenLastCalledWith(
+        7,
+        0,
+        0,
+        512,
+        [0, 1, 2, 3, 4, 5, 6],
+      ),
+    );
+
+    fireEvent.click(lastColumn);
+    expect(lastColumn).toBeChecked();
+    expect(
+      screen.getByLabelText("Query").querySelector(".query-select"),
+    ).toHaveTextContent("*");
+    expect(editorMock.props?.columns).toHaveLength(8);
+    expect(desktop.prepareDataView).not.toHaveBeenCalled();
+  });
+
+  it("hides and shows every column from the SELECT picker", async () => {
+    render(<DataGrid source={source} />);
+    await waitFor(() => expect(desktop.getDataWindow).toHaveBeenCalledOnce());
+    vi.mocked(desktop.getDataWindow).mockClear();
+    const picker = openSelectPicker();
+
+    fireEvent.click(within(picker).getByRole("button", { name: "Hide all" }));
+
+    expect(screen.getByLabelText("Query")).toHaveTextContent("[0/8 cols]");
+    expect(screen.getByText("No columns selected.")).toBeInTheDocument();
+    expect(
+      within(picker).getByRole("button", { name: "Hide all" }),
+    ).toBeDisabled();
+    expect(
+      within(picker).getByRole("button", { name: "Show all" }),
+    ).toBeEnabled();
+    expect(desktop.getDataWindow).not.toHaveBeenCalled();
+    expect(desktop.prepareDataView).not.toHaveBeenCalled();
+
+    fireEvent.click(within(picker).getByRole("button", { name: "Show all" }));
+
+    await waitFor(() =>
+      expect(desktop.getDataWindow).toHaveBeenCalledWith(
+        7,
+        0,
+        0,
+        512,
+        [0, 1, 2, 3, 4, 5, 6, 7],
+      ),
+    );
+    expect(screen.queryByText("No columns selected.")).not.toBeInTheDocument();
+    expect(editorMock.props?.columns).toHaveLength(8);
+  });
+
+  it("virtualizes and searches ten thousand SELECT columns", () => {
+    const wideSource = {
+      ...source,
+      schema: Array.from({ length: 10_000 }, (_, index) => ({
+        ...source.schema[0]!,
+        name: `column_${index}`,
+      })),
+    };
+    render(<DataGrid source={wideSource} />);
+
+    const picker = openSelectPicker();
+    expect(within(picker).getAllByRole("checkbox").length).toBeLessThan(20);
+    fireEvent.change(within(picker).getByRole("searchbox"), {
+      target: { value: "column_9999" },
+    });
+
+    expect(
+      within(picker).getByRole("checkbox", { name: "Show column_9999" }),
+    ).toBeInTheDocument();
+    expect(within(picker).getAllByRole("checkbox")).toHaveLength(1);
+  });
+
+  it("moves through SELECT columns with arrows and toggles with Space", async () => {
+    render(<DataGrid source={source} />);
+    await waitFor(() => expect(desktop.getDataWindow).toHaveBeenCalledOnce());
+    const picker = openSelectPicker();
+    const search = within(picker).getByRole("searchbox");
+
+    expect(search).toHaveFocus();
+    fireEvent.keyDown(search, { key: "ArrowDown" });
+    const first = within(picker).getByRole("checkbox", {
+      name: "Show column_0",
+    });
+    expect(first).toHaveFocus();
+    fireEvent.keyDown(first, { key: "ArrowDown" });
+    const second = within(picker).getByRole("checkbox", {
+      name: "Show column_1",
+    });
+    expect(second).toHaveFocus();
+    fireEvent.keyDown(second, { key: " " });
+
+    expect(second).not.toBeChecked();
+    await waitFor(() =>
+      expect(desktop.getDataWindow).toHaveBeenLastCalledWith(
+        7,
+        0,
+        0,
+        512,
+        [0, 2, 3, 4, 5, 6, 7],
+      ),
+    );
+    expect(desktop.prepareDataView).not.toHaveBeenCalled();
+  });
+
+  it("reloads only windows when a filter and sort column becomes hidden", async () => {
+    render(<DataGrid source={source} />);
+    await waitFor(() => expect(desktop.getDataWindow).toHaveBeenCalledOnce());
+    addNumberFilter("1");
+    await waitFor(() => expect(editorMock.props?.rows).toBe(37));
+    act(() => {
+      editorMock.props?.onHeaderClicked?.(0, {
+        bounds: { x: 0, y: 0, width: 120, height: 32 },
+        localEventX: 16,
+        isEdge: false,
+        shiftKey: false,
+        metaKey: false,
+        ctrlKey: false,
+        preventDefault: vi.fn(),
+      } as never);
+    });
+    await waitFor(() =>
+      expect(desktop.prepareDataView).toHaveBeenLastCalledWith(
+        7,
+        2,
+        [{ columnIndex: 0, operator: "equals", values: ["1"] }],
+        [{ sourceIndex: 0, direction: "ascending" }],
+        { memoryLimit: "mb384" },
+      ),
+    );
+    await waitFor(() =>
+      expect(desktop.getDataWindow).toHaveBeenLastCalledWith(
+        7,
+        2,
+        0,
+        37,
+        expect.any(Array),
+      ),
+    );
+    vi.mocked(desktop.prepareDataView).mockClear();
+    vi.mocked(desktop.getDataWindow).mockClear();
+
+    const picker = openSelectPicker();
+    fireEvent.click(
+      within(picker).getByRole("checkbox", { name: "Show column_0" }),
+    );
+
+    await waitFor(() =>
+      expect(desktop.getDataWindow).toHaveBeenCalledWith(
+        7,
+        2,
+        0,
+        37,
+        [1, 2, 3, 4, 5, 6, 7],
+      ),
+    );
+    expect(desktop.prepareDataView).not.toHaveBeenCalled();
   });
 
   it("does not prepare an empty source when ORDER BY changes", () => {
@@ -2106,6 +2279,17 @@ function openColumnMenu(visibleIndex: number) {
       height: 32,
     });
   });
+}
+
+function openSelectPicker() {
+  const button = screen
+    .getByLabelText("Query")
+    .querySelector<HTMLButtonElement>(".query-select");
+  if (button === null) {
+    throw new Error("SELECT picker button is missing");
+  }
+  fireEvent.click(button);
+  return screen.getByRole("dialog", { name: "SELECT columns" });
 }
 
 function openGridMenu() {

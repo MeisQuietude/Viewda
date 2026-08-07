@@ -15,11 +15,11 @@ describe("projected data windows", () => {
         ],
         2,
       ),
-    ).toEqual([4, 6, 9]);
+    ).toEqual([6, 9, 4]);
   });
 
   it("uses a small leading projection until the grid reports its viewport", () => {
-    expect(projectedSourceIndices(columns, [], 2)).toEqual([2, 6]);
+    expect(projectedSourceIndices(columns, [], 2)).toEqual([6, 2]);
   });
 
   it("compares projections independently of their order", () => {
