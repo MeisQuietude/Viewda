@@ -37,6 +37,7 @@ Backward-incompatible entries start with **Breaking:**.
 
 ### Fixed
 
+- Closing, quitting, or restarting Viewda for an update now warns before cancelling a running data export.
 - Long Parquet type labels in Structure now stay within their column.
 
 ## 0.1.0-alpha.2 — 2026-08-02

@@ -42,7 +42,8 @@ use thiserror::Error;
 use updates::{
     PendingUpdate, UpdateError, UpdateInfo, UpdateStateStore, check_for_update,
     check_for_update_with_state, discard_pending_update, get_update_settings,
-    install_pending_update, open_releases_page, set_update_settings, take_post_update_state,
+    install_pending_update as install_pending_update_without_restart, open_releases_page,
+    set_update_settings, take_post_update_state,
 };
 use view_settings::{DataViewSettings, get_data_view_settings, set_data_view_settings};
 use viewda_data_engine::{
@@ -58,6 +59,84 @@ const CHECK_FOR_UPDATES_MENU_ID: &str = "check-for-updates";
 const OPEN_SOURCE_REQUESTED_EVENT: &str = "open-source-requested";
 const SETTINGS_REQUESTED_EVENT: &str = "settings-requested";
 const UPDATE_AVAILABLE_EVENT: &str = "update-available";
+const DATA_EXPORT_CLOSE_REQUESTED_EVENT: &str = "data-export-close-requested";
+#[cfg(target_os = "macos")]
+const QUIT_MENU_ID: &str = "quit";
+
+#[derive(Default)]
+struct DataExportCloseDialog {
+    pending: Mutex<Option<PendingDataExportCloseDialog>>,
+}
+
+impl DataExportCloseDialog {
+    fn try_open<F>(
+        &self,
+        copy: DataExportCloseDialogCopy,
+        action: DataExportShutdownAction,
+        on_decision: F,
+    ) -> bool
+    where
+        F: FnOnce(bool) + Send + 'static,
+    {
+        let Ok(mut pending) = self.pending.lock() else {
+            on_decision(false);
+            return false;
+        };
+        if pending.is_some() {
+            on_decision(false);
+            return false;
+        }
+        *pending = Some(PendingDataExportCloseDialog {
+            copy,
+            action,
+            on_decision: Box::new(on_decision),
+        });
+        true
+    }
+
+    fn copy(&self) -> Option<DataExportCloseDialogCopy> {
+        self.pending
+            .lock()
+            .ok()?
+            .as_ref()
+            .map(|pending| pending.copy.clone())
+    }
+
+    fn action(&self) -> Option<DataExportShutdownAction> {
+        self.pending
+            .lock()
+            .ok()?
+            .as_ref()
+            .map(|pending| pending.action)
+    }
+
+    fn take_decision(&self) -> Option<Box<dyn FnOnce(bool) + Send>> {
+        self.pending
+            .lock()
+            .ok()?
+            .take()
+            .map(|pending| pending.on_decision)
+    }
+}
+
+struct PendingDataExportCloseDialog {
+    copy: DataExportCloseDialogCopy,
+    action: DataExportShutdownAction,
+    on_decision: Box<dyn FnOnce(bool) + Send>,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DataExportCloseDialogCopy {
+    message: String,
+    destructive_button: &'static str,
+}
+
+#[derive(Clone, Copy)]
+enum DataExportShutdownAction {
+    Close,
+    RestartForUpdate,
+}
 
 #[derive(Default)]
 pub(crate) struct OpenedSource {
@@ -1069,6 +1148,170 @@ fn manual_update_check_dialog(
     }
 }
 
+fn data_export_close_dialog_copy(
+    file_names: &[String],
+    action: DataExportShutdownAction,
+) -> DataExportCloseDialogCopy {
+    debug_assert!(!file_names.is_empty());
+    match (file_names, action) {
+        ([file_name], DataExportShutdownAction::Close) => DataExportCloseDialogCopy {
+            message: format!(
+                "\u{201c}{file_name}\u{201d} is still being exported. If you close Viewda now, the unfinished file will be deleted."
+            ),
+            destructive_button: "Close Viewda",
+        },
+        (_, DataExportShutdownAction::Close) => DataExportCloseDialogCopy {
+            message: format!(
+                "{} exports are still running. If you close Viewda now, their unfinished files will be deleted.",
+                file_names.len()
+            ),
+            destructive_button: "Close Viewda",
+        },
+        ([file_name], DataExportShutdownAction::RestartForUpdate) => DataExportCloseDialogCopy {
+            message: format!(
+                "\u{201c}{file_name}\u{201d} is still being exported. If you restart Viewda now, the unfinished file will be deleted."
+            ),
+            destructive_button: "Restart Viewda",
+        },
+        (_, DataExportShutdownAction::RestartForUpdate) => DataExportCloseDialogCopy {
+            message: format!(
+                "{} exports are still running. If you restart Viewda now, their unfinished files will be deleted.",
+                file_names.len()
+            ),
+            destructive_button: "Restart Viewda",
+        },
+    }
+}
+
+fn request_data_export_close_confirmation<F>(
+    app: &tauri::AppHandle,
+    file_names: Vec<String>,
+    action: DataExportShutdownAction,
+    on_decision: F,
+) where
+    F: FnOnce(bool) + Send + 'static,
+{
+    let copy = data_export_close_dialog_copy(&file_names, action);
+    if !app
+        .state::<DataExportCloseDialog>()
+        .try_open(copy.clone(), action, on_decision)
+    {
+        return;
+    }
+    let _ = app.emit(DATA_EXPORT_CLOSE_REQUESTED_EVENT, copy);
+}
+
+#[tauri::command]
+fn get_pending_data_export_close_dialog(
+    dialog: tauri::State<'_, DataExportCloseDialog>,
+) -> Option<DataExportCloseDialogCopy> {
+    dialog.copy()
+}
+
+#[tauri::command]
+async fn resolve_data_export_close_dialog(app: tauri::AppHandle, cancel_export: bool) -> bool {
+    let dialog = app.state::<DataExportCloseDialog>();
+    let Some(action) = dialog.action() else {
+        return false;
+    };
+
+    if cancel_export {
+        if matches!(action, DataExportShutdownAction::RestartForUpdate) {
+            let _ = app.state::<OpenedSource>().data_exports.block_starts();
+        }
+        let cancellation_app = app.clone();
+        let _ = tauri::async_runtime::spawn_blocking(move || {
+            cancellation_app
+                .state::<OpenedSource>()
+                .data_exports
+                .cancel_all_and_wait();
+        })
+        .await;
+    }
+    let Some(on_decision) = dialog.take_decision() else {
+        return false;
+    };
+    on_decision(cancel_export);
+    true
+}
+
+async fn confirm_running_export_cancellation(
+    app: &tauri::AppHandle,
+    action: DataExportShutdownAction,
+) -> bool {
+    let file_names = running_data_export_file_names(app);
+    if file_names.is_empty() {
+        return true;
+    }
+
+    let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+    request_data_export_close_confirmation(app, file_names, action, move |cancel_export| {
+        let _ = sender.send(cancel_export);
+    });
+    tauri::async_runtime::spawn_blocking(move || receiver.recv().unwrap_or(false))
+        .await
+        .unwrap_or(false)
+}
+
+fn running_data_export_file_names(app: &tauri::AppHandle) -> Vec<String> {
+    app.state::<OpenedSource>()
+        .data_exports
+        .running_file_names()
+        .unwrap_or_default()
+}
+
+#[cfg(target_os = "macos")]
+fn request_application_exit(app: &tauri::AppHandle, exit_code: i32) {
+    let file_names = running_data_export_file_names(app);
+    if file_names.is_empty() {
+        app.exit(exit_code);
+        return;
+    }
+
+    let exit_app = app.clone();
+    request_data_export_close_confirmation(
+        app,
+        file_names,
+        DataExportShutdownAction::Close,
+        move |cancel_export| {
+            if cancel_export {
+                exit_app.exit(exit_code);
+            }
+        },
+    );
+}
+
+fn finish_shutdown(app: &tauri::AppHandle) {
+    let _ = app.state::<OpenedSource>().cancel_data_views();
+    app.state::<OpenedSource>()
+        .data_exports
+        .cancel_all_and_wait();
+}
+
+#[tauri::command]
+async fn install_pending_update(app: tauri::AppHandle) -> Result<bool, UpdateError> {
+    if !confirm_running_export_cancellation(&app, DataExportShutdownAction::RestartForUpdate).await
+    {
+        return Ok(false);
+    }
+    app.state::<OpenedSource>()
+        .data_exports
+        .block_starts()
+        .map_err(|_| UpdateError::Unavailable)?;
+    let result = install_pending_update_without_restart(
+        app.clone(),
+        app.state::<PendingUpdate>(),
+        app.state::<UpdateStateStore>(),
+        app.state::<OpenedSource>(),
+    )
+    .await;
+    if let Err(error) = result {
+        app.state::<OpenedSource>().data_exports.allow_starts();
+        return Err(error);
+    }
+    app.restart()
+}
+
 /// Starts the Viewda desktop application.
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
@@ -1090,6 +1333,7 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
         .manage(OpenedSource::default())
+        .manage(DataExportCloseDialog::default())
         .manage(ColumnStatisticsJobs::default())
         .manage(PendingOpenedSource::default())
         .manage(PendingUpdate::default())
@@ -1117,6 +1361,11 @@ pub fn run() {
                 .build(app)?;
             let check_for_updates =
                 MenuItemBuilder::with_id(CHECK_FOR_UPDATES_MENU_ID, "Check for Updates…")
+                    .build(app)?;
+            #[cfg(target_os = "macos")]
+            let quit =
+                MenuItemBuilder::with_id(QUIT_MENU_ID, format!("Quit {}", app.package_info().name))
+                    .accelerator("Cmd+Q")
                     .build(app)?;
             // Lookup by title assumes Tauri's default menu is English;
             // revisit if menus are ever localized.
@@ -1153,7 +1402,10 @@ pub fn run() {
                     .item(&settings)
                     .item(&check_for_updates)
                     .separator();
-                let file_menu = file_menu.close_window().quit().build()?;
+                let file_menu = file_menu.close_window();
+                #[cfg(not(target_os = "macos"))]
+                let file_menu = file_menu.quit();
+                let file_menu = file_menu.build()?;
                 menu.prepend(&file_menu)?;
             }
 
@@ -1165,11 +1417,23 @@ pub fn run() {
                 let separator = PredefinedMenuItem::separator(app)?;
                 // The default application menu starts with About + separator.
                 app_menu.insert_items(&[&settings, &check_for_updates, &separator], 2)?;
+
+                // Tauri's pinned default menu ends with a predefined Quit item.
+                // On macOS that item calls `terminate:` and bypasses ExitRequested,
+                // so replace it with an event-producing item the export guard owns.
+                let quit_position = app_menu.items()?.len().saturating_sub(1);
+                let _ = app_menu.remove_at(quit_position)?;
+                app_menu.insert(&quit, quit_position)?;
             }
 
             Ok(menu)
         })
         .on_menu_event(|app, event| {
+            #[cfg(target_os = "macos")]
+            if event.id() == QUIT_MENU_ID {
+                request_application_exit(app, 0);
+                return;
+            }
             if event.id() == OPEN_SOURCE_MENU_ID {
                 // The frontend receiver can already be gone while the app is shutting down.
                 let _ = app.emit(OPEN_SOURCE_REQUESTED_EVENT, ());
@@ -1177,6 +1441,27 @@ pub fn run() {
                 let _ = app.emit(SETTINGS_REQUESTED_EVENT, ());
             } else if event.id() == CHECK_FOR_UPDATES_MENU_ID {
                 check_for_updates_from_menu(app);
+            }
+        })
+        .on_window_event(|window, event| {
+            if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                let file_names = running_data_export_file_names(window.app_handle());
+                if file_names.is_empty() {
+                    return;
+                }
+                api.prevent_close();
+                let app = window.app_handle().clone();
+                let window = window.clone();
+                request_data_export_close_confirmation(
+                    &app,
+                    file_names,
+                    DataExportShutdownAction::Close,
+                    move |cancel_export| {
+                        if cancel_export {
+                            let _ = window.close();
+                        }
+                    },
+                );
             }
         })
         .invoke_handler(tauri::generate_handler![
@@ -1205,6 +1490,8 @@ pub fn run() {
             get_theme_preference,
             set_theme_preference,
             sync_system_theme,
+            get_pending_data_export_close_dialog,
+            resolve_data_export_close_dialog,
             check_for_update,
             discard_pending_update,
             install_pending_update,
@@ -1214,14 +1501,30 @@ pub fn run() {
         .build(tauri::generate_context!())
         .expect("Viewda desktop runtime failed")
         .run(|app, event| {
-            if matches!(
-                &event,
-                tauri::RunEvent::ExitRequested { .. } | tauri::RunEvent::Exit
-            ) {
-                let _ = app.state::<OpenedSource>().cancel_data_views();
-                app.state::<OpenedSource>()
-                    .data_exports
-                    .cancel_all_and_wait();
+            match &event {
+                tauri::RunEvent::ExitRequested { api, code, .. } => {
+                    let file_names = running_data_export_file_names(app);
+                    if *code != Some(tauri::RESTART_EXIT_CODE) && !file_names.is_empty() {
+                        api.prevent_exit();
+                        let dialog_app = app.clone();
+                        let exit_app = app.clone();
+                        let exit_code = code.unwrap_or(0);
+                        request_data_export_close_confirmation(
+                            &dialog_app,
+                            file_names,
+                            DataExportShutdownAction::Close,
+                            move |cancel_export| {
+                                if cancel_export {
+                                    exit_app.exit(exit_code);
+                                }
+                            },
+                        );
+                    }
+                }
+                tauri::RunEvent::Exit => {
+                    finish_shutdown(app);
+                }
+                _ => {}
             }
             #[cfg(target_os = "macos")]
             if let tauri::RunEvent::Opened { urls } = event
@@ -1239,6 +1542,80 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn close_dialog_names_one_running_export_with_concise_actions() {
+        let copy = data_export_close_dialog_copy(
+            &["orders-view.csv".to_owned()],
+            DataExportShutdownAction::Close,
+        );
+
+        assert_eq!(copy.destructive_button, "Close Viewda");
+        assert_eq!(
+            copy.message,
+            "\u{201c}orders-view.csv\u{201d} is still being exported. If you close Viewda now, the unfinished file will be deleted."
+        );
+    }
+
+    #[test]
+    fn close_dialog_summarizes_several_running_exports_once() {
+        let copy = data_export_close_dialog_copy(
+            &[
+                "orders-view.csv".to_owned(),
+                "customers-view.csv".to_owned(),
+            ],
+            DataExportShutdownAction::Close,
+        );
+
+        assert_eq!(copy.destructive_button, "Close Viewda");
+        assert_eq!(
+            copy.message,
+            "2 exports are still running. If you close Viewda now, their unfinished files will be deleted."
+        );
+    }
+
+    #[test]
+    fn update_restart_dialog_explains_that_the_export_will_be_cancelled() {
+        let copy = data_export_close_dialog_copy(
+            &["orders-view.csv".to_owned()],
+            DataExportShutdownAction::RestartForUpdate,
+        );
+
+        assert_eq!(copy.destructive_button, "Restart Viewda");
+        assert_eq!(
+            copy.message,
+            "\u{201c}orders-view.csv\u{201d} is still being exported. If you restart Viewda now, the unfinished file will be deleted."
+        );
+    }
+
+    #[test]
+    fn close_dialog_keeps_one_pending_decision_and_declines_duplicates() {
+        let dialog = DataExportCloseDialog::default();
+        let copy = data_export_close_dialog_copy(
+            &["orders-view.csv".to_owned()],
+            DataExportShutdownAction::Close,
+        );
+        let (first_sender, first_receiver) = std::sync::mpsc::sync_channel(1);
+        let (second_sender, second_receiver) = std::sync::mpsc::sync_channel(1);
+
+        assert!(dialog.try_open(
+            copy.clone(),
+            DataExportShutdownAction::Close,
+            move |decision| first_sender.send(decision).unwrap(),
+        ));
+        assert!(!dialog.try_open(
+            copy.clone(),
+            DataExportShutdownAction::Close,
+            move |decision| second_sender.send(decision).unwrap(),
+        ));
+        assert!(!second_receiver.recv().unwrap());
+        assert_eq!(dialog.copy().unwrap().message, copy.message);
+
+        dialog.take_decision().unwrap()(false);
+        assert!(!first_receiver.recv().unwrap());
+
+        assert!(dialog.try_open(copy, DataExportShutdownAction::Close, |_| {}));
+    }
 
     #[test]
     fn readiness_is_owned_by_the_data_engine() {
