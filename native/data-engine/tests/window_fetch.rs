@@ -1029,6 +1029,22 @@ fn combines_filter_sort_windows_and_exact_count_in_one_view() {
 
     assert_eq!(view.row_count(), 6);
     assert_eq!(int64_values(&window[0], 0), vec![15, 14, 13]);
+    let projected = decode(
+        view.fetch_window_columns(1, 3, &[2])
+            .expect("window projected away from filter and sort columns"),
+    );
+    assert_eq!(projected[0].num_columns(), 1);
+    assert_eq!(projected[0].schema().field(0).name(), "active");
+    assert_eq!(
+        projected[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<BooleanArray>()
+            .expect("active column")
+            .iter()
+            .collect::<Vec<_>>(),
+        [Some(false), Some(true), Some(false)]
+    );
 
     let filtered_file_order = prepare_view(source.path(), &filters, &[])
         .expect("filtered file-order view after clearing sort");

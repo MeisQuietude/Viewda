@@ -81,7 +81,7 @@ describe("schema field layout", () => {
 describe("query row", () => {
   it("keeps inline clauses clipped and their popups complete", () => {
     expect(styles).toMatch(
-      /\.query-where,\s*\.query-order\s*\{[^}]*overflow:\s*hidden;[^}]*text-overflow:\s*ellipsis;[^}]*white-space:\s*nowrap;/s,
+      /\.query-where,\s*\.query-order,\s*\.query-select\s*\{[^}]*overflow:\s*hidden;[^}]*text-overflow:\s*ellipsis;[^}]*white-space:\s*nowrap;/s,
     );
     expect(styles).toMatch(
       /\.where-popup\s*\{[^}]*max-height:[^}]*overflow:\s*auto;[^}]*white-space:\s*normal;/s,
@@ -98,13 +98,36 @@ describe("query row", () => {
     expect(styles).toMatch(
       /\.query-keyword,\s*\.query-empty-slot,\s*\.query-count\s*\{\s*color:\s*var\(--grid-text-faint\);/s,
     );
-    expect(styles).toMatch(/\.query-slot\s*\{\s*color:\s*var\(--grid-text\);/s);
+    expect(styles).toMatch(
+      /\.query-where,\s*\.query-order,\s*\.query-select\s*\{[^}]*color:\s*var\(--grid-text\);/s,
+    );
+    expect(styles).toMatch(
+      /\.column-picker-type,\s*\.column-picker-count\s*\{\s*color:\s*var\(--grid-text-faint\);/s,
+    );
     const darkRoot = styles.match(
       /:root\[data-theme="dark"\] \{([^}]*)\}/s,
     )?.[1];
     expect(darkRoot).toBeDefined();
     expect(darkRoot).toMatch(/--grid-text:\s*#[0-9a-f]{6};/i);
     expect(darkRoot).toMatch(/--grid-text-faint:\s*#[0-9a-f]{6};/i);
+  });
+
+  it("distinguishes selected columns and sizes their types by content", () => {
+    expect(styles).toMatch(
+      /\.column-picker\s*\{[^}]*width:\s*min\(520px,\s*calc\(100vw - 32px\)\);/s,
+    );
+    expect(styles).toMatch(
+      /\.column-picker-row\s*\{[^}]*grid-template-columns:\s*auto auto minmax\(0,\s*1fr\) fit-content\(50%\);/s,
+    );
+    expect(styles).toMatch(
+      /\.column-picker-row input\s*\{[^}]*width:\s*16px;[^}]*height:\s*16px;[^}]*accent-color:\s*var\(--update-accent\);/s,
+    );
+    expect(styles).toMatch(
+      /\.column-picker-type\s*\{[^}]*overflow:\s*hidden;[^}]*text-align:\s*left;[^}]*text-overflow:\s*ellipsis;/s,
+    );
+    expect(styles).toMatch(
+      /\.column-picker-pin\[aria-pressed="true"\]\s*\{\s*color:\s*var\(--update-accent\);/s,
+    );
   });
 });
 

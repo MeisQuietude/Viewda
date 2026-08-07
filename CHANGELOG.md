@@ -29,6 +29,12 @@ Backward-incompatible entries start with **Breaking:**.
 - The Data view now supports multi-column sorting with a visible ORDER BY
   clause. It keeps current rows visible while changes prepare and lets users
   raise the preparation memory limit in Settings.
+- The Data view SELECT clause now opens a searchable, virtualized column picker
+  with high-contrast selection, pin controls, space-efficient type labels, and
+  Show all and Hide all actions. Pinning and visibility changes keep row
+  selections; column-relative selections clear only when the visible order or
+  set changes. Pinning keeps loaded windows, while visibility changes reload
+  only projected row windows without rebuilding the filtered and sorted view.
 - The Data view now has a toggleable schema sidebar with the full nested field
   tree and cancellable, on-demand statistics for the selected column.
 - Data columns now resize live while dragging and can fit one or all visible

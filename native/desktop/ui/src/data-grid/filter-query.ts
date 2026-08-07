@@ -160,6 +160,22 @@ export function formatWhereClause(
     .join(" AND ");
 }
 
+export function formatSelectClause(
+  sourceIndices: readonly number[],
+  schema: readonly SchemaField[],
+): string {
+  const fields = sourceIndices.flatMap((sourceIndex) => {
+    const field = schema[sourceIndex];
+    return field === undefined ? [] : [[sourceIndex, field] as const];
+  });
+  const identityProjection =
+    fields.length === schema.length &&
+    fields.every(([sourceIndex], index) => sourceIndex === index);
+  return identityProjection
+    ? "*"
+    : fields.map(([, field]) => quoteIdentifier(field.name)).join(", ");
+}
+
 export function formatOrderByClause(
   sort: readonly SortColumn[],
   schema: readonly SchemaField[],

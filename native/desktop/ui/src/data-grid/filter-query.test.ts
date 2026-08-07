@@ -15,6 +15,7 @@ import {
   filterInputFromCell,
   formatFilterCondition,
   formatOrderByClause,
+  formatSelectClause,
   formatWhereClause,
 } from "./filter-query";
 
@@ -228,6 +229,17 @@ describe("canonical filter query formatting", () => {
     expect(formatOrderByClause(sort, schema)).toBe(
       '"label" DESC, "value""quoted" ASC',
     );
+  });
+
+  it("renders SELECT in projection order with the engine's identifier quoting", () => {
+    const schema = [
+      field('value"quoted', "INT64", null),
+      field("label", "BYTE_ARRAY", "String"),
+      field("amount", "DOUBLE", null),
+    ];
+
+    expect(formatSelectClause([1, 0], schema)).toBe('"label", "value""quoted"');
+    expect(formatSelectClause([0, 1, 2], schema)).toBe("*");
   });
 });
 
