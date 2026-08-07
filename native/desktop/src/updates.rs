@@ -280,14 +280,13 @@ pub fn discard_pending_update(pending: State<'_, PendingUpdate>) -> Result<(), U
     Ok(())
 }
 
-/// Installs the checked update and relaunches Viewda.
+/// Installs the checked update after the caller has approved shutdown.
 ///
 /// The pending restart marker is written before installation because the
 /// Windows updater exits the process as part of the install. The marker keeps
 /// the currently open source entirely in Rust and lets the new process restore
 /// it without ever handing its path to the webview.
-#[tauri::command]
-pub async fn install_pending_update(
+pub(crate) async fn install_pending_update(
     app: AppHandle,
     pending: State<'_, PendingUpdate>,
     store: State<'_, UpdateStateStore>,
@@ -314,7 +313,7 @@ pub async fn install_pending_update(
         return Err(UpdateError::Unavailable);
     }
 
-    app.restart();
+    Ok(())
 }
 
 /// Restores the pre-update source and reports the installed version once.

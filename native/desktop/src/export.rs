@@ -113,6 +113,7 @@ pub(crate) struct DataExportJobs {
 #[derive(Default)]
 struct DataExportJobsState {
     starting: bool,
+    starts_blocked: bool,
     active: Option<Arc<ActiveDataExportJob>>,
 }
 
@@ -255,6 +256,9 @@ impl DataExportJobs {
             .state
             .lock()
             .map_err(|_| DataExportCommandError::QueryFailed)?;
+        if state.starts_blocked {
+            return Err(DataExportCommandError::Cancelled);
+        }
         let running = state
             .active
             .as_ref()
@@ -288,6 +292,19 @@ impl DataExportJobs {
         self.next_id.fetch_add(1, Ordering::Relaxed) + 1
     }
 
+    pub(crate) fn running_file_names(&self) -> Result<Vec<String>, DataExportCommandError> {
+        let job = self
+            .state
+            .lock()
+            .map_err(|_| DataExportCommandError::QueryFailed)?
+            .active
+            .clone();
+        match job {
+            Some(job) if job.is_running()? => Ok(vec![job.file_name.clone()]),
+            _ => Ok(Vec::new()),
+        }
+    }
+
     pub(crate) fn cancel_all(&self) {
         let job = self
             .state
@@ -308,6 +325,19 @@ impl DataExportJobs {
         if let Some(job) = job {
             job.cancel();
             job.wait_until_finished();
+        }
+    }
+
+    pub(crate) fn block_starts(&self) -> Result<(), DataExportCommandError> {
+        self.state
+            .lock()
+            .map(|mut state| state.starts_blocked = true)
+            .map_err(|_| DataExportCommandError::QueryFailed)
+    }
+
+    pub(crate) fn allow_starts(&self) {
+        if let Ok(mut state) = self.state.lock() {
+            state.starts_blocked = false;
         }
     }
 }
@@ -699,6 +729,17 @@ mod tests {
     }
 
     #[test]
+    fn blocks_new_exports_while_an_update_is_restarting_the_application() {
+        let jobs = DataExportJobs::default();
+
+        jobs.block_starts().expect("block export starts");
+        assert_eq!(jobs.reserve_start(), Err(DataExportCommandError::Cancelled));
+
+        jobs.allow_starts();
+        assert_eq!(jobs.reserve_start(), Ok(()));
+    }
+
+    #[test]
     fn changing_the_open_source_cancels_the_running_export() {
         let opened_source = OpenedSource::default();
         let job = test_running_job();
@@ -841,6 +882,26 @@ mod tests {
 
         job.finish(Err(DataExportError::Cancelled));
         shutdown.join().expect("shutdown wait");
+    }
+
+    #[test]
+    fn close_guard_reports_only_running_export_targets() {
+        let jobs = DataExportJobs::default();
+        let job = test_running_job();
+        jobs.install(Arc::clone(&job)).expect("install running job");
+
+        assert_eq!(
+            jobs.running_file_names().expect("running exports"),
+            vec!["example-view.csv"]
+        );
+
+        job.finish(Ok(42));
+
+        assert!(
+            jobs.running_file_names()
+                .expect("finished exports")
+                .is_empty()
+        );
     }
 
     fn test_running_job() -> Arc<ActiveDataExportJob> {

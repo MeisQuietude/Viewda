@@ -20,6 +20,8 @@ let requestSettings: (() => void) | undefined;
 let requestOpenSource: (() => void) | undefined;
 let reportUpdate: ((update: desktop.UpdateInfo) => void) | undefined;
 let reportOpenedSource: (() => void) | undefined;
+let requestDataExportClose:
+  ((dialog: desktop.DataExportCloseDialog) => void) | undefined;
 let systemDark = false;
 let themeChangeListeners = new Set<EventListener>();
 
@@ -36,6 +38,7 @@ beforeEach(() => {
   requestOpenSource = undefined;
   reportUpdate = undefined;
   reportOpenedSource = undefined;
+  requestDataExportClose = undefined;
   systemDark = false;
   themeChangeListeners = new Set();
   vi.stubGlobal(
@@ -75,6 +78,14 @@ beforeEach(() => {
     reportOpenedSource = handler;
     return Promise.resolve(() => {});
   });
+  vi.spyOn(desktop, "onDataExportCloseRequested").mockImplementation(
+    (handler) => {
+      requestDataExportClose = handler;
+      return Promise.resolve(() => {});
+    },
+  );
+  vi.spyOn(desktop, "getPendingDataExportCloseDialog").mockResolvedValue(null);
+  vi.spyOn(desktop, "resolveDataExportCloseDialog").mockResolvedValue(true);
   vi.spyOn(desktop, "getUpdateSettings").mockResolvedValue({
     channel: "stable",
     automaticChecks: true,
@@ -88,7 +99,7 @@ beforeEach(() => {
   vi.spyOn(desktop, "setThemePreference").mockResolvedValue();
   vi.spyOn(desktop, "syncSystemTheme").mockResolvedValue();
   vi.spyOn(desktop, "discardPendingUpdate").mockResolvedValue();
-  vi.spyOn(desktop, "installPendingUpdate").mockResolvedValue();
+  vi.spyOn(desktop, "installPendingUpdate").mockResolvedValue(true);
   vi.spyOn(desktop, "takePostUpdateState").mockResolvedValue(null);
   vi.spyOn(desktop, "takeOpenedSource").mockResolvedValue(null);
   vi.spyOn(desktop, "openReleasesPage").mockResolvedValue();
@@ -509,6 +520,58 @@ describe("App", () => {
     );
   });
 
+  it("keeps a running export when the close dialog is dismissed", async () => {
+    render(<App />);
+
+    await waitFor(() => expect(requestDataExportClose).toBeTypeOf("function"));
+    act(() =>
+      requestDataExportClose?.({
+        message:
+          "“orders-view.csv” is still being exported. If you close Viewda now, the unfinished file will be deleted.",
+        destructiveButton: "Close Viewda",
+      }),
+    );
+
+    const dialog = await screen.findByRole("dialog", {
+      name: "Export in progress",
+    });
+    expect(dialog).toHaveTextContent("orders-view.csv");
+    expect(dialog).toHaveTextContent("unfinished file will be deleted");
+    await waitFor(() =>
+      expect(
+        within(dialog).getByRole("button", { name: "Keep Exporting" }),
+      ).toHaveFocus(),
+    );
+
+    fireEvent.keyDown(dialog, { key: "Escape" });
+
+    await waitFor(() =>
+      expect(desktop.resolveDataExportCloseDialog).toHaveBeenCalledWith(false),
+    );
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+  });
+
+  it("uses the explicit destructive action to cancel the export and close", async () => {
+    render(<App />);
+
+    await waitFor(() => expect(requestDataExportClose).toBeTypeOf("function"));
+    act(() =>
+      requestDataExportClose?.({
+        message: "2 exports are still running.",
+        destructiveButton: "Close Viewda",
+      }),
+    );
+
+    fireEvent.click(
+      await screen.findByRole("button", { name: "Close Viewda" }),
+    );
+
+    await waitFor(() =>
+      expect(desktop.resolveDataExportCloseDialog).toHaveBeenCalledWith(true),
+    );
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+  });
+
   it("installs an available update directly from the titlebar", async () => {
     vi.spyOn(desktop, "checkForUpdate").mockResolvedValue({
       version: "0.1.0",
@@ -517,7 +580,7 @@ describe("App", () => {
     });
     const install = vi
       .spyOn(desktop, "installPendingUpdate")
-      .mockReturnValue(new Promise(() => {}));
+      .mockReturnValue(new Promise<boolean>(() => {}));
 
     render(<App />);
 
@@ -531,6 +594,28 @@ describe("App", () => {
 
     expect(install).toHaveBeenCalledOnce();
     expect(screen.getByRole("button", { name: "updating…" })).toBeDisabled();
+  });
+
+  it("keeps an available update when the export cancellation is declined", async () => {
+    vi.spyOn(desktop, "checkForUpdate").mockResolvedValue({
+      version: "0.1.0",
+      currentVersion: "0.0.1",
+      isDowngrade: false,
+    });
+    vi.spyOn(desktop, "installPendingUpdate").mockResolvedValue(false);
+
+    render(<App />);
+
+    fireEvent.click(
+      await screen.findByRole("button", { name: "update to 0.1.0" }),
+    );
+
+    expect(
+      await screen.findByRole("button", { name: "update to 0.1.0" }),
+    ).toBeEnabled();
+    expect(
+      screen.queryByText("The update could not be installed. Try again."),
+    ).not.toBeInTheDocument();
   });
 
   it("uses the same titlebar indicator for an update found by the native menu", async () => {
@@ -855,7 +940,7 @@ describe("App", () => {
   it("installs a stable downgrade only after the user chooses it", async () => {
     const install = vi
       .spyOn(desktop, "installPendingUpdate")
-      .mockReturnValue(new Promise(() => {}));
+      .mockReturnValue(new Promise<boolean>(() => {}));
 
     await openStableDowngrade();
     fireEvent.click(screen.getByRole("button", { name: "Downgrade to 0.1.0" }));
