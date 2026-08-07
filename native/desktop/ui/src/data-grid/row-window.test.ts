@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 
 import {
+  clampedVisibleStart,
   nextScrollState,
   requestSatisfiesRequest,
   rowRequest,
@@ -54,6 +55,14 @@ describe("row window planning", () => {
       expect(requestSatisfiesRequest(request, request)).toBe(true);
     },
   );
+
+  it("clamps a stale viewport to a full last page after the row count shrinks", () => {
+    expect(clampedVisibleStart(319_455, 2_063_949, 40)).toBe(319_415);
+    expect(rowRequest(319_455, 2_063_949, 40, 0)).toMatchObject({
+      visibleStart: 319_415,
+      visibleEnd: 319_455,
+    });
+  });
 });
 
 describe("scroll direction hysteresis", () => {

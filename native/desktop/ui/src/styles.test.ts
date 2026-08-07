@@ -51,12 +51,15 @@ describe("schema field layout", () => {
 });
 
 describe("query row", () => {
-  it("keeps the inline WHERE clipped and the popup complete", () => {
+  it("keeps inline clauses clipped and their popups complete", () => {
     expect(styles).toMatch(
-      /\.query-where\s*\{[^}]*overflow:\s*hidden;[^}]*text-overflow:\s*ellipsis;[^}]*white-space:\s*nowrap;/s,
+      /\.query-where,\s*\.query-order\s*\{[^}]*overflow:\s*hidden;[^}]*text-overflow:\s*ellipsis;[^}]*white-space:\s*nowrap;/s,
     );
     expect(styles).toMatch(
       /\.where-popup\s*\{[^}]*max-height:[^}]*overflow:\s*auto;[^}]*white-space:\s*normal;/s,
+    );
+    expect(styles).toMatch(
+      /\.sort-popup\s*\{[^}]*max-height:[^}]*overflow:\s*auto;[^}]*color:\s*var\(--grid-text\);[^}]*background:\s*var\(--grid-header\);[^}]*white-space:\s*normal;/s,
     );
     expect(styles).toMatch(
       /\.query-expression\s*\{[^}]*font-family:\s*ui-monospace,/s,

@@ -17,7 +17,7 @@ use viewda_data_engine::SourceError;
 
 use crate::{
     OpenSourceError, OpenedSource, OpenedSourceInfo, SourceOpenIntent, inspect_selected_source,
-    theme::ThemePreference,
+    theme::ThemePreference, view_settings::DataViewSettings,
 };
 
 const UPDATE_STATE_FILE: &str = "updates.json";
@@ -91,6 +91,8 @@ struct StoredUpdateState {
     #[serde(default)]
     theme_preference: ThemePreference,
     #[serde(default)]
+    data_view_settings: DataViewSettings,
+    #[serde(default)]
     last_automatic_check_unix_seconds: Option<u64>,
     #[serde(default)]
     pending_restart: Option<PendingRestart>,
@@ -138,6 +140,21 @@ impl UpdateStateStore {
         preference: ThemePreference,
     ) -> Result<(), UpdateError> {
         self.mutate(app, |stored| stored.theme_preference = preference)
+    }
+
+    pub(crate) fn data_view_settings(
+        &self,
+        app: &AppHandle,
+    ) -> Result<DataViewSettings, UpdateError> {
+        Ok(self.read(app)?.data_view_settings)
+    }
+
+    pub(crate) fn set_data_view_settings(
+        &self,
+        app: &AppHandle,
+        settings: DataViewSettings,
+    ) -> Result<(), UpdateError> {
+        self.mutate(app, |stored| stored.data_view_settings = settings)
     }
 
     fn read_path(&self, path: &Path) -> Result<StoredUpdateState, UpdateError> {
@@ -428,6 +445,7 @@ mod tests {
 
         assert_eq!(state.settings, UpdateSettings::default());
         assert_eq!(state.theme_preference, ThemePreference::System);
+        assert_eq!(state.data_view_settings, DataViewSettings::default());
         assert!(state.settings.automatic_checks);
         assert!(state.last_automatic_check_unix_seconds.is_none());
         assert!(state.pending_restart.is_none());
@@ -454,6 +472,7 @@ mod tests {
         assert_eq!(state.settings.channel, UpdateChannel::Latest);
         assert!(!state.settings.automatic_checks);
         assert_eq!(state.theme_preference, ThemePreference::System);
+        assert_eq!(state.data_view_settings, DataViewSettings::default());
         assert!(state.last_automatic_check_unix_seconds.is_none());
     }
 
@@ -497,6 +516,12 @@ mod tests {
             .expect("appearance preference");
         store
             .mutate_path(&path, |stored| {
+                stored.data_view_settings.memory_limit =
+                    viewda_data_engine::DataViewMemoryLimit::Mb1536;
+            })
+            .expect("data-view resources");
+        store
+            .mutate_path(&path, |stored| {
                 stored.pending_restart = Some(PendingRestart {
                     version: "0.1.0".to_owned(),
                     source_path: None,
@@ -517,6 +542,10 @@ mod tests {
         assert_eq!(stored.settings.channel, UpdateChannel::Latest);
         assert!(!stored.settings.automatic_checks);
         assert_eq!(stored.theme_preference, ThemePreference::Dark);
+        assert_eq!(
+            stored.data_view_settings.memory_limit,
+            viewda_data_engine::DataViewMemoryLimit::Mb1536
+        );
         assert!(stored.pending_restart.is_none());
     }
 

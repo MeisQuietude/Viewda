@@ -79,8 +79,12 @@ beforeEach(() => {
     channel: "stable",
     automaticChecks: true,
   });
+  vi.spyOn(desktop, "getDataViewSettings").mockResolvedValue({
+    memoryLimit: "mb384",
+  });
   vi.spyOn(desktop, "checkForUpdate").mockResolvedValue(null);
   vi.spyOn(desktop, "setUpdateSettings").mockResolvedValue();
+  vi.spyOn(desktop, "setDataViewSettings").mockResolvedValue();
   vi.spyOn(desktop, "setThemePreference").mockResolvedValue();
   vi.spyOn(desktop, "syncSystemTheme").mockResolvedValue();
   vi.spyOn(desktop, "discardPendingUpdate").mockResolvedValue();
@@ -557,6 +561,7 @@ describe("App", () => {
       automaticChecks: false,
     });
     const persist = vi.spyOn(desktop, "setUpdateSettings");
+    const persistMemory = vi.spyOn(desktop, "setDataViewSettings");
     render(<App />);
 
     const dialog = await openSettings();
@@ -577,6 +582,22 @@ describe("App", () => {
     ).toHaveClass("tonal-button");
     expect(within(dialog).getByText("0.0.1 · DuckDB v1.5.5")).toHaveClass(
       "settings-version",
+    );
+    expect(
+      within(dialog).getByText(/Grid windows are not affected/),
+    ).toBeInTheDocument();
+    expect(
+      within(dialog).getByText(/up to 90% of the drive's currently free space/),
+    ).toBeInTheDocument();
+    const performanceHelp = within(dialog)
+      .getByText("How memory and temporary disk work", { selector: "summary" })
+      .closest("details");
+    expect(performanceHelp).not.toHaveAttribute("open");
+    fireEvent.change(within(dialog).getByLabelText("Preparation memory"), {
+      target: { value: "mb1536" },
+    });
+    await waitFor(() =>
+      expect(persistMemory).toHaveBeenCalledWith({ memoryLimit: "mb1536" }),
     );
     const theme = screen.getByLabelText("Theme");
     expect(theme).toHaveFocus();

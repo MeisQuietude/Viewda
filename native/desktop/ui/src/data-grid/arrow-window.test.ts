@@ -18,10 +18,10 @@ describe("decodeArrowWindow", () => {
     const bytes = tableToIPC(table, { format: "stream" });
     expect(bytes).not.toBeNull();
 
-    const window = decodeArrowWindow(Uint8Array.from(bytes!).buffer, 0);
-    const type = windowDataType(window, 0);
+    const window = decodeArrowWindow(Uint8Array.from(bytes!).buffer, 0, [7]);
+    const type = windowDataType(window, 7);
     expect(type).toBeDefined();
-    const decoded = values.map((_value, row) => windowValue(window, 0, row));
+    const decoded = values.map((_value, row) => windowValue(window, 7, row));
     const presentations = decoded.map((value) => formatCellValue(value, type!));
 
     expect(decoded).toEqual(values);
@@ -34,5 +34,16 @@ describe("decodeArrowWindow", () => {
     expect(
       presentations.every(({ displayData }) => /^\d+$/.test(displayData)),
     ).toBe(true);
+    expect(windowDataType(window, 0)).toBeUndefined();
+  });
+
+  it("rejects a projection that cannot describe the decoded fields", () => {
+    const bytes = tableToIPC(tableFromArrays({ value: [1] }), {
+      format: "stream",
+    });
+
+    expect(() =>
+      decodeArrowWindow(Uint8Array.from(bytes!).buffer, 0, [1, 2]),
+    ).toThrow("does not match");
   });
 });

@@ -68,7 +68,7 @@ export function rowRequest(
       requiredEnd: 0,
     };
   }
-  const safeStart = Math.max(0, Math.min(totalRows - 1, visibleStart));
+  const safeStart = clampedVisibleStart(totalRows, visibleStart, visibleCount);
   const safeCount = Math.min(
     MAX_WINDOW_ROWS,
     Math.max(1, visibleCount),
@@ -101,6 +101,22 @@ export function rowRequest(
     requiredStart,
     requiredEnd,
   };
+}
+
+export function clampedVisibleStart(
+  totalRows: number,
+  visibleStart: number,
+  visibleCount: number,
+): number {
+  if (totalRows <= 0) {
+    return 0;
+  }
+  const safeCount = Math.min(
+    MAX_WINDOW_ROWS,
+    Math.max(1, visibleCount),
+    totalRows,
+  );
+  return Math.max(0, Math.min(totalRows - safeCount, visibleStart));
 }
 
 export function requestSatisfiesRequest(

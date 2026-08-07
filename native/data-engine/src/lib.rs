@@ -6,6 +6,8 @@ mod source;
 #[cfg(feature = "query-engine")]
 mod statistics;
 #[cfg(feature = "query-engine")]
+mod view;
+#[cfg(feature = "query-engine")]
 mod window;
 
 #[cfg(feature = "query-engine")]
@@ -23,9 +25,13 @@ pub use statistics::{
     ColumnStatistics, ColumnStatisticsError, ColumnStatisticsReader, StatisticsInterruptHandle,
 };
 #[cfg(feature = "query-engine")]
-pub use window::{
-    DataWindowError, DataWindowReader, FilteredRowCountInterruptHandle, FilteredRowCountReader,
+pub use view::{
+    DataSort, DataSortDirection, DataViewBuilder, DataViewError, DataViewInterruptHandle,
+    DataViewMemoryLimit, DataViewResourceDiagnostics, DataViewResourceOperation,
+    DataViewSortDiagnostic, PreparedDataView,
 };
+#[cfg(feature = "query-engine")]
+pub use window::{DataWindowError, DataWindowReader};
 
 /// Describes the data engine backing the desktop shell.
 #[cfg(feature = "query-engine")]

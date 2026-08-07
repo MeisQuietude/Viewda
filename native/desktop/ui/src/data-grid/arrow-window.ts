@@ -8,12 +8,15 @@ import {
 export interface ArrowDataWindow {
   rowOffset: number;
   rowCount: number;
+  sourceIndices: readonly number[];
+  sourceColumnOffsets: ReadonlyMap<number, number>;
   table: Table;
 }
 
 export function decodeArrowWindow(
   bytes: ArrayBuffer,
   rowOffset: number,
+  sourceIndices: readonly number[],
 ): ArrowDataWindow {
   const table = tableFromIPC(bytes, {
     useBigInt: true,
@@ -21,7 +24,27 @@ export function decodeArrowWindow(
     useDecimalInt: true,
     useMap: true,
   });
-  return { rowOffset, rowCount: table.numRows, table };
+  if (table.schema.fields.length !== sourceIndices.length) {
+    throw new Error(
+      "The data window projection does not match its Arrow schema.",
+    );
+  }
+  const sourceColumnOffsets = new Map<number, number>();
+  sourceIndices.forEach((sourceIndex, columnOffset) => {
+    if (sourceColumnOffsets.has(sourceIndex)) {
+      throw new Error(
+        "The data window projection contains a duplicate column.",
+      );
+    }
+    sourceColumnOffsets.set(sourceIndex, columnOffset);
+  });
+  return {
+    rowOffset,
+    rowCount: table.numRows,
+    sourceIndices: [...sourceIndices],
+    sourceColumnOffsets,
+    table,
+  };
 }
 
 export function windowContainsRow(
@@ -36,14 +59,20 @@ export function windowValue(
   column: number,
   row: number,
 ): unknown {
-  return window.table.getChildAt(column).at(row - window.rowOffset);
+  const columnOffset = window.sourceColumnOffsets.get(column);
+  return columnOffset === undefined
+    ? undefined
+    : window.table.getChildAt(columnOffset).at(row - window.rowOffset);
 }
 
-export function windowField(
+function windowField(
   window: ArrowDataWindow,
   column: number,
 ): Field | undefined {
-  return window.table.schema.fields[column];
+  const columnOffset = window.sourceColumnOffsets.get(column);
+  return columnOffset === undefined
+    ? undefined
+    : window.table.schema.fields[columnOffset];
 }
 
 export function windowDataType(

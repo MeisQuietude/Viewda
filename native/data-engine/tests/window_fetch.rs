@@ -1,12 +1,12 @@
-use std::{fs, io::Cursor, sync::Arc};
+use std::{cmp::Ordering, fs, io::Cursor, sync::Arc};
 
 use arrow_array::{
     Array, ArrayRef, BooleanArray, Date32Array, Decimal128Array, Float16Array, Float32Array,
     Float64Array, Int32Array, Int64Array, ListArray, RecordBatch, StringArray, StructArray,
-    types::Int32Type,
+    TimestampMicrosecondArray, types::Int32Type,
 };
 use arrow_ipc::reader::StreamReader;
-use arrow_schema::{DataType, Field, Fields, Schema};
+use arrow_schema::{DataType, Field, Fields, Schema, TimeUnit};
 use half::f16;
 use parquet::{
     arrow::ArrowWriter,
@@ -14,9 +14,10 @@ use parquet::{
     file::writer::SerializedFileWriter,
     schema::parser::parse_message_type,
 };
-use tempfile::NamedTempFile;
+use tempfile::{NamedTempFile, TempDir};
 use viewda_data_engine::{
-    DataFilter, DataFilterOperator, DataWindowError, DataWindowReader, FilteredRowCountReader,
+    DataFilter, DataFilterOperator, DataSort, DataSortDirection, DataViewBuilder, DataViewError,
+    DataWindowError, DataWindowReader, PreparedDataView,
 };
 
 #[test]
@@ -127,10 +128,14 @@ fn maps_a_damaged_parquet_source_to_a_typed_error() {
     let mut reader = DataWindowReader::new(source.path().to_owned());
 
     assert_eq!(reader.fetch(0, 4), Err(DataWindowError::CorruptSource));
-    assert_eq!(
-        reader.fetch_filtered(0, 4, &[filter(0, DataFilterOperator::Equals, &["10"])],),
-        Err(DataWindowError::CorruptSource)
-    );
+    assert!(matches!(
+        prepare_view(
+            source.path(),
+            &[filter(0, DataFilterOperator::Equals, &["10"])],
+            &[],
+        ),
+        Err(DataViewError::Engine(DataWindowError::CorruptSource))
+    ));
 }
 
 #[test]
@@ -244,12 +249,8 @@ fn applies_every_operator_to_supported_scalar_types() {
     ];
 
     for (condition, expected) in cases {
-        let mut reader = DataWindowReader::new(source.path().to_owned());
-        let batches = decode(
-            reader
-                .fetch_filtered(0, 32, &[condition])
-                .expect("filtered window"),
-        );
+        let view = prepare_view(source.path(), &[condition], &[]).expect("filtered view");
+        let batches = decode(view.fetch_window(0, 32).expect("filtered window"));
         assert_eq!(int64_values(&batches[0], 0), expected);
     }
 }
@@ -266,12 +267,13 @@ fn applies_numeric_comparisons_to_each_numeric_storage_type() {
 
     for column_index in 1..=5 {
         for (operator, expected) in cases {
-            let mut reader = DataWindowReader::new(source.path().to_owned());
-            let batches = decode(
-                reader
-                    .fetch_filtered(0, 32, &[filter(column_index, operator, &["2"])])
-                    .expect("filtered numeric window"),
-            );
+            let view = prepare_view(
+                source.path(),
+                &[filter(column_index, operator, &["2"])],
+                &[],
+            )
+            .expect("filtered numeric view");
+            let batches = decode(view.fetch_window(0, 32).expect("filtered numeric window"));
 
             assert_eq!(
                 int64_values(&batches[0], 0),
@@ -316,10 +318,10 @@ fn filters_uuid_and_json_columns_as_text() {
     ];
 
     for (condition, expected) in cases {
-        let mut reader = DataWindowReader::new(source.path().to_owned());
+        let view =
+            prepare_view(source.path(), &[condition], &[]).expect("special-type filtered view");
         let batches = decode(
-            reader
-                .fetch_filtered(0, 8, &[condition])
+            view.fetch_window(0, 8)
                 .expect("special-type filtered window"),
         );
         assert_eq!(int64_values(&batches[0], 0), expected);
@@ -329,22 +331,23 @@ fn filters_uuid_and_json_columns_as_text() {
 #[test]
 fn keeps_plain_binary_columns_null_only() {
     let source = write_special_types_parquet();
-    let mut reader = DataWindowReader::new(source.path().to_owned());
 
-    assert_eq!(
-        reader.fetch_filtered(
-            0,
-            8,
+    assert!(matches!(
+        prepare_view(
+            source.path(),
             &[filter(3, DataFilterOperator::TextContains, &["alpha"],)],
+            &[],
         ),
-        Err(DataWindowError::InvalidFilter),
-    );
+        Err(DataViewError::Engine(DataWindowError::InvalidFilter))
+    ));
 
-    let batches = decode(
-        reader
-            .fetch_filtered(0, 8, &[filter(3, DataFilterOperator::IsNotNull, &[])])
-            .expect("binary null-check window"),
-    );
+    let view = prepare_view(
+        source.path(),
+        &[filter(3, DataFilterOperator::IsNotNull, &[])],
+        &[],
+    )
+    .expect("binary null-check view");
+    let batches = decode(view.fetch_window(0, 8).expect("binary null-check window"));
     assert_eq!(int64_values(&batches[0], 0), vec![1, 2, 3]);
 }
 
@@ -355,32 +358,24 @@ fn combines_conditions_and_offsets_the_filtered_view() {
         filter(0, DataFilterOperator::Range, &["11", "17"]),
         filter(1, DataFilterOperator::OneOf, &["row-2", "row-4", "row-6"]),
     ];
-    let mut reader = DataWindowReader::new(source.path().to_owned());
+    let view = prepare_view(source.path(), &filters, &[]).expect("filtered view");
 
-    let batches = decode(
-        reader
-            .fetch_filtered(1, 2, &filters)
-            .expect("filtered offset window"),
-    );
+    let batches = decode(view.fetch_window(1, 2).expect("filtered offset window"));
 
     assert_eq!(int64_values(&batches[0], 0), vec![14, 16]);
-    assert_eq!(
-        FilteredRowCountReader::new(source.path().to_owned(), &filters)
-            .expect("filtered count reader")
-            .fetch()
-            .expect("filtered count"),
-        3
-    );
+    assert_eq!(view.row_count(), 3);
 }
 
 #[test]
 fn returns_a_schema_only_window_for_an_empty_filter_result() {
     let source = write_basic_parquet();
-    let mut reader = DataWindowReader::new(source.path().to_owned());
-
-    let bytes = reader
-        .fetch_filtered(0, 4, &[filter(0, DataFilterOperator::Equals, &["999"])])
-        .expect("empty filtered window");
+    let view = prepare_view(
+        source.path(),
+        &[filter(0, DataFilterOperator::Equals, &["999"])],
+        &[],
+    )
+    .expect("empty filtered view");
+    let bytes = view.fetch_window(0, 4).expect("empty filtered window");
     let reader = StreamReader::try_new(Cursor::new(bytes), None).expect("Arrow IPC stream");
 
     assert_eq!(reader.schema().fields().len(), 5);
@@ -390,27 +385,374 @@ fn returns_a_schema_only_window_for_an_empty_filter_result() {
 #[test]
 fn rejects_an_operator_not_supported_by_the_column_type() {
     let source = write_basic_parquet();
-    let mut reader = DataWindowReader::new(source.path().to_owned());
-
-    assert_eq!(
-        reader.fetch_filtered(0, 4, &[filter(0, DataFilterOperator::TextContains, &["1"])],),
-        Err(DataWindowError::InvalidFilter)
-    );
+    assert!(matches!(
+        prepare_view(
+            source.path(),
+            &[filter(0, DataFilterOperator::TextContains, &["1"])],
+            &[],
+        ),
+        Err(DataViewError::Engine(DataWindowError::InvalidFilter))
+    ));
 }
 
 #[test]
 fn rejects_bound_values_that_cannot_convert_to_the_column_type() {
     let source = write_basic_parquet();
-    let mut reader = DataWindowReader::new(source.path().to_owned());
+    assert!(matches!(
+        prepare_view(
+            source.path(),
+            &[filter(0, DataFilterOperator::Equals, &["1 OR 1=1"])],
+            &[],
+        ),
+        Err(DataViewError::Engine(DataWindowError::InvalidFilter))
+    ));
+}
+
+#[test]
+fn sorts_large_mixed_type_sources_once_for_start_middle_and_end_windows() {
+    let (source, rows) = write_sort_parquet();
+    let view = prepare_view(
+        source.path(),
+        &[],
+        &[DataSort {
+            source_index: 1,
+            direction: DataSortDirection::Ascending,
+        }],
+    )
+    .expect("single-column view");
+    let mut expected = rows.clone();
+    expected.sort_by(|left, right| {
+        compare_optional(&left.number, &right.number).then(left.file_order.cmp(&right.file_order))
+    });
+    assert_sorted_windows(&view, &expected);
+
+    let view = prepare_view(
+        source.path(),
+        &[],
+        &[
+            DataSort {
+                source_index: 2,
+                direction: DataSortDirection::Ascending,
+            },
+            DataSort {
+                source_index: 3,
+                direction: DataSortDirection::Descending,
+            },
+        ],
+    )
+    .expect("two-column view");
+    expected = rows;
+    expected.sort_by(|left, right| {
+        compare_optional(&left.label.as_deref(), &right.label.as_deref())
+            .then(compare_optional_descending(
+                &left.timestamp,
+                &right.timestamp,
+            ))
+            .then(left.file_order.cmp(&right.file_order))
+    });
+    assert_sorted_windows(&view, &expected);
+}
+
+#[test]
+fn reads_first_and_deep_sorted_windows_from_duckdb_nested_parquet() {
+    let (_directory, source) = write_duckdb_nested_sort_parquet();
+    let view = prepare_view(
+        &source,
+        &[],
+        &[DataSort {
+            source_index: 1,
+            direction: DataSortDirection::Ascending,
+        }],
+    )
+    .expect("nested DuckDB view");
+    let first = decode(view.fetch_window(0, 512).expect("first nested window"));
+    let deep = decode(
+        view.fetch_window(view.row_count() - 512, 512)
+            .expect("deep nested window"),
+    );
+    let mut expected = (0_i64..10_000).collect::<Vec<_>>();
+    expected.sort_by_key(|value| (value % 127, *value));
 
     assert_eq!(
-        reader.fetch_filtered(
-            0,
-            4,
-            &[filter(0, DataFilterOperator::Equals, &["1 OR 1=1"],)],
-        ),
-        Err(DataWindowError::InvalidFilter)
+        first
+            .iter()
+            .flat_map(|batch| int64_values(batch, 0))
+            .collect::<Vec<_>>(),
+        expected[..512]
     );
+    assert_eq!(
+        deep.iter()
+            .flat_map(|batch| int64_values(batch, 0))
+            .collect::<Vec<_>>(),
+        expected[expected.len() - 512..]
+    );
+    assert_eq!(first[0].schema(), deep[0].schema());
+    assert!(matches!(deep[0].column(2).data_type(), DataType::List(_)));
+}
+
+#[test]
+fn combines_filter_sort_windows_and_exact_count_in_one_view() {
+    let source = write_basic_parquet();
+    let filters = [filter(0, DataFilterOperator::Range, &["11", "16"])];
+    let view = prepare_view(
+        source.path(),
+        &filters,
+        &[DataSort {
+            source_index: 1,
+            direction: DataSortDirection::Descending,
+        }],
+    )
+    .expect("filtered and sorted view");
+
+    let window = decode(view.fetch_window(1, 3).expect("view window"));
+
+    assert_eq!(view.row_count(), 6);
+    assert_eq!(int64_values(&window[0], 0), vec![15, 14, 13]);
+
+    let filtered_file_order = prepare_view(source.path(), &filters, &[])
+        .expect("filtered file-order view after clearing sort");
+    assert_eq!(filtered_file_order.row_count(), 6);
+    assert_eq!(
+        int64_values(
+            &decode(
+                filtered_file_order
+                    .fetch_window(0, 8)
+                    .expect("file-order filtered window"),
+            )[0],
+            0,
+        ),
+        vec![11, 12, 13, 14, 15, 16]
+    );
+}
+
+#[test]
+fn keeps_nulls_last_in_both_directions_and_direct_windows_in_file_order() {
+    let (source, rows) = write_sort_parquet();
+    for direction in [DataSortDirection::Ascending, DataSortDirection::Descending] {
+        let view = prepare_view(
+            source.path(),
+            &[],
+            &[DataSort {
+                source_index: 1,
+                direction,
+            }],
+        )
+        .expect("nullable number sort");
+        let last = decode(view.fetch_window(10_015, 12).expect("last sorted window"));
+        let positions = int64_values(&last[0], 0);
+        assert!(
+            positions
+                .iter()
+                .all(|position| rows[*position as usize].number.is_none())
+        );
+    }
+
+    let mut direct = DataWindowReader::new(source.path().to_owned());
+    let file_order = decode(direct.fetch(509, 7).expect("file-order window"));
+    assert_eq!(
+        int64_values(&file_order[0], 0),
+        (509..516).collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn cancelled_replacement_does_not_damage_the_completed_view() {
+    let (source, _) = write_sort_parquet();
+    let completed = prepare_view(
+        source.path(),
+        &[],
+        &[DataSort {
+            source_index: 0,
+            direction: DataSortDirection::Descending,
+        }],
+    )
+    .expect("completed view");
+    let replacement = DataViewBuilder::new(
+        source.path().to_owned(),
+        &[],
+        &[DataSort {
+            source_index: 0,
+            direction: DataSortDirection::Ascending,
+        }],
+    )
+    .expect("replacement builder");
+    replacement.interrupt_handle().interrupt();
+
+    assert!(matches!(
+        replacement.build(),
+        Err(DataViewError::Engine(DataWindowError::Cancelled))
+    ));
+    let first = decode(completed.fetch_window(0, 3).expect("completed window"));
+    assert_eq!(int64_values(&first[0], 0), vec![10_026, 10_025, 10_024]);
+}
+
+#[test]
+fn rejects_duplicate_and_out_of_bounds_sort_columns() {
+    let source = write_basic_parquet();
+    assert!(matches!(
+        prepare_view(
+            source.path(),
+            &[],
+            &[
+                DataSort {
+                    source_index: 0,
+                    direction: DataSortDirection::Ascending,
+                },
+                DataSort {
+                    source_index: 0,
+                    direction: DataSortDirection::Descending,
+                },
+            ],
+        ),
+        Err(DataViewError::Engine(DataWindowError::InvalidSort))
+    ));
+    assert!(matches!(
+        prepare_view(
+            source.path(),
+            &[],
+            &[DataSort {
+                source_index: 5,
+                direction: DataSortDirection::Ascending,
+            }],
+        ),
+        Err(DataViewError::Engine(DataWindowError::InvalidSort))
+    ));
+}
+
+#[test]
+fn uses_file_order_as_a_stable_tie_break_across_row_groups() {
+    let source = write_multi_group_parquet();
+    let view = prepare_view(
+        source.path(),
+        &[],
+        &[DataSort {
+            source_index: 1,
+            direction: DataSortDirection::Ascending,
+        }],
+    )
+    .expect("multi-group view");
+
+    let rows = decode(view.fetch_window(0, 12).expect("stable window"));
+
+    assert_eq!(
+        int64_values(&rows[0], 0),
+        vec![0, 3, 6, 9, 1, 4, 7, 10, 2, 5, 8, 11]
+    );
+}
+
+#[test]
+fn orders_nan_after_finite_values_ascending_and_before_them_descending() {
+    let source = write_float_parquet();
+    let ascending = prepare_view(
+        source.path(),
+        &[],
+        &[DataSort {
+            source_index: 1,
+            direction: DataSortDirection::Ascending,
+        }],
+    )
+    .expect("ascending float view");
+    let descending = prepare_view(
+        source.path(),
+        &[],
+        &[DataSort {
+            source_index: 1,
+            direction: DataSortDirection::Descending,
+        }],
+    )
+    .expect("descending float view");
+
+    assert_eq!(
+        int64_values(
+            &decode(ascending.fetch_window(0, 8).expect("ascending"))[0],
+            0
+        ),
+        vec![0, 1, 2, 3, 4]
+    );
+    assert_eq!(
+        int64_values(
+            &decode(descending.fetch_window(0, 8).expect("descending"))[0],
+            0
+        ),
+        vec![3, 2, 1, 0, 4]
+    );
+}
+
+#[test]
+fn distinguishes_a_physical_file_row_number_column_from_the_virtual_position() {
+    let source = NamedTempFile::new().expect("temporary source");
+    let schema = Arc::new(Schema::new(vec![Field::new(
+        "file_row_number",
+        DataType::Int64,
+        false,
+    )]));
+    let batch = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![Arc::new(Int64Array::from(vec![20, 10])) as ArrayRef],
+    )
+    .expect("record batch");
+    write_batch(&source, schema, &batch);
+    let view = prepare_view(
+        source.path(),
+        &[],
+        &[DataSort {
+            source_index: 0,
+            direction: DataSortDirection::Ascending,
+        }],
+    )
+    .expect("view with colliding physical name");
+
+    assert_eq!(
+        int64_values(&decode(view.fetch_window(0, 2).expect("window"))[0], 0),
+        vec![10, 20]
+    );
+}
+
+#[derive(Clone)]
+struct SortRow {
+    file_order: i64,
+    number: Option<i32>,
+    label: Option<String>,
+    timestamp: Option<i64>,
+}
+
+fn assert_sorted_windows(view: &PreparedDataView, expected: &[SortRow]) {
+    for (offset, count) in [(0, 9), (5_009, 11), (10_020, 12)] {
+        let batches = decode(view.fetch_window(offset, count).expect("sorted window"));
+        let actual = int64_values(&batches[0], 0);
+        let expected = expected
+            [offset as usize..usize::min(offset as usize + count as usize, expected.len())]
+            .iter()
+            .map(|row| row.file_order)
+            .collect::<Vec<_>>();
+        assert_eq!(actual, expected, "window at offset {offset}");
+    }
+}
+
+fn compare_optional<T: Ord>(left: &Option<T>, right: &Option<T>) -> Ordering {
+    match (left, right) {
+        (Some(left), Some(right)) => left.cmp(right),
+        (Some(_), None) => Ordering::Less,
+        (None, Some(_)) => Ordering::Greater,
+        (None, None) => Ordering::Equal,
+    }
+}
+
+fn compare_optional_descending<T: Ord>(left: &Option<T>, right: &Option<T>) -> Ordering {
+    match (left, right) {
+        (Some(left), Some(right)) => right.cmp(left),
+        (Some(_), None) => Ordering::Less,
+        (None, Some(_)) => Ordering::Greater,
+        (None, None) => Ordering::Equal,
+    }
+}
+
+fn prepare_view(
+    source: &std::path::Path,
+    filters: &[DataFilter],
+    sort: &[DataSort],
+) -> Result<PreparedDataView, DataViewError> {
+    DataViewBuilder::new(source.to_owned(), filters, sort)?.build()
 }
 
 fn filter(column_index: u32, operator: DataFilterOperator, values: &[&str]) -> DataFilter {
@@ -719,6 +1061,122 @@ fn write_wide_parquet(column_count: usize) -> NamedTempFile {
         })
         .collect::<Vec<_>>();
     let batch = RecordBatch::try_new(Arc::clone(&schema), columns).expect("wide record batch");
+    write_batch(&source, schema, &batch);
+    source
+}
+
+fn write_sort_parquet() -> (NamedTempFile, Vec<SortRow>) {
+    let source = NamedTempFile::new().expect("temporary source");
+    let rows = (0..10_027)
+        .map(|index| SortRow {
+            file_order: index,
+            number: (index % 17 != 0).then_some(((index * 29) % 23) as i32),
+            label: (index % 19 != 0).then(|| format!("label-{:02}", (index * 31) % 13)),
+            timestamp: (index % 23 != 0)
+                .then_some(1_700_000_000_000_000 + ((index * 37) % 101) * 1_000_000),
+        })
+        .collect::<Vec<_>>();
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("file_order", DataType::Int64, false),
+        Field::new("number", DataType::Int32, true),
+        Field::new("label", DataType::Utf8, true),
+        Field::new(
+            "recorded_at",
+            DataType::Timestamp(TimeUnit::Microsecond, None),
+            true,
+        ),
+    ]));
+    let batch = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![
+            Arc::new(Int64Array::from_iter_values(
+                rows.iter().map(|row| row.file_order),
+            )) as ArrayRef,
+            Arc::new(Int32Array::from(
+                rows.iter().map(|row| row.number).collect::<Vec<_>>(),
+            )) as ArrayRef,
+            Arc::new(StringArray::from(
+                rows.iter()
+                    .map(|row| row.label.as_deref())
+                    .collect::<Vec<_>>(),
+            )) as ArrayRef,
+            Arc::new(TimestampMicrosecondArray::from(
+                rows.iter().map(|row| row.timestamp).collect::<Vec<_>>(),
+            )) as ArrayRef,
+        ],
+    )
+    .expect("mixed sort record batch");
+    write_batch(&source, schema, &batch);
+    (source, rows)
+}
+
+fn write_duckdb_nested_sort_parquet() -> (TempDir, std::path::PathBuf) {
+    let directory = TempDir::new().expect("nested fixture directory");
+    let path = directory.path().join("nested-sort.parquet");
+    let escaped_path = path
+        .to_str()
+        .expect("nested fixture path")
+        .replace('\'', "''");
+    let connection = duckdb::Connection::open_in_memory().expect("DuckDB fixture connection");
+    connection
+        .execute_batch(&format!(
+            "COPY (\
+             SELECT value AS file_order, \
+                    CAST(value % 127 AS TINYINT) AS int8_value, \
+                    [CAST(value AS INTEGER), CAST(value + 1 AS INTEGER)] AS list_value \
+             FROM range(10000) AS rows(value)) \
+             TO '{escaped_path}' (FORMAT PARQUET, ROW_GROUP_SIZE 2048)"
+        ))
+        .expect("write nested DuckDB Parquet fixture");
+    (directory, path)
+}
+
+fn write_multi_group_parquet() -> NamedTempFile {
+    let source = NamedTempFile::new().expect("temporary source");
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("file_order", DataType::Int64, false),
+        Field::new("group", DataType::Int32, false),
+    ]));
+    let file = source.reopen().expect("multi-group fixture file");
+    let mut writer = ArrowWriter::try_new(file, Arc::clone(&schema), None).expect("Parquet writer");
+    for start in [0_i64, 4, 8] {
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int64Array::from_iter_values(start..start + 4)) as ArrayRef,
+                Arc::new(Int32Array::from_iter_values(
+                    (start..start + 4).map(|value| (value % 3) as i32),
+                )) as ArrayRef,
+            ],
+        )
+        .expect("row-group batch");
+        writer.write(&batch).expect("write row group");
+        writer.flush().expect("flush row group");
+    }
+    writer.close().expect("write footer");
+    source
+}
+
+fn write_float_parquet() -> NamedTempFile {
+    let source = NamedTempFile::new().expect("temporary source");
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("file_order", DataType::Int64, false),
+        Field::new("value", DataType::Float64, true),
+    ]));
+    let batch = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![
+            Arc::new(Int64Array::from_iter_values(0..5)) as ArrayRef,
+            Arc::new(Float64Array::from(vec![
+                Some(f64::NEG_INFINITY),
+                Some(-1.0),
+                Some(f64::INFINITY),
+                Some(f64::NAN),
+                None,
+            ])) as ArrayRef,
+        ],
+    )
+    .expect("float record batch");
     write_batch(&source, schema, &batch);
     source
 }

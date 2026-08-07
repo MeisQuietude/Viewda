@@ -23,11 +23,13 @@ import type { ArrowDataWindow } from "./arrow-window";
 
 const editorMock = vi.hoisted(() => ({
   props: undefined as DataEditorProps | undefined,
+  mountCount: 0,
   scrollTo: vi.fn(),
   updateCells: vi.fn(),
 }));
 
 const decodeArrowWindow = vi.hoisted(() => vi.fn());
+const clipboardWrite = vi.fn();
 
 vi.mock("@glideapps/glide-data-grid", async (importOriginal) => {
   const actual =
@@ -35,6 +37,9 @@ vi.mock("@glideapps/glide-data-grid", async (importOriginal) => {
   const React = await import("react");
   const MockDataEditor = React.forwardRef<DataEditorRef, DataEditorProps>(
     (props, ref) => {
+      React.useEffect(() => {
+        editorMock.mountCount += 1;
+      }, []);
       editorMock.props = props;
       React.useImperativeHandle(
         ref,
@@ -72,23 +77,46 @@ const source: desktop.SourceSummary = {
 
 beforeEach(() => {
   editorMock.props = undefined;
+  editorMock.mountCount = 0;
   editorMock.scrollTo.mockReset();
   editorMock.updateCells.mockReset();
   decodeArrowWindow.mockImplementation(
-    (_bytes: ArrayBuffer, rowOffset: number): ArrowDataWindow => ({
-      rowOffset,
-      rowCount: 512,
-      table: {
-        schema: {
-          fields: Array.from({ length: 8 }, () => ({ type: utf8() })),
-        },
-        getChildAt: () => ({ at: (row: number) => `row ${row}` }),
-      } as unknown as ArrowDataWindow["table"],
-    }),
+    (
+      _bytes: ArrayBuffer,
+      rowOffset: number,
+      sourceIndices: readonly number[],
+    ): ArrowDataWindow => {
+      const sourceColumnOffsets = new Map(
+        sourceIndices.map((sourceIndex, offset) => [sourceIndex, offset]),
+      );
+      return {
+        rowOffset,
+        rowCount: 512,
+        sourceIndices,
+        sourceColumnOffsets,
+        table: {
+          schema: {
+            fields: Array.from({ length: sourceIndices.length }, () => ({
+              type: utf8(),
+            })),
+          },
+          getChildAt: () => ({ at: (row: number) => `row ${row}` }),
+        } as unknown as ArrowDataWindow["table"],
+      };
+    },
   );
   vi.spyOn(desktop, "getDataWindow").mockResolvedValue(new ArrayBuffer(0));
-  vi.spyOn(desktop, "getFilteredRowCount").mockResolvedValue(37);
-  vi.spyOn(desktop, "cancelFilteredRowCount").mockResolvedValue();
+  vi.spyOn(desktop, "prepareDataView").mockImplementation(
+    async (_generation, revision, filters) => ({
+      revision,
+      rowCount: filters.length === 0 ? source.rowCount : 37,
+    }),
+  );
+  vi.spyOn(desktop, "getDataViewStatus").mockResolvedValue({
+    revision: 0,
+    rowCount: source.rowCount,
+  });
+  vi.spyOn(desktop, "cancelDataView").mockResolvedValue();
   vi.spyOn(desktop, "getColumnStatistics").mockResolvedValue({
     minimum: "1",
     maximum: "9",
@@ -97,6 +125,12 @@ beforeEach(() => {
     approximateDistinctCount: 42,
   });
   vi.spyOn(desktop, "cancelColumnStatistics").mockResolvedValue();
+  clipboardWrite.mockReset();
+  clipboardWrite.mockResolvedValue(undefined);
+  Object.defineProperty(navigator, "clipboard", {
+    configurable: true,
+    value: { writeText: clipboardWrite },
+  });
   vi.stubGlobal(
     "matchMedia",
     vi.fn(() => ({
@@ -158,11 +192,92 @@ describe("DataGrid window rendering", () => {
     expect(damage).not.toContainEqual({ cell: [1, 1_000] });
   });
 
+  it("loads only viewport and frozen columns from a prepared view", async () => {
+    const wideSource = {
+      ...source,
+      schema: Array.from({ length: 20 }, (_, index) => ({
+        ...source.schema[0]!,
+        name: `column_${index}`,
+      })),
+    };
+    render(<DataGrid source={wideSource} />);
+    await waitFor(() => expect(desktop.getDataWindow).toHaveBeenCalledOnce());
+
+    addNumberFilter("1");
+    await waitFor(() =>
+      expect(desktop.getDataWindow).toHaveBeenLastCalledWith(
+        7,
+        1,
+        expect.any(Number),
+        37,
+        [0, 1, 2, 3, 4, 5, 6, 7],
+      ),
+    );
+
+    act(() => {
+      editorMock.props?.onVisibleRegionChanged?.(
+        { x: 10, y: 0, width: 4, height: 5 },
+        0,
+        0,
+        { freezeRegions: [{ x: 0, y: 0, width: 1, height: 5 }] },
+      );
+    });
+
+    await waitFor(() =>
+      expect(desktop.getDataWindow).toHaveBeenLastCalledWith(
+        7,
+        1,
+        0,
+        37,
+        [0, 10, 11, 12, 13],
+      ),
+    );
+  });
+
+  it("loads only selected columns when copying from a prepared view", async () => {
+    render(<DataGrid source={source} />);
+    await waitFor(() => expect(desktop.getDataWindow).toHaveBeenCalledOnce());
+    addNumberFilter("1");
+    await waitFor(() =>
+      expect(desktop.getDataWindow).toHaveBeenLastCalledWith(
+        7,
+        1,
+        expect.any(Number),
+        37,
+        expect.any(Array),
+      ),
+    );
+    vi.mocked(desktop.getDataWindow).mockClear();
+
+    const getCellsForSelection = editorMock.props?.getCellsForSelection;
+    expect(getCellsForSelection).toBeTypeOf("function");
+    if (typeof getCellsForSelection !== "function") {
+      return;
+    }
+    const selection = getCellsForSelection(
+      { x: 2, y: 0, width: 2, height: 1 },
+      new AbortController().signal,
+    );
+    await act(async () => {
+      if (typeof selection === "function") {
+        await selection();
+      }
+    });
+
+    expect(desktop.getDataWindow).toHaveBeenCalledWith(7, 1, 0, 37, [2, 3]);
+  });
+
   it("keeps loaded cells populated without duplicate prefetches", async () => {
     render(<DataGrid source={source} />);
 
     await waitFor(() => expect(desktop.getDataWindow).toHaveBeenCalledOnce());
-    expect(desktop.getDataWindow).toHaveBeenLastCalledWith(7, 0, 512, []);
+    expect(desktop.getDataWindow).toHaveBeenLastCalledWith(
+      7,
+      0,
+      0,
+      512,
+      [0, 1, 2, 3, 4, 5, 6, 7],
+    );
     await waitFor(() => expect(editorMock.updateCells).toHaveBeenCalledOnce());
 
     const nextWindow = deferred<ArrayBuffer>();
@@ -179,9 +294,10 @@ describe("DataGrid window rendering", () => {
     await waitFor(() => expect(desktop.getDataWindow).toHaveBeenCalledTimes(2));
     expect(desktop.getDataWindow).toHaveBeenLastCalledWith(
       7,
+      0,
       expect.any(Number),
       512,
-      [],
+      expect.any(Array),
     );
 
     act(() => {
@@ -219,18 +335,33 @@ describe("DataGrid window rendering", () => {
     const drawHeader = editorMock.props?.drawHeader;
     const context = {
       font: '12px ui-monospace, "SFMono-Regular", Consolas, monospace',
-    } as CanvasRenderingContext2D;
+      fillStyle: "",
+      textAlign: "left",
+      save: vi.fn(),
+      restore: vi.fn(),
+      fillText: vi.fn(),
+    } as unknown as CanvasRenderingContext2D;
     const drawContent = vi.fn(() => {
       expect(context.font).toContain("Inter");
       expect(context.font).not.toContain("ui-monospace");
     });
 
     drawHeader?.(
-      { ctx: context } as Parameters<NonNullable<typeof drawHeader>>[0],
+      {
+        ctx: context,
+        menuBounds: { x: 100, y: 0, width: 20, height: 32 },
+        rect: { x: 0, y: 0, width: 120, height: 32 },
+        theme: { textLight: "#777" },
+      } as Parameters<NonNullable<typeof drawHeader>>[0],
       drawContent,
     );
 
     expect(drawContent).toHaveBeenCalledOnce();
+    expect(editorMock.props?.columns[0]?.icon).toBe("viewda-sort-neutral");
+    const neutralIcon = editorMock.props?.headerIcons?.["viewda-sort-neutral"];
+    expect(neutralIcon?.({ bgColor: "#123456", fgColor: "#ffffff" })).toContain(
+      'stroke="#123456"',
+    );
   });
 
   it("always renders the path-free query row", () => {
@@ -240,14 +371,12 @@ describe("DataGrid window rendering", () => {
     const expression = query.querySelector(".query-expression");
     expect(
       Array.from(expression?.children ?? [], (node) => node.textContent),
-    ).toEqual(["SELECT", "*", "FROM", "this", "WHERE⋯", "ORDER BY", "⋯"]);
+    ).toEqual(["SELECT", "*", "FROM", "this", "WHERE⋯", "ORDER BY⋯"]);
     expect(within(query).getByText("SELECT", { selector: "span" })).toHaveClass(
       "query-keyword",
     );
     expect(within(query).getByText("this")).toBeInTheDocument();
-    expect(within(query).getByRole("button", { name: "⋯" })).toHaveClass(
-      "query-empty-slot",
-    );
+    expect(within(query).getAllByRole("button", { name: "⋯" })).toHaveLength(2);
     expect(query).not.toHaveTextContent(source.displayName);
     expect(query).toHaveTextContent("10,000 rows");
   });
@@ -260,7 +389,9 @@ describe("DataGrid window rendering", () => {
       left: 520,
     } as DOMRect);
 
-    fireEvent.click(screen.getByRole("button", { name: "⋯" }));
+    fireEvent.click(
+      within(wrap as HTMLDivElement).getByRole("button", { name: "⋯" }),
+    );
 
     expect(
       screen.getByRole("dialog", { name: "WHERE conditions" }),
@@ -281,13 +412,15 @@ describe("DataGrid window rendering", () => {
       ),
     );
     fireEvent.click(
-      screen.getByRole("button", { name: "Clear WHERE conditions" }),
+      screen.getByRole("button", { name: "Clear WHERE and ORDER BY" }),
     );
 
-    expect(screen.getByLabelText("Query")).toHaveTextContent("[7/8 cols]");
-    expect(screen.getByLabelText("Query")).not.toHaveTextContent(
-      '"column_0" = 42',
+    await waitFor(() =>
+      expect(screen.getByLabelText("Query")).not.toHaveTextContent(
+        '"column_0" = 42',
+      ),
     );
+    expect(screen.getByLabelText("Query")).toHaveTextContent("[7/8 cols]");
 
     fireEvent.click(screen.getByRole("button", { name: "Show all columns" }));
     expect(
@@ -295,17 +428,352 @@ describe("DataGrid window rendering", () => {
     ).toHaveTextContent("*");
   });
 
-  it("knows an empty source has zero matches without loading or counting", () => {
+  it("does not prepare an empty source when ORDER BY changes", () => {
     render(<DataGrid source={{ ...source, rowCount: 0 }} />);
 
-    addNumberFilter("1");
+    const orderWrap = document.querySelector(".query-order-wrap");
+    fireEvent.click(
+      within(orderWrap as HTMLDivElement).getByRole("button", { name: "⋯" }),
+    );
+    const popup = screen.getByRole("dialog", { name: "ORDER BY columns" });
+    fireEvent.change(within(popup).getByLabelText("Add column"), {
+      target: { value: "0" },
+    });
+    fireEvent.click(within(popup).getByRole("button", { name: "Apply" }));
 
+    expect(screen.getByText("This file has no rows.")).toBeInTheDocument();
     expect(
-      screen.getByText("No rows match these conditions."),
+      screen.getByRole("button", { name: '"column_0" ASC' }),
     ).toBeInTheDocument();
     expect(screen.getByLabelText("Query")).toHaveTextContent("0 rows");
     expect(desktop.getDataWindow).not.toHaveBeenCalled();
-    expect(desktop.getFilteredRowCount).not.toHaveBeenCalled();
+    expect(desktop.prepareDataView).not.toHaveBeenCalled();
+  });
+
+  it("focuses the ORDER BY popup and does not prepare an unchanged view", () => {
+    render(<DataGrid source={source} />);
+
+    fireEvent.click(screen.getAllByRole("button", { name: "⋯" })[1]!);
+    const popup = screen.getByRole("dialog", { name: "ORDER BY columns" });
+
+    expect(within(popup).getByLabelText("Add column")).toHaveFocus();
+    fireEvent.click(within(popup).getByRole("button", { name: "Apply" }));
+    expect(desktop.prepareDataView).not.toHaveBeenCalled();
+    expect(
+      screen.queryByRole("dialog", { name: "ORDER BY columns" }),
+    ).not.toBeInTheDocument();
+  });
+
+  it("applies the selected preparation memory to a new view", async () => {
+    render(
+      <DataGrid source={source} viewSettings={{ memoryLimit: "mb1536" }} />,
+    );
+
+    addNumberFilter("42");
+
+    await waitFor(() =>
+      expect(desktop.prepareDataView).toHaveBeenCalledWith(
+        7,
+        1,
+        [{ columnIndex: 0, operator: "equals", values: ["42"] }],
+        [],
+        { memoryLimit: "mb1536" },
+      ),
+    );
+  });
+
+  it("clamps narrow columns while keeping the title outside the left sort hitbox", () => {
+    render(<DataGrid source={source} />);
+
+    act(() => {
+      editorMock.props?.onColumnResizeEnd?.(
+        editorMock.props.columns[0]!,
+        80,
+        0,
+        80,
+      );
+    });
+    const resized = editorMock.props?.columns[0];
+    expect(
+      resized !== undefined && "width" in resized ? resized.width : 0,
+    ).toBe(112);
+
+    act(() => {
+      editorMock.props?.onHeaderClicked?.(0, {
+        bounds: { x: 0, y: 0, width: 80, height: 32 },
+        localEventX: 40,
+        isEdge: false,
+        shiftKey: false,
+        metaKey: false,
+        ctrlKey: false,
+        preventDefault: vi.fn(),
+      } as never);
+    });
+    expect(desktop.prepareDataView).not.toHaveBeenCalled();
+  });
+
+  it("sorts only from the header hotspot without suppressing column selection", async () => {
+    render(<DataGrid source={source} />);
+    const preventDefault = vi.fn();
+
+    act(() => {
+      editorMock.props?.onHeaderClicked?.(2, {
+        bounds: { x: 0, y: 0, width: 120, height: 32 },
+        localEventX: 16,
+        isEdge: false,
+        shiftKey: false,
+        metaKey: false,
+        ctrlKey: false,
+        preventDefault,
+      } as never);
+    });
+
+    await waitFor(() =>
+      expect(desktop.prepareDataView).toHaveBeenCalledWith(
+        7,
+        1,
+        [],
+        [{ sourceIndex: 2, direction: "ascending" }],
+        { memoryLimit: "mb384" },
+      ),
+    );
+    await waitFor(() => {
+      expect(editorMock.props?.columns[2]?.title).toBe("column_2");
+      expect(editorMock.props?.columns[2]?.icon).toBe("viewda-sort-ascending");
+    });
+    expect(preventDefault).not.toHaveBeenCalled();
+
+    act(() => {
+      editorMock.props?.onHeaderClicked?.(3, {
+        bounds: { x: 0, y: 0, width: 120, height: 32 },
+        localEventX: 16,
+        isEdge: false,
+        shiftKey: true,
+        metaKey: false,
+        ctrlKey: false,
+        preventDefault,
+      } as never);
+    });
+    await waitFor(() =>
+      expect(desktop.prepareDataView).toHaveBeenLastCalledWith(
+        7,
+        2,
+        [],
+        [
+          { sourceIndex: 2, direction: "ascending" },
+          { sourceIndex: 3, direction: "ascending" },
+        ],
+        { memoryLimit: "mb384" },
+      ),
+    );
+    await waitFor(() => {
+      expect(editorMock.props?.columns[2]?.title).toBe("column_2");
+      expect(editorMock.props?.columns[3]?.title).toBe("column_3");
+      expect(editorMock.props?.columns[2]?.icon).toBe(
+        "viewda-sort-ascending-1",
+      );
+      expect(editorMock.props?.columns[3]?.icon).toBe(
+        "viewda-sort-ascending-2",
+      );
+    });
+    const priorityIcon =
+      editorMock.props?.headerIcons?.["viewda-sort-ascending-2"];
+    const prioritySvg = priorityIcon?.({
+      bgColor: "#123456",
+      fgColor: "#ffffff",
+    });
+    expect(prioritySvg).toContain(">2</text>");
+    expect(prioritySvg).toContain('fill="#123456"');
+
+    act(() => {
+      editorMock.props?.onGridSelectionChange?.({
+        columns: desktopSelection(2),
+        rows: desktopSelection(),
+      });
+    });
+    expect(editorMock.props?.gridSelection?.columns.hasIndex(2)).toBe(true);
+
+    vi.mocked(desktop.prepareDataView).mockClear();
+    act(() => {
+      editorMock.props?.onHeaderClicked?.(2, {
+        bounds: { x: 0, y: 0, width: 120, height: 32 },
+        localEventX: 56,
+        isEdge: false,
+        shiftKey: false,
+        metaKey: false,
+        ctrlKey: false,
+        preventDefault,
+      } as never);
+    });
+    expect(desktop.prepareDataView).not.toHaveBeenCalled();
+  });
+
+  it("renders canonical ORDER BY and edits direction and priority in its popup", async () => {
+    const quotedSource: desktop.SourceSummary = {
+      ...source,
+      schema: [
+        { ...source.schema[0]!, name: 'quoted"name' },
+        { ...source.schema[1]!, name: "second" },
+      ],
+    };
+    render(<DataGrid source={quotedSource} />);
+
+    fireEvent.click(screen.getAllByRole("button", { name: "⋯" })[1]!);
+    let popup = screen.getByRole("dialog", { name: "ORDER BY columns" });
+    fireEvent.change(within(popup).getByLabelText("Add column"), {
+      target: { value: "0" },
+    });
+    fireEvent.change(within(popup).getByLabelText("Add column"), {
+      target: { value: "1" },
+    });
+    fireEvent.change(within(popup).getByLabelText("Direction for second"), {
+      target: { value: "descending" },
+    });
+    fireEvent.click(
+      within(popup).getByRole("button", { name: "Move second earlier" }),
+    );
+    fireEvent.click(within(popup).getByRole("button", { name: "Apply" }));
+
+    await waitFor(() =>
+      expect(
+        screen.getByRole("button", {
+          name: '"second" DESC, "quoted""name" ASC',
+        }),
+      ).toBeInTheDocument(),
+    );
+    expect(desktop.prepareDataView).toHaveBeenCalledWith(
+      7,
+      1,
+      [],
+      [
+        { sourceIndex: 1, direction: "descending" },
+        { sourceIndex: 0, direction: "ascending" },
+      ],
+      { memoryLimit: "mb384" },
+    );
+
+    fireEvent.click(
+      screen.getByRole("button", {
+        name: '"second" DESC, "quoted""name" ASC',
+      }),
+    );
+    popup = screen.getByRole("dialog", { name: "ORDER BY columns" });
+    fireEvent.click(
+      within(popup).getByRole("button", { name: "Remove sort second" }),
+    );
+    expect(
+      within(popup).queryByRole("button", { name: "Remove sort second" }),
+    ).not.toBeInTheDocument();
+  });
+
+  it("edits the pending ORDER BY instead of replacing it from the active view", async () => {
+    const first = deferred<desktop.DataViewStatus>();
+    const second = deferred<desktop.DataViewStatus>();
+    vi.mocked(desktop.prepareDataView)
+      .mockReturnValueOnce(first.promise)
+      .mockReturnValueOnce(second.promise);
+    render(<DataGrid source={source} />);
+
+    fireEvent.click(screen.getAllByRole("button", { name: "⋯" })[1]!);
+    let popup = screen.getByRole("dialog", { name: "ORDER BY columns" });
+    fireEvent.change(within(popup).getByLabelText("Add column"), {
+      target: { value: "0" },
+    });
+    fireEvent.click(within(popup).getByRole("button", { name: "Apply" }));
+    await waitFor(() =>
+      expect(desktop.prepareDataView).toHaveBeenLastCalledWith(
+        7,
+        1,
+        [],
+        [{ sourceIndex: 0, direction: "ascending" }],
+        { memoryLimit: "mb384" },
+      ),
+    );
+
+    fireEvent.click(screen.getAllByRole("button", { name: "⋯" })[1]!);
+    popup = screen.getByRole("dialog", { name: "ORDER BY columns" });
+    expect(
+      within(popup).getByRole("button", { name: "Remove sort column_0" }),
+    ).toBeInTheDocument();
+    fireEvent.change(within(popup).getByLabelText("Add column"), {
+      target: { value: "1" },
+    });
+    fireEvent.click(within(popup).getByRole("button", { name: "Apply" }));
+
+    await waitFor(() =>
+      expect(desktop.prepareDataView).toHaveBeenLastCalledWith(
+        7,
+        2,
+        [],
+        [
+          { sourceIndex: 0, direction: "ascending" },
+          { sourceIndex: 1, direction: "ascending" },
+        ],
+        { memoryLimit: "mb384" },
+      ),
+    );
+    expect(desktop.cancelDataView).toHaveBeenCalledWith(7, 1);
+
+    await act(async () => second.resolve({ revision: 2, rowCount: 19 }));
+    await waitFor(() => expect(editorMock.props?.rows).toBe(19));
+    await act(async () => first.resolve({ revision: 1, rowCount: 99 }));
+    expect(editorMock.props?.rows).toBe(19);
+  });
+
+  it("keeps sorting while a filter changes and clears both clauses together", async () => {
+    render(<DataGrid source={source} />);
+    act(() => {
+      editorMock.props?.onHeaderClicked?.(2, {
+        bounds: { x: 0, y: 0, width: 120, height: 32 },
+        localEventX: 16,
+        isEdge: false,
+        shiftKey: false,
+        metaKey: false,
+        ctrlKey: false,
+        preventDefault: vi.fn(),
+      } as never);
+    });
+    await waitFor(() =>
+      expect(editorMock.props?.columns[2]?.icon).toBe("viewda-sort-ascending"),
+    );
+
+    addNumberFilter("4");
+    await waitFor(() =>
+      expect(desktop.prepareDataView).toHaveBeenLastCalledWith(
+        7,
+        2,
+        [{ columnIndex: 0, operator: "equals", values: ["4"] }],
+        [{ sourceIndex: 2, direction: "ascending" }],
+        { memoryLimit: "mb384" },
+      ),
+    );
+    await waitFor(() => {
+      expect(
+        screen.getByRole("button", { name: '"column_0" = 4' }),
+      ).toBeInTheDocument();
+      expect(
+        screen.getByRole("button", { name: '"column_2" ASC' }),
+      ).toBeInTheDocument();
+    });
+
+    fireEvent.click(
+      screen.getByRole("button", { name: "Clear WHERE and ORDER BY" }),
+    );
+
+    await waitFor(() =>
+      expect(desktop.prepareDataView).toHaveBeenLastCalledWith(7, 3, [], [], {
+        memoryLimit: "mb384",
+      }),
+    );
+    await waitFor(() =>
+      expect(
+        within(screen.getByLabelText("Query")).getAllByRole("button", {
+          name: "⋯",
+        }),
+      ).toHaveLength(2),
+    );
+    expect(editorMock.props?.columns[2]?.title).toBe("column_2");
+    expect(editorMock.props?.columns[2]?.icon).toBe("viewda-sort-neutral");
   });
 
   it("edits and removes conditions through the full WHERE popup", async () => {
@@ -328,7 +796,11 @@ describe("DataGrid window rendering", () => {
     fireEvent.click(
       within(editor).getByRole("button", { name: "Save condition" }),
     );
-    expect(screen.getByLabelText("Query")).toHaveTextContent('"column_0" = -7');
+    await waitFor(() =>
+      expect(screen.getByLabelText("Query")).toHaveTextContent(
+        '"column_0" = -7',
+      ),
+    );
 
     fireEvent.click(screen.getByRole("button", { name: '"column_0" = -7' }));
     fireEvent.click(
@@ -336,158 +808,410 @@ describe("DataGrid window rendering", () => {
         screen.getByRole("dialog", { name: "WHERE conditions" }),
       ).getByRole("button", { name: /Remove filter/ }),
     );
-    expect(screen.getByLabelText("Query")).not.toHaveTextContent(
-      '"column_0" = -7',
+    await waitFor(() =>
+      expect(screen.getByLabelText("Query")).not.toHaveTextContent(
+        '"column_0" = -7',
+      ),
     );
   });
 
-  it("bounds the grid to observed rows until the exact COUNT resolves", async () => {
-    const count = deferred<number>();
-    vi.mocked(desktop.getFilteredRowCount).mockReturnValueOnce(count.promise);
+  it("keeps the current grid live until the prepared view and its count are ready", async () => {
+    const preparation = deferred<desktop.DataViewStatus>();
+    vi.mocked(desktop.prepareDataView).mockReturnValueOnce(preparation.promise);
     render(<DataGrid source={source} />);
+    await waitFor(() => expect(desktop.getDataWindow).toHaveBeenCalledOnce());
 
     addNumberFilter("1");
 
     await waitFor(() =>
-      expect(desktop.getFilteredRowCount).toHaveBeenCalledOnce(),
+      expect(desktop.prepareDataView).toHaveBeenCalledWith(
+        7,
+        1,
+        [{ columnIndex: 0, operator: "equals", values: ["1"] }],
+        [],
+        { memoryLimit: "mb384" },
+      ),
     );
-    expect(editorMock.props?.rows).toBe(512);
-    expect(screen.getByLabelText("Query")).toHaveTextContent("counting…");
+    expect(editorMock.props?.rows).toBe(10_000);
+    expect(screen.getByLabelText("Query")).toHaveTextContent("preparing view…");
+    expect(screen.getByLabelText("Query")).not.toHaveTextContent(
+      '"column_0" = 1',
+    );
 
-    await act(async () => count.resolve(37));
+    await act(async () => preparation.resolve({ revision: 1, rowCount: 37 }));
 
     await waitFor(() => expect(editorMock.props?.rows).toBe(37));
+    expect(screen.getByLabelText("Query")).toHaveTextContent('"column_0" = 1');
     expect(screen.getByLabelText("Query")).toHaveTextContent("37 rows");
   });
 
-  it("uses a short first filtered window as the exact non-phantom total", async () => {
-    decodeArrowWindow.mockImplementation(
-      (_bytes: ArrayBuffer, rowOffset: number): ArrowDataWindow => ({
-        rowOffset,
-        rowCount: rowOffset === 0 ? 3 : 0,
-        table: {
-          schema: {
-            fields: Array.from({ length: 8 }, () => ({ type: utf8() })),
-          },
-          getChildAt: () => ({ at: (row: number) => `row ${row}` }),
-        } as unknown as ArrowDataWindow["table"],
-      }),
-    );
+  it("loads the current viewport after preparation completes during scrolling", async () => {
+    const preparation = deferred<desktop.DataViewStatus>();
+    vi.mocked(desktop.prepareDataView).mockReturnValueOnce(preparation.promise);
     render(<DataGrid source={source} />);
-    await waitFor(() => expect(editorMock.props?.rows).toBe(10_000));
-
+    await waitFor(() => expect(desktop.getDataWindow).toHaveBeenCalledOnce());
     addNumberFilter("1");
 
-    await waitFor(() => expect(editorMock.props?.rows).toBe(3));
-    expect(desktop.getFilteredRowCount).not.toHaveBeenCalled();
-    expect(screen.getByLabelText("Query")).toHaveTextContent("3 rows");
+    act(() => {
+      editorMock.props?.onVisibleRegionChanged?.(
+        { x: 0, y: 1_000, width: 4, height: 5 },
+        0,
+        0,
+        { freezeRegions: [] },
+      );
+    });
+    await waitFor(() => expect(desktop.getDataWindow).toHaveBeenCalledTimes(2));
+
+    await act(async () =>
+      preparation.resolve({ revision: 1, rowCount: 5_000 }),
+    );
+
+    await waitFor(() =>
+      expect(desktop.getDataWindow).toHaveBeenLastCalledWith(
+        7,
+        1,
+        expect.any(Number),
+        512,
+        [0, 1, 2, 3],
+      ),
+    );
+    expect(
+      vi.mocked(desktop.getDataWindow).mock.calls.at(-1)?.[2],
+    ).toBeGreaterThan(0);
   });
 
-  it("cancels the previous COUNT when filters change rapidly", async () => {
-    const firstCount = deferred<number>();
-    vi.mocked(desktop.getFilteredRowCount)
-      .mockReturnValueOnce(firstCount.promise)
-      .mockResolvedValueOnce(11);
+  it("clamps and reloads a deep sorted viewport after a cell filter shrinks the view", async () => {
+    const filteredSource: desktop.SourceSummary = {
+      ...source,
+      rowCount: 3_514_000,
+      schema: source.schema.map((field, index) =>
+        index === 0
+          ? {
+              ...field,
+              name: "boolean_value",
+              physicalType: "BOOLEAN",
+            }
+          : index === 1
+            ? { ...field, name: "int16_value" }
+            : field,
+      ),
+    };
+    vi.mocked(desktop.prepareDataView).mockImplementation(
+      async (_generation, revision, filters) => ({
+        revision,
+        rowCount: filters.length === 0 ? filteredSource.rowCount : 270_308,
+      }),
+    );
+    render(<DataGrid source={filteredSource} />);
+    await waitFor(() => expect(desktop.getDataWindow).toHaveBeenCalledOnce());
+
+    act(() => {
+      editorMock.props?.onHeaderClicked?.(1, {
+        bounds: { x: 0, y: 0, width: 120, height: 32 },
+        localEventX: 16,
+        isEdge: false,
+        shiftKey: false,
+        metaKey: false,
+        ctrlKey: false,
+        preventDefault: vi.fn(),
+      } as never);
+    });
+    await waitFor(() =>
+      expect(desktop.getDataWindow).toHaveBeenLastCalledWith(
+        7,
+        1,
+        expect.any(Number),
+        512,
+        expect.any(Array),
+      ),
+    );
+
+    act(() => {
+      editorMock.props?.onVisibleRegionChanged?.(
+        { x: 0, y: 2_063_949, width: 4, height: 40 },
+        0,
+        0,
+        { freezeRegions: [] },
+      );
+    });
+    await waitFor(() =>
+      expect(desktop.getDataWindow).toHaveBeenLastCalledWith(
+        7,
+        1,
+        2_063_885,
+        512,
+        [0, 1, 2, 3],
+      ),
+    );
+
+    act(() => {
+      editorMock.props?.onCellContextMenu?.([0, 2_063_949], {
+        preventDefault: vi.fn(),
+        bounds: { x: 20, y: 20, width: 120, height: 28 },
+      } as never);
+    });
+    const filterEditor = screen.getByRole("form", {
+      name: "Filter boolean_value",
+    });
+    fireEvent.change(within(filterEditor).getByLabelText("Condition"), {
+      target: { value: "isNull" },
+    });
+    fireEvent.click(
+      within(filterEditor).getByRole("button", { name: "Add condition" }),
+    );
+
+    await waitFor(() =>
+      expect(desktop.prepareDataView).toHaveBeenLastCalledWith(
+        7,
+        2,
+        [{ columnIndex: 0, operator: "isNull", values: [] }],
+        [{ sourceIndex: 1, direction: "ascending" }],
+        { memoryLimit: "mb384" },
+      ),
+    );
+    await waitFor(() => expect(editorMock.props?.rows).toBe(270_308));
+    expect(editorMock.mountCount).toBe(2);
+    expect(editorMock.scrollTo).toHaveBeenCalledWith(
+      0,
+      270_268,
+      "vertical",
+      0,
+      0,
+      { vAlign: "start" },
+    );
+    await waitFor(() =>
+      expect(desktop.getDataWindow).toHaveBeenLastCalledWith(
+        7,
+        2,
+        269_796,
+        512,
+        [0, 1, 2, 3],
+      ),
+    );
+    await waitFor(() =>
+      expect(editorMock.props?.getCellContent([0, 270_268]).kind).toBe(
+        GridCellKind.Text,
+      ),
+    );
+  });
+
+  it("cancels stale preparation and ignores its late completion", async () => {
+    const first = deferred<desktop.DataViewStatus>();
+    vi.mocked(desktop.prepareDataView)
+      .mockReturnValueOnce(first.promise)
+      .mockResolvedValueOnce({ revision: 2, rowCount: 11 });
     render(<DataGrid source={source} />);
 
     addNumberFilter("1");
     await waitFor(() =>
-      expect(desktop.getFilteredRowCount).toHaveBeenCalledWith(7, 1, [
-        { columnIndex: 0, operator: "equals", values: ["1"] },
-      ]),
+      expect(desktop.prepareDataView).toHaveBeenCalledTimes(1),
     );
     addNumberFilter("2", 1);
 
     await waitFor(() =>
-      expect(desktop.cancelFilteredRowCount).toHaveBeenCalledWith(7, 1),
+      expect(desktop.cancelDataView).toHaveBeenCalledWith(7, 1),
     );
     await waitFor(() =>
-      expect(desktop.getFilteredRowCount).toHaveBeenLastCalledWith(7, 2, [
-        { columnIndex: 0, operator: "equals", values: ["1"] },
-        { columnIndex: 1, operator: "equals", values: ["2"] },
-      ]),
+      expect(desktop.prepareDataView).toHaveBeenLastCalledWith(
+        7,
+        2,
+        [{ columnIndex: 1, operator: "equals", values: ["2"] }],
+        [],
+        { memoryLimit: "mb384" },
+      ),
     );
     await waitFor(() =>
       expect(screen.getByLabelText("Query")).toHaveTextContent("11 rows"),
     );
 
-    await act(async () => firstCount.resolve(99));
+    await act(async () => first.resolve({ revision: 1, rowCount: 99 }));
 
     expect(screen.getByLabelText("Query")).toHaveTextContent("11 rows");
+    expect(screen.getByLabelText("Query")).not.toHaveTextContent("99 rows");
   });
 
-  it("does not apply a window returned for a stale filter revision", async () => {
+  it("does not apply a window returned for a stale view revision", async () => {
     const staleWindow = deferred<ArrayBuffer>();
     const currentWindow = deferred<ArrayBuffer>();
-    const initialBytes = new ArrayBuffer(1);
-    const staleBytes = new ArrayBuffer(2);
-    const currentBytes = new ArrayBuffer(3);
     vi.mocked(desktop.getDataWindow)
-      .mockResolvedValueOnce(initialBytes)
+      .mockResolvedValueOnce(new ArrayBuffer(1))
       .mockReturnValueOnce(staleWindow.promise)
       .mockReturnValueOnce(currentWindow.promise);
-    decodeArrowWindow.mockImplementation(
-      (bytes: ArrayBuffer, rowOffset: number): ArrowDataWindow => ({
-        rowOffset,
-        rowCount: bytes === staleBytes ? 401 : bytes === currentBytes ? 2 : 512,
-        table: {
-          schema: {
-            fields: Array.from({ length: 8 }, () => ({ type: utf8() })),
-          },
-          getChildAt: () => ({ at: (row: number) => `row ${row}` }),
-        } as unknown as ArrowDataWindow["table"],
-      }),
-    );
     render(<DataGrid source={source} />);
     await waitFor(() => expect(desktop.getDataWindow).toHaveBeenCalledOnce());
 
     addNumberFilter("1");
     await waitFor(() => expect(desktop.getDataWindow).toHaveBeenCalledTimes(2));
     addNumberFilter("2", 1);
-    await act(async () => staleWindow.resolve(staleBytes));
+    await waitFor(() =>
+      expect(desktop.prepareDataView).toHaveBeenCalledTimes(2),
+    );
+    await waitFor(() =>
+      expect(screen.getByLabelText("Query")).toHaveTextContent(
+        '"column_1" = 2',
+      ),
+    );
+    editorMock.updateCells.mockReset();
+    await act(async () => staleWindow.resolve(new ArrayBuffer(2)));
 
     await waitFor(() => expect(desktop.getDataWindow).toHaveBeenCalledTimes(3));
-    expect(editorMock.props?.rows).not.toBe(401);
+    expect(editorMock.updateCells).not.toHaveBeenCalled();
 
-    await act(async () => currentWindow.resolve(currentBytes));
-    await waitFor(() => expect(editorMock.props?.rows).toBe(2));
+    await act(async () => currentWindow.resolve(new ArrayBuffer(3)));
+    await waitFor(() => expect(editorMock.updateCells).toHaveBeenCalled());
   });
 
-  it("interrupts an active COUNT when the grid closes", async () => {
-    const count = deferred<number>();
-    vi.mocked(desktop.getFilteredRowCount).mockReturnValueOnce(count.promise);
+  it("interrupts active preparation when the grid closes", async () => {
+    const preparation = deferred<desktop.DataViewStatus>();
+    vi.mocked(desktop.prepareDataView).mockReturnValueOnce(preparation.promise);
     const { unmount } = render(<DataGrid source={source} />);
     addNumberFilter("1");
     await waitFor(() =>
-      expect(desktop.getFilteredRowCount).toHaveBeenCalledWith(7, 1, [
-        { columnIndex: 0, operator: "equals", values: ["1"] },
-      ]),
+      expect(desktop.prepareDataView).toHaveBeenCalledTimes(1),
     );
 
     unmount();
 
-    expect(desktop.cancelFilteredRowCount).toHaveBeenCalledWith(7, 1);
+    expect(desktop.cancelDataView).toHaveBeenCalledWith(7, 1);
   });
 
-  it("leaves counting state on COUNT failure and retries the same revision", async () => {
-    vi.mocked(desktop.getFilteredRowCount).mockRejectedValueOnce(
+  it("cancels visible preparation and resynchronizes the active view", async () => {
+    const preparation = deferred<desktop.DataViewStatus>();
+    vi.mocked(desktop.prepareDataView).mockReturnValueOnce(preparation.promise);
+    render(<DataGrid source={source} />);
+    await waitFor(() => expect(editorMock.updateCells).toHaveBeenCalled());
+    addNumberFilter("1");
+
+    vi.mocked(desktop.getDataWindow).mockClear();
+
+    fireEvent.click(await screen.findByRole("button", { name: "cancel" }));
+
+    await waitFor(() =>
+      expect(desktop.cancelDataView).toHaveBeenCalledWith(7, 1),
+    );
+    await waitFor(() =>
+      expect(desktop.getDataViewStatus).toHaveBeenCalledWith(7),
+    );
+    await waitFor(() =>
+      expect(screen.getByLabelText("Query")).not.toHaveTextContent(
+        "preparing view…",
+      ),
+    );
+    expect(editorMock.props?.rows).toBe(10_000);
+    await waitFor(() =>
+      expect(desktop.getDataWindow).toHaveBeenCalledWith(
+        7,
+        0,
+        expect.any(Number),
+        expect.any(Number),
+        expect.any(Array),
+      ),
+    );
+  });
+
+  it("keeps the completed grid live when replacement preparation fails", async () => {
+    vi.mocked(desktop.prepareDataView).mockRejectedValueOnce(
       new desktop.DataWindowCommandError("queryEngineUnavailable"),
     );
     render(<DataGrid source={source} />);
+    await waitFor(() => expect(editorMock.updateCells).toHaveBeenCalled());
+    vi.mocked(desktop.getDataWindow).mockClear();
     addNumberFilter("9");
 
-    const retry = await screen.findByRole("button", { name: "retry" });
-    expect(screen.getByLabelText("Query")).not.toHaveTextContent("counting…");
-
-    fireEvent.click(retry);
-
-    await waitFor(() =>
-      expect(desktop.getFilteredRowCount).toHaveBeenCalledTimes(2),
+    const alert = await screen.findByRole("alert");
+    expect(alert).toHaveTextContent("could not be loaded");
+    expect(editorMock.props?.rows).toBe(10_000);
+    expect(screen.getByLabelText("Query")).not.toHaveTextContent(
+      '"column_0" = 9',
     );
-    expect(desktop.getFilteredRowCount).toHaveBeenLastCalledWith(7, 1, [
-      { columnIndex: 0, operator: "equals", values: ["9"] },
-    ]);
+    expect(screen.getByLabelText("Query")).not.toHaveTextContent(
+      "preparing view…",
+    );
+    await waitFor(() =>
+      expect(desktop.getDataWindow).toHaveBeenCalledWith(
+        7,
+        0,
+        expect.any(Number),
+        expect.any(Number),
+        expect.any(Array),
+      ),
+    );
+    fireEvent.click(
+      within(alert).getByRole("button", { name: "Dismiss view error" }),
+    );
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
   });
+
+  it.each([
+    {
+      code: "memoryExhausted" as const,
+      expectedMessage: "There is not enough memory to prepare this view.",
+      failure: "memory",
+    },
+    {
+      code: "temporaryStorageExhausted" as const,
+      expectedMessage:
+        "There is not enough temporary disk space to prepare this view.",
+      failure: "temporary storage",
+    },
+  ])(
+    "reveals, copies and dismisses path-free $failure diagnostics",
+    async ({ code, expectedMessage, failure }) => {
+      vi.mocked(desktop.prepareDataView).mockRejectedValueOnce(
+        new desktop.DataWindowCommandError(code, {
+          operation: "preparation",
+          applicationVersion: "0.1.0-alpha.2",
+          operatingSystem: "macos",
+          architecture: "aarch64",
+          queryEngineVersion: "v1.5.5",
+          message: "Out of Memory Error: failed to allocate 32.0 MiB",
+          memoryLimit: "366.2 MiB",
+          maxTemporaryDirectorySize: "45.0 GiB",
+          threads: 10,
+          rowCount: 3_514_000,
+          sourceSizeBytes: 1_000_000_000,
+          rowGroupCount: 29,
+          columnCount: 43,
+          filterCount: 0,
+          sortColumns: [
+            {
+              physicalType: "INT32",
+              logicalType: "UInt16",
+              direction: "ascending",
+            },
+          ],
+        }),
+      );
+      render(<DataGrid source={source} />);
+      await waitFor(() => expect(editorMock.updateCells).toHaveBeenCalled());
+
+      addNumberFilter("9");
+
+      const alert = await screen.findByRole("alert");
+      expect(alert).toHaveTextContent(expectedMessage);
+      fireEvent.click(within(alert).getByText("Show details"));
+      expect(alert).toHaveTextContent("Platform: macos aarch64");
+      expect(alert).toHaveTextContent("Sort: INT32 · UInt16 ASCENDING");
+      expect(alert).not.toHaveTextContent("large.parquet");
+
+      fireEvent.click(
+        within(alert).getByRole("button", { name: "Copy diagnostics" }),
+      );
+      await waitFor(() => expect(clipboardWrite).toHaveBeenCalledOnce());
+      expect(clipboardWrite.mock.calls[0]?.[0]).toContain(
+        "DuckDB message: Out of Memory Error",
+      );
+      expect(clipboardWrite.mock.calls[0]?.[0]).toContain(
+        `Failure: ${failure}`,
+      );
+      expect(await within(alert).findByText("Copied")).toBeInTheDocument();
+
+      fireEvent.click(
+        within(alert).getByRole("button", { name: "Dismiss view error" }),
+      );
+      expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+    },
+  );
 
   it("retries an unfiltered window without changing the row count or selection", async () => {
     vi.mocked(desktop.getDataWindow)
@@ -496,11 +1220,6 @@ describe("DataGrid window rendering", () => {
     render(<DataGrid source={source} />);
     const alert = await screen.findByRole("alert");
     expect(screen.getByLabelText("Query")).toHaveTextContent("10,000 rows");
-    expect(
-      within(screen.getByLabelText("Query")).queryByRole("button", {
-        name: "retry",
-      }),
-    ).not.toBeInTheDocument();
     const selection = {
       columns: CompactSelection.empty(),
       rows: CompactSelection.fromSingleSelection(4),
@@ -517,39 +1236,206 @@ describe("DataGrid window rendering", () => {
     );
   });
 
-  it("shows filter limits as guidance without discarding the AST", async () => {
+  it("shows diagnostics for a prepared-window resource failure and keeps retry", async () => {
     vi.mocked(desktop.getDataWindow)
-      .mockResolvedValueOnce(new ArrayBuffer(0))
       .mockRejectedValueOnce(
-        new desktop.DataWindowCommandError("invalidFilter"),
+        new desktop.DataWindowCommandError("memoryExhausted", {
+          operation: "window",
+          applicationVersion: "0.1.0-alpha.2",
+          operatingSystem: "macos",
+          architecture: "aarch64",
+          queryEngineVersion: "v1.5.5",
+          message: "Out of Memory Error: failed to allocate 32.0 MiB",
+          memoryLimit: "12.0 GiB",
+          maxTemporaryDirectorySize: "45.0 GiB",
+          threads: 10,
+          rowCount: 3_514_000,
+          sourceSizeBytes: 1_000_000_000,
+          rowGroupCount: 29,
+          columnCount: 43,
+          filterCount: 0,
+          sortColumns: [
+            {
+              physicalType: "INT32",
+              logicalType: "Int16",
+              direction: "ascending",
+            },
+          ],
+        }),
+      )
+      .mockResolvedValueOnce(new ArrayBuffer(0));
+    render(<DataGrid source={source} />);
+
+    const alert = await screen.findByRole("alert");
+    expect(alert).toHaveTextContent(
+      "There is not enough memory to load this window.",
+    );
+    fireEvent.click(within(alert).getByText("Show details"));
+    expect(alert).toHaveTextContent("Operation: window");
+    expect(alert).toHaveTextContent("Memory limit: 12.0 GiB");
+
+    fireEvent.click(
+      within(alert).getByRole("button", { name: "Retry window" }),
+    );
+    await waitFor(() => expect(desktop.getDataWindow).toHaveBeenCalledTimes(2));
+  });
+
+  it("dismisses a window error without retrying the request", async () => {
+    vi.mocked(desktop.getDataWindow).mockRejectedValueOnce(
+      new desktop.DataWindowCommandError("queryFailed"),
+    );
+    render(<DataGrid source={source} />);
+    const alert = await screen.findByRole("alert");
+
+    fireEvent.click(
+      within(alert).getByRole("button", { name: "Dismiss window error" }),
+    );
+
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+    expect(desktop.getDataWindow).toHaveBeenCalledOnce();
+    expect(editorMock.props?.rows).toBe(source.rowCount);
+  });
+
+  it("keeps the grid live when cancelled A completes after failed B", async () => {
+    const first = deferred<desktop.DataViewStatus>();
+    vi.mocked(desktop.prepareDataView)
+      .mockReturnValueOnce(first.promise)
+      .mockRejectedValueOnce(
+        new desktop.DataWindowCommandError("queryEngineUnavailable"),
       );
     render(<DataGrid source={source} />);
+
+    addNumberFilter("1");
+    await waitFor(() =>
+      expect(desktop.prepareDataView).toHaveBeenCalledTimes(1),
+    );
+    addNumberFilter("2", 1);
+    expect(await screen.findByRole("alert")).toHaveTextContent(
+      "could not be loaded",
+    );
+
+    await act(async () => first.resolve({ revision: 1, rowCount: 99 }));
+
+    expect(editorMock.props?.rows).toBe(10_000);
+    expect(screen.getByLabelText("Query")).toHaveTextContent("10,000 rows");
+    expect(screen.getByLabelText("Query")).not.toHaveTextContent(
+      '"column_0" = 1',
+    );
+  });
+
+  it("does not let a delayed status for revision N-1 clear revision N", async () => {
+    const staleStatus = deferred<desktop.DataViewStatus>();
+    const currentPreparation = deferred<desktop.DataViewStatus>();
+    vi.mocked(desktop.prepareDataView)
+      .mockRejectedValueOnce(
+        new desktop.DataWindowCommandError("queryEngineUnavailable"),
+      )
+      .mockReturnValueOnce(currentPreparation.promise);
+    vi.mocked(desktop.getDataViewStatus).mockReturnValueOnce(
+      staleStatus.promise,
+    );
+    render(<DataGrid source={source} />);
+
+    addNumberFilter("1");
+    await waitFor(() =>
+      expect(desktop.getDataViewStatus).toHaveBeenCalledWith(7),
+    );
+    addNumberFilter("2", 1);
+    await waitFor(() =>
+      expect(desktop.prepareDataView).toHaveBeenLastCalledWith(
+        7,
+        2,
+        [{ columnIndex: 1, operator: "equals", values: ["2"] }],
+        [],
+        { memoryLimit: "mb384" },
+      ),
+    );
+
+    await act(async () =>
+      staleStatus.resolve({ revision: 0, rowCount: source.rowCount }),
+    );
+    expect(screen.getByLabelText("Query")).toHaveTextContent("preparing view…");
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+
+    await act(async () =>
+      currentPreparation.resolve({ revision: 2, rowCount: 23 }),
+    );
+    await waitFor(() => expect(editorMock.props?.rows).toBe(23));
+    await waitFor(() =>
+      expect(desktop.getDataWindow).toHaveBeenLastCalledWith(
+        7,
+        2,
+        expect.any(Number),
+        expect.any(Number),
+        expect.any(Array),
+      ),
+    );
+    expect(screen.getByLabelText("Query")).toHaveTextContent('"column_1" = 2');
+  });
+
+  it("resynchronizes and retries a window after the native view changes", async () => {
+    vi.mocked(desktop.getDataWindow)
+      .mockResolvedValueOnce(new ArrayBuffer(0))
+      .mockRejectedValueOnce(new desktop.DataWindowCommandError("viewChanged"))
+      .mockResolvedValueOnce(new ArrayBuffer(0));
+    render(<DataGrid source={source} />);
     await waitFor(() => expect(desktop.getDataWindow).toHaveBeenCalledOnce());
+
+    act(() => {
+      editorMock.props?.onVisibleRegionChanged?.(
+        { x: 0, y: 1_000, width: 4, height: 5 },
+        0,
+        0,
+        { freezeRegions: [] },
+      );
+    });
+
+    await waitFor(() =>
+      expect(desktop.getDataViewStatus).toHaveBeenCalledWith(7),
+    );
+    await waitFor(() => expect(desktop.getDataWindow).toHaveBeenCalledTimes(3));
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+  });
+
+  it("shows filter limits while keeping displayed and executed views equal", async () => {
+    vi.mocked(desktop.prepareDataView).mockRejectedValueOnce(
+      new desktop.DataWindowCommandError("invalidFilter"),
+    );
+    render(<DataGrid source={source} />);
 
     addNumberFilter("1");
 
     expect(await screen.findByRole("alert")).toHaveTextContent(
       "does not match its column type or exceeds the limits",
     );
-    expect(screen.getByLabelText("Query")).toHaveTextContent('"column_0" = 1');
-    expect(screen.getByLabelText("Query")).toHaveTextContent(
-      "count unavailable",
+    expect(screen.getByLabelText("Query")).not.toHaveTextContent(
+      '"column_0" = 1',
     );
     expect(
-      screen.getByRole("button", { name: "Retry window" }),
-    ).toBeInTheDocument();
+      screen.queryByRole("button", { name: "Retry window" }),
+    ).not.toBeInTheDocument();
   });
 
   it("prefills a timestamp from its Arrow value instead of raw copy data", async () => {
     const raw =
       BigInt(new Date("2026-08-01T06:07:08.009Z").valueOf()) * 1_000n + 456n;
     decodeArrowWindow.mockImplementation(
-      (_bytes: ArrayBuffer, rowOffset: number): ArrowDataWindow => ({
+      (
+        _bytes: ArrayBuffer,
+        rowOffset: number,
+        sourceIndices: readonly number[],
+      ): ArrowDataWindow => ({
         rowOffset,
         rowCount: 1,
+        sourceIndices,
+        sourceColumnOffsets: new Map(
+          sourceIndices.map((sourceIndex, offset) => [sourceIndex, offset]),
+        ),
         table: {
           schema: {
-            fields: [{ type: timestamp(TimeUnit.MICROSECOND, "UTC") }],
+            fields: sourceIndices.map(() => ({
+              type: timestamp(TimeUnit.MICROSECOND, "UTC"),
+            })),
           },
           getChildAt: () => ({ at: () => raw }),
         } as unknown as ArrowDataWindow["table"],
@@ -921,4 +1807,10 @@ function deferred<T>() {
     resolvePromise = resolve;
   });
   return { promise, resolve: resolvePromise };
+}
+
+function desktopSelection(index?: number): CompactSelection {
+  return index === undefined
+    ? CompactSelection.empty()
+    : CompactSelection.fromSingleSelection(index);
 }
