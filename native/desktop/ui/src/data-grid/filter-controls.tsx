@@ -28,6 +28,10 @@ const OPERATOR_OPTIONS: Record<ColumnFilterKind, OperatorOption[]> = {
   number: [
     { value: "equals", label: "equals" },
     { value: "notEquals", label: "does not equal" },
+    { value: "greaterThan", label: "is greater than" },
+    { value: "greaterThanOrEqual", label: "is greater than or equal to" },
+    { value: "lessThan", label: "is less than" },
+    { value: "lessThanOrEqual", label: "is less than or equal to" },
     { value: "oneOf", label: "is one of" },
     { value: "range", label: "is between" },
     { value: "isNull", label: "is null" },
@@ -96,7 +100,7 @@ export function FilterEditor({
   );
   const [secondValue, setSecondValue] = useState(initialValues[1] ?? "");
   const editorRef = useRef<HTMLFormElement>(null);
-  const values = filterValues(kind, operator, firstValue, secondValue);
+  const values = filterValues(field, kind, operator, firstValue, secondValue);
   const canApply = values !== null;
   const validationMessage = filterValidationMessage(
     kind,
@@ -104,6 +108,7 @@ export function FilterEditor({
     firstValue,
     secondValue,
     values,
+    field,
   );
 
   useEffect(() => {
@@ -292,6 +297,7 @@ function FilterInput({
 }
 
 function filterValues(
+  field: SchemaField,
   kind: ColumnFilterKind,
   operator: DataFilterOperator,
   firstValue: string,
@@ -322,7 +328,11 @@ function filterValues(
     kind === "number" &&
     values?.some(
       (value) =>
-        !/^[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:e[+-]?\d+)?$/i.test(value.trim()),
+        !(
+          isIntegerField(field)
+            ? /^[+-]?\d+$/
+            : /^[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:e[+-]?\d+)?$/i
+        ).test(value.trim()),
     )
   ) {
     return null;
@@ -336,6 +346,7 @@ function filterValidationMessage(
   firstValue: string,
   secondValue: string,
   values: string[] | null,
+  field: SchemaField,
 ): string | null {
   if (
     values !== null ||
@@ -352,7 +363,14 @@ function filterValidationMessage(
     return "Enter a date or time value.";
   }
   if (kind === "number") {
-    return "Enter a number.";
+    return isIntegerField(field) ? "Enter an integer." : "Enter a number.";
   }
   return null;
+}
+
+function isIntegerField(field: SchemaField): boolean {
+  return (
+    !field.logicalType?.startsWith("Decimal") &&
+    (field.physicalType === "INT32" || field.physicalType === "INT64")
+  );
 }

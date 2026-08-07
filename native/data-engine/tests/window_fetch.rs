@@ -1,11 +1,13 @@
 use std::{fs, io::Cursor, sync::Arc};
 
 use arrow_array::{
-    Array, ArrayRef, BooleanArray, Date32Array, Decimal128Array, Int32Array, Int64Array, ListArray,
-    RecordBatch, StringArray, StructArray, types::Int32Type,
+    Array, ArrayRef, BooleanArray, Date32Array, Decimal128Array, Float16Array, Float32Array,
+    Float64Array, Int32Array, Int64Array, ListArray, RecordBatch, StringArray, StructArray,
+    types::Int32Type,
 };
 use arrow_ipc::reader::StreamReader;
 use arrow_schema::{DataType, Field, Fields, Schema};
+use half::f16;
 use parquet::arrow::ArrowWriter;
 use tempfile::NamedTempFile;
 use viewda_data_engine::{
@@ -154,6 +156,22 @@ fn applies_every_operator_to_supported_scalar_types() {
             vec![10, 11, 13, 14, 15, 16, 17],
         ),
         (
+            filter(0, DataFilterOperator::GreaterThan, &["12"]),
+            vec![13, 14, 15, 16, 17],
+        ),
+        (
+            filter(0, DataFilterOperator::GreaterThanOrEqual, &["12"]),
+            vec![12, 13, 14, 15, 16, 17],
+        ),
+        (
+            filter(0, DataFilterOperator::LessThan, &["12"]),
+            vec![10, 11],
+        ),
+        (
+            filter(0, DataFilterOperator::LessThanOrEqual, &["12"]),
+            vec![10, 11, 12],
+        ),
+        (
             filter(0, DataFilterOperator::OneOf, &["11", "14"]),
             vec![11, 14],
         ),
@@ -228,6 +246,34 @@ fn applies_every_operator_to_supported_scalar_types() {
                 .expect("filtered window"),
         );
         assert_eq!(int64_values(&batches[0], 0), expected);
+    }
+}
+
+#[test]
+fn applies_numeric_comparisons_to_each_numeric_storage_type() {
+    let source = write_numeric_parquet();
+    let cases = [
+        (DataFilterOperator::GreaterThan, &[14, 15][..]),
+        (DataFilterOperator::GreaterThanOrEqual, &[13, 14, 15][..]),
+        (DataFilterOperator::LessThan, &[10, 11, 12][..]),
+        (DataFilterOperator::LessThanOrEqual, &[10, 11, 12, 13][..]),
+    ];
+
+    for column_index in 1..=5 {
+        for (operator, expected) in cases {
+            let mut reader = DataWindowReader::new(source.path().to_owned());
+            let batches = decode(
+                reader
+                    .fetch_filtered(0, 32, &[filter(column_index, operator, &["2"])])
+                    .expect("filtered numeric window"),
+            );
+
+            assert_eq!(
+                int64_values(&batches[0], 0),
+                expected,
+                "column {column_index}, operator {operator:?}"
+            );
+        }
     }
 }
 
@@ -452,6 +498,44 @@ fn write_decimal128_parquet() -> NamedTempFile {
     )]));
     let batch = RecordBatch::try_new(Arc::clone(&schema), vec![Arc::new(values) as ArrayRef])
         .expect("decimal128 record batch");
+    write_batch(&source, schema, &batch);
+    source
+}
+
+fn write_numeric_parquet() -> NamedTempFile {
+    let source = NamedTempFile::new().expect("temporary source");
+    let ids = [10_i64, 11, 12, 13, 14, 15];
+    let integers = [-3_i64, -1, 0, 2, 4, 7];
+    let float32s = [-3_f32, -1.0, 0.0, 2.0, 4.0, 7.0];
+    let float64s = [-3_f64, -1.0, 0.0, 2.0, 4.0, 7.0];
+    let decimals = Decimal128Array::from(vec![-300_i128, -100, 0, 200, 400, 700])
+        .with_precision_and_scale(10, 2)
+        .expect("decimal comparison fixture precision");
+    let float16s = Float16Array::from(
+        [-3_f32, -1.0, 0.0, 2.0, 4.0, 7.0]
+            .map(f16::from_f32)
+            .to_vec(),
+    );
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int64, false),
+        Field::new("integer", DataType::Int64, false),
+        Field::new("float", DataType::Float32, false),
+        Field::new("double", DataType::Float64, false),
+        Field::new("decimal", DataType::Decimal128(10, 2), false),
+        Field::new("half", DataType::Float16, false),
+    ]));
+    let batch = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![
+            Arc::new(Int64Array::from_iter_values(ids)) as ArrayRef,
+            Arc::new(Int64Array::from_iter_values(integers)) as ArrayRef,
+            Arc::new(Float32Array::from(float32s.to_vec())) as ArrayRef,
+            Arc::new(Float64Array::from(float64s.to_vec())) as ArrayRef,
+            Arc::new(decimals) as ArrayRef,
+            Arc::new(float16s) as ArrayRef,
+        ],
+    )
+    .expect("numeric comparison record batch");
     write_batch(&source, schema, &batch);
     source
 }

@@ -7,6 +7,7 @@ import {
 } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
+import type { SchemaField } from "../desktop";
 import { FilterEditor } from "./filter-controls";
 
 afterEach(cleanup);
@@ -29,6 +30,34 @@ describe("FilterEditor", () => {
       columnIndex: 0,
       operator: "equals",
       values: ["-1.25e3"],
+    });
+  });
+
+  it("rejects fractional input for integer columns", () => {
+    const { editor, onApply } = renderNumberEditor({
+      name: "n",
+      physicalType: "INT64",
+      logicalType: "Int64",
+      children: [],
+    });
+    const input = within(editor).getByRole("textbox", { name: "Value" });
+    const apply = within(editor).getByRole("button", {
+      name: "Add condition",
+    });
+
+    fireEvent.change(input, { target: { value: "12.5" } });
+    expect(within(editor).getByRole("alert")).toHaveTextContent(
+      "Enter an integer.",
+    );
+    expect(apply).toBeDisabled();
+
+    fireEvent.change(input, { target: { value: "12" } });
+    expect(apply).toBeEnabled();
+    fireEvent.click(apply);
+    expect(onApply).toHaveBeenCalledWith({
+      columnIndex: 0,
+      operator: "equals",
+      values: ["12"],
     });
   });
 
@@ -77,6 +106,75 @@ describe("FilterEditor", () => {
       columnIndex: 0,
       operator: "range",
       values: ["-2", "9"],
+    });
+  });
+
+  it.each([
+    ["greaterThan", "is greater than"],
+    ["greaterThanOrEqual", "is greater than or equal to"],
+    ["lessThan", "is less than"],
+    ["lessThanOrEqual", "is less than or equal to"],
+  ] as const)(
+    "builds a single-value %s numeric comparison",
+    (operator, label) => {
+      const { editor, onApply } = renderNumberEditor();
+      const condition = within(editor).getByRole("combobox", {
+        name: "Condition",
+      });
+      expect(
+        within(condition).getByRole("option", { name: label }),
+      ).toHaveValue(operator);
+
+      fireEvent.change(condition, { target: { value: operator } });
+      fireEvent.change(within(editor).getByRole("textbox", { name: "Value" }), {
+        target: { value: "2.5" },
+      });
+      expect(
+        within(editor).queryByRole("textbox", { name: "From" }),
+      ).not.toBeInTheDocument();
+      fireEvent.click(
+        within(editor).getByRole("button", { name: "Add condition" }),
+      );
+
+      expect(onApply).toHaveBeenCalledWith({
+        columnIndex: 0,
+        operator,
+        values: ["2.5"],
+      });
+    },
+  );
+
+  it("offers numeric comparisons for Float16", () => {
+    const onApply = vi.fn();
+    render(
+      <FilterEditor
+        request={{ sourceIndex: 0, left: 0, top: 0 }}
+        field={{
+          name: "half",
+          physicalType: "FIXED_LEN_BYTE_ARRAY",
+          logicalType: "Float16",
+          children: [],
+        }}
+        onApply={onApply}
+        onCancel={vi.fn()}
+      />,
+    );
+    const editor = screen.getByRole("form", { name: "Filter half" });
+    fireEvent.change(
+      within(editor).getByRole("combobox", { name: "Condition" }),
+      { target: { value: "greaterThan" } },
+    );
+    fireEvent.change(within(editor).getByRole("textbox", { name: "Value" }), {
+      target: { value: "1.5" },
+    });
+    fireEvent.click(
+      within(editor).getByRole("button", { name: "Add condition" }),
+    );
+
+    expect(onApply).toHaveBeenCalledWith({
+      columnIndex: 0,
+      operator: "greaterThan",
+      values: ["1.5"],
     });
   });
 
@@ -188,23 +286,25 @@ describe("FilterEditor", () => {
   });
 });
 
-function renderNumberEditor() {
+function renderNumberEditor(
+  field: SchemaField = {
+    name: "amount",
+    physicalType: "DOUBLE",
+    logicalType: null,
+    children: [],
+  },
+) {
   const onApply = vi.fn();
   render(
     <FilterEditor
       request={{ sourceIndex: 0, left: 0, top: 0 }}
-      field={{
-        name: "amount",
-        physicalType: "DOUBLE",
-        logicalType: null,
-        children: [],
-      }}
+      field={field}
       onApply={onApply}
       onCancel={vi.fn()}
     />,
   );
   return {
-    editor: screen.getByRole("form", { name: "Filter amount" }),
+    editor: screen.getByRole("form", { name: `Filter ${field.name}` }),
     onApply,
   };
 }

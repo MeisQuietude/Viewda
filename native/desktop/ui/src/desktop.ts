@@ -40,6 +40,10 @@ export interface SchemaField {
 export type DataFilterOperator =
   | "equals"
   | "notEquals"
+  | "greaterThan"
+  | "greaterThanOrEqual"
+  | "lessThan"
+  | "lessThanOrEqual"
   | "oneOf"
   | "range"
   | "textContains"

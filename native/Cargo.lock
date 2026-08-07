@@ -5093,6 +5093,7 @@ dependencies = [
  "arrow-ipc",
  "arrow-schema",
  "duckdb",
+ "half",
  "parquet",
  "serde",
  "tempfile",

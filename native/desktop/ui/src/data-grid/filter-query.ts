@@ -24,7 +24,10 @@ export function columnFilterKind(field: SchemaField): ColumnFilterKind {
   ) {
     return "text";
   }
-  if (field.logicalType?.startsWith("Decimal")) {
+  if (
+    field.logicalType?.startsWith("Decimal") ||
+    field.logicalType === "Float16"
+  ) {
     return "number";
   }
   if (field.physicalType === "BOOLEAN") {
@@ -77,12 +80,20 @@ export function formatFilterCondition(
 ): string {
   const identifier = quoteIdentifier(field.name);
   const literal = (value: string | undefined) =>
-    formatFilterLiteral(value ?? "", field);
+    formatFilterLiteral(value ?? "", field, identifier);
   switch (filter.operator) {
     case "equals":
       return `${identifier} = ${literal(filter.values[0])}`;
     case "notEquals":
       return `${identifier} <> ${literal(filter.values[0])}`;
+    case "greaterThan":
+      return `${identifier} > ${literal(filter.values[0])}`;
+    case "greaterThanOrEqual":
+      return `${identifier} >= ${literal(filter.values[0])}`;
+    case "lessThan":
+      return `${identifier} < ${literal(filter.values[0])}`;
+    case "lessThanOrEqual":
+      return `${identifier} <= ${literal(filter.values[0])}`;
     case "oneOf":
       return `${identifier} IN (${filter.values.map(literal).join(", ")})`;
     case "range":
@@ -96,7 +107,11 @@ export function formatFilterCondition(
   }
 }
 
-function formatFilterLiteral(value: string, field: SchemaField): string {
+function formatFilterLiteral(
+  value: string,
+  field: SchemaField,
+  identifier: string,
+): string {
   const logicalType = field.logicalType;
   if (logicalType?.startsWith("Date")) {
     return `DATE ${quoteString(value)}`;
@@ -106,6 +121,9 @@ function formatFilterLiteral(value: string, field: SchemaField): string {
   }
   if (logicalType?.startsWith("Time")) {
     return `TIME ${quoteString(value)}`;
+  }
+  if (logicalType?.startsWith("Decimal")) {
+    return `cast_to_type(${quoteString(value)}, ${identifier})`;
   }
   const kind = columnFilterKind(field);
   if (kind === "boolean") {

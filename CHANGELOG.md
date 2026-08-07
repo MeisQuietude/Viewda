@@ -12,8 +12,9 @@ Backward-incompatible entries start with **Breaking:**.
 
 - Settings can follow the system theme or force Light or Dark across the app,
   data grid, and native window chrome without restarting.
-- The Data view now shows typed column filters in a query bar with structured
-  condition editing and a cancellable exact match count.
+- The Data view now shows typed column filters, including open-ended numeric
+  comparisons and Float16 support, in a query bar with structured condition
+  editing, type-aware value validation, and a cancellable exact match count.
 - The Data view now has a toggleable schema sidebar with the full nested field
   tree and cancellable, on-demand statistics for the selected column.
 
