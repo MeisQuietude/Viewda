@@ -85,6 +85,7 @@ const COPY_CHUNK_ROWS = 512;
 const EXPORT_STATUS_POLL_MS = 1_000;
 const MAX_CACHED_CELLS = 20_000;
 const MIN_COLUMN_WIDTH = 112;
+const MAX_COLUMN_WIDTH = 500;
 const SORT_HEADER_HITBOX_START = 4;
 const SORT_HEADER_HITBOX_END = 32;
 const WHERE_POPUP_MARGIN = 16;
@@ -93,13 +94,32 @@ const WHERE_POPUP_OFFSET = -42;
 const GRID_HEADER_FONT_STYLE = "600 12px";
 const UI_FONT_FAMILY =
   'Inter, ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif';
+const GRID_HEADER_FONT = `${GRID_HEADER_FONT_STYLE} ${UI_FONT_FAMILY}`;
+const GRID_HEADER_HORIZONTAL_PADDING = 16;
+const GRID_HEADER_ICON_SPACE = 28;
 const MONOSPACE_FONT = 'ui-monospace, "SFMono-Regular", Consolas, monospace';
 const DEFAULT_DATA_VIEW_SETTINGS: DataViewSettings = { memoryLimit: "mb384" };
 
 const drawGridHeader: DrawHeaderCallback = ({ ctx }, drawContent) => {
-  ctx.font = `${GRID_HEADER_FONT_STYLE} ${UI_FONT_FAMILY}`;
+  ctx.font = GRID_HEADER_FONT;
   drawContent();
 };
+
+function fittedHeaderWidth(
+  title: string,
+  context: CanvasRenderingContext2D | null,
+) {
+  const textWidth = context?.measureText(title).width ?? title.length * 8;
+  return Math.min(
+    MAX_COLUMN_WIDTH,
+    Math.max(
+      MIN_COLUMN_WIDTH,
+      Math.ceil(
+        textWidth + GRID_HEADER_HORIZONTAL_PADDING + GRID_HEADER_ICON_SPACE,
+      ),
+    ),
+  );
+}
 
 function sortHeaderSprite(
   direction: "neutral" | "ascending" | "descending",
@@ -384,6 +404,8 @@ export function DataGrid({
   const scrollStateRef = useRef<ScrollState>({ direction: 0, boundary: 0 });
   const aliveRef = useRef(true);
   const exportStatusFailuresRef = useRef(0);
+  const suppressHeaderMenuRef = useRef(false);
+  const suppressHeaderMenuTimerRef = useRef<number | null>(null);
   const menuRef = useRef<HTMLDivElement>(null);
   const gridMenuRef = useRef<HTMLDivElement>(null);
   const wherePopupRef = useRef<HTMLDivElement>(null);
@@ -1383,6 +1405,84 @@ export function DataGrid({
     setCopyLimit(null);
   }, []);
 
+  const resizeColumn = useCallback((width: number, visibleIndex: number) => {
+    const sourceIndex =
+      visibleColumnStatesRef.current[visibleIndex]?.sourceIndex;
+    if (sourceIndex === undefined) {
+      return;
+    }
+    const clampedWidth = Math.min(
+      MAX_COLUMN_WIDTH,
+      Math.max(MIN_COLUMN_WIDTH, width),
+    );
+    setColumnStates((current) =>
+      current.map((column) =>
+        column.sourceIndex === sourceIndex
+          ? { ...column, width: clampedWidth }
+          : column,
+      ),
+    );
+  }, []);
+
+  const startColumnResize = useCallback(() => {
+    if (suppressHeaderMenuTimerRef.current !== null) {
+      window.clearTimeout(suppressHeaderMenuTimerRef.current);
+      suppressHeaderMenuTimerRef.current = null;
+    }
+    suppressHeaderMenuRef.current = true;
+    setHeaderMenu(null);
+  }, []);
+
+  const finishColumnResize = useCallback(
+    (width: number, visibleIndex: number) => {
+      resizeColumn(width, visibleIndex);
+      if (suppressHeaderMenuTimerRef.current !== null) {
+        window.clearTimeout(suppressHeaderMenuTimerRef.current);
+      }
+      // Glide clears its resize state before the browser dispatches the click
+      // synthesized from mouseup, so keep the menu guard through this event turn.
+      suppressHeaderMenuTimerRef.current = window.setTimeout(() => {
+        suppressHeaderMenuRef.current = false;
+        suppressHeaderMenuTimerRef.current = null;
+      }, 0);
+    },
+    [resizeColumn],
+  );
+
+  useEffect(
+    () => () => {
+      if (suppressHeaderMenuTimerRef.current !== null) {
+        window.clearTimeout(suppressHeaderMenuTimerRef.current);
+      }
+    },
+    [],
+  );
+
+  const fitVisibleColumnWidths = useCallback(() => {
+    const visibleCount = visibleColumnStatesRef.current.length;
+    if (visibleCount === 0) {
+      return;
+    }
+    if (gridRef.current !== null) {
+      gridRef.current.remeasureColumns(
+        CompactSelection.fromSingleSelection([0, visibleCount]),
+      );
+      return;
+    }
+
+    const context = document.createElement("canvas").getContext("2d");
+    if (context !== null) {
+      context.font = GRID_HEADER_FONT;
+    }
+    setColumnStates((current) =>
+      current.map((column) =>
+        column.hidden
+          ? column
+          : { ...column, width: fittedHeaderWidth(column.title, context) },
+      ),
+    );
+  }, []);
+
   const updateColumn = useCallback(
     (sourceIndex: number, update: Partial<ColumnState>) => {
       setColumnStates((current) =>
@@ -1725,6 +1825,29 @@ export function DataGrid({
           )}
         </span>
         <button
+          className="query-fit-widths"
+          type="button"
+          aria-label="Fit column widths"
+          title="Fit column widths"
+          onClick={fitVisibleColumnWidths}
+        >
+          <svg
+            aria-hidden="true"
+            width="16"
+            height="16"
+            viewBox="0 0 16 16"
+            fill="none"
+          >
+            <path
+              d="M2 2v12M14 2v12M2 8h12M5 5 2 8l3 3M11 5l3 3-3 3"
+              stroke="currentColor"
+              strokeWidth="1.25"
+              strokeLinecap="round"
+              strokeLinejoin="round"
+            />
+          </svg>
+        </button>
+        <button
           className="query-clear"
           type="button"
           aria-label="Clear WHERE and ORDER BY"
@@ -1827,6 +1950,8 @@ export function DataGrid({
               preventDiagonalScrolling
               smoothScrollX
               smoothScrollY={false}
+              minColumnWidth={MIN_COLUMN_WIDTH}
+              maxColumnWidth={MAX_COLUMN_WIDTH}
               theme={gridTheme}
               onCellContextMenu={(cell, event) => {
                 event.preventDefault();
@@ -1879,23 +2004,17 @@ export function DataGrid({
                 ];
                 requestRows(range.y, range.height);
               }}
-              onColumnResizeEnd={(_column, width, visibleIndex) => {
-                const sourceIndex =
-                  visibleColumnStates[visibleIndex]?.sourceIndex;
-                if (sourceIndex !== undefined) {
-                  setColumnStates((current) =>
-                    current.map((column) =>
-                      column.sourceIndex === sourceIndex
-                        ? {
-                            ...column,
-                            width: Math.max(MIN_COLUMN_WIDTH, width),
-                          }
-                        : column,
-                    ),
-                  );
-                }
-              }}
+              onColumnResize={(_column, width, visibleIndex) =>
+                resizeColumn(width, visibleIndex)
+              }
+              onColumnResizeStart={startColumnResize}
+              onColumnResizeEnd={(_column, width, visibleIndex) =>
+                finishColumnResize(width, visibleIndex)
+              }
               onHeaderMenuClick={(visibleIndex, bounds) => {
+                if (suppressHeaderMenuRef.current) {
+                  return;
+                }
                 const sourceIndex =
                   visibleColumnStates[visibleIndex]?.sourceIndex;
                 if (sourceIndex !== undefined) {
