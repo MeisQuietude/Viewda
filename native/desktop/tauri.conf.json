@@ -42,6 +42,9 @@
       "icons/icon.icns",
       "icons/icon.ico"
     ],
+    "resources": {
+      "node_modules/@fontsource/noto-emoji/LICENSE": "licenses/NotoEmoji-LICENSE.txt"
+    },
     "fileAssociations": [
       {
         "ext": ["parquet"],

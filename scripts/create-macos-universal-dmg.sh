@@ -60,12 +60,13 @@ mount_point=
 rm -rf -- "$volume_root/Viewda.app"
 ditto "$application" "$volume_root/Viewda.app"
 
+# LZFSE keeps native DMG support while compressing the Universal slices more
+# tightly than zlib.
 hdiutil create \
   -quiet \
   -ov \
   -volname Viewda \
   -srcfolder "$volume_root" \
-  -format UDZO \
-  -imagekey zlib-level=9 \
+  -format ULFO \
   "$output_dmg"
 test -f "$output_dmg"

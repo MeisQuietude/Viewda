@@ -1,6 +1,13 @@
 :root {
   color-scheme: light;
   color: #1b1d1e;
+  --font-ui:
+    Inter, ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI",
+    "Apple Color Emoji", "Segoe UI Emoji", "Noto Color Emoji", sans-serif,
+    "Noto Emoji";
+  --font-mono:
+    ui-monospace, "SFMono-Regular", Consolas, "Apple Color Emoji",
+    "Segoe UI Emoji", "Noto Color Emoji", monospace, "Noto Emoji";
   --grid-cell: #f4f3ef;
   --grid-cell-muted: #f7f7f3;
   --grid-header: #fffef9;
@@ -19,13 +26,7 @@
   --error-text: #8f342c;
   --danger-action: #a94336;
   --danger-action-hover: #91382e;
-  font-family:
-    Inter,
-    ui-sans-serif,
-    -apple-system,
-    BlinkMacSystemFont,
-    "Segoe UI",
-    sans-serif;
+  font-family: var(--font-ui);
   font-synthesis: none;
   text-rendering: optimizeLegibility;
 }
@@ -232,7 +233,7 @@ button {
   align-items: center;
   column-gap: 0.6ch;
   flex: 1;
-  font-family: ui-monospace, "SFMono-Regular", Consolas, monospace;
+  font-family: var(--font-mono);
   font-size: 11px;
   white-space: nowrap;
 }
@@ -680,7 +681,7 @@ button {
 
 .column-statistics dd {
   overflow: hidden;
-  font-family: ui-monospace, "SFMono-Regular", Consolas, monospace;
+  font-family: var(--font-mono);
   text-align: right;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -819,7 +820,7 @@ button {
   border-radius: 5px;
   color: var(--grid-text);
   background: var(--grid-header);
-  font-family: ui-monospace, "SFMono-Regular", Consolas, monospace;
+  font-family: var(--font-mono);
   font-size: 11px;
   line-height: 1.45;
   white-space: pre-wrap;
@@ -1368,7 +1369,7 @@ button:focus-visible,
 
 .settings-version {
   color: #777c7c;
-  font-family: ui-monospace, "SFMono-Regular", Consolas, monospace;
+  font-family: var(--font-mono);
   font-size: 12px;
 }
 
@@ -1626,7 +1627,7 @@ button:focus-visible,
   border: 1px solid rgb(27 29 30 / 16%);
   border-radius: 4px;
   color: #5c6262;
-  font-family: ui-monospace, "SFMono-Regular", Consolas, monospace;
+  font-family: var(--font-mono);
   font-size: 12px;
   line-height: 1.2;
 }
@@ -1756,7 +1757,7 @@ button:focus-visible,
 
 .source-facts dd {
   margin: 0;
-  font-family: ui-monospace, "SFMono-Regular", Consolas, monospace;
+  font-family: var(--font-mono);
   font-size: 19px;
   font-weight: 650;
 }
@@ -1816,7 +1817,7 @@ button:focus-visible,
   min-width: 0;
   overflow: hidden;
   color: #777c7c;
-  font-family: ui-monospace, "SFMono-Regular", Consolas, monospace;
+  font-family: var(--font-mono);
   font-size: 12px;
   text-overflow: ellipsis;
   white-space: nowrap;

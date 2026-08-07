@@ -5,6 +5,22 @@ import { describe, expect, it } from "vitest";
 
 const styles = readFileSync(resolve("ui/src/styles.css"), "utf8");
 
+describe("font stacks", () => {
+  it("keeps native emoji ahead of generic fonts and the bundled fallback last", () => {
+    expect(styles).toMatch(
+      /--font-ui:[^;]*"Apple Color Emoji"[^;]*sans-serif,[^;]*"Noto Emoji";/s,
+    );
+    expect(styles).toMatch(
+      /--font-mono:[^;]*"Apple Color Emoji"[^;]*monospace,[^;]*"Noto Emoji";/s,
+    );
+  });
+
+  it("reuses the monospace stack instead of copying its font list", () => {
+    expect(styles.match(/font-family:\s*var\(--font-mono\);/g)).toHaveLength(7);
+    expect(styles).not.toMatch(/font-family:\s*ui-monospace/);
+  });
+});
+
 describe("color theme", () => {
   it("keeps statistics errors readable in the dark sidebar", () => {
     const darkRoot = styles.match(
@@ -74,7 +90,7 @@ describe("query row", () => {
       /\.sort-popup\s*\{[^}]*max-height:[^}]*overflow:\s*auto;[^}]*color:\s*var\(--grid-text\);[^}]*background:\s*var\(--grid-header\);[^}]*white-space:\s*normal;/s,
     );
     expect(styles).toMatch(
-      /\.query-expression\s*\{[^}]*font-family:\s*ui-monospace,/s,
+      /\.query-expression\s*\{[^}]*font-family:\s*var\(--font-mono\);/s,
     );
   });
 
