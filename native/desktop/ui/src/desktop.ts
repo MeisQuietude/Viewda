@@ -164,6 +164,11 @@ export interface UpdateInfo {
   isDowngrade: boolean;
 }
 
+export interface DataExportCloseDialog {
+  message: string;
+  destructiveButton: string;
+}
+
 export interface UpdateCheckOptions {
   allowDowngrade?: boolean;
   automaticCheck?: boolean;
@@ -336,7 +341,7 @@ export function discardPendingUpdate(): Promise<void> {
   return invokeUpdate("discard_pending_update");
 }
 
-export function installPendingUpdate(): Promise<void> {
+export function installPendingUpdate(): Promise<boolean> {
   return invokeUpdate("install_pending_update");
 }
 
@@ -546,6 +551,27 @@ export function onOpenedSourceAvailable(
   handler: () => void,
 ): Promise<UnlistenFn> {
   return listen("opened-source-available", handler);
+}
+
+export function getPendingDataExportCloseDialog(): Promise<DataExportCloseDialog | null> {
+  return invoke<DataExportCloseDialog | null>(
+    "get_pending_data_export_close_dialog",
+  );
+}
+
+export function resolveDataExportCloseDialog(
+  cancelExport: boolean,
+): Promise<boolean> {
+  return invoke<boolean>("resolve_data_export_close_dialog", { cancelExport });
+}
+
+export function onDataExportCloseRequested(
+  handler: (dialog: DataExportCloseDialog) => void,
+): Promise<UnlistenFn> {
+  return listen<DataExportCloseDialog>(
+    "data-export-close-requested",
+    ({ payload }) => handler(payload),
+  );
 }
 
 function readSourceErrorCode(error: unknown): SourceErrorCode {
