@@ -13,23 +13,41 @@ afterEach(() => {
     application = undefined;
   }
   vi.restoreAllMocks();
+  vi.unstubAllGlobals();
+  delete document.documentElement.dataset.theme;
 });
 
-it("shows the native window only after the application is rendered", () => {
+it("applies the saved theme before showing the rendered application", async () => {
   vi.spyOn(desktop, "getEngineStatus").mockReturnValue(new Promise(() => {}));
   vi.spyOn(desktop, "onOpenSourceRequested").mockReturnValue(
     new Promise(() => {}),
+  );
+  vi.spyOn(desktop, "syncSystemTheme").mockResolvedValue();
+  vi.stubGlobal(
+    "matchMedia",
+    vi.fn(() => ({
+      matches: false,
+      addEventListener: vi.fn(),
+      removeEventListener: vi.fn(),
+    })),
   );
 
   const root = document.createElement("div");
   const showMainWindow = vi.fn(() => {
     expect(root.querySelector(".app-shell")).not.toBeNull();
+    expect(document.documentElement.dataset.theme).toBe("dark");
     return Promise.resolve();
   });
+  const getThemePreference = vi.fn(() => Promise.resolve("dark" as const));
 
-  act(() => {
-    application = startApplication(root, showMainWindow);
+  await act(async () => {
+    application = await startApplication(
+      root,
+      showMainWindow,
+      getThemePreference,
+    );
   });
 
+  expect(getThemePreference).toHaveBeenCalledOnce();
   expect(showMainWindow).toHaveBeenCalledOnce();
 });

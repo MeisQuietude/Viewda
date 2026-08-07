@@ -34,6 +34,12 @@ it("keeps the main window hidden until its styled UI is ready", () => {
   expect(document).toContain(
     `--app-background: ${mainWindow?.backgroundColor};`,
   );
+  expect(document).toMatch(
+    /:root\[data-theme="dark"\][^{]*\{[^}]*--app-background:\s*#141617;/s,
+  );
+  expect(document).toMatch(
+    /@media \(prefers-color-scheme: dark\)[^{]*\{\s*:root:not\(\[data-theme\]\)/s,
+  );
 
   const capability = JSON.parse(
     readFileSync(

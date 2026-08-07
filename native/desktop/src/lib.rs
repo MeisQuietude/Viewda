@@ -3,6 +3,7 @@
 mod default_application;
 mod launch;
 mod recents;
+mod theme;
 mod updates;
 
 use std::{
@@ -30,6 +31,7 @@ use tauri::{
     menu::{Menu, MenuItemBuilder, MenuItemKind, PredefinedMenuItem, SubmenuBuilder},
 };
 use tauri_plugin_dialog::{DialogExt, MessageDialogKind};
+use theme::{apply_saved_theme, get_theme_preference, set_theme_preference, sync_system_theme};
 use thiserror::Error;
 use updates::{
     PendingUpdate, UpdateError, UpdateInfo, UpdateStateStore, check_for_update,
@@ -875,6 +877,7 @@ pub fn run() {
         .manage(PendingUpdate::default())
         .manage(UpdateStateStore::default())
         .setup(|_app| {
+            apply_saved_theme(_app.handle(), &_app.state::<UpdateStateStore>());
             #[cfg(not(target_os = "macos"))]
             {
                 let cwd = std::env::current_dir().unwrap_or_default();
@@ -973,6 +976,9 @@ pub fn run() {
             cancel_column_statistics,
             get_update_settings,
             set_update_settings,
+            get_theme_preference,
+            set_theme_preference,
+            sync_system_theme,
             check_for_update,
             discard_pending_update,
             install_pending_update,

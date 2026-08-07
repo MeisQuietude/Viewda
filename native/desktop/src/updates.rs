@@ -17,6 +17,7 @@ use viewda_data_engine::SourceError;
 
 use crate::{
     OpenSourceError, OpenedSource, OpenedSourceInfo, SourceOpenIntent, inspect_selected_source,
+    theme::ThemePreference,
 };
 
 const UPDATE_STATE_FILE: &str = "updates.json";
@@ -88,6 +89,8 @@ struct StoredUpdateState {
     #[serde(default)]
     settings: UpdateSettings,
     #[serde(default)]
+    theme_preference: ThemePreference,
+    #[serde(default)]
     last_automatic_check_unix_seconds: Option<u64>,
     #[serde(default)]
     pending_restart: Option<PendingRestart>,
@@ -104,7 +107,7 @@ struct PendingRestart {
 #[derive(Default)]
 pub struct PendingUpdate(Mutex<Option<Update>>);
 
-/// Serializes persisted update-state mutations within this application process.
+/// Serializes persisted application-state mutations within this process.
 ///
 /// Commands must not write a snapshot read before another command changed the
 /// same file. Keeping the lock around each read-modify-write preserves settings,
@@ -123,6 +126,18 @@ impl UpdateStateStore {
         mutation: impl FnOnce(&mut StoredUpdateState) -> T,
     ) -> Result<T, UpdateError> {
         self.mutate_path(&state_path(app)?, mutation)
+    }
+
+    pub(crate) fn theme_preference(&self, app: &AppHandle) -> Result<ThemePreference, UpdateError> {
+        Ok(self.read(app)?.theme_preference)
+    }
+
+    pub(crate) fn set_theme_preference(
+        &self,
+        app: &AppHandle,
+        preference: ThemePreference,
+    ) -> Result<(), UpdateError> {
+        self.mutate(app, |stored| stored.theme_preference = preference)
     }
 
     fn read_path(&self, path: &Path) -> Result<StoredUpdateState, UpdateError> {
@@ -412,6 +427,7 @@ mod tests {
             .expect("missing state is a first launch");
 
         assert_eq!(state.settings, UpdateSettings::default());
+        assert_eq!(state.theme_preference, ThemePreference::System);
         assert!(state.settings.automatic_checks);
         assert!(state.last_automatic_check_unix_seconds.is_none());
         assert!(state.pending_restart.is_none());
@@ -437,6 +453,7 @@ mod tests {
 
         assert_eq!(state.settings.channel, UpdateChannel::Latest);
         assert!(!state.settings.automatic_checks);
+        assert_eq!(state.theme_preference, ThemePreference::System);
         assert!(state.last_automatic_check_unix_seconds.is_none());
     }
 
@@ -475,6 +492,11 @@ mod tests {
             .expect("user settings");
         store
             .mutate_path(&path, |stored| {
+                stored.theme_preference = ThemePreference::Dark;
+            })
+            .expect("appearance preference");
+        store
+            .mutate_path(&path, |stored| {
                 stored.pending_restart = Some(PendingRestart {
                     version: "0.1.0".to_owned(),
                     source_path: None,
@@ -494,6 +516,7 @@ mod tests {
         assert_eq!(stored.last_automatic_check_unix_seconds, Some(42));
         assert_eq!(stored.settings.channel, UpdateChannel::Latest);
         assert!(!stored.settings.automatic_checks);
+        assert_eq!(stored.theme_preference, ThemePreference::Dark);
         assert!(stored.pending_restart.is_none());
     }
 

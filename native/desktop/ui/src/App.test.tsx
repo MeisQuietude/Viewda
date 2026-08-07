@@ -20,11 +20,15 @@ let requestSettings: (() => void) | undefined;
 let requestOpenSource: (() => void) | undefined;
 let reportUpdate: ((update: desktop.UpdateInfo) => void) | undefined;
 let reportOpenedSource: (() => void) | undefined;
+let systemDark = false;
+let themeChangeListeners = new Set<EventListener>();
 
 afterEach(() => {
   cleanup();
   vi.useRealTimers();
   vi.restoreAllMocks();
+  vi.unstubAllGlobals();
+  delete document.documentElement.dataset.theme;
 });
 
 beforeEach(() => {
@@ -32,6 +36,20 @@ beforeEach(() => {
   requestOpenSource = undefined;
   reportUpdate = undefined;
   reportOpenedSource = undefined;
+  systemDark = false;
+  themeChangeListeners = new Set();
+  vi.stubGlobal(
+    "matchMedia",
+    vi.fn(() => ({
+      get matches() {
+        return systemDark;
+      },
+      addEventListener: (_type: string, listener: EventListener) =>
+        themeChangeListeners.add(listener),
+      removeEventListener: (_type: string, listener: EventListener) =>
+        themeChangeListeners.delete(listener),
+    })),
+  );
   vi.spyOn(desktop, "getEngineStatus").mockResolvedValue({
     name: "Viewda data engine",
     version: "0.0.1",
@@ -63,6 +81,8 @@ beforeEach(() => {
   });
   vi.spyOn(desktop, "checkForUpdate").mockResolvedValue(null);
   vi.spyOn(desktop, "setUpdateSettings").mockResolvedValue();
+  vi.spyOn(desktop, "setThemePreference").mockResolvedValue();
+  vi.spyOn(desktop, "syncSystemTheme").mockResolvedValue();
   vi.spyOn(desktop, "discardPendingUpdate").mockResolvedValue();
   vi.spyOn(desktop, "installPendingUpdate").mockResolvedValue();
   vi.spyOn(desktop, "takePostUpdateState").mockResolvedValue(null);
@@ -558,8 +578,9 @@ describe("App", () => {
     expect(within(dialog).getByText("0.0.1 · DuckDB v1.5.5")).toHaveClass(
       "settings-version",
     );
+    const theme = screen.getByLabelText("Theme");
+    expect(theme).toHaveFocus();
     const channel = screen.getByLabelText("Update channel");
-    expect(channel).toHaveFocus();
     fireEvent.change(channel, { target: { value: "latest" } });
     await waitFor(() =>
       expect(persist).toHaveBeenCalledWith({
@@ -588,6 +609,38 @@ describe("App", () => {
     expect(
       screen.queryByRole("dialog", { name: "Settings" }),
     ).not.toBeInTheDocument();
+  });
+
+  it("applies and persists an explicit theme immediately", async () => {
+    const persist = vi.spyOn(desktop, "setThemePreference");
+    render(<App initialTheme="light" />);
+
+    const dialog = await openSettings();
+    expect(document.documentElement.dataset.theme).toBe("light");
+    fireEvent.change(within(dialog).getByLabelText("Theme"), {
+      target: { value: "dark" },
+    });
+
+    expect(document.documentElement.dataset.theme).toBe("dark");
+    await waitFor(() => expect(persist).toHaveBeenCalledWith("dark"));
+  });
+
+  it("keeps System mode synchronized with live OS theme changes", async () => {
+    render(<App initialTheme="system" />);
+    expect(document.documentElement.dataset.theme).toBe("light");
+
+    act(() => {
+      systemDark = true;
+      const event = new Event("change");
+      for (const listener of themeChangeListeners) {
+        listener(event);
+      }
+    });
+
+    expect(document.documentElement.dataset.theme).toBe("dark");
+    await waitFor(() =>
+      expect(desktop.syncSystemTheme).toHaveBeenLastCalledWith("dark"),
+    );
   });
 
   it("changes the default application only after the Settings action", async () => {
