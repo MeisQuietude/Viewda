@@ -8,7 +8,12 @@ use arrow_array::{
 use arrow_ipc::reader::StreamReader;
 use arrow_schema::{DataType, Field, Fields, Schema};
 use half::f16;
-use parquet::arrow::ArrowWriter;
+use parquet::{
+    arrow::ArrowWriter,
+    data_type::{ByteArray, ByteArrayType, FixedLenByteArray, FixedLenByteArrayType, Int64Type},
+    file::writer::SerializedFileWriter,
+    schema::parser::parse_message_type,
+};
 use tempfile::NamedTempFile;
 use viewda_data_engine::{
     DataFilter, DataFilterOperator, DataWindowError, DataWindowReader, FilteredRowCountReader,
@@ -278,6 +283,72 @@ fn applies_numeric_comparisons_to_each_numeric_storage_type() {
 }
 
 #[test]
+fn filters_uuid_and_json_columns_as_text() {
+    let source = write_special_types_parquet();
+    let cases = [
+        (
+            filter(
+                1,
+                DataFilterOperator::Equals,
+                &["123e4567-e89b-12d3-a456-426614174001"],
+            ),
+            vec![2],
+        ),
+        (
+            filter(
+                1,
+                DataFilterOperator::OneOf,
+                &[
+                    "123e4567-e89b-12d3-a456-426614174000",
+                    "550e8400-e29b-41d4-a716-446655440000",
+                ],
+            ),
+            vec![1, 3],
+        ),
+        (
+            filter(1, DataFilterOperator::TextContains, &["e89b"]),
+            vec![1, 2],
+        ),
+        (
+            filter(2, DataFilterOperator::TextContains, &["beta"]),
+            vec![2],
+        ),
+    ];
+
+    for (condition, expected) in cases {
+        let mut reader = DataWindowReader::new(source.path().to_owned());
+        let batches = decode(
+            reader
+                .fetch_filtered(0, 8, &[condition])
+                .expect("special-type filtered window"),
+        );
+        assert_eq!(int64_values(&batches[0], 0), expected);
+    }
+}
+
+#[test]
+fn keeps_plain_binary_columns_null_only() {
+    let source = write_special_types_parquet();
+    let mut reader = DataWindowReader::new(source.path().to_owned());
+
+    assert_eq!(
+        reader.fetch_filtered(
+            0,
+            8,
+            &[filter(3, DataFilterOperator::TextContains, &["alpha"],)],
+        ),
+        Err(DataWindowError::InvalidFilter),
+    );
+
+    let batches = decode(
+        reader
+            .fetch_filtered(0, 8, &[filter(3, DataFilterOperator::IsNotNull, &[])])
+            .expect("binary null-check window"),
+    );
+    assert_eq!(int64_values(&batches[0], 0), vec![1, 2, 3]);
+}
+
+#[test]
 fn combines_conditions_and_offsets_the_filtered_view() {
     let source = write_basic_parquet();
     let filters = vec![
@@ -537,6 +608,100 @@ fn write_numeric_parquet() -> NamedTempFile {
     )
     .expect("numeric comparison record batch");
     write_batch(&source, schema, &batch);
+    source
+}
+
+fn write_special_types_parquet() -> NamedTempFile {
+    let source = NamedTempFile::new().expect("temporary source");
+    let schema = Arc::new(
+        parse_message_type(
+            "message special_types {
+                REQUIRED INT64 id;
+                REQUIRED FIXED_LEN_BYTE_ARRAY (16) uuid_value (UUID);
+                REQUIRED BYTE_ARRAY json_value (JSON);
+                REQUIRED BYTE_ARRAY binary_value;
+            }",
+        )
+        .expect("special-type Parquet schema"),
+    );
+    let file = source.reopen().expect("temporary source is reopenable");
+    let mut writer =
+        SerializedFileWriter::new(file, schema, Default::default()).expect("Parquet writer");
+    let mut row_group = writer.next_row_group().expect("Parquet row group");
+
+    let mut column = row_group
+        .next_column()
+        .expect("id column")
+        .expect("id column writer");
+    column
+        .typed::<Int64Type>()
+        .write_batch(&[1, 2, 3], None, None)
+        .expect("id values");
+    column.close().expect("id column footer");
+
+    let uuids = [
+        vec![
+            0x12, 0x3e, 0x45, 0x67, 0xe8, 0x9b, 0x12, 0xd3, 0xa4, 0x56, 0x42, 0x66, 0x14, 0x17,
+            0x40, 0x00,
+        ],
+        vec![
+            0x12, 0x3e, 0x45, 0x67, 0xe8, 0x9b, 0x12, 0xd3, 0xa4, 0x56, 0x42, 0x66, 0x14, 0x17,
+            0x40, 0x01,
+        ],
+        vec![
+            0x55, 0x0e, 0x84, 0x00, 0xe2, 0x9b, 0x41, 0xd4, 0xa7, 0x16, 0x44, 0x66, 0x55, 0x44,
+            0x00, 0x00,
+        ],
+    ]
+    .map(FixedLenByteArray::from);
+    let mut column = row_group
+        .next_column()
+        .expect("UUID column")
+        .expect("UUID column writer");
+    column
+        .typed::<FixedLenByteArrayType>()
+        .write_batch(&uuids, None, None)
+        .expect("UUID values");
+    column.close().expect("UUID column footer");
+
+    let json_values = [
+        ByteArray::from(r#"{"kind":"alpha","count":1}"#),
+        ByteArray::from(r#"{"kind":"beta","count":2}"#),
+        ByteArray::from(r#"{"kind":"alphabet","count":3}"#),
+    ];
+    let mut column = row_group
+        .next_column()
+        .expect("JSON column")
+        .expect("JSON column writer");
+    column
+        .typed::<ByteArrayType>()
+        .write_batch(&json_values, None, None)
+        .expect("JSON values");
+    column.close().expect("JSON column footer");
+
+    let binary_values = [
+        ByteArray::from(b"alpha".as_slice()),
+        ByteArray::from(b"beta".as_slice()),
+        ByteArray::from(b"gamma".as_slice()),
+    ];
+    let mut column = row_group
+        .next_column()
+        .expect("binary column")
+        .expect("binary column writer");
+    column
+        .typed::<ByteArrayType>()
+        .write_batch(&binary_values, None, None)
+        .expect("binary values");
+    column.close().expect("binary column footer");
+
+    assert!(
+        row_group
+            .next_column()
+            .expect("end of special-type columns")
+            .is_none()
+    );
+    row_group.close().expect("Parquet row group footer");
+    writer.close().expect("Parquet footer");
     source
 }
 

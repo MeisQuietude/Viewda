@@ -146,7 +146,10 @@ fn column_filter_kind(field: &SchemaField) -> ColumnFilterKind {
         return ColumnFilterKind::Temporal;
     }
     if field.logical_type.as_deref().is_some_and(|logical| {
-        logical.starts_with("String") || logical.starts_with("Enum") || logical.starts_with("JSON")
+        logical.starts_with("String")
+            || logical.starts_with("Enum")
+            || logical.starts_with("JSON")
+            || logical.starts_with("UUID")
     }) {
         return ColumnFilterKind::Text;
     }
@@ -241,11 +244,23 @@ mod tests {
             }
             ColumnFilterKind::NullOnly => ("GROUP", None),
         };
+        schema_field(name, physical_type, logical_type.as_deref())
+    }
+
+    fn schema_field(name: &str, physical_type: &str, logical_type: Option<&str>) -> SchemaField {
         SchemaField {
             name: name.to_owned(),
             physical_type: physical_type.to_owned(),
-            logical_type,
+            logical_type: logical_type.map(str::to_owned),
             children: Vec::new(),
+        }
+    }
+
+    fn text_filter(operator: DataFilterOperator, values: &[&str]) -> DataFilter {
+        DataFilter {
+            column_index: 0,
+            operator,
+            values: values.iter().map(|value| (*value).to_owned()).collect(),
         }
     }
 
@@ -367,6 +382,35 @@ mod tests {
     }
 
     #[test]
+    fn accepts_text_operators_for_uuid_and_json_columns() {
+        let columns = [
+            schema_field("uuid_value", "FIXED_LEN_BYTE_ARRAY", Some("UUID")),
+            schema_field("json_value", "BYTE_ARRAY", Some("JSON")),
+        ];
+        let filters = [
+            text_filter(DataFilterOperator::Equals, &["alpha"]),
+            text_filter(DataFilterOperator::NotEquals, &["alpha"]),
+            text_filter(DataFilterOperator::OneOf, &["alpha", "beta"]),
+            text_filter(DataFilterOperator::TextContains, &["pha"]),
+        ];
+
+        for column in columns {
+            for filter in &filters {
+                assert!(
+                    build_filter_predicate(
+                        std::slice::from_ref(&column),
+                        std::slice::from_ref(filter),
+                    )
+                    .is_ok(),
+                    "{} should accept {:?}",
+                    column.logical_type.as_deref().unwrap_or("binary"),
+                    filter.operator,
+                );
+            }
+        }
+    }
+
+    #[test]
     fn classifies_float16_as_numeric() {
         let float16 = SchemaField {
             name: "half".to_owned(),
@@ -376,6 +420,57 @@ mod tests {
         };
 
         assert_eq!(column_filter_kind(&float16), ColumnFilterKind::Number);
+    }
+
+    #[test]
+    fn keeps_other_special_types_null_only() {
+        let columns = [
+            schema_field("binary_value", "BYTE_ARRAY", None),
+            schema_field("bson_value", "BYTE_ARRAY", Some("BSON")),
+            schema_field("variant_value", "GROUP", Some("Variant (version 1)")),
+            schema_field(
+                "geometry_value",
+                "BYTE_ARRAY",
+                Some("Geometry (CRS OGC:CRS84)"),
+            ),
+            schema_field(
+                "geography_value",
+                "BYTE_ARRAY",
+                Some("Geography (spherical)"),
+            ),
+        ];
+        let text_filters = [
+            text_filter(DataFilterOperator::Equals, &["alpha"]),
+            text_filter(DataFilterOperator::NotEquals, &["alpha"]),
+            text_filter(DataFilterOperator::OneOf, &["alpha", "beta"]),
+            text_filter(DataFilterOperator::TextContains, &["pha"]),
+        ];
+        let null_filter = text_filter(DataFilterOperator::IsNull, &[]);
+
+        for column in columns {
+            for filter in &text_filters {
+                assert_eq!(
+                    build_filter_predicate(
+                        std::slice::from_ref(&column),
+                        std::slice::from_ref(filter),
+                    )
+                    .err(),
+                    Some(FilterBuildError::Invalid),
+                    "{} should reject {:?}",
+                    column.logical_type.as_deref().unwrap_or("binary"),
+                    filter.operator,
+                );
+            }
+            assert!(
+                build_filter_predicate(
+                    std::slice::from_ref(&column),
+                    std::slice::from_ref(&null_filter),
+                )
+                .is_ok(),
+                "{} should accept null checks",
+                column.logical_type.as_deref().unwrap_or("binary"),
+            );
+        }
     }
 
     #[test]

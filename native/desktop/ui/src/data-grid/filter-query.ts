@@ -20,7 +20,8 @@ export function columnFilterKind(field: SchemaField): ColumnFilterKind {
   if (
     field.logicalType?.startsWith("String") ||
     field.logicalType?.startsWith("Enum") ||
-    field.logicalType?.startsWith("JSON")
+    field.logicalType?.startsWith("JSON") ||
+    field.logicalType?.startsWith("UUID")
   ) {
     return "text";
   }
