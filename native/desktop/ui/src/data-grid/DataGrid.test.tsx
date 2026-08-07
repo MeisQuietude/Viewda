@@ -12,7 +12,7 @@ import {
   waitFor,
   within,
 } from "@testing-library/react";
-import { TimeUnit, timestamp, utf8 } from "@uwdata/flechette";
+import { int32, TimeUnit, timestamp, utf8 } from "@uwdata/flechette";
 import { act } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -26,6 +26,7 @@ const editorMock = vi.hoisted(() => ({
   mountCount: 0,
   scrollTo: vi.fn(),
   updateCells: vi.fn(),
+  remeasureColumns: vi.fn(),
 }));
 
 const decodeArrowWindow = vi.hoisted(() => vi.fn());
@@ -47,6 +48,7 @@ vi.mock("@glideapps/glide-data-grid", async (importOriginal) => {
           ({
             scrollTo: editorMock.scrollTo,
             updateCells: editorMock.updateCells,
+            remeasureColumns: editorMock.remeasureColumns,
           }) as unknown as DataEditorRef,
         [],
       );
@@ -80,6 +82,7 @@ beforeEach(() => {
   editorMock.mountCount = 0;
   editorMock.scrollTo.mockReset();
   editorMock.updateCells.mockReset();
+  editorMock.remeasureColumns.mockReset();
   decodeArrowWindow.mockImplementation(
     (
       _bytes: ArrayBuffer,
@@ -466,6 +469,186 @@ describe("DataGrid window rendering", () => {
     expect(within(query).getAllByRole("button", { name: "⋯" })).toHaveLength(2);
     expect(query).not.toHaveTextContent(source.displayName);
     expect(query).toHaveTextContent("10,000 rows");
+    expect(
+      within(query).getByRole("button", { name: "Fit column widths" }),
+    ).toHaveAttribute("title", "Fit column widths");
+  });
+
+  it("fits every visible column, including pinned columns, in one request on every press", async () => {
+    const context = {
+      font: "",
+      measureText: vi.fn(() => ({ width: 20 })),
+    } as unknown as CanvasRenderingContext2D;
+    vi.spyOn(HTMLCanvasElement.prototype, "getContext").mockReturnValue(
+      context,
+    );
+    render(<DataGrid source={source} />);
+    await waitFor(() => expect(desktop.getDataWindow).toHaveBeenCalledOnce());
+    vi.mocked(desktop.getDataWindow).mockClear();
+
+    act(() => {
+      editorMock.props?.onColumnResize?.(
+        editorMock.props.columns[7]!,
+        240,
+        7,
+        240,
+      );
+    });
+    openColumnMenu(7);
+    fireEvent.click(screen.getByRole("menuitem", { name: "Hide column" }));
+    openColumnMenu(2);
+    fireEvent.click(screen.getByRole("menuitem", { name: "Pin column" }));
+
+    const fitButton = screen.getByRole("button", {
+      name: "Fit column widths",
+    });
+    fireEvent.click(fitButton);
+    await waitFor(() => expect(desktop.getDataWindow).toHaveBeenCalledOnce());
+    fireEvent.click(fitButton);
+    await waitFor(() => expect(desktop.getDataWindow).toHaveBeenCalledTimes(2));
+
+    expect(desktop.getDataWindow).toHaveBeenNthCalledWith(
+      1,
+      7,
+      0,
+      0,
+      64,
+      [0, 1, 2, 3, 4, 5, 6],
+    );
+    expect(desktop.getDataWindow).toHaveBeenNthCalledWith(
+      2,
+      7,
+      0,
+      0,
+      64,
+      [0, 1, 2, 3, 4, 5, 6],
+    );
+    expect(editorMock.remeasureColumns).not.toHaveBeenCalled();
+    expect(editorMock.props?.columns[0]?.id).toBe("2");
+
+    fireEvent.click(screen.getByRole("button", { name: "Show all columns" }));
+    const restored = editorMock.props?.columns.find(
+      (column) => column.id === "7",
+    );
+    expect(
+      restored !== undefined && "width" in restored ? restored.width : 0,
+    ).toBe(240);
+  });
+
+  it("measures batch fit with the rendered header and cell fonts", async () => {
+    const fittingSource: desktop.SourceSummary = {
+      ...source,
+      rowCount: 2,
+      schema: [
+        { ...source.schema[0]!, name: "number" },
+        { ...source.schema[1]!, name: "label" },
+      ],
+    };
+    decodeArrowWindow.mockImplementation(
+      (
+        _bytes: ArrayBuffer,
+        rowOffset: number,
+        sourceIndices: readonly number[],
+      ): ArrowDataWindow => ({
+        rowOffset,
+        rowCount: 2,
+        sourceIndices,
+        sourceColumnOffsets: new Map(
+          sourceIndices.map((sourceIndex, offset) => [sourceIndex, offset]),
+        ),
+        table: {
+          schema: {
+            fields: sourceIndices.map((sourceIndex) => ({
+              type: sourceIndex === 0 ? int32() : utf8(),
+            })),
+          },
+          getChildAt: (columnOffset: number) => ({
+            at: () =>
+              sourceIndices[columnOffset] === 0 ? 123_456 : "wide label",
+          }),
+        } as unknown as ArrowDataWindow["table"],
+      }),
+    );
+    const measuredFonts: string[] = [];
+    const context = {
+      font: "",
+      measureText: vi.fn(() => {
+        measuredFonts.push(context.font);
+        return {
+          width: context.font.startsWith("600")
+            ? 30
+            : context.font.includes("ui-monospace")
+              ? 240
+              : 180,
+        };
+      }),
+    } as unknown as CanvasRenderingContext2D;
+    vi.spyOn(HTMLCanvasElement.prototype, "getContext").mockReturnValue(
+      context,
+    );
+    render(<DataGrid source={fittingSource} />);
+    await waitFor(() => expect(desktop.getDataWindow).toHaveBeenCalledOnce());
+    vi.mocked(desktop.getDataWindow).mockClear();
+
+    fireEvent.click(screen.getByRole("button", { name: "Fit column widths" }));
+
+    await waitFor(() => expect(desktop.getDataWindow).toHaveBeenCalledOnce());
+    expect(desktop.getDataWindow).toHaveBeenCalledWith(7, 0, 0, 2, [0, 1]);
+    await waitFor(() => {
+      expect(
+        editorMock.props?.columns.map((column) =>
+          "width" in column ? column.width : 0,
+        ),
+      ).toEqual([260, 200]);
+    });
+    expect(measuredFonts.some((font) => /^600 12px .*Inter/.test(font))).toBe(
+      true,
+    );
+    expect(measuredFonts.some((font) => /^12px ui-monospace/.test(font))).toBe(
+      true,
+    );
+    expect(measuredFonts.some((font) => /^12px Inter/.test(font))).toBe(true);
+  });
+
+  it("fits zero-row columns to capped header widths", async () => {
+    vi.mocked(desktop.prepareDataView).mockImplementation(
+      async (_generation, revision, filters) => ({
+        revision,
+        rowCount: filters.length === 0 ? source.rowCount : 0,
+      }),
+    );
+    const context = {
+      font: "",
+      measureText: vi.fn((title: string) => ({
+        width: title === "column_0" ? 600 : title === "column_1" ? 150 : 20,
+      })),
+    } as unknown as CanvasRenderingContext2D;
+    vi.spyOn(HTMLCanvasElement.prototype, "getContext").mockReturnValue(
+      context,
+    );
+    render(<DataGrid source={source} />);
+
+    addNumberFilter("42");
+    await waitFor(() =>
+      expect(
+        screen.getByText("No rows match these conditions."),
+      ).toBeInTheDocument(),
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Fit column widths" }));
+    expect(context.font).toContain("Inter");
+    expect(context.measureText).toHaveBeenCalledTimes(source.schema.length);
+
+    fireEvent.click(
+      screen.getByRole("button", { name: "Clear WHERE and ORDER BY" }),
+    );
+    await waitFor(() =>
+      expect(screen.getByTestId("data-editor")).toBeVisible(),
+    );
+
+    const widths = editorMock.props?.columns.map((column) =>
+      "width" in column ? column.width : 0,
+    );
+    expect(widths?.slice(0, 3)).toEqual([500, 194, 112]);
   });
 
   it("clamps the WHERE popup inside a narrow viewport", () => {
@@ -569,11 +752,11 @@ describe("DataGrid window rendering", () => {
     );
   });
 
-  it("clamps narrow columns while keeping the title outside the left sort hitbox", () => {
+  it("resizes live within the width limits and keeps the title outside the left sort hitbox", () => {
     render(<DataGrid source={source} />);
 
     act(() => {
-      editorMock.props?.onColumnResizeEnd?.(
+      editorMock.props?.onColumnResize?.(
         editorMock.props.columns[0]!,
         80,
         0,
@@ -584,6 +767,10 @@ describe("DataGrid window rendering", () => {
     expect(
       resized !== undefined && "width" in resized ? resized.width : 0,
     ).toBe(112);
+    expect(editorMock.props).toMatchObject({
+      minColumnWidth: 112,
+      maxColumnWidth: 500,
+    });
 
     act(() => {
       editorMock.props?.onHeaderClicked?.(0, {
@@ -597,6 +784,184 @@ describe("DataGrid window rendering", () => {
       } as never);
     });
     expect(desktop.prepareDataView).not.toHaveBeenCalled();
+  });
+
+  it("keeps the current width when a resize ends without movement", () => {
+    render(<DataGrid source={source} />);
+    const column = editorMock.props?.columns[0];
+    expect(column).toBeDefined();
+    if (column === undefined) {
+      return;
+    }
+
+    act(() => {
+      editorMock.props?.onColumnResizeStart?.(column, 112, 0, 112);
+      editorMock.props?.onColumnResize?.(column, 220, 0, 220);
+      editorMock.props?.onColumnResizeEnd?.(column, 220, 0, 220);
+    });
+    const resized = editorMock.props?.columns[0];
+    expect(
+      resized !== undefined && "width" in resized ? resized.width : 0,
+    ).toBe(220);
+
+    act(() => {
+      editorMock.props?.onColumnResizeStart?.(resized!, 220, 0, 220);
+      editorMock.props?.onColumnResizeEnd?.(resized!, 112, 0, 112);
+    });
+    const unchanged = editorMock.props?.columns[0];
+    expect(
+      unchanged !== undefined && "width" in unchanged ? unchanged.width : 0,
+    ).toBe(220);
+  });
+
+  it("corrects glide double-click fit with the column font", async () => {
+    const fittingSource: desktop.SourceSummary = {
+      ...source,
+      rowCount: 2,
+      schema: [{ ...source.schema[0]!, name: "number" }],
+    };
+    decodeArrowWindow.mockImplementation(
+      (
+        _bytes: ArrayBuffer,
+        rowOffset: number,
+        sourceIndices: readonly number[],
+      ): ArrowDataWindow => ({
+        rowOffset,
+        rowCount: 2,
+        sourceIndices,
+        sourceColumnOffsets: new Map([[0, 0]]),
+        table: {
+          schema: { fields: [{ type: int32() }] },
+          getChildAt: () => ({ at: () => 123_456 }),
+        } as unknown as ArrowDataWindow["table"],
+      }),
+    );
+    const context = {
+      font: "",
+      measureText: vi.fn(() => ({
+        width: context.font.startsWith("600") ? 30 : 240,
+      })),
+    } as unknown as CanvasRenderingContext2D;
+    vi.spyOn(HTMLCanvasElement.prototype, "getContext").mockReturnValue(
+      context,
+    );
+    render(<DataGrid source={fittingSource} />);
+    await waitFor(() => expect(desktop.getDataWindow).toHaveBeenCalledOnce());
+    vi.mocked(desktop.getDataWindow).mockClear();
+
+    const getCellsForSelection = editorMock.props?.getCellsForSelection;
+    expect(getCellsForSelection).toBeTypeOf("function");
+    if (typeof getCellsForSelection !== "function") {
+      return;
+    }
+    const selection = getCellsForSelection(
+      { x: 0, y: 0, width: 1, height: 2 },
+      new AbortController().signal,
+    );
+    await act(async () => {
+      if (typeof selection === "function") {
+        await selection();
+      }
+    });
+    act(() => {
+      const column = editorMock.props?.columns[0];
+      if (column !== undefined) {
+        editorMock.props?.onColumnResize?.(column, 112, 0, 112);
+      }
+    });
+
+    expect(desktop.getDataWindow).toHaveBeenCalledOnce();
+    expect(desktop.getDataWindow).toHaveBeenCalledWith(7, 0, 0, 2, [0]);
+    expect(
+      editorMock.props?.columns[0] !== undefined &&
+        "width" in editorMock.props.columns[0]
+        ? editorMock.props.columns[0].width
+        : 0,
+    ).toBe(260);
+    expect(context.font).toMatch(/^12px ui-monospace/);
+  });
+
+  it("recovers the header menu guard after a resize without an end event", () => {
+    render(<DataGrid source={source} />);
+    const column = editorMock.props?.columns[0];
+    expect(column).toBeDefined();
+    if (column === undefined) {
+      return;
+    }
+
+    act(() => {
+      editorMock.props?.onColumnResizeStart?.(column, 112, 0, 112);
+      editorMock.props?.onHeaderMenuClick?.(0, {
+        x: 20,
+        y: 20,
+        width: 112,
+        height: 32,
+      });
+    });
+    expect(
+      screen.queryByRole("menu", { name: "column_0 column" }),
+    ).not.toBeInTheDocument();
+
+    act(() => {
+      editorMock.props?.onHeaderClicked?.(0, {
+        bounds: { x: 0, y: 0, width: 112, height: 32 },
+        localEventX: 40,
+        isEdge: false,
+        shiftKey: false,
+        metaKey: false,
+        ctrlKey: false,
+        preventDefault: vi.fn(),
+      } as never);
+      editorMock.props?.onHeaderMenuClick?.(0, {
+        x: 20,
+        y: 20,
+        width: 112,
+        height: 32,
+      });
+    });
+    expect(
+      screen.getByRole("menu", { name: "column_0 column" }),
+    ).toBeInTheDocument();
+  });
+
+  it("does not open the header menu from the click synthesized after resize", () => {
+    vi.useFakeTimers();
+    try {
+      render(<DataGrid source={source} />);
+      const column = editorMock.props?.columns[0];
+      expect(column).toBeDefined();
+      if (column === undefined) {
+        return;
+      }
+
+      act(() => {
+        editorMock.props?.onColumnResizeStart?.(column, 120, 0, 120);
+        editorMock.props?.onColumnResize?.(column, 220, 0, 220);
+        editorMock.props?.onColumnResizeEnd?.(column, 220, 0, 220);
+        editorMock.props?.onHeaderMenuClick?.(0, {
+          x: 20,
+          y: 20,
+          width: 220,
+          height: 32,
+        });
+      });
+
+      const resized = editorMock.props?.columns[0];
+      expect(
+        resized !== undefined && "width" in resized ? resized.width : 0,
+      ).toBe(220);
+      expect(
+        screen.queryByRole("menu", { name: "column_0 column" }),
+      ).not.toBeInTheDocument();
+
+      act(() => vi.runOnlyPendingTimers());
+      openColumnMenu(0);
+      expect(
+        screen.getByRole("menu", { name: "column_0 column" }),
+      ).toBeInTheDocument();
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("sorts only from the header hotspot without suppressing column selection", async () => {

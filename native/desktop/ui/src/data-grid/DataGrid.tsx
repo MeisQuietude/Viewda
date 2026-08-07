@@ -85,21 +85,65 @@ const COPY_CHUNK_ROWS = 512;
 const EXPORT_STATUS_POLL_MS = 1_000;
 const MAX_CACHED_CELLS = 20_000;
 const MIN_COLUMN_WIDTH = 112;
+const MAX_COLUMN_WIDTH = 500;
 const SORT_HEADER_HITBOX_START = 4;
 const SORT_HEADER_HITBOX_END = 32;
 const WHERE_POPUP_MARGIN = 16;
 const WHERE_POPUP_MAX_WIDTH = 680;
 const WHERE_POPUP_OFFSET = -42;
 const GRID_HEADER_FONT_STYLE = "600 12px";
+const GRID_BASE_FONT_STYLE = "12px";
 const UI_FONT_FAMILY =
   'Inter, ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif';
+const GRID_HEADER_FONT = `${GRID_HEADER_FONT_STYLE} ${UI_FONT_FAMILY}`;
+const GRID_HEADER_HORIZONTAL_PADDING = 16;
+const GRID_HEADER_ICON_SPACE = 28;
+const GRID_CELL_HORIZONTAL_PADDING = 10;
 const MONOSPACE_FONT = 'ui-monospace, "SFMono-Regular", Consolas, monospace';
 const DEFAULT_DATA_VIEW_SETTINGS: DataViewSettings = { memoryLimit: "mb384" };
 
 const drawGridHeader: DrawHeaderCallback = ({ ctx }, drawContent) => {
-  ctx.font = `${GRID_HEADER_FONT_STYLE} ${UI_FONT_FAMILY}`;
+  ctx.font = GRID_HEADER_FONT;
   drawContent();
 };
+
+function fittedColumnWidth(
+  title: string,
+  displayData: readonly string[],
+  monospace: boolean,
+  context: CanvasRenderingContext2D | null,
+) {
+  if (context !== null) {
+    context.font = GRID_HEADER_FONT;
+  }
+  const headerTextWidth = context?.measureText(title).width ?? title.length * 8;
+  let contentWidth = 0;
+  if (context !== null) {
+    context.font = `${GRID_BASE_FONT_STYLE} ${monospace ? MONOSPACE_FONT : UI_FONT_FAMILY}`;
+  }
+  for (const value of displayData) {
+    const line = value.split("\n", 1)[0] ?? "";
+    const textWidth = context?.measureText(line).width ?? line.length * 8;
+    contentWidth = Math.max(
+      contentWidth,
+      textWidth + GRID_CELL_HORIZONTAL_PADDING * 2,
+    );
+  }
+  return Math.min(
+    MAX_COLUMN_WIDTH,
+    Math.max(
+      MIN_COLUMN_WIDTH,
+      Math.ceil(
+        Math.max(
+          headerTextWidth +
+            GRID_HEADER_HORIZONTAL_PADDING +
+            GRID_HEADER_ICON_SPACE,
+          contentWidth,
+        ),
+      ),
+    ),
+  );
+}
 
 function sortHeaderSprite(
   direction: "neutral" | "ascending" | "descending",
@@ -142,6 +186,18 @@ interface ColumnState {
   width: number;
   pinned: boolean;
   hidden: boolean;
+}
+
+interface ColumnFitSample {
+  revision: number;
+  sourceIndex: number;
+  displayData: readonly string[];
+  monospace: boolean;
+}
+
+interface ColumnResizeGesture {
+  visibleIndex: number;
+  moved: boolean;
 }
 
 interface HeaderMenu {
@@ -384,6 +440,11 @@ export function DataGrid({
   const scrollStateRef = useRef<ScrollState>({ direction: 0, boundary: 0 });
   const aliveRef = useRef(true);
   const exportStatusFailuresRef = useRef(0);
+  const suppressHeaderMenuRef = useRef(false);
+  const suppressHeaderMenuTimerRef = useRef<number | null>(null);
+  const columnResizeGestureRef = useRef<ColumnResizeGesture | null>(null);
+  const columnFitSampleRef = useRef<ColumnFitSample | null>(null);
+  const columnFitRequestRef = useRef(0);
   const menuRef = useRef<HTMLDivElement>(null);
   const gridMenuRef = useRef<HTMLDivElement>(null);
   const wherePopupRef = useRef<HTMLDivElement>(null);
@@ -1256,6 +1317,7 @@ export function DataGrid({
 
   const getCellsForSelection = useCallback(
     (rectangle: Rectangle, abortSignal: AbortSignal) => async () => {
+      const revision = activeViewRef.current.revision;
       const selectedColumns = visibleColumnStates.slice(
         rectangle.x,
         rectangle.x + rectangle.width,
@@ -1274,6 +1336,7 @@ export function DataGrid({
         rectangle.y + rectangle.height,
       );
       const end = Math.min(requestedEnd, rectangle.y + rowLimit);
+      let sampleMonospace = false;
       if (end < requestedEnd) {
         setCopyLimit(rowLimit);
       }
@@ -1287,6 +1350,14 @@ export function DataGrid({
           selectedSourceIndices,
           abortSignal,
         );
+        const sampleSourceIndex = selectedSourceIndices[0];
+        const sampleType =
+          sampleSourceIndex === undefined
+            ? undefined
+            : windowDataType(window, sampleSourceIndex);
+        if (sampleType !== undefined) {
+          sampleMonospace = usesMonospaceCells(sampleType);
+        }
         const windowEnd = Math.min(end, window.rowOffset + window.rowCount);
         for (let row = offset; row < windowEnd; row += 1) {
           rows.push(
@@ -1299,6 +1370,25 @@ export function DataGrid({
           break;
         }
         offset = windowEnd;
+      }
+
+      const sampleColumn = selectedColumns[0];
+      if (
+        rectangle.width === 1 &&
+        sampleColumn !== undefined &&
+        revision === activeViewRef.current.revision
+      ) {
+        // Glide reports double-click auto-fit through onColumnResize after
+        // loading this selection, without a paired resize start event.
+        columnFitSampleRef.current = {
+          revision,
+          sourceIndex: sampleColumn.sourceIndex,
+          displayData: rows.flatMap((row) => {
+            const cell = row[0];
+            return cell?.kind === GridCellKind.Text ? [cell.displayData] : [];
+          }),
+          monospace: sampleMonospace,
+        };
       }
 
       return rows satisfies CellArray;
@@ -1382,6 +1472,225 @@ export function DataGrid({
     setSelection(next);
     setCopyLimit(null);
   }, []);
+
+  const resizeColumn = useCallback((width: number, visibleIndex: number) => {
+    const sourceIndex =
+      visibleColumnStatesRef.current[visibleIndex]?.sourceIndex;
+    if (sourceIndex === undefined) {
+      return;
+    }
+    const clampedWidth = Math.min(
+      MAX_COLUMN_WIDTH,
+      Math.max(MIN_COLUMN_WIDTH, width),
+    );
+    setColumnStates((current) =>
+      current.map((column) =>
+        column.sourceIndex === sourceIndex
+          ? { ...column, width: clampedWidth }
+          : column,
+      ),
+    );
+  }, []);
+
+  const clearColumnResize = useCallback(() => {
+    if (suppressHeaderMenuTimerRef.current !== null) {
+      window.clearTimeout(suppressHeaderMenuTimerRef.current);
+      suppressHeaderMenuTimerRef.current = null;
+    }
+    columnResizeGestureRef.current = null;
+    suppressHeaderMenuRef.current = false;
+  }, []);
+
+  const startColumnResize = useCallback(
+    (_column: GridColumn, _width: number, visibleIndex: number) => {
+      clearColumnResize();
+      columnResizeGestureRef.current = { visibleIndex, moved: false };
+      suppressHeaderMenuRef.current = true;
+      setHeaderMenu(null);
+    },
+    [clearColumnResize],
+  );
+
+  const resizeOrFitColumn = useCallback(
+    (width: number, visibleIndex: number) => {
+      const gesture = columnResizeGestureRef.current;
+      if (gesture !== null) {
+        if (visibleIndex === gesture.visibleIndex) {
+          gesture.moved = true;
+        }
+        if (gesture.moved) {
+          resizeColumn(width, visibleIndex);
+        }
+        return;
+      }
+
+      const column = visibleColumnStatesRef.current[visibleIndex];
+      const sample = columnFitSampleRef.current;
+      if (
+        column === undefined ||
+        sample === null ||
+        sample.revision !== activeViewRef.current.revision ||
+        sample.sourceIndex !== column.sourceIndex
+      ) {
+        resizeColumn(width, visibleIndex);
+        return;
+      }
+
+      const context = document.createElement("canvas").getContext("2d");
+      resizeColumn(
+        fittedColumnWidth(
+          column.title,
+          sample.displayData,
+          sample.monospace,
+          context,
+        ),
+        visibleIndex,
+      );
+    },
+    [resizeColumn],
+  );
+
+  const finishColumnResize = useCallback(
+    (width: number, visibleIndex: number) => {
+      // Glide clamps its unset internal width to the minimum on mouseup, so an
+      // end event is valid only after the primary column emitted a resize.
+      if (columnResizeGestureRef.current?.moved === true) {
+        resizeColumn(width, visibleIndex);
+      }
+      columnResizeGestureRef.current = null;
+      if (suppressHeaderMenuTimerRef.current !== null) {
+        window.clearTimeout(suppressHeaderMenuTimerRef.current);
+      }
+      // Glide clears its resize state before the browser dispatches the click
+      // synthesized from mouseup, so keep the menu guard through this event turn.
+      suppressHeaderMenuTimerRef.current = window.setTimeout(() => {
+        suppressHeaderMenuRef.current = false;
+        suppressHeaderMenuTimerRef.current = null;
+      }, 0);
+    },
+    [resizeColumn],
+  );
+
+  useEffect(
+    () => () => {
+      if (suppressHeaderMenuTimerRef.current !== null) {
+        window.clearTimeout(suppressHeaderMenuTimerRef.current);
+      }
+    },
+    [],
+  );
+
+  const applyFittedColumnWidths = useCallback(
+    (
+      visibleColumns: readonly ColumnState[],
+      dataWindow: ArrowDataWindow | null,
+      sampleOffset = 0,
+      sampleCount = 0,
+    ) => {
+      const context = document.createElement("canvas").getContext("2d");
+      const widths = new Map<number, number>();
+      for (const column of visibleColumns) {
+        const dataType =
+          dataWindow === null
+            ? undefined
+            : windowDataType(dataWindow, column.sourceIndex);
+        const displayData: string[] = [];
+        if (dataWindow !== null && dataType !== undefined) {
+          const sampleEnd = Math.min(
+            sampleOffset + sampleCount,
+            dataWindow.rowOffset + dataWindow.rowCount,
+          );
+          for (
+            let row = Math.max(sampleOffset, dataWindow.rowOffset);
+            row < sampleEnd;
+            row += 1
+          ) {
+            displayData.push(
+              formatCellValue(
+                windowValue(dataWindow, column.sourceIndex, row),
+                dataType,
+              ).displayData,
+            );
+          }
+        }
+        widths.set(
+          column.sourceIndex,
+          fittedColumnWidth(
+            column.title,
+            displayData,
+            dataType !== undefined && usesMonospaceCells(dataType),
+            context,
+          ),
+        );
+      }
+      setColumnStates((current) =>
+        current.map((column) => {
+          const width = widths.get(column.sourceIndex);
+          return width === undefined ? column : { ...column, width };
+        }),
+      );
+    },
+    [],
+  );
+
+  const fitVisibleColumnWidths = useCallback(() => {
+    const visibleColumns = visibleColumnStatesRef.current;
+    if (visibleColumns.length === 0) {
+      return;
+    }
+    const view = activeViewRef.current;
+    const request = columnFitRequestRef.current + 1;
+    columnFitRequestRef.current = request;
+    if (view.rowCount === 0) {
+      applyFittedColumnWidths(visibleColumns, null);
+      return;
+    }
+
+    const visibleRegion = visibleRegionsRef.current[0];
+    const firstVisibleRow = visibleRegion?.y ?? 0;
+    const sampleOffset = Math.min(
+      Math.max(0, firstVisibleRow),
+      view.rowCount - 1,
+    );
+    const sampleCount = Math.min(
+      Math.max(1, visibleRegion?.height ?? INITIAL_ROWS),
+      view.rowCount - sampleOffset,
+    );
+    const sourceIndices = visibleColumns
+      .map((column) => column.sourceIndex)
+      .sort((left, right) => left - right);
+    void getDataWindow(
+      source.generation,
+      view.revision,
+      sampleOffset,
+      sampleCount,
+      sourceIndices,
+    )
+      .then((bytes) => decodeArrowWindow(bytes, sampleOffset, sourceIndices))
+      .then((dataWindow) => {
+        if (
+          aliveRef.current &&
+          request === columnFitRequestRef.current &&
+          view.revision === activeViewRef.current.revision
+        ) {
+          applyFittedColumnWidths(
+            visibleColumns,
+            dataWindow,
+            sampleOffset,
+            sampleCount,
+          );
+        }
+      })
+      .catch((error: unknown) => {
+        if (
+          aliveRef.current &&
+          request === columnFitRequestRef.current &&
+          view.revision === activeViewRef.current.revision
+        ) {
+          setLoadError(dataViewErrorState(error));
+        }
+      });
+  }, [applyFittedColumnWidths, source.generation]);
 
   const updateColumn = useCallback(
     (sourceIndex: number, update: Partial<ColumnState>) => {
@@ -1725,6 +2034,29 @@ export function DataGrid({
           )}
         </span>
         <button
+          className="query-fit-widths"
+          type="button"
+          aria-label="Fit column widths"
+          title="Fit column widths"
+          onClick={fitVisibleColumnWidths}
+        >
+          <svg
+            aria-hidden="true"
+            width="16"
+            height="16"
+            viewBox="0 0 16 16"
+            fill="none"
+          >
+            <path
+              d="M2 2v12M14 2v12M2 8h12M5 5 2 8l3 3M11 5l3 3-3 3"
+              stroke="currentColor"
+              strokeWidth="1.25"
+              strokeLinecap="round"
+              strokeLinejoin="round"
+            />
+          </svg>
+        </button>
+        <button
           className="query-clear"
           type="button"
           aria-label="Clear WHERE and ORDER BY"
@@ -1827,6 +2159,8 @@ export function DataGrid({
               preventDiagonalScrolling
               smoothScrollX
               smoothScrollY={false}
+              minColumnWidth={MIN_COLUMN_WIDTH}
+              maxColumnWidth={MAX_COLUMN_WIDTH}
               theme={gridTheme}
               onCellContextMenu={(cell, event) => {
                 event.preventDefault();
@@ -1851,6 +2185,7 @@ export function DataGrid({
                 });
               }}
               onHeaderClicked={(visibleIndex, event) => {
+                clearColumnResize();
                 if (
                   event.isEdge ||
                   event.localEventX < SORT_HEADER_HITBOX_START ||
@@ -1879,23 +2214,17 @@ export function DataGrid({
                 ];
                 requestRows(range.y, range.height);
               }}
-              onColumnResizeEnd={(_column, width, visibleIndex) => {
-                const sourceIndex =
-                  visibleColumnStates[visibleIndex]?.sourceIndex;
-                if (sourceIndex !== undefined) {
-                  setColumnStates((current) =>
-                    current.map((column) =>
-                      column.sourceIndex === sourceIndex
-                        ? {
-                            ...column,
-                            width: Math.max(MIN_COLUMN_WIDTH, width),
-                          }
-                        : column,
-                    ),
-                  );
-                }
-              }}
+              onColumnResize={(_column, width, visibleIndex) =>
+                resizeOrFitColumn(width, visibleIndex)
+              }
+              onColumnResizeStart={startColumnResize}
+              onColumnResizeEnd={(_column, width, visibleIndex) =>
+                finishColumnResize(width, visibleIndex)
+              }
               onHeaderMenuClick={(visibleIndex, bounds) => {
+                if (suppressHeaderMenuRef.current) {
+                  return;
+                }
                 const sourceIndex =
                   visibleColumnStates[visibleIndex]?.sourceIndex;
                 if (sourceIndex !== undefined) {
@@ -2471,7 +2800,7 @@ function readGridTheme(): Partial<Theme> {
     textLight: value("--grid-text-faint"),
     textHeader: value("--grid-text-muted"),
     textHeaderSelected: value("--grid-text"),
-    baseFontStyle: "12px",
+    baseFontStyle: GRID_BASE_FONT_STYLE,
     headerFontStyle: GRID_HEADER_FONT_STYLE,
     fontFamily: UI_FONT_FAMILY,
     cellHorizontalPadding: 10,
