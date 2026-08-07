@@ -147,6 +147,7 @@ beforeEach(() => {
 
 afterEach(() => {
   cleanup();
+  Reflect.deleteProperty(document, "fonts");
   vi.restoreAllMocks();
   vi.unstubAllGlobals();
 });
@@ -195,6 +196,28 @@ describe("DataGrid window rendering", () => {
     expect(damage).toContainEqual({ cell: [3, 1_000] });
     expect(damage).toContainEqual({ cell: [6, 1_004] });
     expect(damage).not.toContainEqual({ cell: [1, 1_000] });
+  });
+
+  it("loads bundled emoji subsets and repaints the visible cells", async () => {
+    const emojiFont = deferred<void>();
+    const load = vi.fn(() => emojiFont.promise);
+    Object.defineProperty(document, "fonts", {
+      configurable: true,
+      value: {
+        *[Symbol.iterator]() {
+          yield { family: '"Noto Emoji Variable"', load };
+        },
+      },
+    });
+    render(<DataGrid source={source} />);
+
+    await waitFor(() => expect(editorMock.updateCells).toHaveBeenCalledOnce());
+    expect(load).toHaveBeenCalledOnce();
+    editorMock.updateCells.mockClear();
+    await act(async () => {
+      emojiFont.resolve();
+    });
+    await waitFor(() => expect(editorMock.updateCells).toHaveBeenCalledOnce());
   });
 
   it("reloads only direct window columns when the horizontal viewport changes", async () => {
@@ -430,6 +453,8 @@ describe("DataGrid window rendering", () => {
     } as unknown as CanvasRenderingContext2D;
     const drawContent = vi.fn(() => {
       expect(context.font).toContain("Inter");
+      expect(context.font).toContain("Apple Color Emoji");
+      expect(context.font).toContain("Noto Emoji Variable");
       expect(context.font).not.toContain("ui-monospace");
     });
 
@@ -444,6 +469,9 @@ describe("DataGrid window rendering", () => {
     );
 
     expect(drawContent).toHaveBeenCalledOnce();
+    expect(editorMock.props?.theme?.fontFamily).toContain(
+      "Noto Emoji Variable",
+    );
     expect(editorMock.props?.columns[0]?.icon).toBe("viewda-sort-neutral");
     const neutralIcon = editorMock.props?.headerIcons?.["viewda-sort-neutral"];
     expect(neutralIcon?.({ bgColor: "#123456", fgColor: "#ffffff" })).toContain(

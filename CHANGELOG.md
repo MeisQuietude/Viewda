@@ -37,6 +37,8 @@ Backward-incompatible entries start with **Breaking:**.
 
 ### Fixed
 
+- Emoji values now render as glyphs instead of missing-character boxes on
+  Linux systems without an installed emoji font.
 - Long Parquet type labels in Structure now stay within their column.
 
 ## 0.1.0-alpha.2 — 2026-08-02

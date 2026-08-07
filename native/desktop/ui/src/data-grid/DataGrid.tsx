@@ -38,6 +38,11 @@ import {
   type SortColumn,
   type SourceSummary,
 } from "../desktop";
+import {
+  loadBundledEmojiFont,
+  MONOSPACE_FONT_FAMILY,
+  UI_FONT_FAMILY,
+} from "../fonts";
 import { THEME_CHANGED_EVENT } from "../theme";
 import {
   decodeArrowWindow,
@@ -91,9 +96,6 @@ const WHERE_POPUP_MARGIN = 16;
 const WHERE_POPUP_MAX_WIDTH = 680;
 const WHERE_POPUP_OFFSET = -42;
 const GRID_HEADER_FONT_STYLE = "600 12px";
-const UI_FONT_FAMILY =
-  'Inter, ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif';
-const MONOSPACE_FONT = 'ui-monospace, "SFMono-Regular", Consolas, monospace';
 const DEFAULT_DATA_VIEW_SETTINGS: DataViewSettings = { memoryLimit: "mb384" };
 
 const drawGridHeader: DrawHeaderCallback = ({ ctx }, drawContent) => {
@@ -424,6 +426,24 @@ export function DataGrid({
     [sort, source.schema],
   );
 
+  useEffect(() => {
+    const fonts = document.fonts;
+    if (fonts === undefined) {
+      return;
+    }
+    let alive = true;
+    void loadBundledEmojiFont(fonts).then((loaded) => {
+      if (alive && loaded) {
+        gridRef.current?.updateCells(
+          visibleRegionDamage(visibleRegionsRef.current),
+        );
+      }
+    });
+    return () => {
+      alive = false;
+    };
+  }, []);
+
   const columns = useMemo<GridColumn[]>(
     () =>
       visibleColumnStates.map((column) => {
@@ -434,7 +454,7 @@ export function DataGrid({
           width: column.width,
           hasMenu: true,
           themeOverride: monospaceColumns.has(column.sourceIndex)
-            ? { fontFamily: MONOSPACE_FONT }
+            ? { fontFamily: MONOSPACE_FONT_FAMILY }
             : undefined,
         };
       }),

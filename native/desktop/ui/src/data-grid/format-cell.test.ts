@@ -78,6 +78,17 @@ describe("formatCellValue", () => {
     expect(usesMonospaceCells(type)).toBe(true);
   });
 
+  it("preserves emoji sequences in display and copy text", () => {
+    const value = "emoji 🦆 · family 👨‍👩‍👧‍👦";
+
+    expect(formatCellValue(value, utf8())).toEqual({
+      displayData: value,
+      copyData: value,
+      align: "left",
+      faded: false,
+    });
+  });
+
   it("right-aligns integers and marks their columns as monospace", () => {
     expect(formatCellValue(42n, int64())).toMatchObject({
       displayData: "42",
