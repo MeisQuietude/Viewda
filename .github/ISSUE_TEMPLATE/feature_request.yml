@@ -1,0 +1,30 @@
+name: Feature request
+description: Something you need from a Parquet viewer that Viewda cannot do
+labels: [enhancement]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: What are you trying to do with the file?
+      description: >-
+        The task, not the feature. A described problem survives a change of
+        design; a described solution often doesn't.
+    validations:
+      required: true
+  - type: textarea
+    id: today
+    attributes:
+      label: How you do it today
+      description: The workaround, the other tool, or the script you fall back to.
+  - type: textarea
+    id: shape
+    attributes:
+      label: How you would expect it to work in Viewda
+      description: Where it would live in the app and how you would reach it.
+  - type: textarea
+    id: scale
+    attributes:
+      label: Scale
+      description: >-
+        File sizes, row counts and how often you do this. Viewda trades
+        features for responsiveness, so scale decides what is possible.
