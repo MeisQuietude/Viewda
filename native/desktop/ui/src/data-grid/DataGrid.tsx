@@ -60,6 +60,7 @@ import {
   type RowRequest,
   type ScrollState,
 } from "./row-window";
+import { GridScrollViewport } from "./GridScrollViewport";
 import { SchemaSidebar } from "./SchemaSidebar";
 import { nextSort, sortedColumnIcon } from "./sort";
 
@@ -1544,7 +1545,7 @@ export function DataGrid({
             <p>This file has no rows.</p>
           </div>
         ) : (
-          <div className="grid-canvas">
+          <GridScrollViewport headerHeight={HEADER_HEIGHT}>
             <DataEditor
               key={gridInstanceKey}
               ref={gridRef}
@@ -1644,7 +1645,7 @@ export function DataGrid({
                 }
               }}
             />
-          </div>
+          </GridScrollViewport>
         )}
       </div>
       {headerMenu !== null && menuColumn !== undefined && (

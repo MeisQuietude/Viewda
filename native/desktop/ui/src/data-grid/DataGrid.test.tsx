@@ -403,11 +403,25 @@ describe("DataGrid window rendering", () => {
     render(<DataGrid source={source} />);
 
     expect(editorMock.props).toMatchObject({
+      headerHeight: 32,
       overscrollX: 0,
       overscrollY: 0,
       preventDiagonalScrolling: true,
       smoothScrollX: true,
       smoothScrollY: false,
+    });
+  });
+
+  it("renders the vertical scrollbar outside the editor below its header", () => {
+    const { container } = render(<DataGrid source={source} />);
+
+    expect(
+      container.querySelector(
+        ".grid-editor-viewport [data-testid=data-editor]",
+      ),
+    ).not.toBeNull();
+    expect(container.querySelector(".grid-scrollbar-vertical")).toHaveStyle({
+      top: "32px",
     });
   });
 

@@ -33,6 +33,8 @@ Backward-incompatible entries start with **Breaking:**.
 
 ### Fixed
 
+- The data grid's vertical scrollbar now starts below the column header, and
+  pressing it no longer selects the underlying column or cell.
 - Long Parquet type labels in Structure now stay within their column.
 
 ## 0.1.0-alpha.2 — 2026-08-02
