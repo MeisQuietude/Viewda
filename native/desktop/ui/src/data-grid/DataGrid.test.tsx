@@ -17,6 +17,7 @@ import { act } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import * as desktop from "../desktop";
+import { THEME_CHANGED_EVENT } from "../theme";
 import { DataGrid } from "./DataGrid";
 import type { ArrowDataWindow } from "./arrow-window";
 
@@ -112,6 +113,25 @@ afterEach(() => {
 });
 
 describe("DataGrid window rendering", () => {
+  it("refreshes canvas colors when the application theme changes", async () => {
+    let color = "#111111";
+    vi.spyOn(window, "getComputedStyle").mockImplementation(
+      () =>
+        ({
+          getPropertyValue: () => color,
+        }) as unknown as CSSStyleDeclaration,
+    );
+    render(<DataGrid source={source} />);
+
+    expect(editorMock.props?.theme?.accentColor).toBe("#111111");
+    color = "#222222";
+    act(() => window.dispatchEvent(new Event(THEME_CHANGED_EVENT)));
+
+    await waitFor(() =>
+      expect(editorMock.props?.theme?.accentColor).toBe("#222222"),
+    );
+  });
+
   it("damages the loaded visible cells so canvas loading gaps repaint", async () => {
     render(<DataGrid source={source} />);
 

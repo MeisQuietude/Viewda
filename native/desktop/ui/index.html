@@ -6,14 +6,23 @@
     <meta name="color-scheme" content="light dark" />
     <style>
       :root {
+        color-scheme: light;
         --app-background: #f4f3ef;
         --update-accent: #725814;
         --update-accent-strong: #62501f;
         background: var(--app-background);
       }
 
+      :root[data-theme="dark"] {
+        color-scheme: dark;
+        --app-background: #141617;
+        --update-accent: #dfc783;
+        --update-accent-strong: #ead8a4;
+      }
+
       @media (prefers-color-scheme: dark) {
-        :root {
+        :root:not([data-theme]) {
+          color-scheme: dark;
           --app-background: #141617;
           --update-accent: #dfc783;
           --update-accent-strong: #ead8a4;

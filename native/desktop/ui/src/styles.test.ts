@@ -8,7 +8,7 @@ const styles = readFileSync(resolve("ui/src/styles.css"), "utf8");
 describe("color theme", () => {
   it("keeps statistics errors readable in the dark sidebar", () => {
     const darkRoot = styles.match(
-      /@media \(prefers-color-scheme: dark\) \{\s*:root \{([^}]*)\}/s,
+      /:root\[data-theme="dark"\] \{([^}]*)\}/s,
     )?.[1];
     expect(darkRoot).toBeDefined();
     if (darkRoot === undefined) {
@@ -45,7 +45,7 @@ describe("schema field layout", () => {
   it("keeps field type colors in the light and dark themes", () => {
     expect(styles).toMatch(/\.schema-type\s*\{[^}]*color:\s*#777c7c;/s);
     expect(styles).toMatch(
-      /@media \(prefers-color-scheme:\s*dark\)[\s\S]*\.schema-type\s*\{\s*color:\s*#b6bbba;\s*\}/,
+      /:root\[data-theme="dark"\] \.schema-type\s*\{\s*color:\s*#b6bbba;\s*\}/,
     );
   });
 });
@@ -69,7 +69,7 @@ describe("query row", () => {
     );
     expect(styles).toMatch(/\.query-slot\s*\{\s*color:\s*var\(--grid-text\);/s);
     const darkRoot = styles.match(
-      /@media \(prefers-color-scheme: dark\) \{\s*:root \{([^}]*)\}/s,
+      /:root\[data-theme="dark"\] \{([^}]*)\}/s,
     )?.[1];
     expect(darkRoot).toBeDefined();
     expect(darkRoot).toMatch(/--grid-text:\s*#[0-9a-f]{6};/i);
@@ -81,7 +81,7 @@ describe("filter editor actions", () => {
   it("keeps the primary action readable on hover in both themes", () => {
     const lightRoot = styles.match(/:root \{([^}]*)\}/s)?.[1];
     const darkRoot = styles.match(
-      /@media \(prefers-color-scheme: dark\) \{\s*:root \{([^}]*)\}/s,
+      /:root\[data-theme="dark"\] \{([^}]*)\}/s,
     )?.[1];
     expect(lightRoot).toBeDefined();
     expect(darkRoot).toBeDefined();

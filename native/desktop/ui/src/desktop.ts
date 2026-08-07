@@ -7,6 +7,8 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 
+import type { EffectiveTheme, ThemePreference } from "./theme";
+
 export interface EngineStatus {
   name: string;
   version: string;
@@ -193,6 +195,18 @@ export function getUpdateSettings(): Promise<UpdateSettings> {
 
 export function setUpdateSettings(settings: UpdateSettings): Promise<void> {
   return invoke("set_update_settings", { settings });
+}
+
+export function getThemePreference(): Promise<ThemePreference> {
+  return invoke<ThemePreference>("get_theme_preference");
+}
+
+export function setThemePreference(preference: ThemePreference): Promise<void> {
+  return invoke("set_theme_preference", { preference });
+}
+
+export function syncSystemTheme(effectiveTheme: EffectiveTheme): Promise<void> {
+  return invoke("sync_system_theme", { effectiveTheme });
 }
 
 export function checkForUpdate({

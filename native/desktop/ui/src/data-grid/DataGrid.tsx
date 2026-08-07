@@ -22,6 +22,7 @@ import {
   type DataFilter,
   type SourceSummary,
 } from "../desktop";
+import { THEME_CHANGED_EVENT } from "../theme";
 import {
   decodeArrowWindow,
   windowContainsRow,
@@ -1254,10 +1255,9 @@ function useGridTheme(): Partial<Theme> {
   const [theme, setTheme] = useState<Partial<Theme>>(readGridTheme);
 
   useEffect(() => {
-    const colorScheme = window.matchMedia("(prefers-color-scheme: dark)");
     const updateTheme = () => setTheme(readGridTheme());
-    colorScheme.addEventListener("change", updateTheme);
-    return () => colorScheme.removeEventListener("change", updateTheme);
+    window.addEventListener(THEME_CHANGED_EVENT, updateTheme);
+    return () => window.removeEventListener(THEME_CHANGED_EVENT, updateTheme);
   }, []);
 
   return theme;

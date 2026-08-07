@@ -3,6 +3,7 @@ import {
   Suspense,
   useCallback,
   useEffect,
+  useLayoutEffect,
   useRef,
   useState,
   type KeyboardEvent,
@@ -25,9 +26,11 @@ import {
   openRecentSource,
   openReleasesPage,
   OpenSourceError,
+  setThemePreference as persistThemePreference,
   setUpdateSettings as persistUpdateSettings,
   setDefaultApplication,
   shortcutModifier,
+  syncSystemTheme,
   takePostUpdateState,
   takeOpenedSource,
   type DefaultApplicationStatus,
@@ -41,6 +44,11 @@ import {
   UpdateCommandError,
 } from "./desktop";
 import { SchemaTreeNode } from "./SchemaTree";
+import {
+  applyDocumentTheme,
+  SYSTEM_THEME_QUERY,
+  type ThemePreference,
+} from "./theme";
 
 const DataGrid = lazy(async () => {
   const { DataGrid: Grid } = await import("./data-grid/DataGrid");
@@ -70,7 +78,11 @@ const POST_UPDATE_FADE_DELAY_MS = 59_800;
 const POST_UPDATE_REMOVE_DELAY_MS = 60_000;
 const UPDATE_FADE_DURATION_MS = 200;
 
-export function App() {
+export function App({
+  initialTheme = "system",
+}: {
+  initialTheme?: ThemePreference;
+}) {
   const [readiness, setReadiness] = useState<Readiness>({ kind: "loading" });
   const [source, setSource] = useState<SourceSummary | null>(null);
   const [sourceError, setSourceError] = useState<SourceErrorCode | null>(null);
@@ -80,6 +92,9 @@ export function App() {
   const [updateSettings, setUpdateSettings] = useState<UpdateSettings | null>(
     null,
   );
+  const [themePreference, setThemePreference] =
+    useState<ThemePreference>(initialTheme);
+  const [themeMessage, setThemeMessage] = useState<string | null>(null);
   const [titlebarUpdate, setTitlebarUpdate] = useState<TitlebarUpdate | null>(
     null,
   );
@@ -98,6 +113,27 @@ export function App() {
   const simulatedInstallTimer = useRef<number | null>(null);
   const dismissTimer = useRef<number | null>(null);
   const receivedOpenedSource = useRef(false);
+
+  useLayoutEffect(() => {
+    const systemTheme = window.matchMedia(SYSTEM_THEME_QUERY);
+    const applyTheme = () => {
+      const effectiveTheme = applyDocumentTheme(
+        themePreference,
+        systemTheme.matches,
+      );
+      if (themePreference === "system") {
+        void syncSystemTheme(effectiveTheme).catch(() => {
+          // DOM and canvas still follow the live OS theme if native sync fails.
+        });
+      }
+    };
+    applyTheme();
+    if (themePreference !== "system") {
+      return;
+    }
+    systemTheme.addEventListener("change", applyTheme);
+    return () => systemTheme.removeEventListener("change", applyTheme);
+  }, [themePreference]);
 
   const openSource = useCallback(async () => {
     setOpening(true);
@@ -487,6 +523,24 @@ export function App() {
     [runUpdateCheck, updateSettings],
   );
 
+  const changeThemePreference = useCallback(
+    async (preference: ThemePreference) => {
+      if (preference === themePreference) {
+        return;
+      }
+      const previous = themePreference;
+      setThemePreference(preference);
+      setThemeMessage(null);
+      try {
+        await persistThemePreference(preference);
+      } catch {
+        setThemePreference(previous);
+        setThemeMessage("Could not save the appearance preference.");
+      }
+    },
+    [themePreference],
+  );
+
   const changeAutomaticChecks = useCallback(
     async (automaticChecks: boolean) => {
       if (updateSettings === null) {
@@ -687,11 +741,14 @@ export function App() {
           defaultApplication={defaultApplication}
           defaultApplicationMessage={defaultApplicationMessage}
           settings={updateSettings}
+          themePreference={themePreference}
+          themeMessage={themeMessage}
           engine={readiness.kind === "ready" ? readiness.engine : null}
           checking={checkingUpdates}
           message={updateMessage}
           onAutomaticChecks={changeAutomaticChecks}
           onChannel={changeUpdateChannel}
+          onTheme={changeThemePreference}
           onCheck={runUpdateCheck}
           onClose={() => setSettingsOpen(false)}
           onMakeDefault={makeDefaultApplication}
@@ -864,11 +921,14 @@ function SettingsDialog({
   defaultApplication,
   defaultApplicationMessage,
   settings,
+  themePreference,
+  themeMessage,
   engine,
   checking,
   message,
   onAutomaticChecks,
   onChannel,
+  onTheme,
   onCheck,
   onClose,
   onMakeDefault,
@@ -878,11 +938,14 @@ function SettingsDialog({
   defaultApplication: DefaultApplicationStatus | null;
   defaultApplicationMessage: string | null;
   settings: UpdateSettings;
+  themePreference: ThemePreference;
+  themeMessage: string | null;
   engine: EngineStatus | null;
   checking: boolean;
   message: string | null;
   onAutomaticChecks: (enabled: boolean) => Promise<void>;
   onChannel: (channel: UpdateChannel) => Promise<void>;
+  onTheme: (preference: ThemePreference) => Promise<void>;
   onCheck: () => Promise<void>;
   onClose: () => void;
   onMakeDefault: () => Promise<void>;
@@ -916,6 +979,30 @@ function SettingsDialog({
             onMakeDefault={onMakeDefault}
           />
         </div>
+      </section>
+      <section className="settings-section" aria-labelledby="appearance-title">
+        <p id="appearance-title" className="eyebrow">
+          Appearance
+        </p>
+        <div className="settings-row">
+          <label htmlFor="theme-preference">Theme</label>
+          <select
+            id="theme-preference"
+            value={themePreference}
+            onChange={(event) =>
+              void onTheme(event.target.value as ThemePreference)
+            }
+          >
+            <option value="system">System</option>
+            <option value="light">Light</option>
+            <option value="dark">Dark</option>
+          </select>
+        </div>
+        {themeMessage !== null && (
+          <p className="theme-message" role="status">
+            {themeMessage}
+          </p>
+        )}
       </section>
       <section className="settings-section" aria-labelledby="updates-title">
         <p id="updates-title" className="eyebrow">
