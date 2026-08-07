@@ -1,6 +1,7 @@
 //! Tauri adapter for the Viewda desktop application.
 
 mod default_application;
+mod export;
 mod launch;
 mod recents;
 mod theme;
@@ -20,6 +21,10 @@ use std::{
 use std::ffi::OsString;
 
 use default_application::{get_default_application_status, set_default_application};
+use export::{
+    DataExportJobs, cancel_data_export, dismiss_data_export, get_data_export_status,
+    reveal_data_export, start_data_export,
+};
 #[cfg(not(target_os = "macos"))]
 use launch::open_from_args;
 #[cfg(target_os = "macos")]
@@ -59,6 +64,7 @@ pub(crate) struct OpenedSource {
     state: Arc<Mutex<OpenedSourceState>>,
     recents: RecentSourcesStore,
     data_views: DataViewJobs,
+    data_exports: DataExportJobs,
 }
 
 #[derive(Default)]
@@ -345,6 +351,7 @@ impl OpenedSource {
             return Ok(None);
         }
         self.cancel_data_views()?;
+        self.data_exports.cancel_all();
         let generation = state
             .generation
             .checked_add(1)
@@ -1184,6 +1191,11 @@ pub fn run() {
             prepare_data_view,
             get_data_view_status,
             cancel_data_view,
+            start_data_export,
+            get_data_export_status,
+            cancel_data_export,
+            dismiss_data_export,
+            reveal_data_export,
             get_column_statistics,
             cancel_column_statistics,
             get_update_settings,
@@ -1207,6 +1219,9 @@ pub fn run() {
                 tauri::RunEvent::ExitRequested { .. } | tauri::RunEvent::Exit
             ) {
                 let _ = app.state::<OpenedSource>().cancel_data_views();
+                app.state::<OpenedSource>()
+                    .data_exports
+                    .cancel_all_and_wait();
             }
             #[cfg(target_os = "macos")]
             if let tauri::RunEvent::Opened { urls } = event
