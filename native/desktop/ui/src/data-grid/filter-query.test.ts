@@ -21,6 +21,26 @@ const field = (
   logicalType: string | null,
 ): SchemaField => ({ name, physicalType, logicalType, children: [] });
 
+describe("column filter kinds", () => {
+  it.each([
+    [field("uuid_value", "FIXED_LEN_BYTE_ARRAY", "UUID"), "text"],
+    [field("json_value", "BYTE_ARRAY", "JSON"), "text"],
+    [field("binary_value", "BYTE_ARRAY", null), "nullOnly"],
+    [field("bson_value", "BYTE_ARRAY", "BSON"), "nullOnly"],
+    [field("variant_value", "GROUP", "Variant (version 1)"), "nullOnly"],
+    [
+      field("geometry_value", "BYTE_ARRAY", "Geometry (CRS OGC:CRS84)"),
+      "nullOnly",
+    ],
+    [
+      field("geography_value", "BYTE_ARRAY", "Geography (spherical)"),
+      "nullOnly",
+    ],
+  ] as const)("maps %s to %s", (schemaField, expected) => {
+    expect(columnFilterKind(schemaField)).toBe(expected);
+  });
+});
+
 describe("canonical filter query formatting", () => {
   it.each([
     [field("name", "BYTE_ARRAY", "String"), "O'Reilly", "'O''Reilly'"],
