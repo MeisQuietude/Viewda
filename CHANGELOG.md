@@ -1,6 +1,6 @@
 # Changelog
 
-Newest first. `Unreleased` is what's already on `main` but not shipped; every other section matches a GitHub Release.
+Newest first. `Unreleased` is what's already on `main` but not shipped; every other section matches a GitHub Release. When a version leaves prerelease, its prerelease sections fold into the stable section; their original notes stay on the GitHub Releases.
 
 Within a version: Added · Changed · Fixed · Removed.
 
