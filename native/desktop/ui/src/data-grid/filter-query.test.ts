@@ -97,12 +97,43 @@ describe("canonical filter query formatting", () => {
     ];
 
     expect(formatWhereClause(filters, schema)).toBe(
-      `"value""quoted" BETWEEN -2 AND 9 AND contains(CAST("label" AS VARCHAR), 'O''Reilly')`,
+      `"value""quoted" BETWEEN -2 AND 9 AND contains(lower(CAST("label" AS VARCHAR)), lower('O''Reilly'))`,
     );
     expect(formatFilterCondition(filters[0]!, schema[0]!)).toBe(
       `"value""quoted" BETWEEN -2 AND 9`,
     );
   });
+
+  it.each([
+    [
+      { columnIndex: 0, operator: "textContains", values: ["Alpha"] },
+      `contains(lower(CAST("label" AS VARCHAR)), lower('Alpha'))`,
+    ],
+    [
+      { columnIndex: 0, operator: "notContains", values: ["Alpha"] },
+      `NOT contains(lower(CAST("label" AS VARCHAR)), lower('Alpha'))`,
+    ],
+    [
+      {
+        columnIndex: 0,
+        operator: "startsWith",
+        values: ["Alpha"],
+        matchCase: true,
+      },
+      `starts_with(CAST("label" AS VARCHAR), 'Alpha')`,
+    ],
+    [
+      { columnIndex: 0, operator: "endsWith", values: ["Alpha"] },
+      `ends_with(lower(CAST("label" AS VARCHAR)), lower('Alpha'))`,
+    ],
+  ] satisfies [DataFilter, string][])(
+    "renders text condition %# canonically",
+    (filter, expected) => {
+      expect(
+        formatFilterCondition(filter, field("label", "BYTE_ARRAY", "String")),
+      ).toBe(expected);
+    },
+  );
 
   it("renders numeric comparisons in the WHERE bar", () => {
     const schema = [field("amount", "DOUBLE", null)];

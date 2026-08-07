@@ -47,10 +47,12 @@ use updates::{
 };
 use view_settings::{DataViewSettings, get_data_view_settings, set_data_view_settings};
 use viewda_data_engine::{
-    ColumnStatistics, ColumnStatisticsError, ColumnStatisticsReader, DataFilter, DataSort,
-    DataViewBuilder, DataViewError, DataViewInterruptHandle, DataViewResourceDiagnostics,
-    DataWindowError, DataWindowReader, EngineError, EngineStatus, PreparedDataView, SchemaField,
-    SourceError, SourceSummary, StatisticsInterruptHandle, engine_status, inspect_local_source,
+    ColumnStatistics, ColumnStatisticsError, ColumnStatisticsReader, DataFilter,
+    DataFilterOperator, DataSort, DataViewBuilder, DataViewError, DataViewInterruptHandle,
+    DataViewResourceDiagnostics, DataWindowError, DataWindowReader, EngineError, EngineStatus,
+    PreparedDataView, SchemaField, SourceError, SourceSummary, StatisticsInterruptHandle,
+    TextValueSuggestions, TextValueSuggestionsInterruptHandle, TextValueSuggestionsReader,
+    engine_status, inspect_local_source,
 };
 
 const OPEN_SOURCE_MENU_ID: &str = "open-local-source";
@@ -144,6 +146,7 @@ pub(crate) struct OpenedSource {
     recents: RecentSourcesStore,
     data_views: DataViewJobs,
     data_exports: DataExportJobs,
+    text_suggestions: TextValueSuggestionJobs,
 }
 
 #[derive(Default)]
@@ -161,7 +164,24 @@ struct OpenedSourceSession {
     view_revision: u64,
     view: Option<PreparedDataView>,
     reader: DataWindowReader,
+    text_suggestion_reader: Option<Arc<TextValueSuggestionsReader>>,
     statistics_cache: HashMap<(u64, usize), ColumnStatistics>,
+}
+
+impl OpenedSourceSession {
+    fn text_suggestion_reader(
+        &mut self,
+    ) -> Result<Arc<TextValueSuggestionsReader>, DataWindowError> {
+        if self.text_suggestion_reader.is_none() {
+            self.text_suggestion_reader = Some(Arc::new(TextValueSuggestionsReader::new(
+                self.path.clone(),
+            )?));
+        }
+        self.text_suggestion_reader
+            .as_ref()
+            .map(Arc::clone)
+            .ok_or(DataWindowError::QueryEngineUnavailable)
+    }
 }
 
 #[derive(Default)]
@@ -236,6 +256,85 @@ fn cancel_data_view_job(
     }
     if jobs.active.as_ref().is_some_and(|active| {
         active.generation == generation && active.view_revision == view_revision
+    }) {
+        jobs.active.take()
+    } else {
+        None
+    }
+}
+
+#[derive(Default)]
+struct TextValueSuggestionJobs {
+    state: Mutex<TextValueSuggestionJobsState>,
+}
+
+#[derive(Default)]
+struct TextValueSuggestionJobsState {
+    watermark: Option<(u64, u64)>,
+    active: Option<ActiveTextValueSuggestionJob>,
+}
+
+struct ActiveTextValueSuggestionJob {
+    generation: u64,
+    suggestion_revision: u64,
+    interrupt: Arc<TextValueSuggestionsInterruptHandle>,
+}
+
+impl ActiveTextValueSuggestionJob {
+    fn cancel(&self) {
+        self.interrupt.interrupt();
+    }
+}
+
+fn register_text_value_suggestion_job(
+    jobs: &mut TextValueSuggestionJobsState,
+    next: ActiveTextValueSuggestionJob,
+) -> Result<(), DataWindowError> {
+    if jobs.watermark.is_some_and(|(generation, revision)| {
+        generation == next.generation && next.suggestion_revision <= revision
+    }) {
+        next.cancel();
+        return Err(DataWindowError::Cancelled);
+    }
+    jobs.watermark = Some((next.generation, next.suggestion_revision));
+    if let Some(previous) = jobs.active.replace(next) {
+        previous.cancel();
+    }
+    Ok(())
+}
+
+fn finish_text_value_suggestion_job(
+    jobs: &mut TextValueSuggestionJobsState,
+    generation: u64,
+    suggestion_revision: u64,
+    interrupt: &Arc<TextValueSuggestionsInterruptHandle>,
+) -> bool {
+    let is_current = jobs.active.as_ref().is_some_and(|active| {
+        active.generation == generation
+            && active.suggestion_revision == suggestion_revision
+            && Arc::ptr_eq(&active.interrupt, interrupt)
+    }) && jobs.watermark == Some((generation, suggestion_revision));
+    if is_current {
+        jobs.active.take();
+    }
+    is_current
+}
+
+fn cancel_text_value_suggestion_job(
+    jobs: &mut TextValueSuggestionJobsState,
+    generation: u64,
+    suggestion_revision: u64,
+) -> Option<ActiveTextValueSuggestionJob> {
+    if !jobs
+        .watermark
+        .is_some_and(|(watermark_generation, revision)| {
+            watermark_generation == generation && revision >= suggestion_revision
+        })
+    {
+        jobs.watermark = Some((generation, suggestion_revision));
+    }
+    if jobs.active.as_ref().is_some_and(|active| {
+        active.generation == generation && active.suggestion_revision == suggestion_revision
     }) {
         jobs.active.take()
     } else {
@@ -431,6 +530,7 @@ impl OpenedSource {
         }
         self.cancel_data_views()?;
         self.data_exports.cancel_all();
+        self.cancel_text_suggestions()?;
         let generation = state
             .generation
             .checked_add(1)
@@ -445,6 +545,7 @@ impl OpenedSource {
             source_row_count: summary.row_count,
             view_revision: 0,
             view: None,
+            text_suggestion_reader: None,
             statistics_cache: HashMap::new(),
         });
         if intent == SourceOpenIntent::Explicit {
@@ -477,6 +578,21 @@ impl OpenedSource {
     fn cancel_data_views(&self) -> Result<(), OpenSourceError> {
         let mut jobs = self
             .data_views
+            .state
+            .lock()
+            .map_err(|_| RecentSourceError::Storage)?;
+        let active = jobs.active.take();
+        jobs.watermark = None;
+        drop(jobs);
+        if let Some(active) = active {
+            active.cancel();
+        }
+        Ok(())
+    }
+
+    fn cancel_text_suggestions(&self) -> Result<(), OpenSourceError> {
+        let mut jobs = self
+            .text_suggestions
             .state
             .lock()
             .map_err(|_| RecentSourceError::Storage)?;
@@ -788,6 +904,136 @@ fn cancel_data_view(
             .lock()
             .map_err(|_| DataWindowError::Unsupported)?;
         cancel_data_view_job(&mut jobs, generation, view_revision)
+    };
+    if let Some(active) = active {
+        active.cancel();
+    }
+    Ok(())
+}
+
+/// Suggests actual text values on an isolated connection so typing stays responsive.
+#[tauri::command]
+async fn get_text_value_suggestions(
+    generation: u64,
+    suggestion_revision: u64,
+    column_index: usize,
+    prefix: String,
+    operator: DataFilterOperator,
+    opened_source: tauri::State<'_, OpenedSource>,
+) -> Result<TextValueSuggestions, DataWindowCommandError> {
+    let (reader, column) = {
+        let mut state = opened_source
+            .state
+            .lock()
+            .map_err(|_| DataWindowError::Unsupported)?;
+        let session = state
+            .session
+            .as_mut()
+            .ok_or(DataWindowCommandError::Session(
+                DataWindowSessionError::NoSourceOpen,
+            ))?;
+        if session.generation != generation {
+            return Err(DataWindowCommandError::Session(
+                DataWindowSessionError::SourceChanged,
+            ));
+        }
+        let column = session
+            .schema
+            .get(column_index)
+            .cloned()
+            .ok_or(DataWindowError::InvalidFilter)?;
+        (session.text_suggestion_reader()?, column)
+    };
+    let interrupt = Arc::new(reader.interrupt_handle());
+    {
+        let state = opened_source
+            .state
+            .lock()
+            .map_err(|_| DataWindowError::Unsupported)?;
+        let session = state
+            .session
+            .as_ref()
+            .ok_or(DataWindowCommandError::Session(
+                DataWindowSessionError::NoSourceOpen,
+            ))?;
+        if session.generation != generation {
+            return Err(DataWindowCommandError::Session(
+                DataWindowSessionError::SourceChanged,
+            ));
+        }
+        let mut jobs = opened_source
+            .text_suggestions
+            .state
+            .lock()
+            .map_err(|_| DataWindowError::Unsupported)?;
+        register_text_value_suggestion_job(
+            &mut jobs,
+            ActiveTextValueSuggestionJob {
+                generation,
+                suggestion_revision,
+                interrupt: Arc::clone(&interrupt),
+            },
+        )?;
+    }
+
+    let request_interrupt = Arc::clone(&interrupt);
+    let result = tauri::async_runtime::spawn_blocking(move || {
+        reader.fetch(&prefix, &column, operator, &request_interrupt)
+    })
+    .await;
+    let cancelled = interrupt.is_cancelled();
+    let state = opened_source
+        .state
+        .lock()
+        .map_err(|_| DataWindowError::Unsupported)?;
+    let source_is_current = state
+        .session
+        .as_ref()
+        .is_some_and(|session| session.generation == generation);
+    let mut jobs = opened_source
+        .text_suggestions
+        .state
+        .lock()
+        .map_err(|_| DataWindowError::Unsupported)?;
+    let is_current =
+        finish_text_value_suggestion_job(&mut jobs, generation, suggestion_revision, &interrupt);
+    drop(jobs);
+    drop(state);
+
+    if cancelled || !source_is_current || !is_current {
+        Err(DataWindowError::Cancelled.into())
+    } else {
+        result
+            .map_err(|_| DataWindowError::QueryEngineUnavailable)?
+            .map_err(Into::into)
+    }
+}
+
+/// Interrupts one suggestion revision without touching a newer request.
+#[tauri::command]
+fn cancel_text_value_suggestions(
+    generation: u64,
+    suggestion_revision: u64,
+    opened_source: tauri::State<'_, OpenedSource>,
+) -> Result<(), DataWindowCommandError> {
+    let active = {
+        let state = opened_source
+            .state
+            .lock()
+            .map_err(|_| DataWindowError::Unsupported)?;
+        if !state
+            .session
+            .as_ref()
+            .is_some_and(|session| session.generation == generation)
+        {
+            return Ok(());
+        }
+        let mut jobs = opened_source
+            .text_suggestions
+            .state
+            .lock()
+            .map_err(|_| DataWindowError::Unsupported)?;
+        cancel_text_value_suggestion_job(&mut jobs, generation, suggestion_revision)
     };
     if let Some(active) = active {
         active.cancel();
@@ -1286,6 +1532,7 @@ fn finish_shutdown(app: &tauri::AppHandle) {
     app.state::<OpenedSource>()
         .data_exports
         .cancel_all_and_wait();
+    let _ = app.state::<OpenedSource>().cancel_text_suggestions();
 }
 
 #[tauri::command]
@@ -1483,6 +1730,8 @@ pub fn run() {
             cancel_data_export,
             dismiss_data_export,
             reveal_data_export,
+            get_text_value_suggestions,
+            cancel_text_value_suggestions,
             get_column_statistics,
             cancel_column_statistics,
             get_update_settings,
@@ -1796,6 +2045,34 @@ mod tests {
     }
 
     #[test]
+    fn data_filter_accepts_the_camel_case_match_case_flag() {
+        let filter: DataFilter = serde_json::from_value(serde_json::json!({
+            "columnIndex": 0,
+            "operator": "textContains",
+            "values": ["Alpha"],
+            "matchCase": true
+        }))
+        .expect("camelCase filter JSON");
+
+        assert!(filter.match_case);
+    }
+
+    #[test]
+    fn text_suggestions_keep_the_camel_case_wire_shape() {
+        assert_eq!(
+            serde_json::to_value(TextValueSuggestions {
+                values: vec!["Alpha".to_owned()],
+                is_partial: true,
+            })
+            .expect("text suggestions JSON"),
+            serde_json::json!({
+                "values": ["Alpha"],
+                "isPartial": true
+            })
+        );
+    }
+
+    #[test]
     fn explicit_activation_prevents_restore_from_replacing_the_native_source() {
         let opened_source = OpenedSource::default();
         let launched = PathBuf::from("launched.parquet");
@@ -2041,6 +2318,99 @@ mod tests {
     }
 
     #[test]
+    fn replacing_the_source_interrupts_active_text_suggestions() {
+        let reader = TextValueSuggestionsReader::new(PathBuf::from("suggestions.parquet"))
+            .expect("suggestion reader");
+        let interrupt = Arc::new(reader.interrupt_handle());
+        let opened_source = OpenedSource::default();
+        opened_source
+            .text_suggestions
+            .state
+            .lock()
+            .expect("suggestion jobs")
+            .active
+            .replace(ActiveTextValueSuggestionJob {
+                generation: 1,
+                suggestion_revision: 3,
+                interrupt: Arc::clone(&interrupt),
+            });
+
+        opened_source
+            .install(
+                None,
+                PathBuf::from("replacement.parquet"),
+                SourceSummary {
+                    display_name: "replacement.parquet".into(),
+                    size_bytes: 8,
+                    row_count: 1,
+                    row_group_count: 1,
+                    schema: Vec::new(),
+                },
+                SourceOpenIntent::Explicit,
+            )
+            .expect("source state")
+            .expect("replacement source is accepted");
+
+        assert!(interrupt.is_cancelled());
+        assert!(
+            opened_source
+                .text_suggestions
+                .state
+                .lock()
+                .expect("suggestion jobs")
+                .active
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn reuses_one_text_suggestion_reader_until_the_source_changes() {
+        let opened_source = OpenedSource::default();
+        let summary = |display_name: &str| SourceSummary {
+            display_name: display_name.to_owned(),
+            size_bytes: 8,
+            row_count: 1,
+            row_group_count: 1,
+            schema: Vec::new(),
+        };
+        opened_source
+            .install(
+                None,
+                PathBuf::from("source.parquet"),
+                summary("source.parquet"),
+                SourceOpenIntent::Explicit,
+            )
+            .expect("source state");
+
+        let reader = || {
+            opened_source
+                .state
+                .lock()
+                .expect("source state")
+                .session
+                .as_mut()
+                .expect("opened session")
+                .text_suggestion_reader()
+                .expect("suggestion reader")
+        };
+        let first = reader();
+        let second = reader();
+        assert!(Arc::ptr_eq(&first, &second));
+
+        opened_source
+            .install(
+                None,
+                PathBuf::from("replacement.parquet"),
+                summary("replacement.parquet"),
+                SourceOpenIntent::Explicit,
+            )
+            .expect("replacement source state");
+
+        let replacement = reader();
+        assert!(!Arc::ptr_eq(&first, &replacement));
+    }
+
+    #[test]
     fn view_revision_watermark_rejects_late_builds_and_replaces_one_active_job() {
         let make_interrupt = || {
             let builder = DataViewBuilder::new(PathBuf::from("view.parquet"), &[], &[])
@@ -2145,6 +2515,117 @@ mod tests {
         )
         .expect("newer revision");
         assert!(!next.is_cancelled());
+    }
+
+    #[test]
+    fn text_suggestion_revision_replaces_the_active_scan() {
+        let make_interrupt = || {
+            let reader = TextValueSuggestionsReader::new(PathBuf::from("suggestions.parquet"))
+                .expect("suggestion reader");
+            Arc::new(reader.interrupt_handle())
+        };
+        let current = make_interrupt();
+        let stale = make_interrupt();
+        let next = make_interrupt();
+        let mut jobs = TextValueSuggestionJobsState::default();
+
+        register_text_value_suggestion_job(
+            &mut jobs,
+            ActiveTextValueSuggestionJob {
+                generation: 7,
+                suggestion_revision: 2,
+                interrupt: Arc::clone(&current),
+            },
+        )
+        .expect("current revision");
+        assert_eq!(
+            register_text_value_suggestion_job(
+                &mut jobs,
+                ActiveTextValueSuggestionJob {
+                    generation: 7,
+                    suggestion_revision: 1,
+                    interrupt: Arc::clone(&stale),
+                },
+            ),
+            Err(DataWindowError::Cancelled)
+        );
+        assert!(stale.is_cancelled());
+        assert!(!current.is_cancelled());
+
+        register_text_value_suggestion_job(
+            &mut jobs,
+            ActiveTextValueSuggestionJob {
+                generation: 7,
+                suggestion_revision: 3,
+                interrupt: Arc::clone(&next),
+            },
+        )
+        .expect("new revision");
+        assert!(current.is_cancelled());
+        assert!(!next.is_cancelled());
+        assert_eq!(jobs.watermark, Some((7, 3)));
+    }
+
+    #[test]
+    fn completed_text_suggestion_revision_keeps_the_monotonic_watermark() {
+        let make_interrupt = || {
+            let reader = TextValueSuggestionsReader::new(PathBuf::from("suggestions.parquet"))
+                .expect("suggestion reader");
+            Arc::new(reader.interrupt_handle())
+        };
+        let interrupt = make_interrupt();
+        let mut jobs = TextValueSuggestionJobsState::default();
+        register_text_value_suggestion_job(
+            &mut jobs,
+            ActiveTextValueSuggestionJob {
+                generation: 7,
+                suggestion_revision: 3,
+                interrupt: Arc::clone(&interrupt),
+            },
+        )
+        .expect("initial revision");
+
+        assert!(finish_text_value_suggestion_job(
+            &mut jobs, 7, 3, &interrupt
+        ));
+        assert_eq!(jobs.watermark, Some((7, 3)));
+        assert!(jobs.active.is_none());
+
+        let late = make_interrupt();
+        assert_eq!(
+            register_text_value_suggestion_job(
+                &mut jobs,
+                ActiveTextValueSuggestionJob {
+                    generation: 7,
+                    suggestion_revision: 2,
+                    interrupt: Arc::clone(&late),
+                },
+            ),
+            Err(DataWindowError::Cancelled)
+        );
+        assert!(late.is_cancelled());
+    }
+
+    #[test]
+    fn text_suggestion_cancellation_covers_a_request_before_registration() {
+        let reader = TextValueSuggestionsReader::new(PathBuf::from("suggestions.parquet"))
+            .expect("suggestion reader");
+        let late = Arc::new(reader.interrupt_handle());
+        let mut jobs = TextValueSuggestionJobsState::default();
+
+        assert!(cancel_text_value_suggestion_job(&mut jobs, 7, 3).is_none());
+        assert_eq!(
+            register_text_value_suggestion_job(
+                &mut jobs,
+                ActiveTextValueSuggestionJob {
+                    generation: 7,
+                    suggestion_revision: 3,
+                    interrupt: Arc::clone(&late),
+                },
+            ),
+            Err(DataWindowError::Cancelled)
+        );
+        assert!(late.is_cancelled());
     }
 
     #[test]

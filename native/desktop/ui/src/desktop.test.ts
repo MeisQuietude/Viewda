@@ -2,6 +2,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import {
   cancelDataView,
+  cancelTextValueSuggestions,
   ColumnStatisticsCommandError,
   DataExportCommandError,
   DataWindowCommandError,
@@ -11,6 +12,7 @@ import {
   getDataViewSettings,
   getDataWindow,
   getDataViewStatus,
+  getTextValueSuggestions,
   prepareDataView,
   revealDataExport,
   setDataViewSettings,
@@ -45,6 +47,43 @@ describe("desktop seam", () => {
     expect(invokeMock).toHaveBeenNthCalledWith(2, "set_data_view_settings", {
       settings: { memoryLimit: "mb1536" },
     });
+  });
+
+  it("passes text suggestion revisions through the desktop seam", async () => {
+    invokeMock
+      .mockResolvedValueOnce({
+        values: ["Alpha", "Alpine"],
+        isPartial: true,
+      })
+      .mockResolvedValueOnce(undefined);
+
+    await expect(
+      getTextValueSuggestions(7, 4, 2, "Al", "textContains"),
+    ).resolves.toEqual({
+      values: ["Alpha", "Alpine"],
+      isPartial: true,
+    });
+    await expect(cancelTextValueSuggestions(7, 4)).resolves.toBeUndefined();
+
+    expect(invokeMock).toHaveBeenNthCalledWith(
+      1,
+      "get_text_value_suggestions",
+      {
+        generation: 7,
+        suggestionRevision: 4,
+        columnIndex: 2,
+        prefix: "Al",
+        operator: "textContains",
+      },
+    );
+    expect(invokeMock).toHaveBeenNthCalledWith(
+      2,
+      "cancel_text_value_suggestions",
+      {
+        generation: 7,
+        suggestionRevision: 4,
+      },
+    );
   });
 
   it("unwraps a restored source error from the Rust wire shape", async () => {

@@ -47,6 +47,9 @@ export type DataFilterOperator =
   | "oneOf"
   | "range"
   | "textContains"
+  | "notContains"
+  | "startsWith"
+  | "endsWith"
   | "isNull"
   | "isNotNull";
 
@@ -54,6 +57,7 @@ export interface DataFilter {
   columnIndex: number;
   operator: DataFilterOperator;
   values: string[];
+  matchCase?: boolean;
 }
 
 export type SortDirection = "ascending" | "descending";
@@ -143,6 +147,11 @@ export interface ColumnStatistics {
   minMaxComputed: boolean;
   nullShare: number;
   approximateDistinctCount: number;
+}
+
+export interface TextValueSuggestions {
+  values: string[];
+  isPartial: boolean;
 }
 
 export type UpdateChannel = "stable" | "latest";
@@ -504,6 +513,40 @@ export async function revealDataExport(id: number): Promise<void> {
     await invoke("reveal_data_export", { id });
   } catch (error) {
     throw new DataExportCommandError(readDataExportErrorCode(error));
+  }
+}
+
+export async function getTextValueSuggestions(
+  generation: number,
+  suggestionRevision: number,
+  columnIndex: number,
+  prefix: string,
+  operator: DataFilterOperator,
+): Promise<TextValueSuggestions> {
+  try {
+    return await invoke<TextValueSuggestions>("get_text_value_suggestions", {
+      generation,
+      suggestionRevision,
+      columnIndex,
+      prefix,
+      operator,
+    });
+  } catch (error) {
+    throw readDataWindowCommandError(error);
+  }
+}
+
+export async function cancelTextValueSuggestions(
+  generation: number,
+  suggestionRevision: number,
+): Promise<void> {
+  try {
+    await invoke("cancel_text_value_suggestions", {
+      generation,
+      suggestionRevision,
+    });
+  } catch (error) {
+    throw readDataWindowCommandError(error);
   }
 }
 
