@@ -399,8 +399,10 @@ impl DataViewBuilder {
             source_columns,
             source_row_count: summary.row_count,
             row_count: index_summary.row_count,
+            filters: self.filters,
+            sort: self.sort,
             resource_diagnostics: window_resource_diagnostics,
-            temporary_directory: self.temporary_directory,
+            temporary_directory: Arc::new(self.temporary_directory),
         })
     }
 
@@ -559,14 +561,43 @@ pub struct PreparedDataView {
     source_columns: Vec<String>,
     source_row_count: u64,
     row_count: u64,
+    filters: Vec<DataFilter>,
+    sort: Vec<DataSort>,
     resource_diagnostics: DataViewResourceDiagnostics,
-    temporary_directory: TempDir,
+    temporary_directory: Arc<TempDir>,
+}
+
+/// Snapshot of a completed view used by a background export.
+///
+/// The temporary-directory lease keeps the compact position index alive if the
+/// grid replaces its active view while the export is still running.
+pub struct PreparedDataViewExport {
+    pub(crate) source_path: PathBuf,
+    pub(crate) position_index: PathBuf,
+    pub(crate) source_row_count: u64,
+    pub(crate) row_count: u64,
+    pub(crate) filters: Vec<DataFilter>,
+    pub(crate) sorted: bool,
+    pub(crate) _temporary_directory: Arc<TempDir>,
 }
 
 impl PreparedDataView {
     /// Returns the exact number of positions in this view.
     pub fn row_count(&self) -> u64 {
         self.row_count
+    }
+
+    /// Captures the current filter and position index for a background export.
+    pub fn export_snapshot(&self) -> PreparedDataViewExport {
+        PreparedDataViewExport {
+            source_path: self.source_path.clone(),
+            position_index: self.position_index.clone(),
+            source_row_count: self.source_row_count,
+            row_count: self.row_count,
+            filters: self.filters.clone(),
+            sorted: !self.sort.is_empty(),
+            _temporary_directory: Arc::clone(&self.temporary_directory),
+        }
     }
 
     /// Reads a bounded view window without rerunning its filter or sort.

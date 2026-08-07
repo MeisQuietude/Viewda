@@ -24,6 +24,18 @@ describe("color theme", () => {
       /\.statistics-error\s*\{\s*color: var\(--error-text\);\s*\}/,
     );
   });
+
+  it("uses theme variables for export menus and progress states", () => {
+    expect(styles).toMatch(
+      /\.column-menu,\s*\.grid-menu\s*\{[^}]*color:\s*var\(--grid-text\);[^}]*background:\s*var\(--grid-header\);/s,
+    );
+    expect(styles).toMatch(
+      /\.export-progress\s*\{[^}]*color:\s*var\(--grid-text-muted\);[^}]*background:\s*var\(--grid-header\);/s,
+    );
+    expect(styles).toMatch(
+      /\.export-progress\.is-error\s*\{\s*color:\s*var\(--error-text\);\s*\}/,
+    );
+  });
 });
 
 describe("schema field layout", () => {

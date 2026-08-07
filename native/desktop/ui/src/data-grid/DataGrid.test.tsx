@@ -125,6 +125,11 @@ beforeEach(() => {
     approximateDistinctCount: 42,
   });
   vi.spyOn(desktop, "cancelColumnStatistics").mockResolvedValue();
+  vi.spyOn(desktop, "getDataExportStatus").mockResolvedValue(null);
+  vi.spyOn(desktop, "startDataExport").mockResolvedValue(null);
+  vi.spyOn(desktop, "cancelDataExport").mockResolvedValue(true);
+  vi.spyOn(desktop, "dismissDataExport").mockResolvedValue(true);
+  vi.spyOn(desktop, "revealDataExport").mockResolvedValue();
   clipboardWrite.mockReset();
   clipboardWrite.mockResolvedValue(undefined);
   Object.defineProperty(navigator, "clipboard", {
@@ -1030,8 +1035,13 @@ describe("DataGrid window rendering", () => {
       editorMock.props?.onCellContextMenu?.([0, 2_063_949], {
         preventDefault: vi.fn(),
         bounds: { x: 20, y: 20, width: 120, height: 28 },
+        localEventX: 12,
+        localEventY: 10,
       } as never);
     });
+    fireEvent.click(
+      screen.getByRole("menuitem", { name: "Filter by this value…" }),
+    );
     const filterEditor = screen.getByRole("form", {
       name: "Filter boolean_value",
     });
@@ -1545,8 +1555,13 @@ describe("DataGrid window rendering", () => {
       editorMock.props?.onCellContextMenu?.([0, 0], {
         preventDefault: vi.fn(),
         bounds: { x: 20, y: 20, width: 120, height: 28 },
+        localEventX: 12,
+        localEventY: 10,
       } as never);
     });
+    fireEvent.click(
+      screen.getByRole("menuitem", { name: "Filter by this value…" }),
+    );
 
     expect(
       within(
@@ -1858,6 +1873,230 @@ describe("DataGrid window rendering", () => {
   });
 });
 
+describe("DataGrid export", () => {
+  it("exports the active filtered and sorted view revision", async () => {
+    render(<DataGrid source={source} />);
+    addNumberFilter("4");
+    await waitFor(() =>
+      expect(desktop.prepareDataView).toHaveBeenLastCalledWith(
+        7,
+        1,
+        [{ columnIndex: 0, operator: "equals", values: ["4"] }],
+        [],
+        { memoryLimit: "mb384" },
+      ),
+    );
+    await waitFor(() => expect(editorMock.props?.rows).toBe(37));
+    act(() => {
+      editorMock.props?.onHeaderClicked?.(1, {
+        bounds: { x: 0, y: 0, width: 120, height: 32 },
+        localEventX: 16,
+        isEdge: false,
+        shiftKey: false,
+        metaKey: false,
+        ctrlKey: false,
+        preventDefault: vi.fn(),
+      } as never);
+    });
+    await waitFor(() =>
+      expect(desktop.prepareDataView).toHaveBeenLastCalledWith(
+        7,
+        2,
+        [{ columnIndex: 0, operator: "equals", values: ["4"] }],
+        [{ sourceIndex: 1, direction: "ascending" }],
+        { memoryLimit: "mb384" },
+      ),
+    );
+    await waitFor(() =>
+      expect(editorMock.props?.columns[1]?.icon).toBe("viewda-sort-ascending"),
+    );
+
+    openGridMenu();
+    fireEvent.click(
+      screen.getByRole("menuitem", { name: /Export current view \(37 rows\)/ }),
+    );
+
+    await waitFor(() =>
+      expect(desktop.startDataExport).toHaveBeenCalledWith(7, 2, "view", {
+        columnIndices: [0, 1, 2, 3, 4, 5, 6, 7],
+        rowRanges: [],
+        output: { format: "csv", options: {} },
+      }),
+    );
+  });
+
+  it("exports multi-rectangle union rows by union columns in grid order", async () => {
+    render(<DataGrid source={source} />);
+    act(() => {
+      editorMock.props?.onGridSelectionChange?.({
+        columns: CompactSelection.empty(),
+        rows: CompactSelection.empty(),
+        current: {
+          cell: [2, 3],
+          range: { x: 2, y: 3, width: 3, height: 3 },
+          rangeStack: [{ x: 0, y: 1, width: 2, height: 3 }],
+        },
+      });
+    });
+
+    openGridMenu();
+    fireEvent.click(
+      screen.getByRole("menuitem", { name: /Export selection \(5 × 5\)/ }),
+    );
+
+    await waitFor(() =>
+      expect(desktop.startDataExport).toHaveBeenCalledWith(
+        7,
+        0,
+        "selection",
+        expect.objectContaining({
+          columnIndices: [0, 1, 2, 3, 4],
+          rowRanges: [{ start: 1, end: 6 }],
+        }),
+      ),
+    );
+  });
+
+  it("keeps large row selections while clipboard copying stays capped", async () => {
+    render(<DataGrid source={{ ...source, rowCount: 100_000 }} />);
+    act(() => {
+      editorMock.props?.onGridSelectionChange?.({
+        columns: CompactSelection.empty(),
+        rows: CompactSelection.fromSingleSelection([0, 50_000]),
+      });
+    });
+
+    expect(editorMock.props?.gridSelection?.rows.length).toBe(50_000);
+    await waitFor(() => expect(desktop.getDataWindow).toHaveBeenCalled());
+    vi.mocked(desktop.getDataWindow).mockClear();
+    const editor = screen.getByTestId("data-editor");
+    editor.tabIndex = 0;
+    editor.focus();
+    fireEvent.copy(window);
+
+    await waitFor(() => expect(clipboardWrite).toHaveBeenCalledOnce());
+    const copied = clipboardWrite.mock.calls[0]?.[0] as string;
+    expect(copied.split("\n")).toHaveLength(10_000);
+    expect(desktop.getDataWindow).toHaveBeenCalledTimes(20);
+    expect(
+      screen.getByText(/limited to the first 10,000 rows/),
+    ).toHaveAttribute("role", "status");
+
+    openGridMenu();
+    expect(
+      screen.getByRole("menuitem", {
+        name: /Export selection \(50,000 × 8\)/,
+      }),
+    ).toBeInTheDocument();
+  });
+
+  it("does not offer a window retry when capped clipboard copying fails", async () => {
+    clipboardWrite.mockRejectedValueOnce(new Error("clipboard unavailable"));
+    render(<DataGrid source={{ ...source, rowCount: 100_000 }} />);
+    act(() => {
+      editorMock.props?.onGridSelectionChange?.({
+        columns: CompactSelection.empty(),
+        rows: CompactSelection.fromSingleSelection([0, 50_000]),
+      });
+    });
+    await waitFor(() => expect(desktop.getDataWindow).toHaveBeenCalled());
+    const editor = screen.getByTestId("data-editor");
+    editor.tabIndex = 0;
+    editor.focus();
+    fireEvent.copy(window);
+
+    const alert = await screen.findByRole("alert");
+    expect(alert).toHaveTextContent("The selected rows could not be copied.");
+    expect(
+      within(alert).queryByRole("button", { name: "Retry window" }),
+    ).not.toBeInTheDocument();
+  });
+
+  it("uses the shortcut for selection and falls back to the current view", async () => {
+    render(<DataGrid source={source} />);
+
+    fireEvent.keyDown(window, { key: "e", ctrlKey: true, shiftKey: true });
+    await waitFor(() =>
+      expect(desktop.startDataExport).toHaveBeenLastCalledWith(
+        7,
+        0,
+        "view",
+        expect.any(Object),
+      ),
+    );
+    act(() => {
+      editorMock.props?.onGridSelectionChange?.({
+        columns: CompactSelection.empty(),
+        rows: CompactSelection.fromSingleSelection([2, 5]),
+      });
+    });
+
+    fireEvent.keyDown(window, { key: "E", ctrlKey: true, shiftKey: true });
+    await waitFor(() =>
+      expect(desktop.startDataExport).toHaveBeenLastCalledWith(
+        7,
+        0,
+        "selection",
+        expect.objectContaining({ rowRanges: [{ start: 2, end: 5 }] }),
+      ),
+    );
+  });
+
+  it("shows measured progress, blocks parallel exports, and cancels the job", async () => {
+    vi.mocked(desktop.getDataExportStatus).mockResolvedValue({
+      state: "running",
+      id: 12,
+      fileName: "large-view.csv",
+      bytesWritten: 12_400,
+    });
+    render(<DataGrid source={source} />);
+
+    expect(await screen.findByText(/12\.4 KB written/)).toBeInTheDocument();
+    openGridMenu();
+    const exportItem = screen.getByRole("menuitem", {
+      name: /Exporting large-view\.csv \(12\.4 KB\)/,
+    });
+    expect(exportItem).toBeDisabled();
+
+    fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+    await waitFor(() =>
+      expect(desktop.cancelDataExport).toHaveBeenCalledWith(12),
+    );
+  });
+
+  it("auto-dismisses a completed pill even when native dismissal fails", async () => {
+    vi.useFakeTimers();
+    vi.mocked(desktop.getDataExportStatus).mockResolvedValue({
+      state: "completed",
+      id: 9,
+      fileName: "large-view.csv",
+      bytesWritten: 2_500_000,
+    });
+    vi.mocked(desktop.dismissDataExport).mockRejectedValue(
+      new Error("invoke failed"),
+    );
+
+    try {
+      render(<DataGrid source={source} />);
+      await act(async () => Promise.resolve());
+      expect(
+        screen.getByRole("button", { name: "Reveal in folder" }),
+      ).toBeInTheDocument();
+
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(6_000);
+      });
+
+      expect(desktop.dismissDataExport).toHaveBeenCalledWith(9);
+      expect(
+        screen.queryByRole("button", { name: "Reveal in folder" }),
+      ).not.toBeInTheDocument();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});
+
 function openColumnMenu(visibleIndex: number) {
   act(() => {
     editorMock.props?.onHeaderMenuClick?.(visibleIndex, {
@@ -1866,6 +2105,17 @@ function openColumnMenu(visibleIndex: number) {
       width: 120,
       height: 32,
     });
+  });
+}
+
+function openGridMenu() {
+  act(() => {
+    editorMock.props?.onCellContextMenu?.([0, 0], {
+      preventDefault: vi.fn(),
+      bounds: { x: 20, y: 20, width: 120, height: 28 },
+      localEventX: 12,
+      localEventY: 10,
+    } as never);
   });
 }
 

@@ -92,6 +92,51 @@ export interface DataViewResourceDiagnostics {
   sortColumns: DataViewSortDiagnostic[];
 }
 
+export interface ExportRowRange {
+  start: number;
+  end: number;
+}
+
+export interface DataExportRequest {
+  columnIndices: number[];
+  rowRanges: ExportRowRange[];
+  output: { format: "csv"; options: Record<string, never> };
+}
+
+export type DataExportScope = "selection" | "view";
+
+export type DataExportErrorCode =
+  | "noSourceOpen"
+  | "sourceChanged"
+  | "viewChanged"
+  | "alreadyRunning"
+  | "notFound"
+  | "permissionDenied"
+  | "notParquet"
+  | "corruptSource"
+  | "invalidRequest"
+  | "unsupported"
+  | "diskFull"
+  | "resourceExhausted"
+  | "queryFailed"
+  | "queryEngineUnavailable"
+  | "cancelled";
+
+interface DataExportStatusBase {
+  id: number;
+  fileName: string;
+  bytesWritten: number;
+}
+
+export type DataExportStatus =
+  | (DataExportStatusBase & { state: "running" })
+  | (DataExportStatusBase & { state: "completed" })
+  | (DataExportStatusBase & { state: "cancelled" })
+  | (DataExportStatusBase & {
+      state: "failed";
+      error: DataExportErrorCode;
+    });
+
 export interface ColumnStatistics {
   minimum: string | null;
   maximum: string | null;
@@ -221,6 +266,13 @@ export class DataWindowCommandError extends Error {
   ) {
     super(code);
     this.name = "DataWindowCommandError";
+  }
+}
+
+export class DataExportCommandError extends Error {
+  constructor(readonly code: DataExportErrorCode) {
+    super(code);
+    this.name = "DataExportCommandError";
   }
 }
 
@@ -409,6 +461,44 @@ export async function cancelDataView(
     await invoke("cancel_data_view", { generation, viewRevision });
   } catch (error) {
     throw readDataWindowCommandError(error);
+  }
+}
+
+export async function startDataExport(
+  generation: number,
+  viewRevision: number,
+  scope: DataExportScope,
+  request: DataExportRequest,
+): Promise<DataExportStatus | null> {
+  try {
+    return await invoke<DataExportStatus | null>("start_data_export", {
+      generation,
+      viewRevision,
+      scope,
+      request,
+    });
+  } catch (error) {
+    throw new DataExportCommandError(readDataExportErrorCode(error));
+  }
+}
+
+export function getDataExportStatus(): Promise<DataExportStatus | null> {
+  return invoke<DataExportStatus | null>("get_data_export_status");
+}
+
+export function cancelDataExport(id: number): Promise<boolean> {
+  return invoke<boolean>("cancel_data_export", { id });
+}
+
+export function dismissDataExport(id: number): Promise<boolean> {
+  return invoke<boolean>("dismiss_data_export", { id });
+}
+
+export async function revealDataExport(id: number): Promise<void> {
+  try {
+    await invoke("reveal_data_export", { id });
+  } catch (error) {
+    throw new DataExportCommandError(readDataExportErrorCode(error));
   }
 }
 
@@ -603,6 +693,33 @@ function readDataViewResourceDiagnostics(
 
 function isNonNegativeSafeInteger(value: unknown): value is number {
   return typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
+}
+
+function readDataExportErrorCode(error: unknown): DataExportErrorCode {
+  if (typeof error === "object" && error !== null && "code" in error) {
+    const code = error.code;
+    if (
+      code === "noSourceOpen" ||
+      code === "sourceChanged" ||
+      code === "viewChanged" ||
+      code === "alreadyRunning" ||
+      code === "notFound" ||
+      code === "permissionDenied" ||
+      code === "notParquet" ||
+      code === "corruptSource" ||
+      code === "invalidRequest" ||
+      code === "unsupported" ||
+      code === "diskFull" ||
+      code === "resourceExhausted" ||
+      code === "queryFailed" ||
+      code === "queryEngineUnavailable" ||
+      code === "cancelled"
+    ) {
+      return code;
+    }
+  }
+
+  return "queryFailed";
 }
 
 function readColumnStatisticsErrorCode(

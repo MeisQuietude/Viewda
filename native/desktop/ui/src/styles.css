@@ -677,6 +677,8 @@ button {
 
 .grid-controls button,
 .column-menu button,
+.grid-menu button,
+.export-progress button,
 .filter-editor button {
   border: 0;
   color: inherit;
@@ -693,12 +695,16 @@ button {
 
 .grid-controls button:hover,
 .column-menu button:hover:not(:disabled),
+.grid-menu button:hover:not(:disabled),
+.export-progress button:hover:not(:disabled),
 .filter-editor-actions button:not(:last-child):hover:not(:disabled) {
   background: var(--grid-selection);
 }
 
 .grid-controls button:focus-visible,
 .column-menu button:focus-visible,
+.grid-menu button:focus-visible,
+.export-progress button:focus-visible,
 .filter-editor button:focus-visible,
 .filter-editor input:focus-visible,
 .filter-editor select:focus-visible,
@@ -819,7 +825,8 @@ button {
   background: var(--grid-header);
 }
 
-.column-menu {
+.column-menu,
+.grid-menu {
   position: fixed;
   z-index: 20;
   display: grid;
@@ -831,7 +838,8 @@ button {
   background: var(--grid-header);
 }
 
-.column-menu button {
+.column-menu button,
+.grid-menu button {
   min-height: 30px;
   padding: 0 9px;
   border-radius: 5px;
@@ -839,9 +847,87 @@ button {
   text-align: left;
 }
 
-.column-menu button:disabled {
+.column-menu button:disabled,
+.grid-menu button:disabled {
   color: var(--grid-text-faint);
   cursor: default;
+}
+
+.grid-menu {
+  min-width: 306px;
+}
+
+.grid-menu button {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 18px;
+}
+
+.grid-menu-separator {
+  height: 1px;
+  margin: 4px 5px;
+  background: var(--grid-border-soft);
+}
+
+.menu-shortcut {
+  color: var(--grid-text-faint);
+  font-size: 10px;
+}
+
+.export-progress {
+  position: absolute;
+  z-index: 18;
+  right: 14px;
+  bottom: 14px;
+  display: flex;
+  max-width: min(460px, calc(100% - 28px));
+  min-height: 38px;
+  align-items: center;
+  gap: 12px;
+  padding: 7px 9px 7px 12px;
+  border: 1px solid var(--grid-border);
+  border-radius: 9px;
+  color: var(--grid-text-muted);
+  background: var(--grid-header);
+  box-shadow: 0 8px 24px rgb(27 29 30 / 18%);
+  font-size: 12px;
+}
+
+.export-progress > span {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.export-progress strong {
+  color: var(--grid-text);
+  font-weight: 650;
+}
+
+.export-progress button {
+  min-height: 26px;
+  flex: none;
+  padding: 0 7px;
+  border-radius: 5px;
+  font-size: 11px;
+  font-weight: 600;
+}
+
+.export-progress.is-complete {
+  border-color: var(--grid-selection-strong);
+}
+
+.export-progress.is-error {
+  color: var(--error-text);
+}
+
+.export-progress .export-dismiss {
+  width: 24px;
+  padding: 0;
+  color: var(--grid-text-faint);
+  font-size: 16px;
 }
 
 .filter-editor {

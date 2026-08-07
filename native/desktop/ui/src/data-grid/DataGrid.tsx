@@ -1,6 +1,7 @@
 import {
   CompactSelection,
   DataEditor,
+  getCopyBufferContents,
   GridCellKind,
   type CellArray,
   type DataEditorRef,
@@ -15,12 +16,22 @@ import {
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import {
+  cancelDataExport,
   cancelDataView,
+  DataExportCommandError,
   DataWindowCommandError,
+  dismissDataExport,
+  getDataExportStatus,
   getDataWindow,
   getDataViewStatus,
   prepareDataView,
+  revealDataExport,
   shortcutModifier,
+  startDataExport,
+  type DataExportErrorCode,
+  type DataExportRequest,
+  type DataExportScope,
+  type DataExportStatus,
   type DataFilter,
   type DataViewSettings,
   type DataViewResourceDiagnostics,
@@ -37,6 +48,7 @@ import {
 } from "./arrow-window";
 import { copyRowLimit } from "./copy-limit";
 import { projectedSourceIndices, projectionContains } from "./column-window";
+import { exportSelectionShape } from "./export-selection";
 import { formatCellValue, usesMonospaceCells } from "./format-cell";
 import {
   defaultFilterOperator,
@@ -70,6 +82,7 @@ const HEADER_HEIGHT = 32;
 const INITIAL_ROWS = 64;
 const INITIAL_COLUMNS = 8;
 const COPY_CHUNK_ROWS = 512;
+const EXPORT_STATUS_POLL_MS = 1_000;
 const MAX_CACHED_CELLS = 20_000;
 const MIN_COLUMN_WIDTH = 112;
 const SORT_HEADER_HITBOX_START = 4;
@@ -135,6 +148,18 @@ interface HeaderMenu {
   sourceIndex: number;
   left: number;
   top: number;
+}
+
+interface GridMenu {
+  bounds: Rectangle;
+  cell: readonly [number, number];
+  left: number;
+  top: number;
+}
+
+interface ExportUiError {
+  action: "export" | "reveal" | "status";
+  code: DataExportErrorCode;
 }
 
 interface VersionedRowRequest {
@@ -315,6 +340,12 @@ export function DataGrid({
   );
   const [copyLimit, setCopyLimit] = useState<number | null>(null);
   const [headerMenu, setHeaderMenu] = useState<HeaderMenu | null>(null);
+  const [gridMenu, setGridMenu] = useState<GridMenu | null>(null);
+  const [exportStatus, setExportStatus] = useState<DataExportStatus | null>(
+    null,
+  );
+  const [exportStarting, setExportStarting] = useState(false);
+  const [exportError, setExportError] = useState<ExportUiError | null>(null);
   const [filterEditor, setFilterEditor] = useState<FilterEditorRequest | null>(
     null,
   );
@@ -336,6 +367,7 @@ export function DataGrid({
   >(null);
   const [schemaFocusRequest, setSchemaFocusRequest] = useState(0);
   const gridRef = useRef<DataEditorRef>(null);
+  const gridCanvasRef = useRef<HTMLDivElement>(null);
   const schemaFocusColumnRef = useRef<number | null>(null);
   const visibleColumnStatesRef = useRef<readonly ColumnState[]>([]);
   const dataWindowRef = useRef<ArrowDataWindow | null>(null);
@@ -351,7 +383,9 @@ export function DataGrid({
   const nextViewRevisionRef = useRef(0);
   const scrollStateRef = useRef<ScrollState>({ direction: 0, boundary: 0 });
   const aliveRef = useRef(true);
+  const exportStatusFailuresRef = useRef(0);
   const menuRef = useRef<HTMLDivElement>(null);
+  const gridMenuRef = useRef<HTMLDivElement>(null);
   const wherePopupRef = useRef<HTMLDivElement>(null);
   const sortPopupRef = useRef<HTMLDivElement>(null);
 
@@ -373,6 +407,14 @@ export function DataGrid({
   const filters = activeView.filters;
   const sort = activeView.sort;
   const gridRowCount = activeView.rowCount;
+  const visibleSourceIndices = useMemo(
+    () => visibleColumnStates.map((column) => column.sourceIndex),
+    [visibleColumnStates],
+  );
+  const selectedExport = useMemo(
+    () => exportSelectionShape(selection, visibleSourceIndices, gridRowCount),
+    [gridRowCount, selection, visibleSourceIndices],
+  );
   const whereClause = useMemo(
     () => formatWhereClause(filters, source.schema),
     [filters, source.schema],
@@ -491,6 +533,7 @@ export function DataGrid({
       copyWindowsRef.current.clear();
       setSelection(emptySelection());
       setCopyLimit(null);
+      setGridMenu(null);
       gridRef.current?.updateCells(
         visibleRegionDamage(visibleRegionsRef.current),
       );
@@ -729,6 +772,111 @@ export function DataGrid({
     [source.generation],
   );
 
+  const refreshExportStatus = useCallback(() => {
+    void getDataExportStatus().then(
+      (status) => {
+        exportStatusFailuresRef.current = 0;
+        setExportStatus(status);
+      },
+      () => {
+        exportStatusFailuresRef.current += 1;
+        if (exportStatusFailuresRef.current >= 3) {
+          setExportStatus(null);
+          setExportError({ action: "status", code: "queryFailed" });
+        }
+      },
+    );
+  }, []);
+
+  useEffect(() => {
+    refreshExportStatus();
+  }, [refreshExportStatus]);
+
+  useEffect(() => {
+    if (exportStatus?.state !== "running") {
+      return;
+    }
+    const interval = window.setInterval(
+      refreshExportStatus,
+      EXPORT_STATUS_POLL_MS,
+    );
+    return () => window.clearInterval(interval);
+  }, [exportStatus?.state, exportStatus?.id, refreshExportStatus]);
+
+  useEffect(() => {
+    if (exportStatus?.state !== "completed") {
+      return;
+    }
+    const completed = exportStatus;
+    const timeout = window.setTimeout(() => {
+      const clearCompleted = () => {
+        setExportStatus((current) =>
+          current?.id === completed.id ? null : current,
+        );
+      };
+      void dismissDataExport(completed.id).then(clearCompleted, clearCompleted);
+    }, 6_000);
+    return () => window.clearTimeout(timeout);
+  }, [exportStatus]);
+
+  const startExport = useCallback(
+    async (scope: DataExportScope) => {
+      if (exportStarting || exportStatus?.state === "running") {
+        return;
+      }
+      const shape = scope === "selection" ? selectedExport : null;
+      if (scope === "selection" && shape === null) {
+        return;
+      }
+      const request: DataExportRequest = {
+        columnIndices:
+          shape?.columnIndices ??
+          visibleColumnStates.map(({ sourceIndex }) => sourceIndex),
+        rowRanges: shape?.rowRanges ?? [],
+        output: { format: "csv", options: {} },
+      };
+      setExportStarting(true);
+      setExportError(null);
+      setGridMenu(null);
+      try {
+        const status = await startDataExport(
+          source.generation,
+          activeViewRef.current.revision,
+          scope,
+          request,
+        );
+        if (status !== null) {
+          setExportStatus(status);
+        }
+      } catch (error) {
+        if (
+          error instanceof DataExportCommandError &&
+          error.code === "alreadyRunning"
+        ) {
+          refreshExportStatus();
+        } else {
+          setExportError({
+            action: "export",
+            code:
+              error instanceof DataExportCommandError
+                ? error.code
+                : "queryFailed",
+          });
+        }
+      } finally {
+        setExportStarting(false);
+      }
+    },
+    [
+      exportStarting,
+      exportStatus?.state,
+      refreshExportStatus,
+      selectedExport,
+      source.generation,
+      visibleColumnStates,
+    ],
+  );
+
   useEffect(() => {
     if (headerMenu === null) {
       return;
@@ -751,6 +899,31 @@ export function DataGrid({
       document.removeEventListener("keydown", closeOnEscape);
     };
   }, [headerMenu]);
+
+  useEffect(() => {
+    if (gridMenu === null) {
+      return;
+    }
+    gridMenuRef.current
+      ?.querySelector<HTMLButtonElement>("button:not(:disabled)")
+      ?.focus();
+    const closeMenu = (event: PointerEvent) => {
+      if (!gridMenuRef.current?.contains(event.target as Node)) {
+        setGridMenu(null);
+      }
+    };
+    const closeOnEscape = (event: globalThis.KeyboardEvent) => {
+      if (event.key === "Escape") {
+        setGridMenu(null);
+      }
+    };
+    document.addEventListener("pointerdown", closeMenu);
+    document.addEventListener("keydown", closeOnEscape);
+    return () => {
+      document.removeEventListener("pointerdown", closeMenu);
+      document.removeEventListener("keydown", closeOnEscape);
+    };
+  }, [gridMenu]);
 
   useEffect(() => {
     if (!wherePopupOpen) {
@@ -817,6 +990,24 @@ export function DataGrid({
     window.addEventListener("keydown", toggleSidebar);
     return () => window.removeEventListener("keydown", toggleSidebar);
   }, []);
+
+  useEffect(() => {
+    const exportView = (event: globalThis.KeyboardEvent) => {
+      if (
+        !(event.metaKey || event.ctrlKey) ||
+        !event.shiftKey ||
+        event.altKey ||
+        event.key.toLowerCase() !== "e" ||
+        isTypingTarget(event.target)
+      ) {
+        return;
+      }
+      event.preventDefault();
+      void startExport(selectedExport === null ? "view" : "selection");
+    };
+    window.addEventListener("keydown", exportView);
+    return () => window.removeEventListener("keydown", exportView);
+  }, [selectedExport, startExport]);
 
   useEffect(() => {
     const sourceIndex = schemaFocusColumnRef.current;
@@ -1121,19 +1312,76 @@ export function DataGrid({
     ],
   );
 
-  const updateSelection = useCallback(
-    (next: GridSelection) => {
-      const rowLimit = copyRowLimit(visibleColumnStates.length);
-      if (next.rows.length > rowLimit) {
-        setSelection({ ...next, rows: takeSelection(next.rows, rowLimit) });
-        setCopyLimit(rowLimit);
-      } else {
-        setSelection(next);
-        setCopyLimit(null);
+  const copyCappedRowSelection = useCallback(
+    async (rowLimit: number) => {
+      const selectedRows = takeCompactSelection(selection.rows, rowLimit);
+      const rowsByWindow = new Map<number, number[]>();
+      for (const row of selectedRows) {
+        const offset = Math.floor(row / COPY_CHUNK_ROWS) * COPY_CHUNK_ROWS;
+        const rows = rowsByWindow.get(offset) ?? [];
+        rows.push(row);
+        rowsByWindow.set(offset, rows);
       }
+      const abortController = new AbortController();
+      const cells: GridCell[][] = [];
+      for (const rows of rowsByWindow.values()) {
+        const dataWindow = await loadCopyWindow(
+          rows[0] ?? 0,
+          visibleSourceIndices,
+          abortController.signal,
+        );
+        for (const row of rows) {
+          cells.push(
+            visibleColumnStates.map((_, column) =>
+              readCell(dataWindow, column, row, visibleColumnStates, true),
+            ),
+          );
+        }
+      }
+      const clipboard = window.navigator.clipboard;
+      if (clipboard?.writeText === undefined) {
+        throw new Error("The system clipboard is unavailable.");
+      }
+      const columnIndices = visibleColumnStates.map((_, index) => index);
+      await clipboard.writeText(
+        getCopyBufferContents(cells, columnIndices).textPlain,
+      );
     },
-    [visibleColumnStates.length],
+    [
+      loadCopyWindow,
+      readCell,
+      selection.rows,
+      visibleColumnStates,
+      visibleSourceIndices,
+    ],
   );
+
+  useEffect(() => {
+    const copyRows = (event: ClipboardEvent) => {
+      const rowLimit = copyRowLimit(visibleColumnStates.length);
+      if (
+        selection.current !== undefined ||
+        selection.rows.length <= rowLimit ||
+        !gridCanvasRef.current?.contains(document.activeElement)
+      ) {
+        return;
+      }
+      event.preventDefault();
+      event.stopImmediatePropagation();
+      setCopyLimit(rowLimit);
+      void copyCappedRowSelection(rowLimit).catch(() => {
+        failedRequestRef.current = null;
+        setLoadError({ message: "The selected rows could not be copied." });
+      });
+    };
+    window.addEventListener("copy", copyRows, true);
+    return () => window.removeEventListener("copy", copyRows, true);
+  }, [copyCappedRowSelection, selection, visibleColumnStates.length]);
+
+  const updateSelection = useCallback((next: GridSelection) => {
+    setSelection(next);
+    setCopyLimit(null);
+  }, []);
 
   const updateColumn = useCallback(
     (sourceIndex: number, update: Partial<ColumnState>) => {
@@ -1146,6 +1394,7 @@ export function DataGrid({
       );
       setSelection(emptySelection());
       setHeaderMenu(null);
+      setGridMenu(null);
     },
     [],
   );
@@ -1212,6 +1461,11 @@ export function DataGrid({
         );
   const filterEditorField =
     filterEditor === null ? undefined : source.schema[filterEditor.sourceIndex];
+  const exportBusy = exportStarting || exportStatus?.state === "running";
+  const runningExportLabel =
+    exportStatus?.state === "running"
+      ? `Exporting ${exportStatus.fileName} (${formatBytes(exportStatus.bytesWritten)})…`
+      : "Choosing export destination…";
 
   const editFilter = useCallback(
     (filterIndex: number, button: HTMLButtonElement) => {
@@ -1544,7 +1798,7 @@ export function DataGrid({
             <p>This file has no rows.</p>
           </div>
         ) : (
-          <div className="grid-canvas">
+          <div ref={gridCanvasRef} className="grid-canvas">
             <DataEditor
               key={gridInstanceKey}
               ref={gridRef}
@@ -1576,7 +1830,25 @@ export function DataGrid({
               theme={gridTheme}
               onCellContextMenu={(cell, event) => {
                 event.preventDefault();
-                openFilterForCell(cell, event.bounds);
+                setHeaderMenu(null);
+                setGridMenu({
+                  bounds: event.bounds,
+                  cell,
+                  left: Math.max(
+                    4,
+                    Math.min(
+                      event.bounds.x + event.localEventX,
+                      window.innerWidth - 318,
+                    ),
+                  ),
+                  top: Math.max(
+                    4,
+                    Math.min(
+                      event.bounds.y + event.localEventY,
+                      window.innerHeight - 148,
+                    ),
+                  ),
+                });
               }}
               onHeaderClicked={(visibleIndex, event) => {
                 if (
@@ -1627,6 +1899,7 @@ export function DataGrid({
                 const sourceIndex =
                   visibleColumnStates[visibleIndex]?.sourceIndex;
                 if (sourceIndex !== undefined) {
+                  setGridMenu(null);
                   setHeaderMenu({
                     sourceIndex,
                     left: Math.max(
@@ -1701,6 +1974,94 @@ export function DataGrid({
           </button>
         </div>
       )}
+      {gridMenu !== null && (
+        <div
+          ref={gridMenuRef}
+          className="grid-menu"
+          role="menu"
+          aria-label="Data export"
+          style={{ left: gridMenu.left, top: gridMenu.top }}
+        >
+          <button
+            type="button"
+            role="menuitem"
+            onClick={() => {
+              openFilterForCell(gridMenu.cell, gridMenu.bounds);
+              setGridMenu(null);
+            }}
+          >
+            Filter by this value…
+          </button>
+          <div className="grid-menu-separator" role="separator" />
+          {selectedExport !== null && (
+            <button
+              type="button"
+              role="menuitem"
+              disabled={exportBusy}
+              onClick={() => void startExport("selection")}
+            >
+              <span>
+                {exportBusy
+                  ? runningExportLabel
+                  : `Export selection (${formatCount(selectedExport.rowCount)} × ${formatCount(selectedExport.columnCount)})…`}
+              </span>
+              {!exportBusy && (
+                <span className="menu-shortcut">{shortcutModifier}Shift+E</span>
+              )}
+            </button>
+          )}
+          <button
+            type="button"
+            role="menuitem"
+            disabled={exportBusy}
+            onClick={() => void startExport("view")}
+          >
+            <span>
+              {exportBusy
+                ? runningExportLabel
+                : `Export current view (${formatCount(gridRowCount)} rows)…`}
+            </span>
+            {!exportBusy && selectedExport === null && (
+              <span className="menu-shortcut">{shortcutModifier}Shift+E</span>
+            )}
+          </button>
+        </div>
+      )}
+      {(exportStatus !== null || exportError !== null) && (
+        <ExportProgressPill
+          status={exportStatus}
+          error={exportError}
+          onCancel={(id) => {
+            void cancelDataExport(id).then(
+              refreshExportStatus,
+              refreshExportStatus,
+            );
+          }}
+          onDismiss={(id) => {
+            if (id === null) {
+              setExportError(null);
+              return;
+            }
+            const clearDismissed = () => {
+              setExportStatus((current) =>
+                current?.id === id ? null : current,
+              );
+            };
+            void dismissDataExport(id).then(clearDismissed, clearDismissed);
+          }}
+          onReveal={(id) => {
+            void revealDataExport(id).catch((error: unknown) => {
+              setExportError({
+                action: "reveal",
+                code:
+                  error instanceof DataExportCommandError
+                    ? error.code
+                    : "queryFailed",
+              });
+            });
+          }}
+        />
+      )}
       {filterEditor !== null && filterEditorField !== undefined && (
         <FilterEditor
           request={filterEditor}
@@ -1719,6 +2080,161 @@ export function DataGrid({
       )}
     </section>
   );
+}
+
+function ExportProgressPill({
+  status,
+  error,
+  onCancel,
+  onDismiss,
+  onReveal,
+}: {
+  status: DataExportStatus | null;
+  error: ExportUiError | null;
+  onCancel: (id: number) => void;
+  onDismiss: (id: number | null) => void;
+  onReveal: (id: number) => void;
+}) {
+  if (error !== null) {
+    return (
+      <div className="export-progress is-error" role="alert">
+        <span>{exportUiErrorMessage(error)}</span>
+        <button type="button" onClick={() => onDismiss(null)}>
+          Dismiss
+        </button>
+      </div>
+    );
+  }
+  if (status === null) {
+    return null;
+  }
+  if (status.state === "running") {
+    return (
+      <div className="export-progress" role="status" aria-live="off">
+        <span>
+          <strong>{status.fileName}</strong>
+          {` · ${formatBytes(status.bytesWritten)} written`}
+        </span>
+        <button type="button" onClick={() => onCancel(status.id)}>
+          Cancel
+        </button>
+      </div>
+    );
+  }
+  if (status.state === "completed") {
+    return (
+      <div className="export-progress is-complete" role="status">
+        <span>
+          <strong>{status.fileName}</strong>
+          {` · ${formatBytes(status.bytesWritten)} exported`}
+        </span>
+        <button type="button" onClick={() => onReveal(status.id)}>
+          Reveal in folder
+        </button>
+        <button
+          className="export-dismiss"
+          type="button"
+          aria-label="Dismiss export"
+          onClick={() => onDismiss(status.id)}
+        >
+          ×
+        </button>
+      </div>
+    );
+  }
+  return (
+    <div
+      className={`export-progress${status.state === "failed" ? " is-error" : ""}`}
+      role={status.state === "failed" ? "alert" : "status"}
+    >
+      <span>
+        {status.state === "cancelled"
+          ? EXPORT_CANCELLED_MESSAGE
+          : dataExportErrorMessage(status.error)}
+      </span>
+      <button type="button" onClick={() => onDismiss(status.id)}>
+        Dismiss
+      </button>
+    </div>
+  );
+}
+
+function formatCount(count: number): string {
+  return count >= 1_000_000
+    ? new Intl.NumberFormat("en-US", {
+        notation: "compact",
+        maximumFractionDigits: 1,
+      }).format(count)
+    : count.toLocaleString("en-US");
+}
+
+function formatBytes(bytes: number): string {
+  if (bytes < 1_000) {
+    return `${bytes.toLocaleString("en-US")} B`;
+  }
+  const units = ["KB", "MB", "GB", "TB"];
+  let value = bytes / 1_000;
+  let unit = units[0] ?? "KB";
+  for (const next of units.slice(1)) {
+    if (value < 1_000) {
+      break;
+    }
+    value /= 1_000;
+    unit = next;
+  }
+  return `${value.toLocaleString("en-US", { maximumFractionDigits: 1 })} ${unit}`;
+}
+
+const EXPORT_CANCELLED_MESSAGE = "Export cancelled · no file written.";
+
+function exportUiErrorMessage(error: ExportUiError): string {
+  if (error.action === "status") {
+    return "Viewda could not refresh the export status.";
+  }
+  if (error.action === "reveal") {
+    switch (error.code) {
+      case "notFound":
+        return "The exported file is no longer available.";
+      case "permissionDenied":
+        return "Viewda does not have permission to reveal the exported file.";
+      default:
+        return "The exported file could not be revealed.";
+    }
+  }
+  return dataExportErrorMessage(error.code);
+}
+
+function dataExportErrorMessage(code: DataExportErrorCode): string {
+  switch (code) {
+    case "permissionDenied":
+      return "Viewda does not have permission to write this file.";
+    case "diskFull":
+      return "There is not enough disk space to finish the export.";
+    case "resourceExhausted":
+      return "There is not enough memory to finish the export.";
+    case "cancelled":
+      return EXPORT_CANCELLED_MESSAGE;
+    case "notFound":
+    case "noSourceOpen":
+      return "The source file is no longer available.";
+    case "sourceChanged":
+      return "The open file changed before the export started.";
+    case "viewChanged":
+      return "The data view changed before the export started.";
+    case "notParquet":
+    case "corruptSource":
+      return "The open Parquet file is damaged or incomplete.";
+    case "alreadyRunning":
+      return "Another export is already running.";
+    case "invalidRequest":
+      return "This selection cannot be exported.";
+    case "unsupported":
+      return "This view cannot be exported.";
+    case "queryEngineUnavailable":
+      return "The packaged query engine could not start.";
+    case "queryFailed":
+      return "The query engine could not export this view.";
+  }
 }
 
 function isTypingTarget(target: EventTarget | null): boolean {
@@ -1760,20 +2276,18 @@ function emptySelection(): GridSelection {
   };
 }
 
-function takeSelection(
+function takeCompactSelection(
   selection: CompactSelection,
   limit: number,
-): CompactSelection {
-  let result = CompactSelection.empty();
-  let count = 0;
-  for (const index of selection) {
-    result = result.add(index);
-    count += 1;
-    if (count === limit) {
+): number[] {
+  const rows: number[] = [];
+  for (const row of selection) {
+    rows.push(row);
+    if (rows.length === limit) {
       break;
     }
   }
-  return result;
+  return rows;
 }
 
 function loadingCell(): GridCell {

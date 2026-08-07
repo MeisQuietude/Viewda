@@ -10,6 +10,9 @@ Backward-incompatible entries start with **Breaking:**.
 
 ### Added
 
+- The Data view now exports the current filtered and sorted view or a grid
+  selection to CSV through a native save dialog, with measured progress and
+  cancellation.
 - Settings can follow the system theme or force Light or Dark across the app,
   data grid, and native window chrome without restarting.
 - The Data view now shows typed column filters, including open-ended numeric and

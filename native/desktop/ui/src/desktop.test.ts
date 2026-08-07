@@ -3,13 +3,18 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import {
   cancelDataView,
   ColumnStatisticsCommandError,
+  DataExportCommandError,
   DataWindowCommandError,
+  dismissDataExport,
   getColumnStatistics,
+  getDataExportStatus,
   getDataViewSettings,
   getDataWindow,
   getDataViewStatus,
   prepareDataView,
+  revealDataExport,
   setDataViewSettings,
+  startDataExport,
   takePostUpdateState,
 } from "./desktop";
 
@@ -180,6 +185,67 @@ describe("desktop seam", () => {
 
     await expect(getDataWindow(7, 0, 0, 1, [0])).rejects.toEqual(
       new DataWindowCommandError(code),
+    );
+  });
+
+  it("keeps export paths native while passing the active view revision", async () => {
+    const request = {
+      columnIndices: [3, 1],
+      rowRanges: [{ start: 10, end: 20 }],
+      output: { format: "csv" as const, options: {} },
+    };
+    invokeMock.mockResolvedValue({
+      state: "running",
+      id: 12,
+      fileName: "orders-view.csv",
+      bytesWritten: 4096,
+    });
+
+    await expect(startDataExport(7, 4, "view", request)).resolves.toMatchObject(
+      {
+        state: "running",
+        id: 12,
+      },
+    );
+    expect(invokeMock).toHaveBeenCalledWith("start_data_export", {
+      generation: 7,
+      viewRevision: 4,
+      scope: "view",
+      request,
+    });
+    expect(JSON.stringify(invokeMock.mock.calls[0])).not.toContain("path");
+  });
+
+  it("uses narrow commands for export status and dismissal", async () => {
+    invokeMock.mockResolvedValueOnce(null).mockResolvedValueOnce(true);
+
+    await expect(getDataExportStatus()).resolves.toBeNull();
+    await expect(dismissDataExport(9)).resolves.toBe(true);
+
+    expect(invokeMock).toHaveBeenNthCalledWith(1, "get_data_export_status");
+    expect(invokeMock).toHaveBeenNthCalledWith(2, "dismiss_data_export", {
+      id: 9,
+    });
+  });
+
+  it.each([
+    "viewChanged",
+    "alreadyRunning",
+    "permissionDenied",
+    "diskFull",
+    "resourceExhausted",
+  ] as const)("keeps the %s export error typed", async (code) => {
+    invokeMock.mockRejectedValue({ code });
+
+    await expect(
+      startDataExport(7, 4, "view", {
+        columnIndices: [0],
+        rowRanges: [],
+        output: { format: "csv", options: {} },
+      }),
+    ).rejects.toEqual(new DataExportCommandError(code));
+    await expect(revealDataExport(4)).rejects.toEqual(
+      new DataExportCommandError(code),
     );
   });
 });
