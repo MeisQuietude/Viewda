@@ -16,10 +16,15 @@ Backward-incompatible entries start with **Breaking:**.
 - Settings can follow the system theme or force Light or Dark across the app,
   data grid, and native window chrome without restarting.
 - The Data view now shows typed column filters, including open-ended numeric and
-  temporal comparisons and Float16 support, in a query bar with structured
-  condition editing, type-aware validation, temporal format hints, a native
-  date picker, and a cancellable exact match count.
-- UUID columns now support equals, not-equals, one-of, and contains filters.
+  temporal comparisons, Float16 support, case-insensitive contains,
+  does-not-contain, starts-with, and ends-with text matching with an explained
+  Match case toggle, empty-string filtering, and bounded value suggestions that
+  report incomplete scans and show loading and empty states, in a query bar with
+  structured condition editing, type-aware validation, temporal format hints,
+  a native date picker, and a cancellable exact match count.
+- UUID and JSON columns inherit text filters and value suggestions, including
+  equals, not-equals, one-of, contains, does-not-contain, starts-with, and
+  ends-with.
 - The Data view now supports multi-column sorting with a visible ORDER BY
   clause. It keeps current rows visible while changes prepare and lets users
   raise the preparation memory limit in Settings.

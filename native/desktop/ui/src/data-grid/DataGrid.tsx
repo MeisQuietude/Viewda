@@ -221,6 +221,7 @@ function viewDefinitionEquals(
         next !== undefined &&
         filter.columnIndex === next.columnIndex &&
         filter.operator === next.operator &&
+        (filter.matchCase ?? false) === (next.matchCase ?? false) &&
         filter.values.length === next.values.length &&
         filter.values.every(
           (value, valueIndex) => value === next.values[valueIndex],
@@ -381,6 +382,7 @@ export function DataGrid({
   const activeViewRef = useRef(activeView);
   const pendingViewRef = useRef<PendingView | null>(null);
   const nextViewRevisionRef = useRef(0);
+  const nextSuggestionRevisionRef = useRef(0);
   const scrollStateRef = useRef<ScrollState>({ direction: 0, boundary: 0 });
   const aliveRef = useRef(true);
   const exportStatusFailuresRef = useRef(0);
@@ -403,6 +405,11 @@ export function DataGrid({
   ).length;
   const gridTheme = useGridTheme();
   activeViewRef.current = activeView;
+
+  const nextSuggestionRevision = useCallback(() => {
+    nextSuggestionRevisionRef.current += 1;
+    return nextSuggestionRevisionRef.current;
+  }, []);
   pendingViewRef.current = pendingView;
   const filters = activeView.filters;
   const sort = activeView.sort;
@@ -2066,6 +2073,8 @@ export function DataGrid({
         <FilterEditor
           request={filterEditor}
           field={filterEditorField}
+          sourceGeneration={source.generation}
+          nextSuggestionRevision={nextSuggestionRevision}
           onApply={(filter) =>
             changeFilters(
               filterEditor.filterIndex === undefined
