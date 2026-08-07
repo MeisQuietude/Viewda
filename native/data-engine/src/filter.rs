@@ -29,6 +29,10 @@ pub struct DataFilter {
 pub enum DataFilterOperator {
     Equals,
     NotEquals,
+    GreaterThan,
+    GreaterThanOrEqual,
+    LessThan,
+    LessThanOrEqual,
     OneOf,
     Range,
     TextContains,
@@ -80,6 +84,22 @@ pub(crate) fn build_filter_predicate(
             DataFilterOperator::NotEquals => {
                 parameters.push(Value::Text(filter.values[0].clone()));
                 format!("{identifier} <> cast_to_type(?, {identifier})")
+            }
+            DataFilterOperator::GreaterThan => {
+                parameters.push(Value::Text(filter.values[0].clone()));
+                format!("{identifier} > cast_to_type(?, {identifier})")
+            }
+            DataFilterOperator::GreaterThanOrEqual => {
+                parameters.push(Value::Text(filter.values[0].clone()));
+                format!("{identifier} >= cast_to_type(?, {identifier})")
+            }
+            DataFilterOperator::LessThan => {
+                parameters.push(Value::Text(filter.values[0].clone()));
+                format!("{identifier} < cast_to_type(?, {identifier})")
+            }
+            DataFilterOperator::LessThanOrEqual => {
+                parameters.push(Value::Text(filter.values[0].clone()));
+                format!("{identifier} <= cast_to_type(?, {identifier})")
             }
             DataFilterOperator::OneOf => {
                 parameters.extend(filter.values.iter().cloned().map(Value::Text));
@@ -133,7 +153,7 @@ fn column_filter_kind(field: &SchemaField) -> ColumnFilterKind {
     if field
         .logical_type
         .as_deref()
-        .is_some_and(|logical| logical.starts_with("Decimal"))
+        .is_some_and(|logical| logical.starts_with("Decimal") || logical == "Float16")
     {
         return ColumnFilterKind::Number;
     }
@@ -150,6 +170,10 @@ fn validate_filter(filter: &DataFilter, kind: ColumnFilterKind) -> Result<(), Fi
         DataFilterOperator::Equals | DataFilterOperator::NotEquals => {
             kind != ColumnFilterKind::NullOnly
         }
+        DataFilterOperator::GreaterThan
+        | DataFilterOperator::GreaterThanOrEqual
+        | DataFilterOperator::LessThan
+        | DataFilterOperator::LessThanOrEqual => kind == ColumnFilterKind::Number,
         DataFilterOperator::OneOf => matches!(
             kind,
             ColumnFilterKind::Number | ColumnFilterKind::Text | ColumnFilterKind::Temporal
@@ -167,6 +191,10 @@ fn validate_filter(filter: &DataFilter, kind: ColumnFilterKind) -> Result<(), Fi
     let valid_arity = match filter.operator {
         DataFilterOperator::Equals
         | DataFilterOperator::NotEquals
+        | DataFilterOperator::GreaterThan
+        | DataFilterOperator::GreaterThanOrEqual
+        | DataFilterOperator::LessThan
+        | DataFilterOperator::LessThanOrEqual
         | DataFilterOperator::TextContains => filter.values.len() == 1,
         DataFilterOperator::OneOf => (1..=MAX_ONE_OF_VALUES).contains(&filter.values.len()),
         DataFilterOperator::Range => filter.values.len() == 2,
@@ -270,6 +298,84 @@ mod tests {
         assert!(
             build_filter_predicate(&[field("label", ColumnFilterKind::Text)], &[filter]).is_err()
         );
+    }
+
+    #[test]
+    fn builds_numeric_comparisons_with_bound_casts() {
+        let cases = [
+            (DataFilterOperator::GreaterThan, ">"),
+            (DataFilterOperator::GreaterThanOrEqual, ">="),
+            (DataFilterOperator::LessThan, "<"),
+            (DataFilterOperator::LessThanOrEqual, "<="),
+        ];
+
+        for (operator, sql_operator) in cases {
+            let predicate = build_filter_predicate(
+                &[field("value\"quoted", ColumnFilterKind::Number)],
+                &[DataFilter {
+                    column_index: 0,
+                    operator,
+                    values: vec!["12.5".to_owned()],
+                }],
+            )
+            .expect("valid numeric comparison");
+
+            assert_eq!(
+                predicate.sql,
+                format!("\"value\"\"quoted\" {sql_operator} cast_to_type(?, \"value\"\"quoted\")")
+            );
+            assert_eq!(predicate.parameters, vec![Value::Text("12.5".to_owned())]);
+        }
+    }
+
+    #[test]
+    fn rejects_numeric_comparisons_with_invalid_arity_or_column_kind() {
+        let operators = [
+            DataFilterOperator::GreaterThan,
+            DataFilterOperator::GreaterThanOrEqual,
+            DataFilterOperator::LessThan,
+            DataFilterOperator::LessThanOrEqual,
+        ];
+
+        for operator in operators {
+            for values in [Vec::new(), vec!["1".to_owned(), "2".to_owned()]] {
+                let filter = DataFilter {
+                    column_index: 0,
+                    operator,
+                    values,
+                };
+                assert!(
+                    build_filter_predicate(&[field("value", ColumnFilterKind::Number)], &[filter])
+                        .is_err()
+                );
+            }
+
+            for kind in [
+                ColumnFilterKind::Boolean,
+                ColumnFilterKind::Text,
+                ColumnFilterKind::Temporal,
+                ColumnFilterKind::NullOnly,
+            ] {
+                let filter = DataFilter {
+                    column_index: 0,
+                    operator,
+                    values: vec!["1".to_owned()],
+                };
+                assert!(build_filter_predicate(&[field("value", kind)], &[filter]).is_err());
+            }
+        }
+    }
+
+    #[test]
+    fn classifies_float16_as_numeric() {
+        let float16 = SchemaField {
+            name: "half".to_owned(),
+            physical_type: "FIXED_LEN_BYTE_ARRAY".to_owned(),
+            logical_type: Some("Float16".to_owned()),
+            children: Vec::new(),
+        };
+
+        assert_eq!(column_filter_kind(&float16), ColumnFilterKind::Number);
     }
 
     #[test]

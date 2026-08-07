@@ -9,6 +9,7 @@ import { describe, expect, it } from "vitest";
 
 import type { DataFilter, SchemaField } from "../desktop";
 import {
+  columnFilterKind,
   filterInputFromCell,
   formatFilterCondition,
   formatWhereClause,
@@ -24,6 +25,15 @@ describe("canonical filter query formatting", () => {
   it.each([
     [field("name", "BYTE_ARRAY", "String"), "O'Reilly", "'O''Reilly'"],
     [field("delta", "INT64", null), "-42", "-42"],
+    [
+      field(
+        "amount",
+        "FIXED_LEN_BYTE_ARRAY",
+        "Decimal (precision 10, scale 2)",
+      ),
+      "12.50",
+      `cast_to_type('12.50', "amount")`,
+    ],
     [field("day", "INT32", "Date"), "2026-08-01", "DATE '2026-08-01'"],
     [
       field("local_at", "INT64", "Timestamp (microseconds, local)"),
@@ -69,6 +79,26 @@ describe("canonical filter query formatting", () => {
     expect(formatFilterCondition(filters[0]!, schema[0]!)).toBe(
       `"value""quoted" BETWEEN -2 AND 9`,
     );
+  });
+
+  it("renders numeric comparisons in the WHERE bar", () => {
+    const schema = [field("amount", "DOUBLE", null)];
+    const filters: DataFilter[] = [
+      { columnIndex: 0, operator: "greaterThan", values: ["1"] },
+      { columnIndex: 0, operator: "greaterThanOrEqual", values: ["2"] },
+      { columnIndex: 0, operator: "lessThan", values: ["9"] },
+      { columnIndex: 0, operator: "lessThanOrEqual", values: ["8"] },
+    ];
+
+    expect(formatWhereClause(filters, schema)).toBe(
+      `"amount" > 1 AND "amount" >= 2 AND "amount" < 9 AND "amount" <= 8`,
+    );
+  });
+
+  it("classifies Float16 as numeric", () => {
+    expect(
+      columnFilterKind(field("half", "FIXED_LEN_BYTE_ARRAY", "Float16")),
+    ).toBe("number");
   });
 
   it.each([
