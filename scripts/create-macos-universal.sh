@@ -40,6 +40,11 @@ lipo -create \
   "$intel_app/Contents/Frameworks/libduckdb.dylib" \
   -output "$output_app/Contents/Frameworks/libduckdb.dylib"
 
+# The release artifacts do not ship separate debug symbols. Remove local symbol
+# tables before signing so the derived installer stays within its size budget.
+strip -x "$output_app/Contents/MacOS/viewda"
+strip -x "$output_app/Contents/Frameworks/libduckdb.dylib"
+
 codesign --force --sign - "$output_app/Contents/Frameworks/libduckdb.dylib"
 codesign --force --sign - \
   --options runtime \
