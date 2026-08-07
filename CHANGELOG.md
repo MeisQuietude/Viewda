@@ -10,6 +10,8 @@ Backward-incompatible entries start with **Breaking:**.
 
 ### Added
 
+- The Data view now shows typed column filters in a query bar with structured
+  condition editing and a cancellable exact match count.
 - The Data view now has a toggleable schema sidebar with the full nested field
   tree and cancellable, on-demand statistics for the selected column.
 

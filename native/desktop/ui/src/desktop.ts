@@ -35,6 +35,21 @@ export interface SchemaField {
   children: SchemaField[];
 }
 
+export type DataFilterOperator =
+  | "equals"
+  | "notEquals"
+  | "oneOf"
+  | "range"
+  | "textContains"
+  | "isNull"
+  | "isNotNull";
+
+export interface DataFilter {
+  columnIndex: number;
+  operator: DataFilterOperator;
+  values: string[];
+}
+
 export interface ColumnStatistics {
   minimum: string | null;
   maximum: string | null;
@@ -110,12 +125,16 @@ export type SourceErrorCode =
 export type DataWindowErrorCode =
   | "noSourceOpen"
   | "sourceChanged"
+  | "cancelled"
   | "notFound"
   | "permissionDenied"
   | "notParquet"
   | "corruptSource"
   | "unsupported"
   | "windowTooLarge"
+  | "invalidFilter"
+  | "resourceExhausted"
+  | "queryFailed"
   | "queryEngineUnavailable"
   | "encodingFailed";
 
@@ -261,13 +280,42 @@ export async function getDataWindow(
   generation: number,
   rowOffset: number,
   rowCount: number,
+  filters: DataFilter[] = [],
 ): Promise<ArrayBuffer> {
   try {
     return await invoke<ArrayBuffer>("get_data_window", {
       generation,
       rowOffset,
       rowCount,
+      filters,
     });
+  } catch (error) {
+    throw new DataWindowCommandError(readDataWindowErrorCode(error));
+  }
+}
+
+export async function getFilteredRowCount(
+  generation: number,
+  filterRevision: number,
+  filters: DataFilter[],
+): Promise<number> {
+  try {
+    return await invoke<number>("get_filtered_row_count", {
+      generation,
+      filterRevision,
+      filters,
+    });
+  } catch (error) {
+    throw new DataWindowCommandError(readDataWindowErrorCode(error));
+  }
+}
+
+export async function cancelFilteredRowCount(
+  generation: number,
+  filterRevision: number,
+): Promise<void> {
+  try {
+    await invoke("cancel_filtered_row_count", { generation, filterRevision });
   } catch (error) {
     throw new DataWindowCommandError(readDataWindowErrorCode(error));
   }
@@ -342,12 +390,16 @@ function readDataWindowErrorCode(error: unknown): DataWindowErrorCode {
     if (
       code === "noSourceOpen" ||
       code === "sourceChanged" ||
+      code === "cancelled" ||
       code === "notFound" ||
       code === "permissionDenied" ||
       code === "notParquet" ||
       code === "corruptSource" ||
       code === "unsupported" ||
       code === "windowTooLarge" ||
+      code === "invalidFilter" ||
+      code === "resourceExhausted" ||
+      code === "queryFailed" ||
       code === "queryEngineUnavailable" ||
       code === "encodingFailed"
     ) {

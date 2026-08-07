@@ -37,9 +37,10 @@ use updates::{
     install_pending_update, open_releases_page, set_update_settings, take_post_update_state,
 };
 use viewda_data_engine::{
-    ColumnStatistics, ColumnStatisticsError, ColumnStatisticsReader, DataWindowError,
-    DataWindowReader, EngineError, EngineStatus, SchemaField, SourceError, SourceSummary,
-    StatisticsInterruptHandle, engine_status, inspect_local_source,
+    ColumnStatistics, ColumnStatisticsError, ColumnStatisticsReader, DataFilter, DataWindowError,
+    DataWindowReader, EngineError, EngineStatus, FilteredRowCountInterruptHandle,
+    FilteredRowCountReader, SchemaField, SourceError, SourceSummary, StatisticsInterruptHandle,
+    engine_status, inspect_local_source,
 };
 
 const OPEN_SOURCE_MENU_ID: &str = "open-local-source";
@@ -53,6 +54,7 @@ const UPDATE_AVAILABLE_EVENT: &str = "update-available";
 pub(crate) struct OpenedSource {
     state: Arc<Mutex<OpenedSourceState>>,
     recents: RecentSourcesStore,
+    filtered_counts: FilteredRowCountJobs,
 }
 
 #[derive(Default)]
@@ -68,6 +70,83 @@ struct OpenedSourceSession {
     schema: Vec<SchemaField>,
     reader: DataWindowReader,
     statistics_cache: HashMap<(u64, usize), ColumnStatistics>,
+}
+
+#[derive(Default)]
+struct FilteredRowCountJobs {
+    state: Mutex<FilteredRowCountJobsState>,
+}
+
+#[derive(Default)]
+struct FilteredRowCountJobsState {
+    watermark: Option<(u64, u64)>,
+    active: Option<ActiveFilteredRowCountJob>,
+}
+
+struct ActiveFilteredRowCountJob {
+    generation: u64,
+    filter_revision: u64,
+    interrupt: Arc<FilteredRowCountInterruptHandle>,
+}
+
+impl ActiveFilteredRowCountJob {
+    fn cancel(&self) {
+        self.interrupt.interrupt();
+    }
+}
+
+fn register_filtered_count_job(
+    jobs: &mut FilteredRowCountJobsState,
+    next: ActiveFilteredRowCountJob,
+) -> Result<(), DataWindowError> {
+    if jobs.watermark.is_some_and(|(generation, revision)| {
+        generation == next.generation && next.filter_revision <= revision
+    }) {
+        next.cancel();
+        return Err(DataWindowError::Cancelled);
+    }
+    jobs.watermark = Some((next.generation, next.filter_revision));
+    if let Some(previous) = jobs.active.replace(next) {
+        previous.cancel();
+    }
+    Ok(())
+}
+
+fn finish_filtered_count_job(
+    jobs: &mut FilteredRowCountJobsState,
+    generation: u64,
+    filter_revision: u64,
+) {
+    if jobs.active.as_ref().is_some_and(|active| {
+        active.generation == generation && active.filter_revision == filter_revision
+    }) {
+        jobs.active.take();
+        if jobs.watermark == Some((generation, filter_revision)) {
+            jobs.watermark = None;
+        }
+    }
+}
+
+fn cancel_filtered_count_job(
+    jobs: &mut FilteredRowCountJobsState,
+    generation: u64,
+    filter_revision: u64,
+) -> Option<ActiveFilteredRowCountJob> {
+    if !jobs
+        .watermark
+        .is_some_and(|(watermark_generation, revision)| {
+            watermark_generation == generation && revision >= filter_revision
+        })
+    {
+        jobs.watermark = Some((generation, filter_revision));
+    }
+    if jobs.active.as_ref().is_some_and(|active| {
+        active.generation == generation && active.filter_revision == filter_revision
+    }) {
+        jobs.active.take()
+    } else {
+        None
+    }
 }
 
 #[derive(Debug, PartialEq)]
@@ -197,6 +276,7 @@ impl OpenedSource {
         if intent == SourceOpenIntent::Restore && state.blocks_restore {
             return Ok(None);
         }
+        self.cancel_filtered_counts()?;
         let generation = state
             .generation
             .checked_add(1)
@@ -236,6 +316,21 @@ impl OpenedSource {
     fn blocks_restore(&self) -> Result<bool, OpenSourceError> {
         Ok(self.lock_state()?.blocks_restore)
     }
+
+    fn cancel_filtered_counts(&self) -> Result<(), OpenSourceError> {
+        let mut jobs = self
+            .filtered_counts
+            .state
+            .lock()
+            .map_err(|_| RecentSourceError::Storage)?;
+        let active = jobs.active.take();
+        jobs.watermark = None;
+        drop(jobs);
+        if let Some(active) = active {
+            active.cancel();
+        }
+        Ok(())
+    }
 }
 
 /// Reports whether the shell-independent engine is linked and responsive.
@@ -250,12 +345,13 @@ async fn get_data_window(
     generation: u64,
     row_offset: u64,
     row_count: u32,
+    filters: Vec<DataFilter>,
     opened_source: tauri::State<'_, OpenedSource>,
 ) -> Result<tauri::ipc::Response, DataWindowCommandError> {
     let state = Arc::clone(&opened_source.state);
     let bytes = tauri::async_runtime::spawn_blocking(move || {
         let mut state = state.lock().map_err(|_| DataWindowError::Unsupported)?;
-        fetch_opened_source_window(&mut state, generation, row_offset, row_count)
+        fetch_opened_source_window(&mut state, generation, row_offset, row_count, &filters)
     })
     .await
     .map_err(|_| DataWindowError::QueryEngineUnavailable)??;
@@ -268,6 +364,7 @@ fn fetch_opened_source_window(
     generation: u64,
     row_offset: u64,
     row_count: u32,
+    filters: &[DataFilter],
 ) -> Result<Vec<u8>, DataWindowCommandError> {
     let session = state
         .session
@@ -282,8 +379,121 @@ fn fetch_opened_source_window(
     }
     session
         .reader
-        .fetch(row_offset, row_count)
+        .fetch_filtered(row_offset, row_count, filters)
         .map_err(Into::into)
+}
+
+/// Counts filtered rows on an isolated connection so grid windows stay responsive.
+#[tauri::command]
+async fn get_filtered_row_count(
+    generation: u64,
+    filter_revision: u64,
+    filters: Vec<DataFilter>,
+    opened_source: tauri::State<'_, OpenedSource>,
+) -> Result<u64, DataWindowCommandError> {
+    let path = {
+        let state = opened_source
+            .state
+            .lock()
+            .map_err(|_| DataWindowError::Unsupported)?;
+        let session = state
+            .session
+            .as_ref()
+            .ok_or(DataWindowCommandError::Session(
+                DataWindowSessionError::NoSourceOpen,
+            ))?;
+        if session.generation != generation {
+            return Err(DataWindowCommandError::Session(
+                DataWindowSessionError::SourceChanged,
+            ));
+        }
+        session.path.clone()
+    };
+    let reader = FilteredRowCountReader::new(path, &filters)?;
+    let interrupt = Arc::new(reader.interrupt_handle());
+    {
+        // Registration shares the source -> count lock order with source replacement.
+        // A replacement therefore either sees and cancels this job, or wins first and
+        // makes this generation stale before the scan can start.
+        let state = opened_source
+            .state
+            .lock()
+            .map_err(|_| DataWindowError::Unsupported)?;
+        let session = state
+            .session
+            .as_ref()
+            .ok_or(DataWindowCommandError::Session(
+                DataWindowSessionError::NoSourceOpen,
+            ))?;
+        if session.generation != generation {
+            return Err(DataWindowCommandError::Session(
+                DataWindowSessionError::SourceChanged,
+            ));
+        }
+        let mut jobs = opened_source
+            .filtered_counts
+            .state
+            .lock()
+            .map_err(|_| DataWindowError::Unsupported)?;
+        register_filtered_count_job(
+            &mut jobs,
+            ActiveFilteredRowCountJob {
+                generation,
+                filter_revision,
+                interrupt: Arc::clone(&interrupt),
+            },
+        )?;
+    }
+
+    let result = tauri::async_runtime::spawn_blocking(move || reader.fetch()).await;
+    let cancelled = interrupt.is_cancelled();
+    let mut jobs = opened_source
+        .filtered_counts
+        .state
+        .lock()
+        .map_err(|_| DataWindowError::Unsupported)?;
+    finish_filtered_count_job(&mut jobs, generation, filter_revision);
+    drop(jobs);
+
+    if cancelled {
+        Err(DataWindowError::Cancelled.into())
+    } else {
+        result
+            .map_err(|_| DataWindowError::QueryEngineUnavailable)?
+            .map_err(Into::into)
+    }
+}
+
+/// Interrupts one count revision without touching a newer request.
+#[tauri::command]
+fn cancel_filtered_row_count(
+    generation: u64,
+    filter_revision: u64,
+    opened_source: tauri::State<'_, OpenedSource>,
+) -> Result<(), DataWindowCommandError> {
+    let active = {
+        let state = opened_source
+            .state
+            .lock()
+            .map_err(|_| DataWindowError::Unsupported)?;
+        if !state
+            .session
+            .as_ref()
+            .is_some_and(|session| session.generation == generation)
+        {
+            return Ok(());
+        }
+        let mut jobs = opened_source
+            .filtered_counts
+            .state
+            .lock()
+            .map_err(|_| DataWindowError::Unsupported)?;
+        cancel_filtered_count_job(&mut jobs, generation, filter_revision)
+    };
+    if let Some(active) = active {
+        active.cancel();
+    }
+    Ok(())
 }
 
 /// Computes statistics on a separate, cancellable query connection.
@@ -757,6 +967,8 @@ pub fn run() {
             get_default_application_status,
             set_default_application,
             get_data_window,
+            get_filtered_row_count,
+            cancel_filtered_row_count,
             get_column_statistics,
             cancel_column_statistics,
             get_update_settings,
@@ -769,13 +981,19 @@ pub fn run() {
         ])
         .build(tauri::generate_context!())
         .expect("Viewda desktop runtime failed")
-        .run(|_app, _event| {
+        .run(|app, event| {
+            if matches!(
+                &event,
+                tauri::RunEvent::ExitRequested { .. } | tauri::RunEvent::Exit
+            ) {
+                let _ = app.state::<OpenedSource>().cancel_filtered_counts();
+            }
             #[cfg(target_os = "macos")]
-            if let tauri::RunEvent::Opened { urls } = _event
+            if let tauri::RunEvent::Opened { urls } = event
                 && let Some(path) = urls.into_iter().find_map(|url| url.to_file_path().ok())
             {
-                open_path(_app, path);
-                if let Some(window) = _app.get_webview_window("main") {
+                open_path(app, path);
+                if let Some(window) = app.get_webview_window("main") {
                     let _ = window.show();
                     let _ = window.set_focus();
                 }
@@ -1053,11 +1271,190 @@ mod tests {
 
         assert!(second.generation > first.generation);
         assert_eq!(
-            fetch_opened_source_window(&mut state, first.generation, 0, 1),
+            fetch_opened_source_window(&mut state, first.generation, 0, 1, &[]),
             Err(DataWindowCommandError::Session(
                 DataWindowSessionError::SourceChanged,
             ))
         );
+    }
+
+    #[test]
+    fn replacing_the_source_interrupts_the_active_filtered_count() {
+        let opened_source = OpenedSource::default();
+        let reader =
+            FilteredRowCountReader::new(PathBuf::from("count.parquet"), &[]).expect("count reader");
+        let interrupt = Arc::new(reader.interrupt_handle());
+        opened_source
+            .filtered_counts
+            .state
+            .lock()
+            .expect("count jobs")
+            .active
+            .replace(ActiveFilteredRowCountJob {
+                generation: 1,
+                filter_revision: 3,
+                interrupt: Arc::clone(&interrupt),
+            });
+
+        opened_source
+            .install(
+                None,
+                PathBuf::from("replacement.parquet"),
+                SourceSummary {
+                    display_name: "replacement.parquet".into(),
+                    size_bytes: 8,
+                    row_count: 1,
+                    row_group_count: 1,
+                    schema: Vec::new(),
+                },
+                SourceOpenIntent::Explicit,
+            )
+            .expect("source state")
+            .expect("replacement source is accepted");
+
+        assert!(interrupt.is_cancelled());
+        assert!(
+            opened_source
+                .filtered_counts
+                .state
+                .lock()
+                .expect("count jobs")
+                .active
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn count_revision_watermark_rejects_late_scans_and_replaces_one_active_job() {
+        let make_interrupt = || {
+            let reader = FilteredRowCountReader::new(PathBuf::from("count.parquet"), &[])
+                .expect("count reader");
+            Arc::new(reader.interrupt_handle())
+        };
+        let current = make_interrupt();
+        let stale = make_interrupt();
+        let next = make_interrupt();
+        let mut jobs = FilteredRowCountJobsState::default();
+
+        register_filtered_count_job(
+            &mut jobs,
+            ActiveFilteredRowCountJob {
+                generation: 7,
+                filter_revision: 2,
+                interrupt: Arc::clone(&current),
+            },
+        )
+        .expect("current revision");
+        assert_eq!(
+            register_filtered_count_job(
+                &mut jobs,
+                ActiveFilteredRowCountJob {
+                    generation: 7,
+                    filter_revision: 1,
+                    interrupt: Arc::clone(&stale),
+                },
+            ),
+            Err(DataWindowError::Cancelled)
+        );
+        assert!(stale.is_cancelled());
+        assert!(!current.is_cancelled());
+
+        register_filtered_count_job(
+            &mut jobs,
+            ActiveFilteredRowCountJob {
+                generation: 7,
+                filter_revision: 3,
+                interrupt: Arc::clone(&next),
+            },
+        )
+        .expect("new revision");
+        assert!(current.is_cancelled());
+        assert!(!next.is_cancelled());
+        assert_eq!(jobs.watermark, Some((7, 3)));
+        assert!(
+            jobs.active
+                .as_ref()
+                .is_some_and(|active| active.filter_revision == 3)
+        );
+    }
+
+    #[test]
+    fn completed_count_revision_can_be_retried_after_a_transient_failure() {
+        let reader =
+            FilteredRowCountReader::new(PathBuf::from("count.parquet"), &[]).expect("count reader");
+        let interrupt = Arc::new(reader.interrupt_handle());
+        let mut jobs = FilteredRowCountJobsState::default();
+        register_filtered_count_job(
+            &mut jobs,
+            ActiveFilteredRowCountJob {
+                generation: 7,
+                filter_revision: 3,
+                interrupt,
+            },
+        )
+        .expect("initial revision");
+
+        finish_filtered_count_job(&mut jobs, 7, 3);
+
+        assert_eq!(jobs.watermark, None);
+        assert!(jobs.active.is_none());
+        let retry = FilteredRowCountReader::new(PathBuf::from("count.parquet"), &[])
+            .expect("retry reader")
+            .interrupt_handle();
+        let retry = Arc::new(retry);
+        register_filtered_count_job(
+            &mut jobs,
+            ActiveFilteredRowCountJob {
+                generation: 7,
+                filter_revision: 3,
+                interrupt: Arc::clone(&retry),
+            },
+        )
+        .expect("same revision retry");
+        assert!(!retry.is_cancelled());
+    }
+
+    #[test]
+    fn cancellation_watermark_covers_cancel_before_registration() {
+        let mut jobs = FilteredRowCountJobsState::default();
+
+        assert!(cancel_filtered_count_job(&mut jobs, 7, 3).is_none());
+        let late = FilteredRowCountReader::new(PathBuf::from("count.parquet"), &[])
+            .expect("late reader")
+            .interrupt_handle();
+        let late = Arc::new(late);
+        assert_eq!(
+            register_filtered_count_job(
+                &mut jobs,
+                ActiveFilteredRowCountJob {
+                    generation: 7,
+                    filter_revision: 3,
+                    interrupt: Arc::clone(&late),
+                },
+            ),
+            Err(DataWindowError::Cancelled)
+        );
+        assert!(late.is_cancelled());
+
+        let current = FilteredRowCountReader::new(PathBuf::from("count.parquet"), &[])
+            .expect("current reader")
+            .interrupt_handle();
+        let current = Arc::new(current);
+        register_filtered_count_job(
+            &mut jobs,
+            ActiveFilteredRowCountJob {
+                generation: 7,
+                filter_revision: 4,
+                interrupt: Arc::clone(&current),
+            },
+        )
+        .expect("newer revision");
+        cancel_filtered_count_job(&mut jobs, 7, 4)
+            .expect("active revision")
+            .cancel();
+        assert!(current.is_cancelled());
+        assert!(jobs.active.is_none());
+        assert_eq!(jobs.watermark, Some((7, 4)));
     }
 
     #[test]

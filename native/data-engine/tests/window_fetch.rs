@@ -1,14 +1,16 @@
 use std::{fs, io::Cursor, sync::Arc};
 
 use arrow_array::{
-    Array, ArrayRef, Decimal128Array, Int32Array, Int64Array, ListArray, RecordBatch, StringArray,
-    StructArray, types::Int32Type,
+    Array, ArrayRef, BooleanArray, Date32Array, Decimal128Array, Int32Array, Int64Array, ListArray,
+    RecordBatch, StringArray, StructArray, types::Int32Type,
 };
 use arrow_ipc::reader::StreamReader;
 use arrow_schema::{DataType, Field, Fields, Schema};
 use parquet::arrow::ArrowWriter;
 use tempfile::NamedTempFile;
-use viewda_data_engine::{DataWindowError, DataWindowReader};
+use viewda_data_engine::{
+    DataFilter, DataFilterOperator, DataWindowError, DataWindowReader, FilteredRowCountReader,
+};
 
 #[test]
 fn fetches_exact_basic_windows_at_the_first_and_last_boundaries() {
@@ -42,7 +44,7 @@ fn returns_the_schema_and_no_rows_for_a_window_after_eof() {
     let bytes = reader.fetch(80, 4).expect("past-EOF window");
     let reader = StreamReader::try_new(Cursor::new(bytes), None).expect("Arrow IPC stream");
 
-    assert_eq!(reader.schema().fields().len(), 2);
+    assert_eq!(reader.schema().fields().len(), 5);
     assert_eq!(reader.count(), 0);
 }
 
@@ -118,6 +120,10 @@ fn maps_a_damaged_parquet_source_to_a_typed_error() {
     let mut reader = DataWindowReader::new(source.path().to_owned());
 
     assert_eq!(reader.fetch(0, 4), Err(DataWindowError::CorruptSource));
+    assert_eq!(
+        reader.fetch_filtered(0, 4, &[filter(0, DataFilterOperator::Equals, &["10"])],),
+        Err(DataWindowError::CorruptSource)
+    );
 }
 
 #[test]
@@ -126,6 +132,176 @@ fn rejects_an_unbounded_window_before_querying_duckdb() {
     let mut reader = DataWindowReader::new(source.path().to_owned());
 
     assert_eq!(reader.fetch(0, 513), Err(DataWindowError::WindowTooLarge));
+}
+
+#[test]
+fn accepts_a_window_at_the_row_limit() {
+    let source = write_basic_parquet();
+    let mut reader = DataWindowReader::new(source.path().to_owned());
+
+    let batches = decode(reader.fetch(0, 512).expect("maximum bounded window"));
+
+    assert_eq!(batches[0].num_rows(), 8);
+}
+
+#[test]
+fn applies_every_operator_to_supported_scalar_types() {
+    let source = write_basic_parquet();
+    let cases = [
+        (filter(0, DataFilterOperator::Equals, &["12"]), vec![12]),
+        (
+            filter(0, DataFilterOperator::NotEquals, &["12"]),
+            vec![10, 11, 13, 14, 15, 16, 17],
+        ),
+        (
+            filter(0, DataFilterOperator::OneOf, &["11", "14"]),
+            vec![11, 14],
+        ),
+        (
+            filter(0, DataFilterOperator::Range, &["12", "14"]),
+            vec![12, 13, 14],
+        ),
+        (filter(4, DataFilterOperator::IsNull, &[]), vec![15]),
+        (
+            filter(4, DataFilterOperator::IsNotNull, &[]),
+            vec![10, 11, 12, 13, 14, 16, 17],
+        ),
+        (filter(1, DataFilterOperator::Equals, &["row-2"]), vec![12]),
+        (
+            filter(1, DataFilterOperator::NotEquals, &["row-2"]),
+            vec![10, 13, 14, 15, 16, 17],
+        ),
+        (
+            filter(1, DataFilterOperator::OneOf, &["row-2", "row-4"]),
+            vec![12, 14],
+        ),
+        (
+            filter(1, DataFilterOperator::TextContains, &["row-"]),
+            vec![10, 12, 13, 14, 15, 16, 17],
+        ),
+        (filter(1, DataFilterOperator::IsNull, &[]), vec![11]),
+        (
+            filter(1, DataFilterOperator::IsNotNull, &[]),
+            vec![10, 12, 13, 14, 15, 16, 17],
+        ),
+        (
+            filter(2, DataFilterOperator::Equals, &["true"]),
+            vec![10, 12, 14, 16],
+        ),
+        (
+            filter(2, DataFilterOperator::NotEquals, &["true"]),
+            vec![11, 13, 15],
+        ),
+        (filter(2, DataFilterOperator::IsNull, &[]), vec![17]),
+        (
+            filter(2, DataFilterOperator::IsNotNull, &[]),
+            vec![10, 11, 12, 13, 14, 15, 16],
+        ),
+        (
+            filter(3, DataFilterOperator::Equals, &["1970-01-03"]),
+            vec![12],
+        ),
+        (
+            filter(3, DataFilterOperator::NotEquals, &["1970-01-03"]),
+            vec![10, 11, 13, 14, 15, 17],
+        ),
+        (
+            filter(3, DataFilterOperator::OneOf, &["1970-01-02", "1970-01-05"]),
+            vec![11, 14],
+        ),
+        (
+            filter(3, DataFilterOperator::Range, &["1970-01-03", "1970-01-05"]),
+            vec![12, 13, 14],
+        ),
+        (filter(3, DataFilterOperator::IsNull, &[]), vec![16]),
+        (
+            filter(3, DataFilterOperator::IsNotNull, &[]),
+            vec![10, 11, 12, 13, 14, 15, 17],
+        ),
+    ];
+
+    for (condition, expected) in cases {
+        let mut reader = DataWindowReader::new(source.path().to_owned());
+        let batches = decode(
+            reader
+                .fetch_filtered(0, 32, &[condition])
+                .expect("filtered window"),
+        );
+        assert_eq!(int64_values(&batches[0], 0), expected);
+    }
+}
+
+#[test]
+fn combines_conditions_and_offsets_the_filtered_view() {
+    let source = write_basic_parquet();
+    let filters = vec![
+        filter(0, DataFilterOperator::Range, &["11", "17"]),
+        filter(1, DataFilterOperator::OneOf, &["row-2", "row-4", "row-6"]),
+    ];
+    let mut reader = DataWindowReader::new(source.path().to_owned());
+
+    let batches = decode(
+        reader
+            .fetch_filtered(1, 2, &filters)
+            .expect("filtered offset window"),
+    );
+
+    assert_eq!(int64_values(&batches[0], 0), vec![14, 16]);
+    assert_eq!(
+        FilteredRowCountReader::new(source.path().to_owned(), &filters)
+            .expect("filtered count reader")
+            .fetch()
+            .expect("filtered count"),
+        3
+    );
+}
+
+#[test]
+fn returns_a_schema_only_window_for_an_empty_filter_result() {
+    let source = write_basic_parquet();
+    let mut reader = DataWindowReader::new(source.path().to_owned());
+
+    let bytes = reader
+        .fetch_filtered(0, 4, &[filter(0, DataFilterOperator::Equals, &["999"])])
+        .expect("empty filtered window");
+    let reader = StreamReader::try_new(Cursor::new(bytes), None).expect("Arrow IPC stream");
+
+    assert_eq!(reader.schema().fields().len(), 5);
+    assert_eq!(reader.count(), 0);
+}
+
+#[test]
+fn rejects_an_operator_not_supported_by_the_column_type() {
+    let source = write_basic_parquet();
+    let mut reader = DataWindowReader::new(source.path().to_owned());
+
+    assert_eq!(
+        reader.fetch_filtered(0, 4, &[filter(0, DataFilterOperator::TextContains, &["1"])],),
+        Err(DataWindowError::InvalidFilter)
+    );
+}
+
+#[test]
+fn rejects_bound_values_that_cannot_convert_to_the_column_type() {
+    let source = write_basic_parquet();
+    let mut reader = DataWindowReader::new(source.path().to_owned());
+
+    assert_eq!(
+        reader.fetch_filtered(
+            0,
+            4,
+            &[filter(0, DataFilterOperator::Equals, &["1 OR 1=1"],)],
+        ),
+        Err(DataWindowError::InvalidFilter)
+    );
+}
+
+fn filter(column_index: u32, operator: DataFilterOperator, values: &[&str]) -> DataFilter {
+    DataFilter {
+        column_index,
+        operator,
+        values: values.iter().map(|value| (*value).to_owned()).collect(),
+    }
 }
 
 fn decode(bytes: Vec<u8>) -> Vec<RecordBatch> {
@@ -168,8 +344,11 @@ fn int32_value(batch: &RecordBatch, column: usize) -> i32 {
 fn write_basic_parquet() -> NamedTempFile {
     let source = NamedTempFile::new().expect("temporary source");
     let schema = Arc::new(Schema::new(vec![
-        Field::new("id", DataType::Int64, false),
+        Field::new("id\"quoted", DataType::Int64, false),
         Field::new("label", DataType::Utf8, true),
+        Field::new("active", DataType::Boolean, true),
+        Field::new("day", DataType::Date32, true),
+        Field::new("score", DataType::Int64, true),
     ]));
     let batch = RecordBatch::try_new(
         Arc::clone(&schema),
@@ -184,6 +363,36 @@ fn write_basic_parquet() -> NamedTempFile {
                 Some("row-5"),
                 Some("row-6"),
                 Some("row-7"),
+            ])) as ArrayRef,
+            Arc::new(BooleanArray::from(vec![
+                Some(true),
+                Some(false),
+                Some(true),
+                Some(false),
+                Some(true),
+                Some(false),
+                Some(true),
+                None,
+            ])) as ArrayRef,
+            Arc::new(Date32Array::from(vec![
+                Some(0),
+                Some(1),
+                Some(2),
+                Some(3),
+                Some(4),
+                Some(5),
+                None,
+                Some(7),
+            ])) as ArrayRef,
+            Arc::new(Int64Array::from(vec![
+                Some(100),
+                Some(101),
+                Some(102),
+                Some(103),
+                Some(104),
+                None,
+                Some(106),
+                Some(107),
             ])) as ArrayRef,
         ],
     )
