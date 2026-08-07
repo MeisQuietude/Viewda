@@ -13,6 +13,7 @@
     "test:e2e": "node e2e/launch.e2e.js"
   },
   "dependencies": {
+    "@fontsource-variable/noto-emoji": "5.2.12",
     "@glideapps/glide-data-grid": "6.0.3",
     "@tauri-apps/api": "2.11.1",
     "@uwdata/flechette": "2.5.0",
