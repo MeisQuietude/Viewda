@@ -44,8 +44,8 @@ pub enum DataWindowError {
     /// The requested sort does not identify distinct source columns.
     #[error("The sort order is invalid for this source.")]
     InvalidSort,
-    /// The caller cancelled preparation of a data view.
-    #[error("The data view preparation was cancelled.")]
+    /// The caller cancelled a long-running data query.
+    #[error("The data query was cancelled.")]
     Cancelled,
     /// The preparation exceeded its bounded memory and spill resources.
     #[error("There are not enough resources to prepare this data view.")]

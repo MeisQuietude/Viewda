@@ -11,13 +11,26 @@ import {
   timeMicrosecond,
   timestamp,
 } from "@uwdata/flechette";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { act } from "react";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
+import * as desktop from "../desktop";
 import type { SchemaField } from "../desktop";
 import { FilterEditor } from "./filter-controls";
 import { filterInputFromCell } from "./filter-query";
 
-afterEach(cleanup);
+beforeEach(() => {
+  vi.spyOn(desktop, "getTextValueSuggestions").mockResolvedValue(
+    suggestionResult([]),
+  );
+  vi.spyOn(desktop, "cancelTextValueSuggestions").mockResolvedValue();
+});
+
+afterEach(() => {
+  cleanup();
+  vi.useRealTimers();
+  vi.restoreAllMocks();
+});
 
 describe("FilterEditor", () => {
   it("accepts numeric literals but not free-form expressions", () => {
@@ -162,6 +175,8 @@ describe("FilterEditor", () => {
           logicalType: "Float16",
           children: [],
         }}
+        sourceGeneration={7}
+        nextSuggestionRevision={revisionCounter()}
         onApply={onApply}
         onCancel={vi.fn()}
       />,
@@ -228,6 +243,8 @@ describe("FilterEditor", () => {
           logicalType: null,
           children: [],
         }}
+        sourceGeneration={7}
+        nextSuggestionRevision={revisionCounter()}
         onApply={onApply}
         onCancel={vi.fn()}
       />,
@@ -694,6 +711,381 @@ describe("FilterEditor", () => {
       });
     },
   );
+  it("offers every text operator and applies Match case to substring operators", () => {
+    const onApply = vi.fn();
+    renderTextEditor(onApply);
+    const editor = screen.getByRole("form", { name: "Filter label" });
+    const condition = within(editor).getByRole("combobox", {
+      name: "Condition",
+    });
+
+    expect(
+      Array.from(
+        condition.querySelectorAll("option"),
+        (option) => option.value,
+      ),
+    ).toEqual([
+      "equals",
+      "notEquals",
+      "oneOf",
+      "textContains",
+      "notContains",
+      "startsWith",
+      "endsWith",
+      "isNull",
+      "isNotNull",
+    ]);
+
+    for (const operator of [
+      "textContains",
+      "notContains",
+      "startsWith",
+      "endsWith",
+    ]) {
+      fireEvent.change(condition, { target: { value: operator } });
+      expect(
+        within(editor).getByRole("button", { name: "Match case" }),
+      ).toBeInTheDocument();
+    }
+
+    fireEvent.change(condition, { target: { value: "startsWith" } });
+    fireEvent.change(within(editor).getByLabelText("Value"), {
+      target: { value: "View" },
+    });
+    fireEvent.click(within(editor).getByRole("button", { name: "Match case" }));
+    fireEvent.click(
+      within(editor).getByRole("button", { name: "Add condition" }),
+    );
+
+    expect(onApply).toHaveBeenCalledWith({
+      columnIndex: 0,
+      operator: "startsWith",
+      values: ["View"],
+      matchCase: true,
+    });
+  });
+
+  it("disables host text correction and explains Match case", () => {
+    renderTextEditor(vi.fn());
+    const editor = screen.getByRole("form", { name: "Filter label" });
+    const input = within(editor).getByLabelText("Value");
+
+    expect(input).toHaveAttribute("autocomplete", "off");
+    expect(input).toHaveAttribute("autocapitalize", "none");
+    expect(input).toHaveAttribute("autocorrect", "off");
+    expect(input).toHaveAttribute("spellcheck", "false");
+
+    fireEvent.change(
+      within(editor).getByRole("combobox", { name: "Condition" }),
+      { target: { value: "textContains" } },
+    );
+    const toggle = within(editor).getByRole("button", { name: "Match case" });
+    const tooltip = within(toggle).getByRole("tooltip");
+    expect(tooltip).toHaveTextContent(
+      "Match case: match uppercase and lowercase exactly",
+    );
+    expect(toggle).not.toHaveAttribute("title");
+    expect(toggle).toHaveAttribute("aria-describedby", tooltip.id);
+  });
+
+  it("requires intent before applying an empty text equality condition", () => {
+    const onApply = vi.fn();
+    renderTextEditor(onApply);
+    const editor = screen.getByRole("form", { name: "Filter label" });
+    const input = within(editor).getByLabelText("Value");
+    const apply = within(editor).getByRole("button", {
+      name: "Add condition",
+    });
+
+    expect(apply).toBeDisabled();
+    fireEvent.submit(editor);
+    expect(onApply).not.toHaveBeenCalled();
+
+    fireEvent.change(input, { target: { value: "value" } });
+    fireEvent.change(input, { target: { value: "" } });
+    expect(apply).toBeEnabled();
+    fireEvent.click(apply);
+
+    expect(onApply).toHaveBeenCalledWith({
+      columnIndex: 0,
+      operator: "equals",
+      values: [""],
+    });
+  });
+
+  it("applies an empty text value prefilled from a cell", () => {
+    const onApply = vi.fn();
+    renderTextEditor(onApply, "");
+    const editor = screen.getByRole("form", { name: "Filter label" });
+    const apply = within(editor).getByRole("button", {
+      name: "Add condition",
+    });
+
+    expect(apply).toBeEnabled();
+    fireEvent.click(apply);
+    expect(onApply).toHaveBeenCalledWith({
+      columnIndex: 0,
+      operator: "equals",
+      values: [""],
+    });
+  });
+
+  it("loads suggestions for an empty value and reports progress", async () => {
+    vi.useFakeTimers();
+    const request = deferred<desktop.TextValueSuggestions>();
+    vi.mocked(desktop.getTextValueSuggestions).mockReturnValue(request.promise);
+    renderTextEditor(vi.fn());
+    const editor = screen.getByRole("form", { name: "Filter label" });
+    const input = within(editor).getByLabelText("Value");
+
+    fireEvent.focus(input);
+    expect(input).toHaveAttribute("aria-expanded", "true");
+    expect(within(editor).getByRole("status")).toHaveTextContent(
+      "Loading suggestions…",
+    );
+    expect(
+      within(editor).getByRole("progressbar", {
+        name: "Loading suggestions",
+      }),
+    ).toBeInTheDocument();
+    expect(input).toHaveAttribute("aria-busy", "true");
+    await act(async () => vi.advanceTimersByTime(150));
+    expect(desktop.getTextValueSuggestions).toHaveBeenCalledWith(
+      7,
+      1,
+      0,
+      "",
+      "equals",
+    );
+
+    await act(async () => request.resolve(suggestionResult(["Alpha", "Beta"])));
+    expect(
+      within(editor).queryByRole("progressbar", {
+        name: "Loading suggestions",
+      }),
+    ).not.toBeInTheDocument();
+    expect(input).toHaveAttribute("aria-busy", "false");
+    expect(suggestionValues()).toEqual(["Alpha", "Beta"]);
+    expect(input).toHaveAttribute("aria-expanded", "true");
+    expect(
+      within(editor).getByRole("button", { name: "Add condition" }),
+    ).toBeDisabled();
+  });
+
+  it.each([
+    ["complete", false, "No matching values"],
+    ["partial", true, "No matches in the first 10,000 rows"],
+  ])(
+    "keeps a finished %s empty result visible",
+    async (_, isPartial, message) => {
+      vi.useFakeTimers();
+      vi.mocked(desktop.getTextValueSuggestions).mockResolvedValue(
+        suggestionResult([], isPartial),
+      );
+      renderTextEditor(vi.fn());
+      const input = screen.getByLabelText("Value");
+
+      fireEvent.focus(input);
+      await act(async () => vi.advanceTimersByTime(150));
+
+      expect(input).toHaveAttribute("aria-expanded", "true");
+      expect(screen.getByRole("status")).toHaveTextContent(message);
+      expect(screen.getByRole("listbox")).toBeEmptyDOMElement();
+    },
+  );
+
+  it("does not navigate or apply the empty suggestion row", async () => {
+    vi.useFakeTimers();
+    vi.mocked(desktop.getTextValueSuggestions).mockResolvedValue(
+      suggestionResult([]),
+    );
+    renderTextEditor(vi.fn());
+    const input = screen.getByLabelText("Value");
+
+    fireEvent.focus(input);
+    await act(async () => vi.advanceTimersByTime(150));
+    fireEvent.keyDown(input, { key: "ArrowDown" });
+    fireEvent.keyDown(input, { key: "ArrowUp" });
+
+    expect(input).not.toHaveAttribute("aria-activedescendant");
+    fireEvent.keyDown(input, { key: "Enter" });
+    expect(input).toHaveValue("");
+    expect(
+      within(screen.getByRole("listbox")).queryByRole("option"),
+    ).not.toBeInTheDocument();
+  });
+
+  it("debounces suggestions and ignores a stale response", async () => {
+    vi.useFakeTimers();
+    const first = deferred<desktop.TextValueSuggestions>();
+    const second = deferred<desktop.TextValueSuggestions>();
+    vi.mocked(desktop.getTextValueSuggestions)
+      .mockReturnValueOnce(first.promise)
+      .mockReturnValueOnce(second.promise);
+    renderTextEditor(vi.fn());
+    const input = screen.getByLabelText("Value");
+
+    fireEvent.change(input, { target: { value: "a" } });
+    expect(desktop.getTextValueSuggestions).not.toHaveBeenCalled();
+    await act(async () => vi.advanceTimersByTime(150));
+    expect(desktop.getTextValueSuggestions).toHaveBeenCalledWith(
+      7,
+      1,
+      0,
+      "a",
+      "equals",
+    );
+
+    fireEvent.change(input, { target: { value: "al" } });
+    expect(desktop.cancelTextValueSuggestions).toHaveBeenCalledWith(7, 1);
+    await act(async () => vi.advanceTimersByTime(150));
+    expect(desktop.getTextValueSuggestions).toHaveBeenLastCalledWith(
+      7,
+      2,
+      0,
+      "al",
+      "equals",
+    );
+
+    await act(async () =>
+      second.resolve(suggestionResult(["Alpha", "Alpine"])),
+    );
+    expect(suggestionValues()).toEqual(["Alpha", "Alpine"]);
+    await act(async () => first.resolve(suggestionResult(["stale"])));
+    expect(suggestionValues()).toEqual(["Alpha", "Alpine"]);
+  });
+
+  it("keeps loaded suggestions while a narrower request is pending", async () => {
+    vi.useFakeTimers();
+    const next = deferred<desktop.TextValueSuggestions>();
+    vi.mocked(desktop.getTextValueSuggestions)
+      .mockResolvedValueOnce(suggestionResult(["Alpha", "Aster"]))
+      .mockReturnValueOnce(next.promise);
+    renderTextEditor(vi.fn());
+    const input = screen.getByLabelText("Value");
+
+    fireEvent.change(input, { target: { value: "a" } });
+    await act(async () => vi.advanceTimersByTime(150));
+    expect(suggestionValues()).toEqual(["Alpha", "Aster"]);
+
+    fireEvent.change(input, { target: { value: "al" } });
+    expect(suggestionValues()).toEqual(["Alpha"]);
+    const listbox = screen.getByRole("listbox");
+    expect(input).toHaveAttribute("aria-controls", listbox.id);
+    expect(within(listbox).queryByRole("status")).not.toBeInTheDocument();
+    expect(
+      [...listbox.children].every(
+        (child) => child.getAttribute("role") === "option",
+      ),
+    ).toBe(true);
+    expect(screen.getByRole("status")).toHaveTextContent(
+      "Loading suggestions…",
+    );
+    await act(async () => vi.advanceTimersByTime(150));
+    expect(suggestionValues()).toEqual(["Alpha"]);
+
+    await act(async () => next.resolve(suggestionResult(["Alpha", "Alpine"])));
+    expect(suggestionValues()).toEqual(["Alpha", "Alpine"]);
+  });
+
+  it.each([
+    ["textContains", "ph", "Alpha"],
+    ["endsWith", "ta", "Beta"],
+  ] as const)(
+    "filters pending %s suggestions with the current input",
+    async (operator, value, expected) => {
+      vi.useFakeTimers();
+      vi.mocked(desktop.getTextValueSuggestions).mockResolvedValue(
+        suggestionResult(["Alpha", "Aster", "Beta"]),
+      );
+      renderTextEditor(vi.fn());
+      const condition = screen.getByRole("combobox", { name: "Condition" });
+      const input = screen.getByLabelText("Value");
+
+      fireEvent.change(condition, { target: { value: operator } });
+      fireEvent.change(input, { target: { value } });
+      await act(async () => vi.advanceTimersByTime(150));
+
+      expect(suggestionValues()).toEqual([expected]);
+      expect(desktop.getTextValueSuggestions).toHaveBeenCalledWith(
+        7,
+        1,
+        0,
+        value,
+        operator,
+      );
+    },
+  );
+
+  it("keeps the suggestion list open while typing and supports keyboard selection", async () => {
+    vi.useFakeTimers();
+    vi.mocked(desktop.getTextValueSuggestions).mockResolvedValue(
+      suggestionResult(["Alpha", "Aster"]),
+    );
+    renderTextEditor(vi.fn());
+    const input = screen.getByLabelText("Value");
+
+    fireEvent.change(input, { target: { value: "a" } });
+    await act(async () => vi.advanceTimersByTime(150));
+    expect(input).toHaveAttribute("aria-expanded", "true");
+
+    fireEvent.change(input, { target: { value: "al" } });
+    expect(input).toHaveAttribute("aria-expanded", "true");
+    expect(suggestionValues()).toEqual(["Alpha"]);
+
+    fireEvent.keyDown(input, { key: "ArrowDown" });
+    expect(screen.getByRole("option", { name: "Alpha" })).toHaveAttribute(
+      "aria-selected",
+      "true",
+    );
+    fireEvent.keyDown(input, { key: "Enter" });
+    expect(input).toHaveValue("Alpha");
+    expect(input).toHaveAttribute("aria-expanded", "false");
+  });
+
+  it("closes an open suggestion popup before cancelling the editor", async () => {
+    vi.useFakeTimers();
+    const onCancel = vi.fn();
+    vi.mocked(desktop.getTextValueSuggestions).mockResolvedValue(
+      suggestionResult(["Alpha"]),
+    );
+    renderTextEditor(vi.fn(), undefined, onCancel);
+    const input = screen.getByLabelText("Value");
+
+    input.focus();
+    fireEvent.change(input, { target: { value: "a" } });
+    await act(async () => vi.advanceTimersByTime(150));
+    expect(screen.getByRole("listbox")).toBeInTheDocument();
+
+    fireEvent.keyDown(input, { key: "Escape" });
+    expect(
+      screen.getByRole("form", { name: "Filter label" }),
+    ).toBeInTheDocument();
+    expect(input).toHaveFocus();
+    expect(input).toHaveValue("a");
+    expect(screen.queryByRole("listbox")).not.toBeInTheDocument();
+    expect(onCancel).not.toHaveBeenCalled();
+
+    fireEvent.keyDown(input, { key: "Escape" });
+    expect(onCancel).toHaveBeenCalledTimes(1);
+  });
+
+  it("keeps single-Escape cancellation for non-text editors", () => {
+    const number = renderNumberEditor();
+    fireEvent.keyDown(within(number.editor).getByLabelText("Value"), {
+      key: "Escape",
+    });
+    expect(number.onCancel).toHaveBeenCalledTimes(1);
+
+    cleanup();
+    const temporal = renderTemporalEditor(
+      temporalField("day", "INT32", "Date"),
+    );
+    fireEvent.keyDown(within(temporal.editor).getByLabelText("Value"), {
+      key: "Escape",
+    });
+    expect(temporal.onCancel).toHaveBeenCalledTimes(1);
+  });
 });
 
 function renderNumberEditor(
@@ -705,17 +1097,21 @@ function renderNumberEditor(
   },
 ) {
   const onApply = vi.fn();
+  const onCancel = vi.fn();
   render(
     <FilterEditor
       request={{ sourceIndex: 0, left: 0, top: 0 }}
       field={field}
+      sourceGeneration={7}
+      nextSuggestionRevision={revisionCounter()}
       onApply={onApply}
-      onCancel={vi.fn()}
+      onCancel={onCancel}
     />,
   );
   return {
     editor: screen.getByRole("form", { name: `Filter ${field.name}` }),
     onApply,
+    onCancel,
   };
 }
 
@@ -724,18 +1120,44 @@ function renderTemporalEditor(
   initialValue?: string,
 ) {
   const onApply = vi.fn();
+  const onCancel = vi.fn();
   render(
     <FilterEditor
       request={{ sourceIndex: 0, left: 0, top: 0, initialValue }}
       field={field}
+      sourceGeneration={7}
+      nextSuggestionRevision={revisionCounter()}
       onApply={onApply}
-      onCancel={vi.fn()}
+      onCancel={onCancel}
     />,
   );
   return {
     editor: screen.getByRole("form", { name: `Filter ${field.name}` }),
     onApply,
+    onCancel,
   };
+}
+
+function renderTextEditor(
+  onApply: (filter: desktop.DataFilter) => void,
+  initialValue?: string,
+  onCancel = vi.fn(),
+) {
+  render(
+    <FilterEditor
+      request={{ sourceIndex: 0, left: 0, top: 0, initialValue }}
+      field={{
+        name: "label",
+        physicalType: "BYTE_ARRAY",
+        logicalType: "String",
+        children: [],
+      }}
+      sourceGeneration={7}
+      nextSuggestionRevision={revisionCounter()}
+      onApply={onApply}
+      onCancel={onCancel}
+    />,
+  );
 }
 
 function temporalField(
@@ -744,4 +1166,34 @@ function temporalField(
   logicalType: string | null,
 ) {
   return { name, physicalType, logicalType, children: [] };
+}
+
+function suggestionValues(): string[] {
+  return screen
+    .getAllByRole("option")
+    .filter((option) => option.closest("[role=listbox]") !== null)
+    .map((option) => option.textContent ?? "");
+}
+
+function suggestionResult(
+  values: string[],
+  isPartial = false,
+): desktop.TextValueSuggestions {
+  return { values, isPartial, scanLimit: 10_000 };
+}
+
+function deferred<T>() {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>((promiseResolve) => {
+    resolve = promiseResolve;
+  });
+  return { promise, resolve };
+}
+
+function revisionCounter(): () => number {
+  let revision = 0;
+  return () => {
+    revision += 1;
+    return revision;
+  };
 }

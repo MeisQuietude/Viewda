@@ -22,7 +22,7 @@ use parquet::{
 use tempfile::{NamedTempFile, TempDir};
 use viewda_data_engine::{
     DataFilter, DataFilterOperator, DataSort, DataSortDirection, DataViewBuilder, DataViewError,
-    DataWindowError, DataWindowReader, PreparedDataView,
+    DataWindowError, DataWindowReader, PreparedDataView, SchemaField, TextValueSuggestionsReader,
 };
 
 #[test]
@@ -342,6 +342,188 @@ fn applies_every_operator_to_supported_scalar_types() {
         let view = prepare_view(source.path(), &[condition], &[]).expect("filtered view");
         let batches = decode(view.fetch_window(0, 32).expect("filtered window"));
         assert_eq!(int64_values(&batches[0], 0), expected);
+    }
+}
+
+#[test]
+fn applies_text_operators_case_insensitively_unless_match_case_is_enabled() {
+    let source = write_text_parquet(vec![
+        Some("Alphabet".to_owned()),
+        Some("alphabet".to_owned()),
+        Some("ALPHABET".to_owned()),
+        Some("omegaBeta".to_owned()),
+        Some("Бета".to_owned()),
+        Some("бета".to_owned()),
+        Some(String::new()),
+        None,
+    ]);
+    let cases = [
+        (
+            text_filter(DataFilterOperator::TextContains, "PHA", false),
+            vec![Some("Alphabet"), Some("alphabet"), Some("ALPHABET")],
+        ),
+        (
+            text_filter(DataFilterOperator::TextContains, "PHA", true),
+            vec![Some("ALPHABET")],
+        ),
+        (
+            text_filter(DataFilterOperator::StartsWith, "ALP", false),
+            vec![Some("Alphabet"), Some("alphabet"), Some("ALPHABET")],
+        ),
+        (
+            text_filter(DataFilterOperator::EndsWith, "BET", false),
+            vec![Some("Alphabet"), Some("alphabet"), Some("ALPHABET")],
+        ),
+        (
+            text_filter(DataFilterOperator::NotContains, "PHA", false),
+            vec![Some("omegaBeta"), Some("Бета"), Some("бета"), Some("")],
+        ),
+        (
+            text_filter(DataFilterOperator::StartsWith, "БЕ", false),
+            vec![Some("Бета"), Some("бета")],
+        ),
+        (
+            text_filter(DataFilterOperator::StartsWith, "БЕ", true),
+            Vec::new(),
+        ),
+    ];
+
+    for (condition, expected) in cases {
+        let view = prepare_view(source.path(), &[condition], &[]).expect("text-filtered view");
+        assert_eq!(view.row_count(), expected.len() as u64);
+        if !expected.is_empty() {
+            let batches = decode(view.fetch_window(0, 32).expect("text filter window"));
+            assert_eq!(string_values(&batches[0], 0), expected);
+        }
+    }
+}
+
+#[test]
+fn empty_string_equals_matches_empty_cells_but_not_nulls() {
+    let source = write_text_parquet(vec![Some(String::new()), None, Some("value".to_owned())]);
+    let view = prepare_view(
+        source.path(),
+        &[filter(0, DataFilterOperator::Equals, &[""])],
+        &[],
+    )
+    .expect("empty-string filtered view");
+    let batches = decode(view.fetch_window(0, 8).expect("empty-string window"));
+
+    assert_eq!(string_values(&batches[0], 0), vec![Some("")]);
+}
+
+#[test]
+fn suggests_distinct_prefix_matches_with_a_fixed_cap() {
+    let mut values = (0..25)
+        .map(|index| Some(format!("Alpha{index:02}")))
+        .collect::<Vec<_>>();
+    values.extend([
+        Some("Alpha00".to_owned()),
+        Some("alpha00".to_owned()),
+        Some("Beta".to_owned()),
+        None,
+    ]);
+    let source = write_text_parquet(values);
+
+    let suggestions = TextValueSuggestionsReader::new(source.path().to_owned(), "ALP".to_owned())
+        .expect("suggestions reader")
+        .fetch(&text_schema_field(), DataFilterOperator::Equals)
+        .expect("suggestions");
+
+    assert_eq!(suggestions.values.len(), 20);
+    assert!(!suggestions.is_partial);
+    assert_eq!(suggestions.scan_limit, 10_000);
+    assert!(
+        suggestions
+            .values
+            .iter()
+            .all(|value| value.to_lowercase().starts_with("alp"))
+    );
+    assert_eq!(
+        suggestions
+            .values
+            .iter()
+            .filter(|value| *value == "Alpha00")
+            .count(),
+        1
+    );
+    assert!(!suggestions.values.contains(&"Beta".to_owned()));
+}
+
+#[test]
+fn suggestions_match_contains_and_ends_with_input_positions() {
+    let source = write_text_parquet(vec![Some("Alphabet".to_owned()), Some("Gamma".to_owned())]);
+
+    for (operator, input) in [
+        (DataFilterOperator::TextContains, "pha"),
+        (DataFilterOperator::NotContains, "pha"),
+        (DataFilterOperator::EndsWith, "bet"),
+    ] {
+        let suggestions =
+            TextValueSuggestionsReader::new(source.path().to_owned(), input.to_owned())
+                .expect("suggestions reader")
+                .fetch(&text_schema_field(), operator)
+                .expect("suggestions");
+
+        assert_eq!(suggestions.values, vec!["Alphabet"]);
+        assert!(!suggestions.is_partial);
+    }
+}
+
+#[test]
+fn marks_suggestions_partial_when_a_match_exists_beyond_the_scan_limit() {
+    let mut values = vec![Some("common".to_owned()); 10_000];
+    values.push(Some("late".to_owned()));
+    let source = write_text_parquet(values);
+
+    let suggestions = TextValueSuggestionsReader::new(source.path().to_owned(), "late".to_owned())
+        .expect("suggestions reader")
+        .fetch(&text_schema_field(), DataFilterOperator::Equals)
+        .expect("suggestions");
+
+    assert!(suggestions.values.is_empty());
+    assert!(suggestions.is_partial);
+    assert_eq!(suggestions.scan_limit, 10_000);
+}
+
+#[test]
+fn marks_a_suggestion_scan_complete_when_the_column_ends_before_the_limit() {
+    let source = write_text_parquet(vec![
+        Some("Alpha".to_owned()),
+        Some("Beta".to_owned()),
+        None,
+    ]);
+
+    let suggestions = TextValueSuggestionsReader::new(source.path().to_owned(), String::new())
+        .expect("suggestions reader")
+        .fetch(&text_schema_field(), DataFilterOperator::Equals)
+        .expect("suggestions");
+
+    assert_eq!(suggestions.values, vec!["Alpha", "Beta"]);
+    assert!(!suggestions.is_partial);
+}
+
+#[test]
+fn cancels_text_value_suggestions_before_scanning() {
+    let source = write_text_parquet(vec![Some("value".to_owned())]);
+    let reader = TextValueSuggestionsReader::new(source.path().to_owned(), String::new())
+        .expect("suggestions reader");
+    let interrupt = reader.interrupt_handle();
+
+    interrupt.interrupt();
+
+    assert_eq!(
+        reader.fetch(&text_schema_field(), DataFilterOperator::Equals),
+        Err(DataWindowError::Cancelled)
+    );
+}
+
+fn text_schema_field() -> SchemaField {
+    SchemaField {
+        name: "label".to_owned(),
+        physical_type: "BYTE_ARRAY".to_owned(),
+        logical_type: Some("String".to_owned()),
+        children: Vec::new(),
     }
 }
 
@@ -1053,6 +1235,16 @@ fn filter(column_index: u32, operator: DataFilterOperator, values: &[&str]) -> D
         column_index,
         operator,
         values: values.iter().map(|value| (*value).to_owned()).collect(),
+        match_case: false,
+    }
+}
+
+fn text_filter(operator: DataFilterOperator, value: &str, match_case: bool) -> DataFilter {
+    DataFilter {
+        column_index: 0,
+        operator,
+        values: vec![value.to_owned()],
+        match_case,
     }
 }
 
@@ -1192,6 +1384,16 @@ fn write_temporal_filter_parquet() -> NamedTempFile {
         ],
     )
     .expect("temporal record batch");
+    write_batch(&source, schema, &batch);
+    source
+}
+
+fn write_text_parquet(values: Vec<Option<String>>) -> NamedTempFile {
+    let source = NamedTempFile::new().expect("temporary source");
+    let schema = Arc::new(Schema::new(vec![Field::new("label", DataType::Utf8, true)]));
+    let strings = StringArray::from_iter(values.iter().map(|value| value.as_deref()));
+    let batch = RecordBatch::try_new(Arc::clone(&schema), vec![Arc::new(strings) as ArrayRef])
+        .expect("text record batch");
     write_batch(&source, schema, &batch);
     source
 }
