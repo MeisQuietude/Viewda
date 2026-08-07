@@ -192,6 +192,64 @@ describe("DataGrid window rendering", () => {
     expect(damage).not.toContainEqual({ cell: [1, 1_000] });
   });
 
+  it("reloads only direct window columns when the horizontal viewport changes", async () => {
+    const wideSource = {
+      ...source,
+      schema: Array.from({ length: 20 }, (_, index) => ({
+        ...source.schema[0]!,
+        name: `column_${index}`,
+      })),
+    };
+    render(<DataGrid source={wideSource} />);
+
+    await waitFor(() =>
+      expect(desktop.getDataWindow).toHaveBeenLastCalledWith(
+        7,
+        0,
+        0,
+        512,
+        [0, 1, 2, 3, 4, 5, 6, 7],
+      ),
+    );
+
+    act(() => {
+      editorMock.props?.onVisibleRegionChanged?.(
+        { x: 10, y: 0, width: 4, height: 5 },
+        0,
+        0,
+        { freezeRegions: [{ x: 0, y: 0, width: 1, height: 5 }] },
+      );
+    });
+    await waitFor(() =>
+      expect(desktop.getDataWindow).toHaveBeenLastCalledWith(
+        7,
+        0,
+        0,
+        512,
+        [0, 10, 11, 12, 13],
+      ),
+    );
+
+    act(() => {
+      editorMock.props?.onVisibleRegionChanged?.(
+        { x: 15, y: 0, width: 3, height: 5 },
+        0,
+        0,
+        { freezeRegions: [{ x: 0, y: 0, width: 1, height: 5 }] },
+      );
+    });
+    await waitFor(() =>
+      expect(desktop.getDataWindow).toHaveBeenLastCalledWith(
+        7,
+        0,
+        0,
+        512,
+        [0, 15, 16, 17],
+      ),
+    );
+    expect(desktop.prepareDataView).not.toHaveBeenCalled();
+  });
+
   it("loads only viewport and frozen columns from a prepared view", async () => {
     const wideSource = {
       ...source,
@@ -232,6 +290,30 @@ describe("DataGrid window rendering", () => {
         [0, 10, 11, 12, 13],
       ),
     );
+  });
+
+  it("loads only selected columns when copying from a direct view", async () => {
+    render(<DataGrid source={source} />);
+    await waitFor(() => expect(desktop.getDataWindow).toHaveBeenCalledOnce());
+    vi.mocked(desktop.getDataWindow).mockClear();
+
+    const getCellsForSelection = editorMock.props?.getCellsForSelection;
+    expect(getCellsForSelection).toBeTypeOf("function");
+    if (typeof getCellsForSelection !== "function") {
+      return;
+    }
+    const selection = getCellsForSelection(
+      { x: 2, y: 0, width: 2, height: 1 },
+      new AbortController().signal,
+    );
+    await act(async () => {
+      if (typeof selection === "function") {
+        await selection();
+      }
+    });
+
+    expect(desktop.getDataWindow).toHaveBeenCalledWith(7, 0, 0, 512, [2, 3]);
+    expect(desktop.prepareDataView).not.toHaveBeenCalled();
   });
 
   it("loads only selected columns when copying from a prepared view", async () => {

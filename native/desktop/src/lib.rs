@@ -467,18 +467,26 @@ fn fetch_opened_source_window(
             .fetch_window_columns(row_offset, row_count, source_indices)
             .map_err(Into::into),
         None => {
-            let identity_projection = source_indices.len() == session.schema.len()
+            // The session installs its schema and reader from the same source generation.
+            // Keep this predicate aligned with DataWindowReader::fetch_columns: this fast path
+            // avoids parsing the footer, while the reader still protects direct library callers.
+            let identity_projection = !source_indices.is_empty()
+                && source_indices.len() == session.schema.len()
                 && source_indices
                     .iter()
                     .enumerate()
                     .all(|(index, source_index)| usize::try_from(*source_index) == Ok(index));
-            if !identity_projection {
-                return Err(DataWindowError::Unsupported.into());
+            if identity_projection {
+                session
+                    .reader
+                    .fetch(row_offset, row_count)
+                    .map_err(Into::into)
+            } else {
+                session
+                    .reader
+                    .fetch_columns(row_offset, row_count, source_indices)
+                    .map_err(Into::into)
             }
-            session
-                .reader
-                .fetch(row_offset, row_count)
-                .map_err(Into::into)
         }
     }
 }
@@ -1534,23 +1542,31 @@ mod tests {
     }
 
     #[test]
-    fn direct_windows_require_the_full_identity_projection() {
+    fn direct_windows_validate_projection_before_reading_the_source() {
         let opened_source = OpenedSource::default();
         let opened = opened_source
             .install(
                 None,
-                PathBuf::from("source.parquet"),
+                PathBuf::from("missing-direct-projection-source.parquet"),
                 SourceSummary {
                     display_name: "source.parquet".into(),
                     size_bytes: 8,
                     row_count: 1,
                     row_group_count: 1,
-                    schema: vec![SchemaField {
-                        name: "value".into(),
-                        physical_type: "INT64".into(),
-                        logical_type: None,
-                        children: Vec::new(),
-                    }],
+                    schema: vec![
+                        SchemaField {
+                            name: "value".into(),
+                            physical_type: "INT64".into(),
+                            logical_type: None,
+                            children: Vec::new(),
+                        },
+                        SchemaField {
+                            name: "other".into(),
+                            physical_type: "INT64".into(),
+                            logical_type: None,
+                            children: Vec::new(),
+                        },
+                    ],
                 },
                 SourceOpenIntent::Explicit,
             )
@@ -1561,6 +1577,10 @@ mod tests {
         assert_eq!(
             fetch_opened_source_window(&mut state, opened.generation, 0, 0, 1, &[]),
             Err(DataWindowCommandError::Engine(DataWindowError::Unsupported))
+        );
+        assert_eq!(
+            fetch_opened_source_window(&mut state, opened.generation, 0, 0, 1, &[1]),
+            Err(DataWindowCommandError::Engine(DataWindowError::NotFound))
         );
     }
 

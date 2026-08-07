@@ -362,10 +362,6 @@ export function DataGrid({
     ],
     [columnStates],
   );
-  const allSourceIndices = useMemo(
-    () => source.schema.map((_field, sourceIndex) => sourceIndex),
-    [source.schema],
-  );
   visibleColumnStatesRef.current = visibleColumnStates;
   const hiddenCount = columnStates.length - visibleColumnStates.length;
   const pinnedCount = visibleColumnStates.filter(
@@ -620,14 +616,11 @@ export function DataGrid({
         scrollState.direction,
       );
       const activeView = activeViewRef.current;
-      const sourceIndices =
-        activeView.filters.length === 0 && activeView.sort.length === 0
-          ? allSourceIndices
-          : projectedSourceIndices(
-              visibleColumnStatesRef.current,
-              visibleRegionsRef.current,
-              INITIAL_COLUMNS,
-            );
+      const sourceIndices = projectedSourceIndices(
+        visibleColumnStatesRef.current,
+        visibleRegionsRef.current,
+        INITIAL_COLUMNS,
+      );
       if (sourceIndices.length === 0) {
         return;
       }
@@ -658,7 +651,7 @@ export function DataGrid({
       pendingRequestRef.current = requestedWindow;
       void drainRequests();
     },
-    [allSourceIndices, drainRequests],
+    [drainRequests],
   );
 
   const retryWindow = useCallback(() => {
@@ -1029,10 +1022,9 @@ export function DataGrid({
     ): Promise<ArrowDataWindow> => {
       const offset = Math.floor(row / COPY_CHUNK_ROWS) * COPY_CHUNK_ROWS;
       const view = activeViewRef.current;
-      const sourceIndices =
-        view.filters.length === 0 && view.sort.length === 0
-          ? allSourceIndices
-          : [...selectedSourceIndices].sort((left, right) => left - right);
+      const sourceIndices = [...selectedSourceIndices].sort(
+        (left, right) => left - right,
+      );
       const key = `${view.revision}:${offset}:${sourceIndices.join(",")}`;
       const existing = copyWindowsRef.current.get(key);
       if (existing !== undefined) {
@@ -1068,7 +1060,7 @@ export function DataGrid({
       void request.then(release, release);
       return request;
     },
-    [allSourceIndices, source.generation],
+    [source.generation],
   );
 
   const getCellsForSelection = useCallback(

@@ -31,7 +31,10 @@ use tempfile::TempDir;
 use crate::{
     filter::{DataFilter, build_filter_predicate_with_names, quote_identifier},
     source::{inspect_local_source, open_local_source},
-    window::{DataWindowError, MAX_WINDOW_ROWS, classify_query_error, set_utc_session_timezone},
+    window::{
+        DataWindowError, MAX_WINDOW_ROWS, classify_query_error, set_utc_session_timezone,
+        validate_projection,
+    },
 };
 
 // Sparse windows bypass DuckDB. This cap bounds only the compatibility fallback for Parquet 58
@@ -584,13 +587,13 @@ impl PreparedDataView {
         if row_count > MAX_WINDOW_ROWS {
             return Err(DataWindowError::WindowTooLarge.into());
         }
-        validate_projection(&self.schema, source_indices)?;
+        let source_indices = validate_projection(&self.schema, source_indices)?;
         let offset = usize::try_from(row_offset).map_err(|_| DataWindowError::Unsupported)?;
         let limit = usize::try_from(row_count).map_err(|_| DataWindowError::Unsupported)?;
         let positions =
             read_positions(&self.position_index, &self.position_metadata, offset, limit)?;
         if let Some(metadata) = &self.source_metadata {
-            match read_source_positions(&self.source_path, metadata, &positions, source_indices) {
+            match read_source_positions(&self.source_path, metadata, &positions, &source_indices) {
                 Ok(window) => return Ok(window),
                 Err(DataWindowError::CorruptSource) => {
                     // TODO(Arrow 59): parquet 58 rejects some valid nested-list row groups.
@@ -600,14 +603,14 @@ impl PreparedDataView {
                 Err(error) => return Err(error.into()),
             }
         }
-        self.fetch_window_columns_with_duckdb(row_offset, row_count, source_indices)
+        self.fetch_window_columns_with_duckdb(row_offset, row_count, &source_indices)
     }
 
     fn fetch_window_columns_with_duckdb(
         &self,
         row_offset: u64,
         row_count: u32,
-        source_indices: &[u32],
+        source_indices: &[usize],
     ) -> Result<Vec<u8>, DataViewError> {
         let source_path = self
             .source_path
@@ -713,12 +716,11 @@ fn build_window_query(
     source_row_count: u64,
     source_path: &str,
     position_index_path: &str,
-    source_indices: &[u32],
+    source_indices: &[usize],
 ) -> Result<String, DataWindowError> {
     if source_columns.len() != schema.len() {
         return Err(DataWindowError::Unsupported);
     }
-    validate_projection(schema, source_indices)?;
     let requested = quote_identifier("__viewda_requested");
     let requested_source = quote_identifier("__viewda_requested_source");
     let source = quote_identifier("__viewda_source");
@@ -735,21 +737,13 @@ fn build_window_query(
     let projection = source_indices
         .iter()
         .map(|source_index| {
-            let source_index =
-                usize::try_from(*source_index).map_err(|_| DataWindowError::Unsupported)?;
-            let field = schema
-                .get(source_index)
-                .ok_or(DataWindowError::Unsupported)?;
-            let column = source_columns
-                .get(source_index)
-                .ok_or(DataWindowError::Unsupported)?;
-            Ok(format!(
+            format!(
                 "{source}.{} AS {}",
-                quote_identifier(column),
-                quote_identifier(&field.name),
-            ))
+                quote_identifier(&source_columns[*source_index]),
+                quote_identifier(&schema[*source_index].name),
+            )
         })
-        .collect::<Result<Vec<_>, DataWindowError>>()?
+        .collect::<Vec<_>>()
         .join(", ");
     let requested_cte = format!(
         "{requested} AS (\
@@ -788,27 +782,6 @@ fn build_window_query(
     }
 }
 
-fn validate_projection(
-    schema: &[crate::source::SchemaField],
-    source_indices: &[u32],
-) -> Result<(), DataWindowError> {
-    if source_indices.is_empty() {
-        return Err(DataWindowError::Unsupported);
-    }
-    let mut seen = vec![false; schema.len()];
-    for source_index in source_indices {
-        let source_index =
-            usize::try_from(*source_index).map_err(|_| DataWindowError::Unsupported)?;
-        let Some(slot) = seen.get_mut(source_index) else {
-            return Err(DataWindowError::Unsupported);
-        };
-        if std::mem::replace(slot, true) {
-            return Err(DataWindowError::Unsupported);
-        }
-    }
-    Ok(())
-}
-
 fn read_positions(
     path: &Path,
     metadata: &ArrowReaderMetadata,
@@ -843,9 +816,9 @@ fn read_source_positions(
     path: &Path,
     metadata: &ArrowReaderMetadata,
     positions: &[u64],
-    source_indices: &[u32],
+    source_indices: &[usize],
 ) -> Result<Vec<u8>, DataWindowError> {
-    let output_schema = projected_arrow_schema(metadata.schema(), source_indices)?;
+    let output_schema = projected_arrow_schema_from_usize(metadata.schema(), source_indices)?;
     if positions.is_empty() {
         return encode_empty(output_schema);
     }
@@ -873,10 +846,7 @@ fn read_source_positions(
         return Err(DataWindowError::CorruptSource);
     }
 
-    let mut source_order_indices = source_indices
-        .iter()
-        .map(|index| usize::try_from(*index).map_err(|_| DataWindowError::Unsupported))
-        .collect::<Result<Vec<_>, _>>()?;
+    let mut source_order_indices = source_indices.to_vec();
     source_order_indices.sort_unstable();
     let selection = RowSelection::from_consecutive_ranges(
         sorted_positions
@@ -914,10 +884,8 @@ fn read_source_positions(
     let columns = source_indices
         .iter()
         .map(|source_index| {
-            let source_index =
-                usize::try_from(*source_index).map_err(|_| DataWindowError::Unsupported)?;
             let column_offset = source_order_indices
-                .binary_search(&source_index)
+                .binary_search(source_index)
                 .map_err(|_| DataWindowError::Unsupported)?;
             take(
                 sorted_batch.column(column_offset).as_ref(),
@@ -930,17 +898,6 @@ fn read_source_positions(
     let batch = RecordBatch::try_new(output_schema, columns)
         .map_err(|_| DataWindowError::EncodingFailed)?;
     encode_batch(&batch)
-}
-
-fn projected_arrow_schema(
-    schema: &SchemaRef,
-    source_indices: &[u32],
-) -> Result<SchemaRef, DataWindowError> {
-    let source_indices = source_indices
-        .iter()
-        .map(|index| usize::try_from(*index).map_err(|_| DataWindowError::Unsupported))
-        .collect::<Result<Vec<_>, _>>()?;
-    projected_arrow_schema_from_usize(schema, &source_indices)
 }
 
 fn projected_arrow_schema_from_usize(
