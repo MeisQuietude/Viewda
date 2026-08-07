@@ -1,7 +1,12 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useId, useRef, useState } from "react";
 
 import type { DataFilter, DataFilterOperator, SchemaField } from "../desktop";
-import { columnFilterKind, type ColumnFilterKind } from "./filter-query";
+import {
+  columnFilterKind,
+  temporalFormatForField,
+  type ColumnFilterKind,
+  type TemporalFormat,
+} from "./filter-query";
 
 export interface FilterEditorRequest {
   sourceIndex: number;
@@ -48,6 +53,10 @@ const OPERATOR_OPTIONS: Record<ColumnFilterKind, OperatorOption[]> = {
   temporal: [
     { value: "equals", label: "equals" },
     { value: "notEquals", label: "does not equal" },
+    { value: "greaterThan", label: "is after" },
+    { value: "greaterThanOrEqual", label: "is on or after" },
+    { value: "lessThan", label: "is before" },
+    { value: "lessThanOrEqual", label: "is on or before" },
     { value: "oneOf", label: "is one of" },
     { value: "range", label: "is between" },
     { value: "isNull", label: "is null" },
@@ -100,7 +109,18 @@ export function FilterEditor({
   );
   const [secondValue, setSecondValue] = useState(initialValues[1] ?? "");
   const editorRef = useRef<HTMLFormElement>(null);
-  const values = filterValues(field, kind, operator, firstValue, secondValue);
+  const temporalFormat =
+    kind === "temporal" ? temporalFormatForField(field) : null;
+  const temporalHintId = useId();
+  const valueResult = filterValueResult(
+    field,
+    kind,
+    temporalFormat,
+    operator,
+    firstValue,
+    secondValue,
+  );
+  const values = valueResult.values;
   const canApply = values !== null;
   const validationMessage = filterValidationMessage(
     kind,
@@ -108,6 +128,7 @@ export function FilterEditor({
     firstValue,
     secondValue,
     values,
+    valueResult.temporalError,
     field,
   );
 
@@ -175,6 +196,8 @@ export function FilterEditor({
       </label>
       <FilterValues
         kind={kind}
+        temporalFormat={temporalFormat}
+        temporalHintId={temporalHintId}
         operator={operator}
         firstValue={firstValue}
         secondValue={secondValue}
@@ -202,6 +225,8 @@ export function FilterEditor({
 
 function FilterValues({
   kind,
+  temporalFormat,
+  temporalHintId,
   operator,
   firstValue,
   secondValue,
@@ -209,6 +234,8 @@ function FilterValues({
   setSecondValue,
 }: {
   kind: ColumnFilterKind;
+  temporalFormat: TemporalFormat | null;
+  temporalHintId: string;
   operator: DataFilterOperator;
   firstValue: string;
   secondValue: string;
@@ -220,52 +247,74 @@ function FilterValues({
   }
   if (operator === "oneOf") {
     return (
-      <label>
-        <span>Values, one per line</span>
-        <textarea
-          rows={4}
-          value={firstValue}
-          onChange={(event) => setFirstValue(event.target.value)}
-        />
-      </label>
+      <>
+        <label>
+          <span>Values, one per line</span>
+          <textarea
+            aria-describedby={
+              temporalFormat === null ? undefined : temporalHintId
+            }
+            rows={4}
+            value={firstValue}
+            onChange={(event) => setFirstValue(event.target.value)}
+          />
+        </label>
+        <TemporalFormatHint id={temporalHintId} format={temporalFormat} />
+      </>
     );
   }
   if (operator === "range") {
     return (
-      <div className="filter-range">
-        <FilterInput
-          label="From"
-          kind={kind}
-          value={firstValue}
-          onChange={setFirstValue}
-        />
-        <FilterInput
-          label="To"
-          kind={kind}
-          value={secondValue}
-          onChange={setSecondValue}
-        />
-      </div>
+      <>
+        <div className="filter-range">
+          <FilterInput
+            label="From"
+            kind={kind}
+            temporalFormat={temporalFormat}
+            temporalHintId={temporalHintId}
+            value={firstValue}
+            onChange={setFirstValue}
+          />
+          <FilterInput
+            label="To"
+            kind={kind}
+            temporalFormat={temporalFormat}
+            temporalHintId={temporalHintId}
+            value={secondValue}
+            onChange={setSecondValue}
+          />
+        </div>
+        <TemporalFormatHint id={temporalHintId} format={temporalFormat} />
+      </>
     );
   }
   return (
-    <FilterInput
-      label="Value"
-      kind={kind}
-      value={firstValue}
-      onChange={setFirstValue}
-    />
+    <>
+      <FilterInput
+        label="Value"
+        kind={kind}
+        temporalFormat={temporalFormat}
+        temporalHintId={temporalHintId}
+        value={firstValue}
+        onChange={setFirstValue}
+      />
+      <TemporalFormatHint id={temporalHintId} format={temporalFormat} />
+    </>
   );
 }
 
 function FilterInput({
   label,
   kind,
+  temporalFormat,
+  temporalHintId,
   value,
   onChange,
 }: {
   label: string;
   kind: ColumnFilterKind;
+  temporalFormat: TemporalFormat | null;
+  temporalHintId: string;
   value: string;
   onChange: (value: string) => void;
 }) {
@@ -288,6 +337,8 @@ function FilterInput({
     <label>
       <span>{label}</span>
       <input
+        aria-describedby={temporalFormat === null ? undefined : temporalHintId}
+        type={temporalFormat?.valueKind === "date" ? "date" : "text"}
         inputMode={kind === "number" ? "decimal" : undefined}
         value={value}
         onChange={(event) => onChange(event.target.value)}
@@ -296,16 +347,22 @@ function FilterInput({
   );
 }
 
-function filterValues(
+interface FilterValueResult {
+  values: string[] | null;
+  temporalError: string | null;
+}
+
+function filterValueResult(
   field: SchemaField,
   kind: ColumnFilterKind,
+  temporalFormat: TemporalFormat | null,
   operator: DataFilterOperator,
   firstValue: string,
   secondValue: string,
-): string[] | null {
+): FilterValueResult {
   let values: string[] | null;
   if (operator === "isNull" || operator === "isNotNull") {
-    return [];
+    return { values: [], temporalError: null };
   }
   if (operator === "oneOf") {
     values = firstValue
@@ -335,9 +392,17 @@ function filterValues(
         ).test(value.trim()),
     )
   ) {
-    return null;
+    return { values: null, temporalError: null };
   }
-  return values;
+  if (temporalFormat !== null && values !== null) {
+    for (const value of values) {
+      const temporalError = temporalValidationError(value, temporalFormat);
+      if (temporalError !== null) {
+        return { values: null, temporalError };
+      }
+    }
+  }
+  return { values, temporalError: null };
 }
 
 function filterValidationMessage(
@@ -346,6 +411,7 @@ function filterValidationMessage(
   firstValue: string,
   secondValue: string,
   values: string[] | null,
+  temporalError: string | null,
   field: SchemaField,
 ): string | null {
   if (
@@ -360,7 +426,7 @@ function filterValidationMessage(
     return "Enter both range values.";
   }
   if (kind === "temporal") {
-    return "Enter a date or time value.";
+    return temporalError;
   }
   if (kind === "number") {
     return isIntegerField(field) ? "Enter an integer." : "Enter a number.";
@@ -373,4 +439,116 @@ function isIntegerField(field: SchemaField): boolean {
     !field.logicalType?.startsWith("Decimal") &&
     (field.physicalType === "INT32" || field.physicalType === "INT64")
   );
+}
+
+function TemporalFormatHint({
+  id,
+  format,
+}: {
+  id: string;
+  format: TemporalFormat | null;
+}) {
+  if (format === null) {
+    return null;
+  }
+  return (
+    <small id={id} className="filter-editor-hint">
+      Format: {format.hint}
+    </small>
+  );
+}
+
+function temporalValidationError(
+  value: string,
+  format: TemporalFormat,
+): string | null {
+  if (format.valueKind === "date") {
+    return dateValidationError(value);
+  }
+
+  let core = value;
+  if (format.timezone === "UTC") {
+    if (format.valueKind === "time" && core.endsWith("Z")) {
+      return "Use a numeric offset (±HH:mm), not Z.";
+    }
+    const timezone =
+      format.valueKind === "timestamp"
+        ? /(Z|[+-](\d{2}):(\d{2}))$/.exec(core)
+        : /([+-](\d{2}):(\d{2}))$/.exec(core);
+    if (format.valueKind === "timestamp" && timezone === null) {
+      return "Timezone suffix required: Z or ±HH:mm.";
+    }
+    if (
+      timezone !== null &&
+      timezone[2] !== undefined &&
+      (Number(timezone[2]) > 23 || Number(timezone[3]!) > 59)
+    ) {
+      return "Invalid timezone offset.";
+    }
+    if (timezone !== null) {
+      core = core.slice(0, -timezone[1]!.length);
+    }
+  } else if (/(?:Z|[+-]\d{2}:\d{2})$/.test(core)) {
+    return "Timezone suffix not allowed.";
+  }
+  if (format.valueKind === "timestamp") {
+    const separator = core.indexOf("T");
+    if (separator === -1 || core.indexOf("T", separator + 1) !== -1) {
+      return "Expected T between date and time.";
+    }
+    const dateError = dateValidationError(core.slice(0, separator));
+    if (dateError !== null) {
+      return dateError;
+    }
+    core = core.slice(separator + 1);
+  }
+
+  return timeValidationError(core);
+}
+
+function dateValidationError(value: string): string | null {
+  const match = /^(\d{4})-(\d{2})-(\d{2})$/.exec(value);
+  if (match === null) {
+    return "Expected YYYY-MM-DD.";
+  }
+  const year = Number(match[1]);
+  const month = Number(match[2]);
+  const day = Number(match[3]);
+  if (year === 0 || month < 1 || month > 12 || day < 1) {
+    return "Invalid calendar date.";
+  }
+  const leapYear = year % 4 === 0 && (year % 100 !== 0 || year % 400 === 0);
+  const daysInMonth = [
+    31,
+    leapYear ? 29 : 28,
+    31,
+    30,
+    31,
+    30,
+    31,
+    31,
+    30,
+    31,
+    30,
+    31,
+  ];
+  return day <= daysInMonth[month - 1]! ? null : "Invalid calendar date.";
+}
+
+function timeValidationError(value: string): string | null {
+  const match = /^(\d{2}):(\d{2}):(\d{2})(?:\.(\d*))?$/.exec(value);
+  if (match === null) {
+    return "Expected HH:mm:ss with an optional fraction.";
+  }
+  if (
+    match[4] !== undefined &&
+    (match[4].length === 0 || match[4].length > 9)
+  ) {
+    return "Fraction must have 1–9 digits.";
+  }
+  return Number(match[1]) <= 23 &&
+    Number(match[2]) <= 59 &&
+    Number(match[3]) <= 59
+    ? null
+    : "Time must be within 00:00:00–23:59:59.";
 }

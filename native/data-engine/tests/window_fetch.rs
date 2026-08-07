@@ -3,14 +3,19 @@ use std::{cmp::Ordering, fs, io::Cursor, sync::Arc};
 use arrow_array::{
     Array, ArrayRef, BooleanArray, Date32Array, Decimal128Array, Float16Array, Float32Array,
     Float64Array, Int32Array, Int64Array, ListArray, RecordBatch, StringArray, StructArray,
-    TimestampMicrosecondArray, types::Int32Type,
+    Time64MicrosecondArray, TimestampMicrosecondArray, TimestampMillisecondArray,
+    TimestampNanosecondArray, types::Int32Type,
 };
 use arrow_ipc::reader::StreamReader;
 use arrow_schema::{DataType, Field, Fields, Schema, TimeUnit};
 use half::f16;
 use parquet::{
     arrow::ArrowWriter,
-    data_type::{ByteArray, ByteArrayType, FixedLenByteArray, FixedLenByteArrayType, Int64Type},
+    data_type::{
+        ByteArray, ByteArrayType, FixedLenByteArray, FixedLenByteArrayType,
+        Int32Type as ParquetInt32Type, Int64Type as ParquetInt64Type, Int96,
+        Int96Type as ParquetInt96Type,
+    },
     file::writer::SerializedFileWriter,
     schema::parser::parse_message_type,
 };
@@ -434,6 +439,209 @@ fn keeps_plain_binary_columns_null_only() {
     .expect("binary null-check view");
     let batches = decode(view.fetch_window(0, 8).expect("binary null-check window"));
     assert_eq!(int64_values(&batches[0], 0), vec![1, 2, 3]);
+}
+
+#[test]
+fn applies_every_comparison_to_modern_temporal_types() {
+    let source = write_temporal_filter_parquet();
+    assert_temporal_comparisons(
+        &source,
+        &[
+            (1, "1970-01-02"),
+            (2, "1970-01-02T00:00:00.123"),
+            (3, "1970-01-02T00:00:00.123456Z"),
+            (4, "1970-01-02T00:00:00.123456789"),
+            (5, "12:00:00"),
+            (6, "1970-01-02T00:00:00.123Z"),
+            (7, "1970-01-02T00:00:00.123456"),
+            (8, "1970-01-02T00:00:00.123456789Z"),
+        ],
+    );
+}
+
+#[test]
+fn applies_every_comparison_to_all_time_units_legacy_types_and_int96() {
+    let source = write_raw_temporal_parquet();
+    assert_temporal_comparisons(
+        &source,
+        &[
+            (1, "12:00:00.123"),
+            (2, "12:00:00.123+00:00"),
+            (3, "12:00:00.123+00:00"),
+            (4, "12:00:00.123456"),
+            (5, "12:00:00.123456+00:00"),
+            (6, "12:00:00.123456789"),
+            (7, "12:00:00.123456789+00:00"),
+            (8, "12:00:00.123456+00:00"),
+            (9, "1970-01-02T00:00:00.123Z"),
+            (10, "1970-01-02T00:00:00.123456Z"),
+            (11, "1970-01-02T00:00:00.123456789"),
+        ],
+    );
+}
+
+fn assert_temporal_comparisons(source: &NamedTempFile, cases: &[(u32, &str)]) {
+    let operators = [
+        (DataFilterOperator::GreaterThan, &[2][..]),
+        (DataFilterOperator::GreaterThanOrEqual, &[1, 2][..]),
+        (DataFilterOperator::LessThan, &[0][..]),
+        (DataFilterOperator::LessThanOrEqual, &[0, 1][..]),
+    ];
+
+    for &(column_index, value) in cases {
+        for (operator, expected) in operators {
+            let view = prepare_view(
+                source.path(),
+                &[filter(column_index, operator, &[value])],
+                &[],
+            )
+            .unwrap_or_else(|error| {
+                panic!("column {column_index}, operator {operator:?}: {error:?}")
+            });
+            let batches = decode(view.fetch_window(0, 4).expect("filtered temporal window"));
+
+            assert_eq!(
+                int64_values(&batches[0], 0),
+                expected,
+                "column {column_index}, operator {operator:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn accepts_an_explicit_offset_for_a_utc_timestamp_filter() {
+    let source = write_temporal_filter_parquet();
+    let view = prepare_view(
+        source.path(),
+        &[filter(
+            3,
+            DataFilterOperator::Equals,
+            &["1970-01-02T03:00:00.123456+03:00"],
+        )],
+        &[],
+    )
+    .expect("UTC view with an explicit offset");
+    let batches = decode(
+        view.fetch_window(0, 4)
+            .expect("UTC filter with an explicit offset"),
+    );
+
+    assert_eq!(int64_values(&batches[0], 0), vec![1]);
+}
+
+#[test]
+fn accepts_a_timezone_free_value_for_a_utc_time_filter() {
+    let source = write_raw_temporal_parquet();
+    let view = prepare_view(
+        source.path(),
+        &[filter(2, DataFilterOperator::Equals, &["12:00:00.123"])],
+        &[],
+    )
+    .expect("UTC time view without an offset");
+    let batches = decode(
+        view.fetch_window(0, 4)
+            .expect("UTC time filter without an offset"),
+    );
+
+    assert_eq!(int64_values(&batches[0], 0), vec![1]);
+}
+
+#[test]
+fn uses_a_timestamp_filter_boundary_beyond_the_column_storage_precision() {
+    let source = write_temporal_filter_parquet();
+    let view = prepare_view(
+        source.path(),
+        &[filter(
+            2,
+            DataFilterOperator::GreaterThanOrEqual,
+            &["1970-01-02T00:00:00.1234"],
+        )],
+        &[],
+    )
+    .expect("millisecond view with extra precision");
+    let batches = decode(
+        view.fetch_window(0, 4)
+            .expect("millisecond filter with extra precision"),
+    );
+
+    assert_eq!(int64_values(&batches[0], 0), vec![2]);
+}
+
+#[test]
+fn returns_duckdb_temporal_types_used_by_cell_prefill() {
+    let source = write_temporal_filter_parquet();
+    let mut reader = DataWindowReader::new(source.path().to_owned());
+    let batches = decode(reader.fetch(0, 1).expect("temporal window"));
+    let schema = batches[0].schema();
+
+    let types = schema
+        .fields()
+        .iter()
+        .skip(2)
+        .map(|field| field.data_type())
+        .collect::<Vec<_>>();
+
+    assert!(matches!(
+        types[0],
+        DataType::Timestamp(arrow_schema::TimeUnit::Microsecond, None)
+    ));
+    assert!(matches!(
+        types[1],
+        DataType::Timestamp(arrow_schema::TimeUnit::Microsecond, Some(_))
+    ));
+    assert!(matches!(
+        types[2],
+        DataType::Timestamp(arrow_schema::TimeUnit::Nanosecond, None)
+    ));
+    assert!(matches!(
+        types[3],
+        DataType::Time64(arrow_schema::TimeUnit::Microsecond)
+    ));
+    assert!(matches!(
+        types[4],
+        DataType::Timestamp(arrow_schema::TimeUnit::Microsecond, Some(_))
+    ));
+    assert!(matches!(
+        types[5],
+        DataType::Timestamp(arrow_schema::TimeUnit::Microsecond, None)
+    ));
+    assert!(matches!(
+        types[6],
+        DataType::Timestamp(arrow_schema::TimeUnit::Microsecond, Some(_))
+    ));
+}
+
+#[test]
+fn returns_duckdb_types_for_all_time_units_legacy_types_and_int96() {
+    let source = write_raw_temporal_parquet();
+    let mut reader = DataWindowReader::new(source.path().to_owned());
+    let batches = decode(reader.fetch(0, 3).expect("raw temporal window"));
+    let schema = batches[0].schema();
+
+    let types = schema
+        .fields()
+        .iter()
+        .skip(1)
+        .map(|field| field.data_type().clone())
+        .collect::<Vec<_>>();
+
+    assert_eq!(
+        types,
+        vec![
+            DataType::Time64(arrow_schema::TimeUnit::Microsecond),
+            DataType::Time64(arrow_schema::TimeUnit::Microsecond),
+            DataType::Time64(arrow_schema::TimeUnit::Microsecond),
+            DataType::Time64(arrow_schema::TimeUnit::Microsecond),
+            DataType::Time64(arrow_schema::TimeUnit::Microsecond),
+            DataType::Time64(arrow_schema::TimeUnit::Microsecond),
+            DataType::Time64(arrow_schema::TimeUnit::Microsecond),
+            DataType::Time64(arrow_schema::TimeUnit::Microsecond),
+            DataType::Timestamp(arrow_schema::TimeUnit::Microsecond, None),
+            DataType::Timestamp(arrow_schema::TimeUnit::Microsecond, None),
+            DataType::Timestamp(arrow_schema::TimeUnit::Microsecond, None),
+        ]
+    );
 }
 
 #[test]
@@ -945,6 +1153,157 @@ fn write_basic_parquet() -> NamedTempFile {
     source
 }
 
+fn write_temporal_filter_parquet() -> NamedTempFile {
+    let source = NamedTempFile::new().expect("temporary source");
+    let millis = TimestampMillisecondArray::from(vec![0, 86_400_123, 172_800_123]);
+    let micros = TimestampMicrosecondArray::from(vec![0, 86_400_123_456, 172_800_123_456])
+        .with_timezone("UTC");
+    let nanos = TimestampNanosecondArray::from(vec![0, 86_400_123_456_789, 172_800_123_456_789]);
+    let time = Time64MicrosecondArray::from(vec![0, 43_200_000_000, 80_000_000_000]);
+    let millis_utc =
+        TimestampMillisecondArray::from(vec![0, 86_400_123, 172_800_123]).with_timezone("UTC");
+    let micros_local = TimestampMicrosecondArray::from(vec![0, 86_400_123_456, 172_800_123_456]);
+    let nanos_utc =
+        TimestampNanosecondArray::from(vec![0, 86_400_123_456_789, 172_800_123_456_789])
+            .with_timezone("UTC");
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int64, false),
+        Field::new("day", DataType::Date32, false),
+        Field::new("millis", millis.data_type().clone(), false),
+        Field::new("micros_utc", micros.data_type().clone(), false),
+        Field::new("nanos", nanos.data_type().clone(), false),
+        Field::new("time", time.data_type().clone(), false),
+        Field::new("millis_utc", millis_utc.data_type().clone(), false),
+        Field::new("micros_local", micros_local.data_type().clone(), false),
+        Field::new("nanos_utc", nanos_utc.data_type().clone(), false),
+    ]));
+    let batch = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![
+            Arc::new(Int64Array::from(vec![0, 1, 2])) as ArrayRef,
+            Arc::new(Date32Array::from(vec![0, 1, 2])) as ArrayRef,
+            Arc::new(millis) as ArrayRef,
+            Arc::new(micros) as ArrayRef,
+            Arc::new(nanos) as ArrayRef,
+            Arc::new(time) as ArrayRef,
+            Arc::new(millis_utc) as ArrayRef,
+            Arc::new(micros_local) as ArrayRef,
+            Arc::new(nanos_utc) as ArrayRef,
+        ],
+    )
+    .expect("temporal record batch");
+    write_batch(&source, schema, &batch);
+    source
+}
+
+fn write_raw_temporal_parquet() -> NamedTempFile {
+    let source = NamedTempFile::new().expect("temporary source");
+    let schema = Arc::new(
+        parse_message_type(
+            "message schema {
+                required INT64 id;
+                required INT32 time_ms_local (TIME(MILLIS,false));
+                required INT32 time_ms_utc (TIME(MILLIS,true));
+                required INT32 legacy_time_ms (TIME_MILLIS);
+                required INT64 time_us_local (TIME(MICROS,false));
+                required INT64 time_us_utc (TIME(MICROS,true));
+                required INT64 time_ns_local (TIME(NANOS,false));
+                required INT64 time_ns_utc (TIME(NANOS,true));
+                required INT64 legacy_time_us (TIME_MICROS);
+                required INT64 legacy_ts_ms (TIMESTAMP_MILLIS);
+                required INT64 legacy_ts_us (TIMESTAMP_MICROS);
+                required INT96 int96_ts;
+            }",
+        )
+        .expect("raw temporal schema"),
+    );
+    let file = source.reopen().expect("temporary source is reopenable");
+    let mut writer =
+        SerializedFileWriter::new(file, schema, Default::default()).expect("raw Parquet writer");
+    let mut row_group = writer.next_row_group().expect("raw temporal row group");
+
+    let mut column = row_group
+        .next_column()
+        .expect("id column")
+        .expect("id writer");
+    column
+        .typed::<ParquetInt64Type>()
+        .write_batch(&[0, 1, 2], None, None)
+        .expect("id values");
+    column.close().expect("id column");
+
+    for values in [
+        [0, 43_200_123, 80_000_123],
+        [0, 43_200_123, 80_000_123],
+        [0, 43_200_123, 80_000_123],
+    ] {
+        let mut column = row_group
+            .next_column()
+            .expect("millisecond time column")
+            .expect("millisecond time writer");
+        column
+            .typed::<ParquetInt32Type>()
+            .write_batch(&values, None, None)
+            .expect("millisecond time values");
+        column.close().expect("millisecond time column");
+    }
+
+    for values in [
+        [0, 43_200_123_456, 80_000_123_456],
+        [0, 43_200_123_456, 80_000_123_456],
+        [0, 43_200_123_456_789, 80_000_123_456_789],
+        [0, 43_200_123_456_789, 80_000_123_456_789],
+        [0, 43_200_123_456, 80_000_123_456],
+        [0, 86_400_123, 172_800_123],
+        [0, 86_400_123_456, 172_800_123_456],
+    ] {
+        let mut column = row_group
+            .next_column()
+            .expect("microsecond, nanosecond, or timestamp column")
+            .expect("i64 temporal writer");
+        column
+            .typed::<ParquetInt64Type>()
+            .write_batch(&values, None, None)
+            .expect("i64 temporal values");
+        column.close().expect("i64 temporal column");
+    }
+
+    let int96_values = [
+        int96(2_440_588, 0),
+        int96(2_440_589, 123_456_789),
+        int96(2_440_590, 123_456_789),
+    ];
+    let mut column = row_group
+        .next_column()
+        .expect("INT96 column")
+        .expect("INT96 writer");
+    column
+        .typed::<ParquetInt96Type>()
+        .write_batch(&int96_values, None, None)
+        .expect("INT96 values");
+    column.close().expect("INT96 column");
+
+    assert!(
+        row_group
+            .next_column()
+            .expect("end of raw temporal columns")
+            .is_none()
+    );
+    row_group.close().expect("raw temporal row group");
+    writer.close().expect("raw temporal Parquet footer");
+    source
+}
+
+fn int96(julian_day: u32, nanoseconds: u64) -> Int96 {
+    let mut value = Int96::new();
+    value.set_data(
+        nanoseconds as u32,
+        (nanoseconds >> u32::BITS) as u32,
+        julian_day,
+    );
+    value
+}
+
 fn write_nested_parquet() -> NamedTempFile {
     let source = NamedTempFile::new().expect("temporary source");
     let profile_fields = Fields::from(vec![
@@ -1061,7 +1420,7 @@ fn write_special_types_parquet() -> NamedTempFile {
         .expect("id column")
         .expect("id column writer");
     column
-        .typed::<Int64Type>()
+        .typed::<ParquetInt64Type>()
         .write_batch(&[1, 2, 3], None, None)
         .expect("id values");
     column.close().expect("id column footer");

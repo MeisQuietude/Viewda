@@ -902,6 +902,11 @@ button {
   font-size: 11px;
 }
 
+.filter-editor-hint {
+  color: var(--grid-text-faint);
+  font-size: 10px;
+}
+
 .filter-editor-actions {
   display: flex;
   justify-content: flex-end;

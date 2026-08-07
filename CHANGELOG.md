@@ -12,9 +12,10 @@ Backward-incompatible entries start with **Breaking:**.
 
 - Settings can follow the system theme or force Light or Dark across the app,
   data grid, and native window chrome without restarting.
-- The Data view now shows typed column filters, including open-ended numeric
-  comparisons and Float16 support, in a query bar with structured condition
-  editing, type-aware value validation, and a cancellable exact match count.
+- The Data view now shows typed column filters, including open-ended numeric and
+  temporal comparisons and Float16 support, in a query bar with structured
+  condition editing, type-aware validation, temporal format hints, a native
+  date picker, and a cancellable exact match count.
 - UUID columns now support equals, not-equals, one-of, and contains filters.
 - The Data view now supports multi-column sorting with a visible ORDER BY
   clause. It keeps current rows visible while changes prepare and lets users

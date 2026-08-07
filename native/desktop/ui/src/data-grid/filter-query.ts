@@ -5,6 +5,21 @@ import type { DataFilter, SchemaField, SortColumn } from "../desktop";
 export type ColumnFilterKind =
   "boolean" | "number" | "text" | "temporal" | "nullOnly";
 
+export type TemporalFormat =
+  | {
+      valueKind: "date";
+      hint: string;
+    }
+  | {
+      valueKind: "time" | "timestamp";
+      hint: string;
+      prefillFractionDigits: number;
+      timezone: "local" | "UTC" | null;
+    };
+
+const TEMPORAL_TYPE_PATTERN =
+  /^(Time|Timestamp) \((milliseconds|microseconds|nanoseconds), (local|UTC)\)$/;
+
 export function columnFilterKind(field: SchemaField): ColumnFilterKind {
   if (field.physicalType === "GROUP") {
     return "nullOnly";
@@ -40,26 +55,96 @@ export function columnFilterKind(field: SchemaField): ColumnFilterKind {
   return "nullOnly";
 }
 
+export function temporalFormatForField(
+  field: SchemaField,
+): TemporalFormat | null {
+  if (field.logicalType === "Date") {
+    return {
+      valueKind: "date",
+      hint: "YYYY-MM-DD",
+    };
+  }
+
+  const match = field.logicalType?.match(TEMPORAL_TYPE_PATTERN);
+  if (match !== undefined && match !== null) {
+    const valueKind = match[1] === "Time" ? "time" : "timestamp";
+    const unit = match[2]!;
+    const timezone = match[3] as "local" | "UTC";
+    const prefillFractionDigits =
+      unit === "milliseconds" ? 3 : unit === "microseconds" ? 6 : 9;
+    const inputPrefix =
+      valueKind === "time" ? "HH:mm:ss" : "YYYY-MM-DDTHH:mm:ss";
+    const timezoneRule =
+      timezone === "local"
+        ? "timezone suffix: not allowed"
+        : valueKind === "timestamp"
+          ? "timezone: required, Z or ±HH:mm"
+          : "offset: optional, ±HH:mm";
+    return {
+      valueKind,
+      hint: `${inputPrefix}; fraction: optional, 1–9 digits; ${timezoneRule}; column: ${unit}, ${timezone}`,
+      prefillFractionDigits,
+      timezone,
+    };
+  }
+
+  return field.physicalType === "INT96"
+    ? {
+        valueKind: "timestamp",
+        hint: "YYYY-MM-DDTHH:mm:ss; fraction: optional, 1–9 digits; timezone suffix: not allowed; column: INT96",
+        prefillFractionDigits: 9,
+        timezone: null,
+      }
+    : null;
+}
+
 /** Returns the canonical editor value for an Arrow cell. */
 export function filterInputFromCell(
   value: unknown,
   dataType: DataType,
+  field: SchemaField,
 ): string {
   const type = unwrapDictionary(dataType);
   if (type.typeId === Type.Timestamp) {
-    const iso = timestampToText(value, type.unit);
-    return type.timezone === null ? iso.replace(/Z$/, "") : iso;
+    const format = temporalFormatForField(field);
+    const iso =
+      format?.valueKind === "timestamp"
+        ? limitFractionDigits(
+            timestampToText(value, type.unit),
+            format.prefillFractionDigits,
+          )
+        : timestampToText(value, type.unit);
+    const timezone =
+      format?.valueKind === "timestamp"
+        ? format.timezone
+        : type.timezone === null
+          ? "local"
+          : "UTC";
+    return timezone === "UTC" ? iso : iso.replace(/Z$/, "");
   }
   if (type.typeId === Type.Date) {
     return timestampToText(value, TimeUnit.MILLISECOND).slice(0, 10);
   }
   if (type.typeId === Type.Time) {
-    return timeToText(value, type.unit);
+    const text = timeToText(value, type.unit);
+    const format = temporalFormatForField(field);
+    if (format?.valueKind !== "time") {
+      return text;
+    }
+    const limited = limitFractionDigits(text, format.prefillFractionDigits);
+    return format.timezone === "UTC" ? `${limited}+00:00` : limited;
   }
   if (type.typeId === Type.Decimal) {
     return decimalToText(value, type.scale);
   }
   return String(value);
+}
+
+function limitFractionDigits(value: string, maximum: number): string {
+  const match = /^(.*)\.(\d+)(Z?)$/.exec(value);
+  return match === null
+    ? value
+    : `${match[1]}.${match[2]!.slice(0, maximum)}${match[3]}`;
 }
 
 export function formatWhereClause(

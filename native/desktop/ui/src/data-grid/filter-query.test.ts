@@ -2,7 +2,9 @@ import {
   dateDay,
   decimal128,
   TimeUnit,
+  timeMillisecond,
   timeMicrosecond,
+  timeNanosecond,
   timestamp,
 } from "@uwdata/flechette";
 import { describe, expect, it } from "vitest";
@@ -143,6 +145,38 @@ describe("canonical filter query formatting", () => {
       field("label", "BYTE_ARRAY", "String"),
       '"label" IS NOT NULL',
     ],
+    [
+      { columnIndex: 0, operator: "greaterThan", values: ["2026-08-01"] },
+      field("day", "INT32", "Date"),
+      "\"day\" > DATE '2026-08-01'",
+    ],
+    [
+      {
+        columnIndex: 0,
+        operator: "greaterThanOrEqual",
+        values: ["06:07:08.009+00:00"],
+      },
+      field("clock", "INT32", "Time (milliseconds, UTC)"),
+      "\"clock\" >= TIME '06:07:08.009+00:00'",
+    ],
+    [
+      {
+        columnIndex: 0,
+        operator: "lessThan",
+        values: ["2026-08-01T06:07:08.009456Z"],
+      },
+      field("recorded_at", "INT64", "Timestamp (microseconds, UTC)"),
+      "\"recorded_at\" < TIMESTAMP '2026-08-01T06:07:08.009456Z'",
+    ],
+    [
+      {
+        columnIndex: 0,
+        operator: "lessThanOrEqual",
+        values: ["2026-08-01T06:07:08.009456789"],
+      },
+      field("legacy_at", "INT96", null),
+      "\"legacy_at\" <= TIMESTAMP '2026-08-01T06:07:08.009456789'",
+    ],
   ] satisfies [DataFilter, SchemaField, string][])(
     "renders structured operator %# canonically",
     (filter, schemaField, expected) => {
@@ -167,34 +201,107 @@ describe("canonical filter query formatting", () => {
 });
 
 describe("filter prefill", () => {
-  const rawTimestamp =
-    BigInt(new Date("2026-08-01T06:07:08.009Z").valueOf()) * 1_000n + 456n;
+  const milliseconds = BigInt(new Date("2026-08-01T06:07:08.009Z").valueOf());
+  const rawTimestamp = milliseconds * 1_000n + 456n;
+
+  it.each([
+    [TimeUnit.MILLISECOND, milliseconds, "2026-08-01T06:07:08.009"],
+    [
+      TimeUnit.MICROSECOND,
+      milliseconds * 1_000n + 456n,
+      "2026-08-01T06:07:08.009456",
+    ],
+    [
+      TimeUnit.NANOSECOND,
+      milliseconds * 1_000_000n + 456_789n,
+      "2026-08-01T06:07:08.009456789",
+    ],
+  ])("formats local timestamp unit %s", (unit, value, expected) => {
+    const unitName =
+      unit === TimeUnit.MILLISECOND
+        ? "milliseconds"
+        : unit === TimeUnit.MICROSECOND
+          ? "microseconds"
+          : "nanoseconds";
+    expect(
+      filterInputFromCell(
+        value,
+        timestamp(unit),
+        field("local_at", "INT64", `Timestamp (${unitName}, local)`),
+      ),
+    ).toBe(expected);
+  });
 
   it("formats timestamps with timezone", () => {
     expect(
-      filterInputFromCell(rawTimestamp, timestamp(TimeUnit.MICROSECOND, "UTC")),
+      filterInputFromCell(
+        rawTimestamp,
+        timestamp(TimeUnit.MICROSECOND, "UTC"),
+        field("recorded_at", "INT64", "Timestamp (microseconds, UTC)"),
+      ),
     ).toBe("2026-08-01T06:07:08.009456Z");
   });
 
   it("formats timestamps without timezone as local timestamp text", () => {
     expect(
-      filterInputFromCell(rawTimestamp, timestamp(TimeUnit.MICROSECOND)),
+      filterInputFromCell(
+        rawTimestamp,
+        timestamp(TimeUnit.MICROSECOND),
+        field("local_at", "INT64", "Timestamp (microseconds, local)"),
+      ),
     ).toBe("2026-08-01T06:07:08.009456");
   });
 
-  it("formats time values", () => {
-    expect(filterInputFromCell(22_028_009_456n, timeMicrosecond())).toBe(
-      "06:07:08.009456",
-    );
+  it.each([
+    [timeMillisecond(), 22_028_009, "06:07:08.009"],
+    [timeMicrosecond(), 22_028_009_456n, "06:07:08.009456"],
+    [timeNanosecond(), 22_028_009_456_789n, "06:07:08.009456789"],
+  ])(
+    "formats time values for supported Parquet units",
+    (type, value, expected) => {
+      const unitName =
+        type.unit === TimeUnit.MILLISECOND
+          ? "milliseconds"
+          : type.unit === TimeUnit.MICROSECOND
+            ? "microseconds"
+            : "nanoseconds";
+      expect(
+        filterInputFromCell(
+          value,
+          type,
+          field("clock", "INT64", `Time (${unitName}, local)`),
+        ),
+      ).toBe(expected);
+    },
+  );
+
+  it("adds the declared UTC offset to a timezone-naive Arrow time", () => {
+    expect(
+      filterInputFromCell(
+        22_028_009_456n,
+        timeMicrosecond(),
+        field("clock", "INT64", "Time (microseconds, UTC)"),
+      ),
+    ).toBe("06:07:08.009456+00:00");
   });
 
   it("formats date values", () => {
     expect(
-      filterInputFromCell(Date.parse("2026-08-01T00:00:00.000Z"), dateDay()),
+      filterInputFromCell(
+        Date.parse("2026-08-01T00:00:00.000Z"),
+        dateDay(),
+        field("day", "INT32", "Date"),
+      ),
     ).toBe("2026-08-01");
   });
 
   it("applies the Arrow decimal scale", () => {
-    expect(filterInputFromCell(12_345n, decimal128(20, 2))).toBe("123.45");
+    expect(
+      filterInputFromCell(
+        12_345n,
+        decimal128(20, 2),
+        field("amount", "FIXED_LEN_BYTE_ARRAY", "Decimal (20, 2)"),
+      ),
+    ).toBe("123.45");
   });
 });

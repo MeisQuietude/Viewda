@@ -1183,7 +1183,7 @@ export function DataGrid({
       const initialValue =
         value === null || value === undefined || dataType === undefined
           ? undefined
-          : filterInputFromCell(value, dataType);
+          : filterInputFromCell(value, dataType, field);
       setHeaderMenu(null);
       setFilterEditor({
         sourceIndex,
