@@ -71,10 +71,14 @@ debian_version() {
 
 repack_debian_package() (
   local package application_version package_version architecture
-  local filename product expected_filename target staging control
+  local filename product expected_filename target staging control release_object
 
   if ! command -v dpkg-deb >/dev/null 2>&1; then
     printf 'dpkg-deb is required to normalize the Debian package version.\n' >&2
+    exit 1
+  fi
+  if ! command -v strip >/dev/null 2>&1; then
+    printf 'strip is required to minimize the Debian package.\n' >&2
     exit 1
   fi
 
@@ -112,6 +116,19 @@ repack_debian_package() (
     }
   ' "$control" > "$staging/control"
   mv "$staging/control" "$control"
+
+  # Release packages do not ship separate debug symbols. Remove the static
+  # symbol tables from both native objects instead of weakening the package
+  # size budget as features add executable code.
+  for release_object in \
+    "$staging/root/usr/bin/viewda" \
+    "$staging/root/usr/lib/viewda/libduckdb.so"; do
+    if [[ ! -f "$release_object" ]]; then
+      printf 'Debian release object not found: %s\n' "$release_object" >&2
+      exit 1
+    fi
+    strip --strip-unneeded "$release_object"
+  done
 
   dpkg-deb -Zgzip -z9 --root-owner-group --build "$staging/root" "$target"
   test "$(dpkg-deb --field "$target" Version)" = "$package_version"
