@@ -196,7 +196,9 @@ fn validate_filter(filter: &DataFilter, kind: ColumnFilterKind) -> Result<(), Fi
         DataFilterOperator::GreaterThan
         | DataFilterOperator::GreaterThanOrEqual
         | DataFilterOperator::LessThan
-        | DataFilterOperator::LessThanOrEqual => kind == ColumnFilterKind::Number,
+        | DataFilterOperator::LessThanOrEqual => {
+            matches!(kind, ColumnFilterKind::Number | ColumnFilterKind::Temporal)
+        }
         DataFilterOperator::OneOf => matches!(
             kind,
             ColumnFilterKind::Number | ColumnFilterKind::Text | ColumnFilterKind::Temporal
@@ -336,67 +338,61 @@ mod tests {
     }
 
     #[test]
-    fn builds_numeric_comparisons_with_bound_casts() {
-        let cases = [
+    fn validates_comparison_operators_with_one_shared_kind_table() {
+        let operators = [
             (DataFilterOperator::GreaterThan, ">"),
             (DataFilterOperator::GreaterThanOrEqual, ">="),
             (DataFilterOperator::LessThan, "<"),
             (DataFilterOperator::LessThanOrEqual, "<="),
         ];
-
-        for (operator, sql_operator) in cases {
-            let predicate = build_filter_predicate(
-                &[field("value\"quoted", ColumnFilterKind::Number)],
-                &[DataFilter {
-                    column_index: 0,
-                    operator,
-                    values: vec!["12.5".to_owned()],
-                }],
-            )
-            .expect("valid numeric comparison");
-
-            assert_eq!(
-                predicate.sql,
-                format!("\"value\"\"quoted\" {sql_operator} cast_to_type(?, \"value\"\"quoted\")")
-            );
-            assert_eq!(predicate.parameters, vec![Value::Text("12.5".to_owned())]);
-        }
-    }
-
-    #[test]
-    fn rejects_numeric_comparisons_with_invalid_arity_or_column_kind() {
-        let operators = [
-            DataFilterOperator::GreaterThan,
-            DataFilterOperator::GreaterThanOrEqual,
-            DataFilterOperator::LessThan,
-            DataFilterOperator::LessThanOrEqual,
+        let kinds = [
+            (ColumnFilterKind::Number, true),
+            (ColumnFilterKind::Temporal, true),
+            (ColumnFilterKind::Boolean, false),
+            (ColumnFilterKind::Text, false),
+            (ColumnFilterKind::NullOnly, false),
         ];
 
-        for operator in operators {
-            for values in [Vec::new(), vec!["1".to_owned(), "2".to_owned()]] {
-                let filter = DataFilter {
-                    column_index: 0,
-                    operator,
-                    values,
-                };
-                assert!(
-                    build_filter_predicate(&[field("value", ColumnFilterKind::Number)], &[filter])
-                        .is_err()
-                );
-            }
-
-            for kind in [
-                ColumnFilterKind::Boolean,
-                ColumnFilterKind::Text,
-                ColumnFilterKind::Temporal,
-                ColumnFilterKind::NullOnly,
-            ] {
+        for (operator, sql_operator) in operators {
+            for (kind, supported) in kinds {
                 let filter = DataFilter {
                     column_index: 0,
                     operator,
                     values: vec!["1".to_owned()],
                 };
-                assert!(build_filter_predicate(&[field("value", kind)], &[filter]).is_err());
+                let result = build_filter_predicate(&[field("value", kind)], &[filter]);
+
+                if supported {
+                    let predicate = result.expect("supported comparison");
+                    assert_eq!(
+                        predicate.sql,
+                        format!("\"value\" {sql_operator} cast_to_type(?, \"value\")")
+                    );
+                    assert_eq!(predicate.parameters, vec![Value::Text("1".to_owned())]);
+                } else {
+                    assert_eq!(result.err(), Some(FilterBuildError::Invalid));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn rejects_comparisons_with_zero_or_two_values() {
+        for operator in [
+            DataFilterOperator::GreaterThan,
+            DataFilterOperator::GreaterThanOrEqual,
+            DataFilterOperator::LessThan,
+            DataFilterOperator::LessThanOrEqual,
+        ] {
+            for kind in [ColumnFilterKind::Number, ColumnFilterKind::Temporal] {
+                for values in [Vec::new(), vec!["1".to_owned(), "2".to_owned()]] {
+                    let filter = DataFilter {
+                        column_index: 0,
+                        operator,
+                        values,
+                    };
+                    assert!(build_filter_predicate(&[field("value", kind)], &[filter]).is_err());
+                }
             }
         }
     }
