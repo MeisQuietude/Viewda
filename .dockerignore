@@ -1,0 +1,8 @@
+.git
+**/node_modules
+**/target
+artifacts
+native/.duckdb
+native/.toolchain
+native/desktop/gen
+native/desktop/ui/dist

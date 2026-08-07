@@ -1,0 +1,342 @@
+# Builds Viewda from the current checkout and runs it in a disposable Linux GUI.
+# This gives pre-CI black-box tests a branch-owned X11/WebKit environment without
+# installing toolchains on the host or sharing state between runs. A separate
+# target accepts an exact CI AppImage for post-CI acceptance testing.
+#
+# Primary flow — build the current checkout and its pinned dependencies:
+#   IMAGE=viewda-gui-test:$(git rev-parse --short HEAD)
+#   docker build -f Dockerfile.gui-test -t "$IMAGE" .
+#
+# Run (the host evidence directory must be writable by UID 1000):
+#   FIXTURES=/absolute/path/to/samples
+#   EVIDENCE=$(mktemp -d)
+#   NAME=viewda-gui-$(git rev-parse --short HEAD)
+#   docker run --detach --name "$NAME" --network none \
+#     --env VIEWDA_THEME=system \
+#     --mount type=bind,source="$FIXTURES",target=/fixtures,readonly \
+#     --mount type=bind,source="$EVIDENCE",target=/evidence \
+#     "$IMAGE"
+# Omit VIEWDA_BASELINE to test the empty start screen. To seed one Recent entry,
+# add `--env VIEWDA_BASELINE=/fixtures/FILE.parquet` to either run command.
+#
+# Optional CI-artifact flow — build only the runtime, then mount the exact artifact:
+#   CI_IMAGE=viewda-gui-test:ci-runtime
+#   ARTIFACT=/absolute/path/to/Viewda.AppImage
+#   docker build --target artifact-runtime -f Dockerfile.gui-test -t "$CI_IMAGE" .
+#   docker run --detach --name "$NAME" --network none \
+#     --env VIEWDA_THEME=system \
+#     --mount type=bind,source="$ARTIFACT",target=/artifact/Viewda.AppImage,readonly \
+#     --mount type=bind,source="$FIXTURES",target=/fixtures,readonly \
+#     --mount type=bind,source="$EVIDENCE",target=/evidence \
+#     "$CI_IMAGE"
+# The default image is pre-CI evidence from the current context. Only the optional
+# target with the exact downloaded artifact is evidence about a CI-produced build.
+# The read-only fixture tree may contain any files and nested directories needed
+# for Recents, path, naming, empty, error, or multi-file scenarios.
+#
+# Wait for `docker inspect --format '{{.State.Health.Status}}' "$NAME"` to report
+# `healthy`, then read connection details with:
+#   docker exec "$NAME" jq . /run/viewda/session.json
+#
+# Create the WebDriver session inside the container. Allow 90 seconds:
+#   docker exec "$NAME" sh -c '
+#     app=$(jq -r .application /run/viewda/session.json)
+#     jq -nc --arg app "$app" \
+#       '\''{capabilities:{alwaysMatch:{"tauri:options":{application:$app}}}}'\'' |
+#       curl --fail --max-time 90 --header "Content-Type: application/json" \
+#         --data-binary @- http://127.0.0.1:4444/session
+#   '
+# Save the returned session ID and use the standard WebDriver HTTP API directly.
+# WebDriver controls the webview. For native shortcuts, focus the X11 window first:
+#   docker exec "$NAME" sh -c '
+#     window=$(xdotool search --onlyvisible --name Viewda | head -n 1)
+#     xdotool windowfocus --sync "$window"
+#     xdotool key ctrl+comma
+#     scrot --overwrite /evidence/settings.png
+#   '
+#
+# Cleanup is the container boundary:
+#   docker stop --timeout 10 "$NAME"
+#   docker rm "$NAME"
+# Remove the evidence directory and image when they are no longer needed. Multiple
+# containers may run concurrently because display, ports, processes, and state are
+# namespaced; no host port is required when commands use `docker exec`.
+
+# Keep this aligned with the branch's CI version. `--locked` uses the crate's lock.
+ARG TAURI_DRIVER_VERSION=2.0.6
+
+# Compile tauri-driver in its own stable layer. The source builder below reuses
+# this pinned Rust base, and runtime package changes do not trigger recompilation.
+FROM rust:1.97.1-slim-trixie@sha256:3b2879047d42784ca9403ad20c51ed3df361a50f1df96f5777d39b4e33aa65cd AS tauri-driver-builder
+
+ARG TAURI_DRIVER_VERSION
+
+RUN --mount=type=cache,id=viewda-cargo-registry,target=/usr/local/cargo/registry,sharing=locked \
+    --mount=type=cache,id=viewda-cargo-git,target=/usr/local/cargo/git,sharing=locked \
+    --mount=type=cache,id=viewda-tauri-driver-target,target=/tmp/tauri-driver-target,sharing=locked \
+    CARGO_TARGET_DIR=/tmp/tauri-driver-target \
+      cargo install tauri-driver --locked --version "${TAURI_DRIVER_VERSION}" --root /opt/tauri-driver
+
+# Debian 13.6 slim and its multi-platform manifest are pinned so the base cannot
+# silently move. The AppImage architecture must still match the selected platform.
+# APT packages follow Debian 13 repositories at image-build time; rebuild the image
+# from the tested branch instead of reusing one built for another commit.
+FROM debian:13.6-slim@sha256:3a39a0592364683e6bab97937b72cad5a8fa6dcbbee90edb3bb48c7f8e94f258 AS gui-runtime
+
+# Runtime tools:
+# - tauri-driver translates WebDriver HTTP calls into Tauri WebKit automation;
+# - WebKitWebDriver (webkit2gtk-driver) controls the packaged webview;
+# - Xvfb provides the headless X11 display;
+# - xdotool drives native windows, menus, dialogs, and shortcuts;
+# - scrot captures the full X11 display, including native UI;
+# - curl performs HTTP readiness checks and direct WebDriver calls;
+# - jq creates/parses state, session metadata, and WebDriver payloads;
+# - python3 supports non-trivial test automation without host dependencies;
+# - procps supports run-scoped process inspection;
+# - tini forwards signals to the whole process group and reaps children.
+# APT caches survive layer invalidation but never enter the final image.
+COPY --from=tauri-driver-builder /opt/tauri-driver/bin/tauri-driver /usr/local/bin/tauri-driver
+
+RUN --mount=type=cache,id=viewda-apt-archives,target=/var/cache/apt,sharing=locked \
+    --mount=type=cache,id=viewda-apt-lists,target=/var/lib/apt/lists,sharing=locked \
+    rm -f /etc/apt/apt.conf.d/docker-clean \
+    && apt-get update \
+    && apt-get install --yes --no-install-recommends \
+      ca-certificates \
+      curl \
+      jq \
+      procps \
+      python3 \
+      scrot \
+      tini \
+      webkit2gtk-driver \
+      xdotool \
+      xvfb
+
+# The embedded entrypoint owns environment launch and cleanup, not test actions.
+# Embedding it keeps the runtime contract in this single file.
+COPY --chmod=755 <<'EOF' /usr/local/bin/viewda-gui-env
+#!/bin/sh
+set -eu
+
+runtime=/run/viewda
+app="$runtime/Viewda.AppImage"
+xvfb_pid=
+driver_pid=
+
+# `tini -g` also forwards Docker's signal to descendants; this trap handles files
+# and direct children during both normal exit and `docker stop`.
+cleanup() {
+  rm -f /run/viewda/ready
+  if [ -n "$driver_pid" ]; then
+    kill -TERM "$driver_pid" 2>/dev/null || true
+  fi
+  if [ -n "$xvfb_pid" ]; then
+    kill -TERM "$xvfb_pid" 2>/dev/null || true
+  fi
+  wait 2>/dev/null || true
+  find "$runtime" -mindepth 1 -maxdepth 1 -exec rm -rf -- {} +
+}
+trap cleanup EXIT HUP INT TERM
+
+# Fail before launching partial infrastructure when either required writable/read
+# boundary is invalid.
+test -f "$VIEWDA_APP" || {
+  echo "$VIEWDA_APP is not a file" >&2
+  exit 1
+}
+test -w "$VIEWDA_EVIDENCE" || {
+  echo "$VIEWDA_EVIDENCE is not writable by UID $(id -u)" >&2
+  exit 1
+}
+case "$VIEWDA_THEME" in
+  system|light|dark) ;;
+  *) echo "VIEWDA_THEME must be system, light, or dark" >&2; exit 2 ;;
+esac
+
+# The artifact stays read-only on the host. Its disposable copy can be made
+# executable and can use AppImage extract-and-run without FUSE.
+cp "$VIEWDA_APP" "$app"
+chmod 755 "$app"
+mkdir -p "$XDG_CONFIG_HOME/io.github.meisquietude.viewda" "$XDG_CACHE_HOME" "$XDG_DATA_HOME" "$XDG_RUNTIME_DIR" "$TMPDIR"
+chmod 700 "$XDG_RUNTIME_DIR"
+
+# Disable update traffic, set the requested initial theme, and cap preparation
+# memory. If mounted, list the immutable baseline in Recents for one-click opening.
+jq -n --arg theme "$VIEWDA_THEME" '{settings:{channel:"latest",automaticChecks:false},themePreference:$theme,dataViewSettings:{memoryLimit:"mb384"},lastAutomaticCheckUnixSeconds:null,pendingRestart:null}' \
+  > "$XDG_CONFIG_HOME/io.github.meisquietude.viewda/updates.json"
+
+if [ -f "$VIEWDA_BASELINE" ]; then
+  jq -n --arg path "$VIEWDA_BASELINE" '{nextId:2,entries:[{id:"baseline",path:$path}]}' \
+    > "$XDG_CONFIG_HOME/io.github.meisquietude.viewda/recents.json"
+fi
+
+# Xvfb is reachable only inside the container. Wait for its Unix socket, then
+# start tauri-driver and use its HTTP /status endpoint as the readiness signal.
+Xvfb "$DISPLAY" -screen 0 "$VIEWDA_SCREEN" -nolisten tcp -ac > "$runtime/xvfb.log" 2>&1 &
+xvfb_pid=$!
+
+attempt=0
+display_number=${DISPLAY#:}
+display_number=${display_number%%.*}
+while [ ! -S "/tmp/.X11-unix/X$display_number" ]; do
+  attempt=$((attempt + 1))
+  if [ "$attempt" -ge 100 ] || ! kill -0 "$xvfb_pid" 2>/dev/null; then
+    echo "Xvfb did not start" >&2
+    exit 1
+  fi
+  sleep 0.1
+done
+
+tauri-driver --port "$VIEWDA_WEBDRIVER_PORT" --native-port "$VIEWDA_NATIVE_PORT" --native-driver /usr/bin/WebKitWebDriver > "$runtime/driver.log" 2>&1 &
+driver_pid=$!
+
+attempt=0
+until curl --silent --fail --max-time 1 "http://127.0.0.1:$VIEWDA_WEBDRIVER_PORT/status" >/dev/null; do
+  attempt=$((attempt + 1))
+  if [ "$attempt" -ge 150 ] || ! kill -0 "$driver_pid" 2>/dev/null; then
+    echo "tauri-driver did not start" >&2
+    exit 1
+  fi
+  sleep 0.1
+done
+
+# Publish stable discovery metadata only after the driver is ready. The caller
+# creates and owns the WebDriver session and every subsequent test action.
+jq -nc \
+  --arg webdriver_url "http://127.0.0.1:$VIEWDA_WEBDRIVER_PORT" \
+  --arg display "$DISPLAY" \
+  --arg application "$app" \
+  --arg evidence "$VIEWDA_EVIDENCE" \
+  --arg artifact_source "$VIEWDA_ARTIFACT_SOURCE" \
+  '{webdriver_url:$webdriver_url,display:$display,application:$application,evidence:$evidence,artifact_source:$artifact_source}' \
+  | tee "$runtime/session.json"
+touch /run/viewda/ready
+wait "$driver_pid"
+EOF
+
+# Run the app and automation as an unprivileged user. UID 1000 matches the target
+# host and lets a bind-mounted evidence directory retain host-accessible ownership.
+RUN useradd --create-home --uid 1000 tester \
+    && install --directory --owner tester --group tester /run/viewda /evidence
+
+USER tester
+WORKDIR /home/tester
+
+# Inputs and tunables:
+# - VIEWDA_APP: read-only packaged artifact mount;
+# - VIEWDA_BASELINE: optional file inside the read-only `/fixtures` tree to seed;
+# - VIEWDA_EVIDENCE: writable screenshot/report mount;
+# - VIEWDA_THEME: system, light, or dark initial preference;
+# - VIEWDA_SCREEN: Xvfb WIDTHxHEIGHTxDEPTH;
+# - DISPLAY and both ports: container-local X11/WebDriver endpoints.
+# - VIEWDA_ARTIFACT_SOURCE: evidence provenance published in session.json.
+# The remaining variables isolate AppImage extraction and all application state.
+ENV VIEWDA_APP=/artifact/Viewda.AppImage \
+    VIEWDA_ARTIFACT_SOURCE=ci-artifact \
+    VIEWDA_BASELINE="" \
+    VIEWDA_EVIDENCE=/evidence \
+    VIEWDA_NATIVE_PORT=4445 \
+    VIEWDA_SCREEN=1400x900x24 \
+    VIEWDA_THEME=system \
+    VIEWDA_WEBDRIVER_PORT=4444 \
+    APPIMAGE_EXTRACT_AND_RUN=1 \
+    DISPLAY=:99 \
+    HOME=/home/tester \
+    TAURI_WEBVIEW_AUTOMATION=true \
+    TMPDIR=/run/viewda/tmp \
+    XDG_CACHE_HOME=/run/viewda/cache \
+    XDG_CONFIG_HOME=/run/viewda/config \
+    XDG_DATA_HOME=/run/viewda/data \
+    XDG_RUNTIME_DIR=/run/viewda/runtime
+
+# EXPOSE documents the internal endpoint; `--network none` plus `docker exec` keeps
+# it unavailable to the host. Health means driver-ready, not app/session-ready.
+EXPOSE ${VIEWDA_WEBDRIVER_PORT}
+HEALTHCHECK --interval=2s --timeout=1s --start-period=45s --retries=45 \
+  CMD test -f /run/viewda/ready
+
+# Group signal forwarding prevents orphaned Viewda, WebKit, driver, or Xvfb work.
+ENTRYPOINT ["tini", "-g", "--", "/usr/local/bin/viewda-gui-env"]
+
+# This target skips the source build. Mount an exact CI AppImage at runtime.
+FROM gui-runtime AS artifact-runtime
+
+# The source builder follows the repository's own setup and bundle scripts. The
+# official Rust image matches native/rust-toolchain.toml; its manifest is pinned.
+# BuildKit caches downloads and compilation across source edits, while only the
+# resulting AppImage crosses into the small runtime image.
+FROM rust:1.97.1-slim-trixie@sha256:3b2879047d42784ca9403ad20c51ed3df361a50f1df96f5777d39b4e33aa65cd AS viewda-builder
+
+WORKDIR /source
+
+# This shared CI/contributor script owns the compile dependencies. Its packages:
+# - build-essential and pkg-config compile and discover native libraries;
+# - WebKitGTK, appindicator, XDo, RSVG, and OpenSSL headers build Tauri features;
+# - patchelf and file inspect and patch Linux executables during bundling;
+# - CA certificates, curl, wget, and unzip fetch and unpack pinned tools.
+# Disabling recommendations avoids unrelated desktop/media packages; xdg-utils
+# supplies xdg-open, which Tauri's AppImage bundler requires.
+COPY scripts/install-tauri-deps.sh /source/scripts/install-tauri-deps.sh
+RUN --mount=type=cache,id=viewda-apt-archives,target=/var/cache/apt,sharing=locked \
+    --mount=type=cache,id=viewda-apt-lists,target=/var/lib/apt/lists,sharing=locked \
+    rm -f /etc/apt/apt.conf.d/docker-clean \
+    && printf '%s\n' 'APT::Install-Recommends "false";' 'APT::Install-Suggests "false";' \
+      > /etc/apt/apt.conf.d/99-viewda-container \
+    && scripts/install-tauri-deps.sh \
+    && apt-get install --yes --no-install-recommends xdg-utils
+
+# Install manifest-pinned Rust components and checksum-pinned Node before source
+# code. rustc/cargo compile the native app; clippy/rustfmt satisfy the repository
+# toolchain contract; Node/npm compile the UI and run the pinned Tauri CLI.
+COPY native/rust-toolchain.toml /source/native/rust-toolchain.toml
+RUN rustup component add clippy rustfmt
+
+COPY .node-version /source/.node-version
+COPY scripts/install-node.sh /source/scripts/install-node.sh
+RUN scripts/install-node.sh
+
+ENV PATH=/source/native/.toolchain/node/bin:${PATH}
+
+# npm ci is keyed only by its manifests, so source edits never reinstall packages.
+COPY native/desktop/package.json native/desktop/package-lock.json /source/native/desktop/
+RUN --mount=type=cache,id=viewda-npm,target=/root/.npm,sharing=locked \
+    npm ci --prefix native/desktop
+
+# DuckDB executes Viewda's Parquet queries. Its binary is checksum-pinned and this
+# layer invalidates only when the installer changes.
+COPY scripts/install-duckdb.sh /source/scripts/install-duckdb.sh
+RUN scripts/install-duckdb.sh /source/native/.duckdb
+
+# Copy only application/build inputs. Repository docs, CI metadata, and this
+# Dockerfile cannot invalidate the AppImage; .dockerignore removes generated data.
+COPY scripts /source/scripts
+COPY native /source/native
+
+ENV APPIMAGE_EXTRACT_AND_RUN=1 \
+    CARGO_INCREMENTAL=1
+
+SHELL ["/bin/bash", "-c"]
+
+# Doctor validates the repository pins. The pinned Tauri CLI builds only AppImage:
+# no Debian package and no unavailable local updater signature. Cargo downloads and
+# release outputs live in locked BuildKit caches; only `/out` enters the runtime.
+RUN --mount=type=cache,id=viewda-cargo-registry,target=/usr/local/cargo/registry,sharing=locked \
+    --mount=type=cache,id=viewda-cargo-git,target=/usr/local/cargo/git,sharing=locked \
+    --mount=type=cache,id=viewda-cargo-target,target=/source/native/target,sharing=locked \
+    --mount=type=cache,id=viewda-tauri,target=/root/.cache/tauri,sharing=locked \
+    set -euo pipefail \
+    && scripts/doctor.sh \
+    && source scripts/env.sh \
+    && npm run tauri --prefix native/desktop -- build --bundles appimage \
+      --config '{"bundle":{"createUpdaterArtifacts":false}}' \
+    && appimage=$(find native/target/release/bundle/appimage -maxdepth 1 -type f -name '*.AppImage' -print -quit) \
+    && test -n "$appimage" \
+    && install -D --mode=755 "$appimage" /out/Viewda.AppImage
+
+# Default target: a ready GUI runtime containing the AppImage built above.
+FROM gui-runtime AS worktree-runtime
+
+COPY --from=viewda-builder --chmod=755 /out/Viewda.AppImage /artifact/Viewda.AppImage
+
+ENV VIEWDA_ARTIFACT_SOURCE=worktree-build
