@@ -36,6 +36,7 @@ on:
           - windows-x64
 
 permissions:
+  actions: read
   contents: read
 
 concurrency:
@@ -54,13 +55,17 @@ env:
   CARGO_PROFILE_DEV_DEBUG: "0"
   CARGO_PROFILE_TEST_DEBUG: "0"
   CARGO_CACHE_EPOCH: bundle-v1
-  REQUIRE_UPDATER_ARTIFACTS: ${{ github.event_name != 'workflow_dispatch' }}
+  REQUIRE_UPDATER_ARTIFACTS: >-
+    ${{ github.event_name == 'schedule' ||
+    (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')) }}
 
 jobs:
   source:
     name: Resolve source commit
     runs-on: ubuntu-24.04
     outputs:
+      build: ${{ steps.nightly.outputs.build }}
+      release: ${{ steps.source.outputs.release }}
       sha: ${{ steps.source.outputs.sha }}
     steps:
       - name: Check out the requested source
@@ -72,14 +77,55 @@ jobs:
 
       - name: Record the exact source commit
         id: source
-        run: echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+        run: |
+          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          if [[ "$GITHUB_EVENT_NAME" == push && "$GITHUB_REF" == refs/tags/v* ]]; then
+            echo "release=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "release=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Skip an unchanged nightly rehearsal
+        id: nightly
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SOURCE_SHA: ${{ steps.source.outputs.sha }}
+        run: |
+          if [[ "$GITHUB_EVENT_NAME" != schedule ]]; then
+            echo "build=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          runs_api="repos/${GITHUB_REPOSITORY}/actions/workflows/platform-builds.yml/runs?branch=${GITHUB_REF_NAME}&event=schedule&status=success&per_page=1"
+          if previous_sha=$(gh api "$runs_api" --jq '.workflow_runs[0].head_sha // empty'); then
+            if [[ "$previous_sha" == "$SOURCE_SHA" ]]; then
+              echo "build=false" >> "$GITHUB_OUTPUT"
+              echo "Skipping: the latest successful nightly already tested $SOURCE_SHA."
+              exit 0
+            fi
+          else
+            echo "::warning::Could not inspect earlier nightly runs; building instead."
+          fi
+
+          echo "build=true" >> "$GITHUB_OUTPUT"
+
+  release-checks:
+    name: Verify the release source
+    needs: source
+    if: needs.source.outputs.release == 'true'
+    uses: ./.github/workflows/ci.yml
 
   linux:
-    needs: source
+    needs: [source, release-checks]
     if: >-
-      github.event_name != 'workflow_dispatch' ||
+      always() &&
+      needs.source.result == 'success' &&
+      needs.source.outputs.build == 'true' &&
+      (needs.source.outputs.release != 'true' ||
+      needs.release-checks.result == 'success') &&
+      (github.event_name != 'workflow_dispatch' ||
       inputs.platform == 'all' ||
-      inputs.platform == 'linux-x64'
+      inputs.platform == 'linux-x64')
     name: Linux x64 artifact
     # AppImage inherits its glibc floor from the build host. Ubuntu 22.04 is
     # the oldest supported GitHub runner with WebKitGTK 4.1, so using a newer
@@ -272,7 +318,7 @@ jobs:
           retention-days: 7
 
       - name: Upload the Linux updater signature
-        if: startsWith(github.ref, 'refs/tags/v')
+        if: needs.source.outputs.release == 'true'
         uses: actions/upload-artifact@v7
         with:
           name: viewda-updater-linux-x64-${{ needs.source.outputs.sha }}
@@ -281,11 +327,16 @@ jobs:
           retention-days: 7
 
   macos:
-    needs: source
+    needs: [source, release-checks]
     if: >-
-      github.event_name != 'workflow_dispatch' ||
+      always() &&
+      needs.source.result == 'success' &&
+      needs.source.outputs.build == 'true' &&
+      (needs.source.outputs.release != 'true' ||
+      needs.release-checks.result == 'success') &&
+      (github.event_name != 'workflow_dispatch' ||
       inputs.platform == 'all' ||
-      startsWith(inputs.platform, 'macos-')
+      startsWith(inputs.platform, 'macos-'))
     # Pinned to the OS generation real users run: dyld and signing policy
     # tighten across macOS generations, so a launch gate on an older
     # runner accepts bundles a newer macOS refuses.
@@ -527,7 +578,9 @@ jobs:
           retention-days: 7
 
       - name: Upload the macOS ${{ matrix.artifact-architecture }} updater
-        if: startsWith(github.ref, 'refs/tags/v')
+        if: >-
+          env.BUILD_SELECTED == 'true' &&
+          needs.source.outputs.release == 'true'
         uses: actions/upload-artifact@v7
         with:
           name: viewda-updater-macos-${{ matrix.artifact-architecture }}-${{ needs.source.outputs.sha }}
@@ -719,11 +772,16 @@ jobs:
           retention-days: 7
 
   windows:
-    needs: source
+    needs: [source, release-checks]
     if: >-
-      github.event_name != 'workflow_dispatch' ||
+      always() &&
+      needs.source.result == 'success' &&
+      needs.source.outputs.build == 'true' &&
+      (needs.source.outputs.release != 'true' ||
+      needs.release-checks.result == 'success') &&
+      (github.event_name != 'workflow_dispatch' ||
       inputs.platform == 'all' ||
-      inputs.platform == 'windows-x64'
+      inputs.platform == 'windows-x64')
     name: Windows x64 installer
     runs-on: windows-2025
     env:
@@ -915,7 +973,7 @@ jobs:
           retention-days: 7
 
       - name: Upload the Windows updater signature
-        if: startsWith(github.ref, 'refs/tags/v')
+        if: needs.source.outputs.release == 'true'
         uses: actions/upload-artifact@v7
         with:
           name: viewda-updater-windows-x64-${{ needs.source.outputs.sha }}

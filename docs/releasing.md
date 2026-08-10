@@ -38,6 +38,11 @@ remains available for seven days.
 Manual branch builds never receive the updater signing key and cannot create a
 release. Select `all` to run the same platform and installer gates as the
 nightly rehearsal, without updater companions or release publication.
+Before merging changes to Linux packaging, bundled native libraries, startup,
+or updater behavior, run `linux-x64`: it includes the installed Debian and
+AppImage WebDriver smoke tests that ordinary pull requests omit. Run the
+affected macOS or Windows target before merging platform-specific packaging
+changes.
 
 ## Prereleases
 
@@ -62,10 +67,14 @@ Release notes follow the reader:
 
 ## What automation produces
 
-Pull requests run the complete shared checks on Linux and native Rust checks on
-macOS arm64 and Windows x64. They do not build installers. The nightly platform
-rehearsal and release tags verify Linux x64 AppImage and Debian packages, macOS
-Apple silicon and Intel installers, Universal macOS, and Windows x64. Each
-directly installable format has its own Actions archive with the full commit
-SHA. Updater companions are archived only for release tags; release files use
-the release version instead.
+Branches without an open pull request run the complete shared checks on Linux
+and native Rust checks on macOS arm64 and Windows x64 for every push. Pull
+requests run the same checks against GitHub's merge ref with their target
+branch. They do not build installers. A release tag must pass those checks
+before any platform build starts. The nightly platform rehearsal runs only when
+`main` changed since its latest successful scheduled run. Nightlies and release
+tags verify Linux x64 AppImage and Debian packages, macOS Apple silicon and
+Intel installers, Universal macOS, and Windows x64. Each directly installable
+format has its own Actions archive with the full commit SHA. Updater companions
+are archived only for release tags; release files use the release version
+instead.

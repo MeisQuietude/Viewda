@@ -6,11 +6,13 @@ name: CI
 on:
   pull_request:
   push:
-    branches: [main]
+    branches: ["**"]
   workflow_dispatch:
+  workflow_call:
 
 permissions:
   contents: read
+  pull-requests: read
 
 concurrency:
   group: ci-${{ github.ref }}
@@ -23,7 +25,44 @@ env:
   CARGO_CACHE_EPOCH: check-v1
 
 jobs:
+  scope:
+    name: Select CI source
+    runs-on: ubuntu-24.04
+    outputs:
+      run_checks: ${{ steps.scope.outputs.run_checks }}
+    steps:
+      - name: Prefer the PR merge ref over a duplicate branch run
+        id: scope
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if [[ "$GITHUB_EVENT_NAME" != push || "$GITHUB_REF" == refs/heads/main ]]; then
+            echo "run_checks=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          head="${GITHUB_REPOSITORY_OWNER}:${GITHUB_REF_NAME}"
+          if open_prs=$(
+            gh api --method GET "repos/${GITHUB_REPOSITORY}/pulls" \
+              -f state=open \
+              -f head="$head" \
+              -f per_page=1 \
+              --jq length
+          ); then
+            if (( open_prs > 0 )); then
+              echo "run_checks=false" >> "$GITHUB_OUTPUT"
+              echo "Skipping: an open PR checks this commit against its base."
+              exit 0
+            fi
+          else
+            echo "::warning::Could not inspect open PRs; running branch checks."
+          fi
+
+          echo "run_checks=true" >> "$GITHUB_OUTPUT"
+
   linux:
+    needs: scope
+    if: needs.scope.outputs.run_checks == 'true'
     name: Linux checks
     runs-on: ubuntu-22.04
     env:
@@ -74,6 +113,8 @@ jobs:
         run: cargo check --no-default-features --examples
 
   native:
+    needs: scope
+    if: needs.scope.outputs.run_checks == 'true'
     name: ${{ matrix.name }} native checks
     strategy:
       fail-fast: false
