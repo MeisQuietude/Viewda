@@ -78,6 +78,14 @@ const source: desktop.SourceSummary = {
 };
 
 beforeEach(() => {
+  document.documentElement.style.setProperty(
+    "--font-ui",
+    'Inter, sans-serif, "Noto Emoji"',
+  );
+  document.documentElement.style.setProperty(
+    "--font-mono",
+    'ui-monospace, monospace, "Noto Emoji"',
+  );
   editorMock.props = undefined;
   editorMock.mountCount = 0;
   editorMock.scrollTo.mockReset();
@@ -155,6 +163,9 @@ beforeEach(() => {
 
 afterEach(() => {
   cleanup();
+  document.documentElement.style.removeProperty("--font-ui");
+  document.documentElement.style.removeProperty("--font-mono");
+  Reflect.deleteProperty(document, "fonts");
   vi.restoreAllMocks();
   vi.unstubAllGlobals();
 });
@@ -203,6 +214,28 @@ describe("DataGrid window rendering", () => {
     expect(damage).toContainEqual({ cell: [3, 1_000] });
     expect(damage).toContainEqual({ cell: [6, 1_004] });
     expect(damage).not.toContainEqual({ cell: [1, 1_000] });
+  });
+
+  it("loads the bundled emoji font and repaints the visible cells", async () => {
+    const emojiFont = deferred<void>();
+    const load = vi.fn(() => emojiFont.promise);
+    Object.defineProperty(document, "fonts", {
+      configurable: true,
+      value: {
+        *[Symbol.iterator]() {
+          yield { family: '"Noto Emoji"', load };
+        },
+      },
+    });
+    render(<DataGrid source={source} />);
+
+    await waitFor(() => expect(editorMock.updateCells).toHaveBeenCalledOnce());
+    expect(load).toHaveBeenCalledOnce();
+    editorMock.updateCells.mockClear();
+    await act(async () => {
+      emojiFont.resolve();
+    });
+    await waitFor(() => expect(editorMock.updateCells).toHaveBeenCalledOnce());
   });
 
   it("reloads only direct window columns when the horizontal viewport changes", async () => {
@@ -424,7 +457,7 @@ describe("DataGrid window rendering", () => {
     });
   });
 
-  it("renders column headers with the UI font", () => {
+  it("renders column headers with the UI font from CSS", () => {
     render(<DataGrid source={source} />);
 
     const drawHeader = editorMock.props?.drawHeader;
@@ -438,6 +471,7 @@ describe("DataGrid window rendering", () => {
     } as unknown as CanvasRenderingContext2D;
     const drawContent = vi.fn(() => {
       expect(context.font).toContain("Inter");
+      expect(context.font).toContain("Noto Emoji");
       expect(context.font).not.toContain("ui-monospace");
     });
 
@@ -452,6 +486,7 @@ describe("DataGrid window rendering", () => {
     );
 
     expect(drawContent).toHaveBeenCalledOnce();
+    expect(editorMock.props?.theme?.fontFamily).toContain("Noto Emoji");
     expect(editorMock.props?.columns[0]?.icon).toBe("viewda-sort-neutral");
     const neutralIcon = editorMock.props?.headerIcons?.["viewda-sort-neutral"];
     expect(neutralIcon?.({ bgColor: "#123456", fgColor: "#ffffff" })).toContain(
@@ -606,13 +641,11 @@ describe("DataGrid window rendering", () => {
         ),
       ).toEqual([260, 200]);
     });
-    expect(measuredFonts.some((font) => /^600 12px .*Inter/.test(font))).toBe(
-      true,
+    expect(measuredFonts).toContain('600 12px Inter, sans-serif, "Noto Emoji"');
+    expect(measuredFonts).toContain(
+      '12px ui-monospace, monospace, "Noto Emoji"',
     );
-    expect(measuredFonts.some((font) => /^12px ui-monospace/.test(font))).toBe(
-      true,
-    );
-    expect(measuredFonts.some((font) => /^12px Inter/.test(font))).toBe(true);
+    expect(measuredFonts).toContain('12px Inter, sans-serif, "Noto Emoji"');
   });
 
   it("fits zero-row columns to capped header widths", async () => {

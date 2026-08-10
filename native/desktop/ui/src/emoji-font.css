@@ -1,0 +1,8 @@
+@font-face {
+  font-family: "Noto Emoji";
+  font-style: normal;
+  font-display: swap;
+  font-weight: 400;
+  src: url("@fontsource/noto-emoji/files/noto-emoji-emoji-400-normal.woff2")
+    format("woff2");
+}

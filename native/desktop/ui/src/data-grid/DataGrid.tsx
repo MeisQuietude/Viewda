@@ -38,6 +38,7 @@ import {
   type SortColumn,
   type SourceSummary,
 } from "../desktop";
+import { loadBundledEmojiFont } from "../fonts";
 import { THEME_CHANGED_EVENT } from "../theme";
 import {
   decodeArrowWindow,
@@ -93,33 +94,25 @@ const WHERE_POPUP_MAX_WIDTH = 680;
 const WHERE_POPUP_OFFSET = -42;
 const GRID_HEADER_FONT_STYLE = "600 12px";
 const GRID_BASE_FONT_STYLE = "12px";
-const UI_FONT_FAMILY =
-  'Inter, ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif';
-const GRID_HEADER_FONT = `${GRID_HEADER_FONT_STYLE} ${UI_FONT_FAMILY}`;
 const GRID_HEADER_HORIZONTAL_PADDING = 16;
 const GRID_HEADER_ICON_SPACE = 28;
 const GRID_CELL_HORIZONTAL_PADDING = 10;
-const MONOSPACE_FONT = 'ui-monospace, "SFMono-Regular", Consolas, monospace';
 const DEFAULT_DATA_VIEW_SETTINGS: DataViewSettings = { memoryLimit: "mb384" };
-
-const drawGridHeader: DrawHeaderCallback = ({ ctx }, drawContent) => {
-  ctx.font = GRID_HEADER_FONT;
-  drawContent();
-};
 
 function fittedColumnWidth(
   title: string,
   displayData: readonly string[],
-  monospace: boolean,
+  headerFontFamily: string,
+  cellFontFamily: string,
   context: CanvasRenderingContext2D | null,
 ) {
   if (context !== null) {
-    context.font = GRID_HEADER_FONT;
+    context.font = `${GRID_HEADER_FONT_STYLE} ${headerFontFamily}`;
   }
   const headerTextWidth = context?.measureText(title).width ?? title.length * 8;
   let contentWidth = 0;
   if (context !== null) {
-    context.font = `${GRID_BASE_FONT_STYLE} ${monospace ? MONOSPACE_FONT : UI_FONT_FAMILY}`;
+    context.font = `${GRID_BASE_FONT_STYLE} ${cellFontFamily}`;
   }
   for (const value of displayData) {
     const line = value.split("\n", 1)[0] ?? "";
@@ -465,6 +458,13 @@ export function DataGrid({
     (column) => column.pinned,
   ).length;
   const gridTheme = useGridTheme();
+  const drawGridHeader = useCallback<DrawHeaderCallback>(
+    ({ ctx }, drawContent) => {
+      ctx.font = `${GRID_HEADER_FONT_STYLE} ${gridTheme.fontFamily}`;
+      drawContent();
+    },
+    [gridTheme.fontFamily],
+  );
   activeViewRef.current = activeView;
 
   const nextSuggestionRevision = useCallback(() => {
@@ -492,6 +492,24 @@ export function DataGrid({
     [sort, source.schema],
   );
 
+  useEffect(() => {
+    const fonts = document.fonts;
+    if (fonts === undefined) {
+      return;
+    }
+    let alive = true;
+    void loadBundledEmojiFont(fonts).then((loaded) => {
+      if (alive && loaded) {
+        gridRef.current?.updateCells(
+          visibleRegionDamage(visibleRegionsRef.current),
+        );
+      }
+    });
+    return () => {
+      alive = false;
+    };
+  }, []);
+
   const columns = useMemo<GridColumn[]>(
     () =>
       visibleColumnStates.map((column) => {
@@ -502,11 +520,16 @@ export function DataGrid({
           width: column.width,
           hasMenu: true,
           themeOverride: monospaceColumns.has(column.sourceIndex)
-            ? { fontFamily: MONOSPACE_FONT }
+            ? { fontFamily: gridTheme.monospaceFontFamily }
             : undefined,
         };
       }),
-    [monospaceColumns, sort, visibleColumnStates],
+    [
+      gridTheme.monospaceFontFamily,
+      monospaceColumns,
+      sort,
+      visibleColumnStates,
+    ],
   );
 
   const readCell = useCallback(
@@ -1548,13 +1571,16 @@ export function DataGrid({
         fittedColumnWidth(
           column.title,
           sample.displayData,
-          sample.monospace,
+          gridTheme.fontFamily,
+          sample.monospace
+            ? gridTheme.monospaceFontFamily
+            : gridTheme.fontFamily,
           context,
         ),
         visibleIndex,
       );
     },
-    [resizeColumn],
+    [gridTheme.fontFamily, gridTheme.monospaceFontFamily, resizeColumn],
   );
 
   const finishColumnResize = useCallback(
@@ -1625,7 +1651,10 @@ export function DataGrid({
           fittedColumnWidth(
             column.title,
             displayData,
-            dataType !== undefined && usesMonospaceCells(dataType),
+            gridTheme.fontFamily,
+            dataType !== undefined && usesMonospaceCells(dataType)
+              ? gridTheme.monospaceFontFamily
+              : gridTheme.fontFamily,
             context,
           ),
         );
@@ -1637,7 +1666,7 @@ export function DataGrid({
         }),
       );
     },
-    [],
+    [gridTheme.fontFamily, gridTheme.monospaceFontFamily],
   );
 
   const fitVisibleColumnWidths = useCallback(() => {
@@ -2777,8 +2806,13 @@ function clampedPopupLeft(anchorLeft: number, viewportWidth: number): number {
   return viewportLeft - anchorLeft;
 }
 
-function useGridTheme(): Partial<Theme> {
-  const [theme, setTheme] = useState<Partial<Theme>>(readGridTheme);
+interface ViewdaGridTheme extends Partial<Theme> {
+  readonly fontFamily: string;
+  readonly monospaceFontFamily: string;
+}
+
+function useGridTheme(): ViewdaGridTheme {
+  const [theme, setTheme] = useState<ViewdaGridTheme>(readGridTheme);
 
   useEffect(() => {
     const updateTheme = () => setTheme(readGridTheme());
@@ -2789,7 +2823,7 @@ function useGridTheme(): Partial<Theme> {
   return theme;
 }
 
-function readGridTheme(): Partial<Theme> {
+function readGridTheme(): ViewdaGridTheme {
   const styles = getComputedStyle(document.documentElement);
   const value = (name: string) => styles.getPropertyValue(name).trim();
   return {
@@ -2811,7 +2845,8 @@ function readGridTheme(): Partial<Theme> {
     textHeaderSelected: value("--grid-text"),
     baseFontStyle: GRID_BASE_FONT_STYLE,
     headerFontStyle: GRID_HEADER_FONT_STYLE,
-    fontFamily: UI_FONT_FAMILY,
+    fontFamily: value("--font-ui"),
+    monospaceFontFamily: value("--font-mono"),
     cellHorizontalPadding: 10,
     cellVerticalPadding: 4,
     roundingRadius: 0,
