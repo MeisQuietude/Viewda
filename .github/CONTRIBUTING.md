@@ -44,9 +44,10 @@ Windows development uses Git Bash and requires the
 
 `scripts/run.sh check` is the canonical gate: CI runs the same one, so a green
 run locally means a green run there. Other commands are `test`, `fmt`, `dev`,
-`bundle` and `doctor`; an optional Justfile exposes the same names. The
-scripts provision pinned Node.js and DuckDB dependencies, while rustup reads
-the pinned toolchain from `native/rust-toolchain.toml`.
+`bundle` and `doctor`; `check-native` runs the host-specific Rust gate used by
+macOS and Windows CI. An optional Justfile exposes the same names. The scripts
+provision pinned Node.js and DuckDB dependencies, while rustup reads the pinned
+toolchain from `native/rust-toolchain.toml`.
 
 ## Working on code
 
