@@ -1,4 +1,5 @@
 import type { SortColumn } from "../desktop";
+import type { ColumnSortIndicator } from "./grid-model";
 
 export function nextSort(
   current: readonly SortColumn[],
@@ -29,18 +30,16 @@ export function nextSort(
   );
 }
 
-export function sortedColumnIcon(
+export function sortIndicator(
   sort: readonly SortColumn[],
   sourceIndex: number,
-): string {
+): ColumnSortIndicator {
   const ordinal = sort.findIndex(
     (column) => column.sourceIndex === sourceIndex,
   );
   if (ordinal < 0) {
-    return "viewda-sort-neutral";
+    return { direction: "neutral" };
   }
   const direction = sort[ordinal]?.direction ?? "ascending";
-  return sort.length > 1
-    ? `viewda-sort-${direction}-${ordinal + 1}`
-    : `viewda-sort-${direction}`;
+  return sort.length > 1 ? { direction, priority: ordinal + 1 } : { direction };
 }

@@ -1,7 +1,4 @@
-import {
-  CompactSelection,
-  type GridSelection,
-} from "@glideapps/glide-data-grid";
+import { CompactSelection, type GridSelection } from "./grid-model";
 import { describe, expect, it } from "vitest";
 
 import { exportSelectionShape } from "./export-selection";

@@ -1,8 +1,4 @@
-import {
-  type CompactSelection,
-  type GridSelection,
-  type Rectangle,
-} from "@glideapps/glide-data-grid";
+import type { CompactSelection, GridSelection, Rectangle } from "./grid-model";
 
 import type { ExportRowRange } from "../desktop";
 

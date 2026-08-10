@@ -1,0 +1,26 @@
+export const GRID_ROW_HEIGHT = 28;
+export const GRID_HEADER_HEIGHT = 32;
+export const GRID_FONT_SIZE = 12;
+export const GRID_HEADER_FONT_WEIGHT = 500;
+export const GRID_ESTIMATED_CHARACTER_WIDTH = 8;
+export const GRID_CELL_HORIZONTAL_PADDING = 10;
+export const GRID_CELL_BORDER_WIDTH = 1;
+export const GRID_ROW_MARKER_HORIZONTAL_PADDING = 8;
+export const GRID_MIN_ROW_MARKER_WIDTH = 56;
+
+export const GRID_SORT_ICON_LEFT = 6;
+export const GRID_SORT_ICON_WIDTH = 12;
+export const GRID_HEADER_CONTROL_GAP = 2;
+export const GRID_HEADER_MENU_RIGHT = 10;
+export const GRID_HEADER_MENU_WIDTH = 22;
+
+const sortControlWidth =
+  GRID_SORT_ICON_LEFT + GRID_SORT_ICON_WIDTH + GRID_HEADER_CONTROL_GAP;
+const menuControlWidth =
+  GRID_HEADER_MENU_RIGHT + GRID_HEADER_MENU_WIDTH + GRID_HEADER_CONTROL_GAP;
+
+export const GRID_HEADER_SIDE_RESERVED_SPACE = Math.max(
+  sortControlWidth,
+  menuControlWidth,
+);
+export const GRID_HEADER_RESERVED_SPACE = GRID_HEADER_SIDE_RESERVED_SPACE * 2;

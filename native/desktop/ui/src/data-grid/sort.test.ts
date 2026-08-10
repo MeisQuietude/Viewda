@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { nextSort, sortedColumnIcon } from "./sort";
+import { nextSort, sortIndicator } from "./sort";
 
 describe("grid sort order", () => {
   it("cycles a primary column through ascending, descending and file order", () => {
@@ -40,15 +40,21 @@ describe("grid sort order", () => {
     ).toEqual([{ sourceIndex: 5, direction: "descending" }]);
   });
 
-  it("selects neutral, directional and prioritized header icons", () => {
+  it("describes neutral, directional and prioritized header indicators", () => {
     const sort = [
       { sourceIndex: 2, direction: "ascending" },
       { sourceIndex: 5, direction: "descending" },
     ] as const;
 
-    expect(sortedColumnIcon(sort, 2)).toBe("viewda-sort-ascending-1");
-    expect(sortedColumnIcon(sort, 5)).toBe("viewda-sort-descending-2");
-    expect(sortedColumnIcon(sort, 7)).toBe("viewda-sort-neutral");
-    expect(sortedColumnIcon([sort[0]], 2)).toBe("viewda-sort-ascending");
+    expect(sortIndicator(sort, 2)).toEqual({
+      direction: "ascending",
+      priority: 1,
+    });
+    expect(sortIndicator(sort, 5)).toEqual({
+      direction: "descending",
+      priority: 2,
+    });
+    expect(sortIndicator(sort, 7)).toEqual({ direction: "neutral" });
+    expect(sortIndicator([sort[0]], 2)).toEqual({ direction: "ascending" });
   });
 });

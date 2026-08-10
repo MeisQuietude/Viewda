@@ -7,15 +7,21 @@ interface ColumnRegion {
   width: number;
 }
 
+const COLUMN_OVERSCAN = 2;
+
 export function projectedSourceIndices(
   columns: readonly SourceColumn[],
   regions: readonly ColumnRegion[],
   initialColumnCount: number,
 ): number[] {
   const visibleIndices = new Set<number>();
-  for (const region of regions) {
-    const start = Math.max(0, region.x);
-    const end = Math.min(columns.length, start + Math.max(0, region.width));
+  for (const [index, region] of regions.entries()) {
+    const overscan = index === 0 ? COLUMN_OVERSCAN : 0;
+    const start = Math.max(0, region.x - overscan);
+    const end = Math.min(
+      columns.length,
+      region.x + Math.max(0, region.width) + overscan,
+    );
     for (let visibleIndex = start; visibleIndex < end; visibleIndex += 1) {
       const sourceIndex = columns[visibleIndex]?.sourceIndex;
       if (sourceIndex !== undefined) {

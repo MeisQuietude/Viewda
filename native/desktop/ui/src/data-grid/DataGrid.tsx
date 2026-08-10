@@ -1,18 +1,3 @@
-import {
-  CompactSelection,
-  DataEditor,
-  getCopyBufferContents,
-  GridCellKind,
-  type CellArray,
-  type DataEditorRef,
-  type DrawHeaderCallback,
-  type GridCell,
-  type GridColumn,
-  type GridSelection,
-  type Rectangle,
-  type SpriteMap,
-  type Theme,
-} from "@glideapps/glide-data-grid";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import {
@@ -47,6 +32,7 @@ import {
   windowValue,
   type ArrowDataWindow,
 } from "./arrow-window";
+import { writeClipboardContents } from "./clipboard";
 import { copyRowLimit } from "./copy-limit";
 import { projectedSourceIndices, projectionContains } from "./column-window";
 import { exportSelectionShape } from "./export-selection";
@@ -75,19 +61,33 @@ import {
   type ScrollState,
 } from "./row-window";
 import { SchemaSidebar } from "./SchemaSidebar";
-import { nextSort, sortedColumnIcon } from "./sort";
+import { nextSort, sortIndicator } from "./sort";
 import { ColumnPicker } from "./ColumnPicker";
+import {
+  CompactSelection,
+  getCopyBufferContents,
+  GridCellKind,
+  type CellArray,
+  type GridCell,
+  type GridColumn,
+  type GridSelection,
+  type Rectangle,
+} from "./grid-model";
+import {
+  GRID_CELL_HORIZONTAL_PADDING,
+  GRID_ESTIMATED_CHARACTER_WIDTH,
+  GRID_FONT_SIZE,
+  GRID_HEADER_FONT_WEIGHT,
+  GRID_HEADER_RESERVED_SPACE,
+} from "./grid-layout";
+import { RegularTableGrid, type RegularTableGridRef } from "./RegularTableGrid";
 
-import "@glideapps/glide-data-grid/dist/index.css";
-
-const ROW_HEIGHT = 28;
-const HEADER_HEIGHT = 32;
 const INITIAL_ROWS = 64;
 const INITIAL_COLUMNS = 8;
 const COPY_CHUNK_ROWS = 512;
 const EXPORT_STATUS_POLL_MS = 1_000;
 const MAX_CACHED_CELLS = 20_000;
-const MIN_COLUMN_WIDTH = 112;
+const MIN_COLUMN_WIDTH = 64;
 const MAX_COLUMN_WIDTH = 500;
 const SORT_HEADER_HITBOX_START = 4;
 const SORT_HEADER_HITBOX_END = 32;
@@ -95,11 +95,11 @@ const WHERE_POPUP_MARGIN = 16;
 const WHERE_POPUP_MAX_WIDTH = 680;
 const WHERE_POPUP_OFFSET = -42;
 const SELECT_TOOLTIP_COLUMN_LIMIT = 50;
-const GRID_HEADER_FONT_STYLE = "600 12px";
-const GRID_BASE_FONT_STYLE = "12px";
-const GRID_HEADER_HORIZONTAL_PADDING = 16;
-const GRID_HEADER_ICON_SPACE = 28;
-const GRID_CELL_HORIZONTAL_PADDING = 10;
+const DEFAULT_COLUMN_WIDTH = 280;
+const COLUMN_SCROLL_PADDING = 16;
+const GRID_HEADER_FONT_STYLE = `${GRID_HEADER_FONT_WEIGHT} ${GRID_FONT_SIZE}px`;
+const GRID_BASE_FONT_STYLE = `${GRID_FONT_SIZE}px`;
+const GRID_FIT_SAFETY = 8;
 const DEFAULT_DATA_VIEW_SETTINGS: DataViewSettings = { memoryLimit: "mb384" };
 
 function fittedColumnWidth(
@@ -112,17 +112,21 @@ function fittedColumnWidth(
   if (context !== null) {
     context.font = `${GRID_HEADER_FONT_STYLE} ${headerFontFamily}`;
   }
-  const headerTextWidth = context?.measureText(title).width ?? title.length * 8;
+  const headerTextWidth =
+    context?.measureText(title).width ??
+    title.length * GRID_ESTIMATED_CHARACTER_WIDTH;
   let contentWidth = 0;
   if (context !== null) {
     context.font = `${GRID_BASE_FONT_STYLE} ${cellFontFamily}`;
   }
   for (const value of displayData) {
     const line = value.split("\n", 1)[0] ?? "";
-    const textWidth = context?.measureText(line).width ?? line.length * 8;
+    const textWidth =
+      context?.measureText(line).width ??
+      line.length * GRID_ESTIMATED_CHARACTER_WIDTH;
     contentWidth = Math.max(
       contentWidth,
-      textWidth + GRID_CELL_HORIZONTAL_PADDING * 2,
+      textWidth + GRID_CELL_HORIZONTAL_PADDING * 2 + GRID_FIT_SAFETY,
     );
   }
   return Math.min(
@@ -131,48 +135,11 @@ function fittedColumnWidth(
       MIN_COLUMN_WIDTH,
       Math.ceil(
         Math.max(
-          headerTextWidth +
-            GRID_HEADER_HORIZONTAL_PADDING +
-            GRID_HEADER_ICON_SPACE,
+          headerTextWidth + GRID_HEADER_RESERVED_SPACE + GRID_FIT_SAFETY,
           contentWidth,
         ),
       ),
     ),
-  );
-}
-
-function sortHeaderSprite(
-  direction: "neutral" | "ascending" | "descending",
-  priority?: number,
-): SpriteMap[string] {
-  return ({ bgColor, fgColor }) => {
-    const arrow =
-      direction === "neutral"
-        ? '<path d="M7 7l3-3 3 3M10 4v12M7 13l3 3 3-3"/>'
-        : direction === "ascending"
-          ? '<path d="M6.5 9.5 10 6l3.5 3.5M10 6v9"/>'
-          : '<path d="M6.5 10.5 10 14l3.5-3.5M10 5v9"/>';
-    const badge =
-      priority === undefined
-        ? ""
-        : `<circle cx="15.5" cy="15.5" r="4" fill="${bgColor}" stroke="none"/><text x="15.5" y="17.4" fill="${fgColor}" stroke="none" text-anchor="middle" font-family="sans-serif" font-size="${priority >= 10 ? 5 : 6}" font-weight="700">${priority}</text>`;
-    return `<svg width="20" height="20" viewBox="0 0 20 20" fill="none" xmlns="http://www.w3.org/2000/svg"><g stroke="${bgColor}" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">${arrow}</g>${badge}</svg>`;
-  };
-}
-
-const sortHeaderIcons: SpriteMap = {
-  "viewda-sort-neutral": sortHeaderSprite("neutral"),
-  "viewda-sort-ascending": sortHeaderSprite("ascending"),
-  "viewda-sort-descending": sortHeaderSprite("descending"),
-};
-for (let priority = 1; priority <= 32; priority += 1) {
-  sortHeaderIcons[`viewda-sort-ascending-${priority}`] = sortHeaderSprite(
-    "ascending",
-    priority,
-  );
-  sortHeaderIcons[`viewda-sort-descending-${priority}`] = sortHeaderSprite(
-    "descending",
-    priority,
   );
 }
 
@@ -182,13 +149,6 @@ interface ColumnState {
   width: number;
   pinned: boolean;
   hidden: boolean;
-}
-
-interface ColumnFitSample {
-  revision: number;
-  sourceIndex: number;
-  displayData: readonly string[];
-  monospace: boolean;
 }
 
 interface ColumnResizeGesture {
@@ -379,8 +339,12 @@ export function DataGrid({
       sourceIndex,
       title: field.name,
       width: Math.min(
-        280,
-        Math.max(MIN_COLUMN_WIDTH, field.name.length * 8 + 48),
+        DEFAULT_COLUMN_WIDTH,
+        Math.max(
+          MIN_COLUMN_WIDTH,
+          field.name.length * GRID_ESTIMATED_CHARACTER_WIDTH +
+            GRID_HEADER_RESERVED_SPACE,
+        ),
       ),
       pinned: false,
       hidden: false,
@@ -423,7 +387,7 @@ export function DataGrid({
     number | null
   >(null);
   const [schemaFocusRequest, setSchemaFocusRequest] = useState(0);
-  const gridRef = useRef<DataEditorRef>(null);
+  const gridRef = useRef<RegularTableGridRef>(null);
   const gridCanvasRef = useRef<HTMLDivElement>(null);
   const schemaFocusColumnRef = useRef<number | null>(null);
   const visibleColumnStatesRef = useRef<readonly ColumnState[]>([]);
@@ -447,7 +411,6 @@ export function DataGrid({
   const suppressHeaderMenuRef = useRef(false);
   const suppressHeaderMenuTimerRef = useRef<number | null>(null);
   const columnResizeGestureRef = useRef<ColumnResizeGesture | null>(null);
-  const columnFitSampleRef = useRef<ColumnFitSample | null>(null);
   const columnFitRequestRef = useRef(0);
   const menuRef = useRef<HTMLDivElement>(null);
   const gridMenuRef = useRef<HTMLDivElement>(null);
@@ -467,14 +430,7 @@ export function DataGrid({
   const pinnedCount = visibleColumnStates.filter(
     (column) => column.pinned,
   ).length;
-  const gridTheme = useGridTheme();
-  const drawGridHeader = useCallback<DrawHeaderCallback>(
-    ({ ctx }, drawContent) => {
-      ctx.font = `${GRID_HEADER_FONT_STYLE} ${gridTheme.fontFamily}`;
-      drawContent();
-    },
-    [gridTheme.fontFamily],
-  );
+  const gridFonts = useGridFonts();
   activeViewRef.current = activeView;
 
   const nextSuggestionRevision = useCallback(() => {
@@ -533,9 +489,7 @@ export function DataGrid({
     let alive = true;
     void loadBundledEmojiFont(fonts).then((loaded) => {
       if (alive && loaded) {
-        gridRef.current?.updateCells(
-          visibleRegionDamage(visibleRegionsRef.current),
-        );
+        gridRef.current?.refresh();
       }
     });
     return () => {
@@ -547,22 +501,13 @@ export function DataGrid({
     () =>
       visibleColumnStates.map((column) => {
         return {
-          id: String(column.sourceIndex),
           title: column.title,
-          icon: sortedColumnIcon(sort, column.sourceIndex),
           width: column.width,
-          hasMenu: true,
-          themeOverride: monospaceColumns.has(column.sourceIndex)
-            ? { fontFamily: gridTheme.monospaceFontFamily }
-            : undefined,
+          monospace: monospaceColumns.has(column.sourceIndex),
+          sort: sortIndicator(sort, column.sourceIndex),
         };
       }),
-    [
-      gridTheme.monospaceFontFamily,
-      monospaceColumns,
-      sort,
-      visibleColumnStates,
-    ],
+    [monospaceColumns, sort, visibleColumnStates],
   );
 
   const readCell = useCallback(
@@ -588,9 +533,6 @@ export function DataGrid({
       );
       return {
         kind: GridCellKind.Text,
-        allowOverlay: false,
-        readonly: true,
-        data: formatted.copyData || formatted.displayData,
         displayData: formatted.displayData,
         copyData: formatted.copyData,
         contentAlign: formatted.align,
@@ -636,8 +578,8 @@ export function DataGrid({
         visible !== undefined &&
         clampedVisibleStart(rowCount, visible.y, visible.height) !== visible.y
       ) {
-        // Glide's virtual scroller retains its logical offset when rows shrink below the
-        // current viewport. Remount only in that case so the canvas can reach the clamped row.
+        // Remount when the active view shrinks past the current logical offset so the
+        // virtual table can reach the clamped row.
         setGridInstanceKey((current) => current + 1);
       }
       nextViewRevisionRef.current = Math.max(
@@ -658,9 +600,7 @@ export function DataGrid({
       setSelection(emptySelection());
       setCopyLimit(null);
       setGridMenu(null);
-      gridRef.current?.updateCells(
-        visibleRegionDamage(visibleRegionsRef.current),
-      );
+      gridRef.current?.refresh();
     },
     [],
   );
@@ -710,16 +650,20 @@ export function DataGrid({
         }
         const latest = pendingRequestRef.current as VersionedRowRequest | null;
         if (
-          latest === null ||
-          latest.revision !== request.revision ||
-          requestContainsVisibleWindow(request, latest)
+          (latest === null ||
+            latest.revision !== request.revision ||
+            requestContainsVisibleWindow(request, latest)) &&
+          windowCoversVisibleViewport(
+            decoded,
+            visibleColumnStatesRef.current,
+            visibleRegionsRef.current,
+            activeViewRef.current.rowCount,
+          )
         ) {
           dataWindowRef.current = decoded;
           failedRequestRef.current = null;
           cellCacheRef.current.clear();
-          gridRef.current?.updateCells(
-            loadedWindowDamage(decoded, visibleRegionsRef.current),
-          );
+          gridRef.current?.refresh();
           setLoadError(null);
         }
       } catch (error) {
@@ -888,9 +832,7 @@ export function DataGrid({
     setSelection(clearColumnSelection);
     setCopyLimit(null);
     setGridMenu(null);
-    gridRef.current?.updateCells(
-      visibleRegionDamage(visibleRegionsRef.current),
-    );
+    gridRef.current?.refresh();
   }, [visibleSourceIndices]);
 
   useEffect(() => {
@@ -911,9 +853,7 @@ export function DataGrid({
           height: Math.min(region.height, activeView.rowCount - visibleStart),
         }));
         scrollStateRef.current = { direction: 0, boundary: visibleStart };
-        gridRef.current?.scrollTo(0, visibleStart, "vertical", 0, 0, {
-          vAlign: "start",
-        });
+        gridRef.current?.scrollToRow(visibleStart);
       }
       requestRows(visibleStart, visibleCount);
     }
@@ -1211,7 +1151,7 @@ export function DataGrid({
     if (visibleIndex < 0) {
       return;
     }
-    gridRef.current?.scrollTo(visibleIndex, 0, "horizontal", 16);
+    gridRef.current?.scrollToColumn(visibleIndex, COLUMN_SCROLL_PADDING);
     setSelection({
       columns: CompactSelection.fromSingleSelection(visibleIndex),
       rows: CompactSelection.empty(),
@@ -1446,8 +1386,7 @@ export function DataGrid({
   );
 
   const getCellsForSelection = useCallback(
-    (rectangle: Rectangle, abortSignal: AbortSignal) => async () => {
-      const revision = activeViewRef.current.revision;
+    async (rectangle: Rectangle, abortSignal: AbortSignal) => {
       const selectedColumns = visibleColumnStates.slice(
         rectangle.x,
         rectangle.x + rectangle.width,
@@ -1466,7 +1405,6 @@ export function DataGrid({
         rectangle.y + rectangle.height,
       );
       const end = Math.min(requestedEnd, rectangle.y + rowLimit);
-      let sampleMonospace = false;
       if (end < requestedEnd) {
         setCopyLimit(rowLimit);
       }
@@ -1480,14 +1418,6 @@ export function DataGrid({
           selectedSourceIndices,
           abortSignal,
         );
-        const sampleSourceIndex = selectedSourceIndices[0];
-        const sampleType =
-          sampleSourceIndex === undefined
-            ? undefined
-            : windowDataType(window, sampleSourceIndex);
-        if (sampleType !== undefined) {
-          sampleMonospace = usesMonospaceCells(sampleType);
-        }
         const windowEnd = Math.min(end, window.rowOffset + window.rowCount);
         for (let row = offset; row < windowEnd; row += 1) {
           rows.push(
@@ -1500,25 +1430,6 @@ export function DataGrid({
           break;
         }
         offset = windowEnd;
-      }
-
-      const sampleColumn = selectedColumns[0];
-      if (
-        rectangle.width === 1 &&
-        sampleColumn !== undefined &&
-        revision === activeViewRef.current.revision
-      ) {
-        // Glide reports double-click auto-fit through onColumnResize after
-        // loading this selection, without a paired resize start event.
-        columnFitSampleRef.current = {
-          revision,
-          sourceIndex: sampleColumn.sourceIndex,
-          displayData: rows.flatMap((row) => {
-            const cell = row[0];
-            return cell?.kind === GridCellKind.Text ? [cell.displayData] : [];
-          }),
-          monospace: sampleMonospace,
-        };
       }
 
       return rows satisfies CellArray;
@@ -1558,14 +1469,8 @@ export function DataGrid({
           );
         }
       }
-      const clipboard = window.navigator.clipboard;
-      if (clipboard?.writeText === undefined) {
-        throw new Error("The system clipboard is unavailable.");
-      }
       const columnIndices = visibleColumnStates.map((_, index) => index);
-      await clipboard.writeText(
-        getCopyBufferContents(cells, columnIndices).textPlain,
-      );
+      return getCopyBufferContents(cells, columnIndices);
     },
     [
       loadCopyWindow,
@@ -1589,10 +1494,12 @@ export function DataGrid({
       event.preventDefault();
       event.stopImmediatePropagation();
       setCopyLimit(rowLimit);
-      void copyCappedRowSelection(rowLimit).catch(() => {
-        failedRequestRef.current = null;
-        setLoadError({ message: "The selected rows could not be copied." });
-      });
+      void writeClipboardContents(copyCappedRowSelection(rowLimit)).catch(
+        () => {
+          failedRequestRef.current = null;
+          setLoadError({ message: "The selected rows could not be copied." });
+        },
+      );
     };
     window.addEventListener("copy", copyRows, true);
     return () => window.removeEventListener("copy", copyRows, true);
@@ -1632,7 +1539,7 @@ export function DataGrid({
   }, []);
 
   const startColumnResize = useCallback(
-    (_column: GridColumn, _width: number, visibleIndex: number) => {
+    (visibleIndex: number) => {
       clearColumnResize();
       columnResizeGestureRef.current = { visibleIndex, moved: false };
       suppressHeaderMenuRef.current = true;
@@ -1641,52 +1548,21 @@ export function DataGrid({
     [clearColumnResize],
   );
 
-  const resizeOrFitColumn = useCallback(
+  const resizeColumnDuringGesture = useCallback(
     (width: number, visibleIndex: number) => {
       const gesture = columnResizeGestureRef.current;
-      if (gesture !== null) {
-        if (visibleIndex === gesture.visibleIndex) {
-          gesture.moved = true;
-        }
-        if (gesture.moved) {
-          resizeColumn(width, visibleIndex);
-        }
+      if (gesture === null || visibleIndex !== gesture.visibleIndex) {
         return;
       }
-
-      const column = visibleColumnStatesRef.current[visibleIndex];
-      const sample = columnFitSampleRef.current;
-      if (
-        column === undefined ||
-        sample === null ||
-        sample.revision !== activeViewRef.current.revision ||
-        sample.sourceIndex !== column.sourceIndex
-      ) {
-        resizeColumn(width, visibleIndex);
-        return;
-      }
-
-      const context = document.createElement("canvas").getContext("2d");
-      resizeColumn(
-        fittedColumnWidth(
-          column.title,
-          sample.displayData,
-          gridTheme.fontFamily,
-          sample.monospace
-            ? gridTheme.monospaceFontFamily
-            : gridTheme.fontFamily,
-          context,
-        ),
-        visibleIndex,
-      );
+      gesture.moved = true;
+      resizeColumn(width, visibleIndex);
     },
-    [gridTheme.fontFamily, gridTheme.monospaceFontFamily, resizeColumn],
+    [resizeColumn],
   );
 
   const finishColumnResize = useCallback(
     (width: number, visibleIndex: number) => {
-      // Glide clamps its unset internal width to the minimum on mouseup, so an
-      // end event is valid only after the primary column emitted a resize.
+      // An end event is valid only after the primary column emitted a resize.
       if (columnResizeGestureRef.current?.moved === true) {
         resizeColumn(width, visibleIndex);
       }
@@ -1694,8 +1570,7 @@ export function DataGrid({
       if (suppressHeaderMenuTimerRef.current !== null) {
         window.clearTimeout(suppressHeaderMenuTimerRef.current);
       }
-      // Glide clears its resize state before the browser dispatches the click
-      // synthesized from mouseup, so keep the menu guard through this event turn.
+      // Keep the menu guard through the click synthesized from mouseup.
       suppressHeaderMenuTimerRef.current = window.setTimeout(() => {
         suppressHeaderMenuRef.current = false;
         suppressHeaderMenuTimerRef.current = null;
@@ -1751,10 +1626,10 @@ export function DataGrid({
           fittedColumnWidth(
             column.title,
             displayData,
-            gridTheme.fontFamily,
+            gridFonts.fontFamily,
             dataType !== undefined && usesMonospaceCells(dataType)
-              ? gridTheme.monospaceFontFamily
-              : gridTheme.fontFamily,
+              ? gridFonts.monospaceFontFamily
+              : gridFonts.fontFamily,
             context,
           ),
         );
@@ -1766,7 +1641,50 @@ export function DataGrid({
         }),
       );
     },
-    [gridTheme.fontFamily, gridTheme.monospaceFontFamily],
+    [gridFonts.fontFamily, gridFonts.monospaceFontFamily],
+  );
+
+  const autoFitColumn = useCallback(
+    async (
+      visibleIndex: number,
+      rowStart: number,
+      rowCount: number,
+      abortSignal: AbortSignal,
+    ) => {
+      const column = visibleColumnStatesRef.current[visibleIndex];
+      if (column === undefined) {
+        return;
+      }
+      const view = activeViewRef.current;
+      const request = columnFitRequestRef.current + 1;
+      columnFitRequestRef.current = request;
+      try {
+        const bytes = await getDataWindow(
+          source.generation,
+          view.revision,
+          rowStart,
+          rowCount,
+          [column.sourceIndex],
+        );
+        if (abortSignal.aborted) {
+          return;
+        }
+        const dataWindow = decodeArrowWindow(bytes, rowStart, [
+          column.sourceIndex,
+        ]);
+        if (
+          request === columnFitRequestRef.current &&
+          view.revision === activeViewRef.current.revision
+        ) {
+          applyFittedColumnWidths([column], dataWindow, rowStart, rowCount);
+        }
+      } catch (error) {
+        if (!abortSignal.aborted) {
+          setLoadError(dataViewErrorState(error));
+        }
+      }
+    },
+    [applyFittedColumnWidths, source.generation],
   );
 
   const setColumnVisibility = useCallback(
@@ -2327,37 +2245,18 @@ export function DataGrid({
           </div>
         ) : (
           <div ref={gridCanvasRef} className="grid-canvas">
-            <DataEditor
+            <RegularTableGrid
               key={gridInstanceKey}
               ref={gridRef}
               columns={columns}
               rows={gridRowCount}
-              width="100%"
-              height="100%"
-              rowHeight={ROW_HEIGHT}
-              headerHeight={HEADER_HEIGHT}
-              rowMarkers={{ kind: "clickable-number", startIndex: 1 }}
-              rangeSelect="multi-rect"
-              rowSelect="multi"
-              columnSelect="multi"
               gridSelection={selection}
               onGridSelectionChange={updateSelection}
               getCellContent={getCellContent}
               getCellsForSelection={getCellsForSelection}
-              drawHeader={drawGridHeader}
-              headerIcons={sortHeaderIcons}
-              copyHeaders={false}
               freezeColumns={pinnedCount}
-              fixedShadowX={false}
-              fixedShadowY={false}
-              overscrollX={0}
-              overscrollY={0}
-              preventDiagonalScrolling
-              smoothScrollX
-              smoothScrollY={false}
               minColumnWidth={MIN_COLUMN_WIDTH}
               maxColumnWidth={MAX_COLUMN_WIDTH}
-              theme={gridTheme}
               onCellContextMenu={(cell, event) => {
                 event.preventDefault();
                 setHeaderMenu(null);
@@ -2383,7 +2282,6 @@ export function DataGrid({
               onHeaderClicked={(visibleIndex, event) => {
                 clearColumnResize();
                 if (
-                  event.isEdge ||
                   event.localEventX < SORT_HEADER_HITBOX_START ||
                   event.localEventX >= SORT_HEADER_HITBOX_END
                 ) {
@@ -2403,20 +2301,17 @@ export function DataGrid({
                   );
                 }
               }}
-              onVisibleRegionChanged={(range, _tx, _ty, extras) => {
+              onVisibleRegionChanged={(range, extras) => {
                 visibleRegionsRef.current = [
                   range,
                   ...(extras.freezeRegions ?? []),
                 ];
                 requestRows(range.y, range.height);
               }}
-              onColumnResize={(_column, width, visibleIndex) =>
-                resizeOrFitColumn(width, visibleIndex)
-              }
+              onColumnResize={resizeColumnDuringGesture}
               onColumnResizeStart={startColumnResize}
-              onColumnResizeEnd={(_column, width, visibleIndex) =>
-                finishColumnResize(width, visibleIndex)
-              }
+              onColumnResizeEnd={finishColumnResize}
+              onColumnAutoFit={autoFitColumn}
               onHeaderMenuClick={(visibleIndex, bounds) => {
                 if (suppressHeaderMenuRef.current) {
                   return;
@@ -2835,48 +2730,29 @@ function takeCompactSelection(
 }
 
 function loadingCell(): GridCell {
-  return { kind: GridCellKind.Loading, allowOverlay: false };
+  return { kind: GridCellKind.Loading };
 }
 
-function loadedWindowDamage(
+function windowCoversVisibleViewport(
   window: ArrowDataWindow,
-  visibleRegions: readonly Rectangle[],
-): { cell: readonly [number, number] }[] {
-  const damaged = new Map<string, { cell: readonly [number, number] }>();
-  const windowEnd = window.rowOffset + window.rowCount;
-
-  for (const region of visibleRegions) {
-    const rowStart = Math.max(window.rowOffset, region.y);
-    const rowEnd = Math.min(windowEnd, region.y + region.height);
-    const columnStart = Math.max(0, region.x);
-    const columnEnd = Math.max(columnStart, region.x + region.width);
-    for (let row = rowStart; row < rowEnd; row += 1) {
-      for (let column = columnStart; column < columnEnd; column += 1) {
-        const cell = [column, row] as const;
-        damaged.set(`${column}:${row}`, { cell });
-      }
-    }
+  columns: readonly Pick<ColumnState, "sourceIndex">[],
+  regions: readonly Rectangle[],
+  rowCount: number,
+): boolean {
+  const visible = regions[0];
+  if (visible === undefined) {
+    return true;
   }
-
-  return [...damaged.values()];
-}
-
-function visibleRegionDamage(
-  visibleRegions: readonly Rectangle[],
-): { cell: readonly [number, number] }[] {
-  return visibleRegions.flatMap((region) => {
-    const damage: { cell: readonly [number, number] }[] = [];
-    for (let row = region.y; row < region.y + region.height; row += 1) {
-      for (
-        let column = region.x;
-        column < region.x + region.width;
-        column += 1
-      ) {
-        damage.push({ cell: [column, row] });
-      }
-    }
-    return damage;
-  });
+  const visibleStart = Math.max(0, Math.floor(visible.y));
+  const visibleEnd = Math.min(rowCount, Math.ceil(visible.y + visible.height));
+  return (
+    window.rowOffset <= visibleStart &&
+    window.rowOffset + window.rowCount >= visibleEnd &&
+    projectionContains(
+      window.sourceIndices,
+      projectedSourceIndices(columns, regions, INITIAL_COLUMNS),
+    )
+  );
 }
 
 function dataWindowErrorMessage(error: unknown): string {
@@ -2983,49 +2859,28 @@ function clampedPopupLeft(anchorLeft: number, viewportWidth: number): number {
   return viewportLeft - anchorLeft;
 }
 
-interface ViewdaGridTheme extends Partial<Theme> {
+interface GridFonts {
   readonly fontFamily: string;
   readonly monospaceFontFamily: string;
 }
 
-function useGridTheme(): ViewdaGridTheme {
-  const [theme, setTheme] = useState<ViewdaGridTheme>(readGridTheme);
+function useGridFonts(): GridFonts {
+  const [fonts, setFonts] = useState<GridFonts>(readGridFonts);
 
   useEffect(() => {
-    const updateTheme = () => setTheme(readGridTheme());
+    const updateTheme = () => setFonts(readGridFonts());
     window.addEventListener(THEME_CHANGED_EVENT, updateTheme);
     return () => window.removeEventListener(THEME_CHANGED_EVENT, updateTheme);
   }, []);
 
-  return theme;
+  return fonts;
 }
 
-function readGridTheme(): ViewdaGridTheme {
+function readGridFonts(): GridFonts {
   const styles = getComputedStyle(document.documentElement);
   const value = (name: string) => styles.getPropertyValue(name).trim();
   return {
-    accentColor: value("--grid-selection-strong"),
-    accentFg: value("--grid-selection-text"),
-    accentLight: value("--grid-selection"),
-    bgCell: value("--grid-cell"),
-    bgCellMedium: value("--grid-cell-muted"),
-    bgHeader: value("--grid-header"),
-    bgHeaderHasFocus: value("--grid-header-active"),
-    bgHeaderHovered: value("--grid-header-hover"),
-    borderColor: value("--grid-border"),
-    horizontalBorderColor: value("--grid-border-soft"),
-    headerBottomBorderColor: value("--grid-border"),
-    textDark: value("--grid-text"),
-    textMedium: value("--grid-text-muted"),
-    textLight: value("--grid-text-faint"),
-    textHeader: value("--grid-text-muted"),
-    textHeaderSelected: value("--grid-text"),
-    baseFontStyle: GRID_BASE_FONT_STYLE,
-    headerFontStyle: GRID_HEADER_FONT_STYLE,
     fontFamily: value("--font-ui"),
     monospaceFontFamily: value("--font-mono"),
-    cellHorizontalPadding: 10,
-    cellVerticalPadding: 4,
-    roundingRadius: 0,
   };
 }

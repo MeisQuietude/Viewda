@@ -16,12 +16,81 @@ describe("font stacks", () => {
   });
 
   it("reuses the monospace stack instead of copying its font list", () => {
-    expect(styles.match(/font-family:\s*var\(--font-mono\);/g)).toHaveLength(7);
+    expect(styles.match(/font-family:\s*var\(--font-mono\);/g)).toHaveLength(8);
     expect(styles).not.toMatch(/font-family:\s*ui-monospace/);
   });
 });
 
+describe("data grid layout", () => {
+  it("reserves header controls without moving the label on hover", () => {
+    expect(styles).toMatch(
+      /\.viewda-regular-table \.viewda-grid-header\s*\{[^}]*padding:\s*0 var\(--viewda-grid-header-side-reserve\);/s,
+    );
+    expect(styles).not.toMatch(
+      /\.viewda-grid-header:(?:hover|focus-within)[^{]*\{[^}]*padding-/s,
+    );
+    expect(styles).toMatch(
+      /\.viewda-regular-table \.viewda-grid-header::before\s*\{[^}]*left:\s*var\(--viewda-grid-sort-icon-left\);[^}]*width:\s*var\(--viewda-grid-sort-icon-width\);/s,
+    );
+  });
+
+  it("starts the vertical scrollbar below the column headers", () => {
+    expect(styles).toMatch(
+      /\.viewda-regular-table::-webkit-scrollbar-track:vertical\s*\{[^}]*margin-top:\s*var\(--viewda-grid-header-height\);/s,
+    );
+  });
+
+  it("keeps pinned columns above translated scrolling cells", () => {
+    expect(styles).toMatch(
+      /\.viewda-regular-table thead \.rt-group-corner,\s*\.viewda-regular-table tbody th\s*\{[^}]*z-index:\s*2;/s,
+    );
+  });
+
+  it("applies the continuous horizontal offset without per-cell layers", () => {
+    expect(styles).toMatch(
+      /\.viewda-regular-table tbody td,\s*\.viewda-regular-table thead th:not\(\.rt-group-corner\)\s*\{[^}]*transform:\s*translateX\(var\(--viewda-grid-transform-x,\s*0\)\);/s,
+    );
+    expect(styles).toMatch(/var\(--viewda-grid-clip-x,\s*0\)/);
+  });
+
+  it("combines vertical sub-row scrolling with the header correction", () => {
+    expect(styles).toMatch(
+      /transform:\s*translateY\([^;]*var\(--regular-table--transform-y,\s*0px\)[^;]*var\(--viewda-grid-transform-y,\s*0px\)[^;]*\);/s,
+    );
+    expect(styles).toMatch(
+      /var\(--regular-table--clip-y,\s*0px\)\s*-\s*var\(--viewda-grid-transform-y,\s*0px\)/s,
+    );
+  });
+
+  it("shows that row markers and the select-all corner are clickable", () => {
+    expect(styles).toMatch(
+      /\.viewda-regular-table \.viewda-grid-row-marker\s*\{[^}]*cursor:\s*pointer;/s,
+    );
+  });
+
+  it("renders null as one muted UI label without a separate fill", () => {
+    expect(styles).toMatch(
+      /\.viewda-regular-table \.viewda-grid-cell\.viewda-grid-faded\s*\{[^}]*color:\s*var\(--grid-text-faint\);[^}]*font-family:\s*var\(--font-ui\);/s,
+    );
+    expect(styles).not.toMatch(
+      /\.viewda-grid-cell\.viewda-grid-faded\s*\{[^}]*background:/s,
+    );
+  });
+});
+
 describe("color theme", () => {
+  it("applies the document grid palette to regular-table states", () => {
+    expect(styles).toMatch(
+      /\.viewda-regular-table\s*\{[^}]*color:\s*var\(--grid-text\);[^}]*background:\s*var\(--grid-cell\);/s,
+    );
+    expect(styles).toMatch(
+      /\.viewda-regular-table \.viewda-grid-header\s*\{[^}]*color:\s*var\(--grid-text-muted\);[^}]*background:\s*var\(--grid-header\);/s,
+    );
+    expect(styles).toMatch(
+      /\.viewda-regular-table \.viewda-grid-selected\s*\{[^}]*color:\s*var\(--grid-text\);[^}]*background:\s*var\(--grid-selection\);/s,
+    );
+  });
+
   it("keeps statistics errors readable in the dark sidebar", () => {
     const darkRoot = styles.match(
       /:root\[data-theme="dark"\] \{([^}]*)\}/s,
