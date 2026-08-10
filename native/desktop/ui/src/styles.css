@@ -15,6 +15,8 @@
   --grid-selection-strong: #777c7c;
   --grid-selection-text: #f7f7f3;
   --error-text: #8f342c;
+  --danger-action: #a94336;
+  --danger-action-hover: #91382e;
   font-family:
     Inter,
     ui-sans-serif,
@@ -1239,6 +1241,7 @@ button:focus-visible,
 .text-button,
 .tonal-button,
 .update-action,
+.danger-button,
 .dialog-close {
   min-height: 32px;
   padding: 0 11px;
@@ -1278,13 +1281,23 @@ button:focus-visible,
   background: var(--update-accent);
 }
 
+.danger-button {
+  color: #fff;
+  background: var(--danger-action);
+}
+
+.danger-button:hover:not(:disabled) {
+  background: var(--danger-action-hover);
+}
+
 .dialog-close {
   color: #f7f7f3;
   background: #1b1d1e;
 }
 
 .text-button:disabled,
-.update-action:disabled {
+.update-action:disabled,
+.danger-button:disabled {
   cursor: wait;
   opacity: 0.55;
 }
@@ -1316,6 +1329,14 @@ button:focus-visible,
   width: min(430px, 100%);
   scrollbar-gutter: stable;
   padding: 24px;
+}
+
+.export-close-dialog {
+  width: min(420px, 100%);
+}
+
+.export-close-dialog > p {
+  overflow-wrap: anywhere;
 }
 
 .modal-dialog h2 {

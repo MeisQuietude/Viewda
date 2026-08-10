@@ -13,6 +13,7 @@ import {
 import {
   checkForUpdate,
   discardPendingUpdate,
+  getPendingDataExportCloseDialog,
   getDefaultApplicationStatus,
   getDataViewSettings,
   getEngineStatus,
@@ -21,12 +22,14 @@ import {
   installPendingUpdate,
   onOpenSourceRequested,
   onOpenedSourceAvailable,
+  onDataExportCloseRequested,
   onSettingsRequested,
   onUpdateAvailable,
   openLocalSource,
   openRecentSource,
   openReleasesPage,
   OpenSourceError,
+  resolveDataExportCloseDialog,
   setThemePreference as persistThemePreference,
   setDataViewSettings as persistDataViewSettings,
   setUpdateSettings as persistUpdateSettings,
@@ -38,6 +41,7 @@ import {
   type DefaultApplicationStatus,
   type DataViewMemoryLimit,
   type DataViewSettings,
+  type DataExportCloseDialog,
   type EngineStatus,
   type RecentSource,
   type SourceErrorCode,
@@ -109,6 +113,10 @@ export function App({
     null,
   );
   const [downgrade, setDowngrade] = useState<UpdateInfo | null>(null);
+  const [dataExportCloseDialog, setDataExportCloseDialog] =
+    useState<DataExportCloseDialog | null>(null);
+  const [resolvingDataExportClose, setResolvingDataExportClose] =
+    useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [defaultApplication, setDefaultApplicationStatus] =
     useState<DefaultApplicationStatus | null>(null);
@@ -295,6 +303,44 @@ export function App({
       unlisten();
     };
   }, [receiveOpenedSource]);
+
+  useEffect(() => {
+    let active = true;
+    let unlisten = () => {};
+    const receivePendingDialog = () => {
+      void getPendingDataExportCloseDialog()
+        .then((dialog) => {
+          if (active && dialog !== null) {
+            setDataExportCloseDialog(dialog);
+          }
+        })
+        .catch(() => {
+          // A later close request emits the same copy again.
+        });
+    };
+
+    onDataExportCloseRequested((dialog) => {
+      if (active) {
+        setDataExportCloseDialog(dialog);
+      }
+    })
+      .then((stopListening) => {
+        if (!active) {
+          stopListening();
+          return;
+        }
+        unlisten = stopListening;
+        receivePendingDialog();
+      })
+      .catch(() => {
+        receivePendingDialog();
+      });
+
+    return () => {
+      active = false;
+      unlisten();
+    };
+  }, []);
 
   useEffect(() => {
     let active = true;
@@ -622,7 +668,10 @@ export function App({
     }
 
     try {
-      await installPendingUpdate();
+      const restarting = await installPendingUpdate();
+      if (!restarting) {
+        setTitlebarUpdate(available);
+      }
     } catch {
       setTitlebarUpdate(available);
       setUpdateMessage("The update could not be installed. Try again.");
@@ -633,7 +682,10 @@ export function App({
     setInstallingDowngrade(true);
     setUpdateMessage(null);
     try {
-      await installPendingUpdate();
+      const restarting = await installPendingUpdate();
+      if (!restarting) {
+        setInstallingDowngrade(false);
+      }
     } catch {
       setInstallingDowngrade(false);
       setUpdateMessage("The update could not be installed. Try again.");
@@ -681,6 +733,18 @@ export function App({
       await openReleasesPage();
     } catch {
       setUpdateMessage("Could not open the releases page.");
+    }
+  }, []);
+
+  const resolveExportClose = useCallback(async (cancelExport: boolean) => {
+    setResolvingDataExportClose(true);
+    try {
+      await resolveDataExportCloseDialog(cancelExport);
+      setDataExportCloseDialog(null);
+    } catch {
+      // Keep the decision available so the user can retry.
+    } finally {
+      setResolvingDataExportClose(false);
     }
   }, []);
 
@@ -812,7 +876,53 @@ export function App({
           onWait={waitForStable}
         />
       )}
+      {dataExportCloseDialog !== null && (
+        <ExportCloseDialog
+          copy={dataExportCloseDialog}
+          resolving={resolvingDataExportClose}
+          onDecision={resolveExportClose}
+        />
+      )}
     </main>
+  );
+}
+
+function ExportCloseDialog({
+  copy,
+  resolving,
+  onDecision,
+}: {
+  copy: DataExportCloseDialog;
+  resolving: boolean;
+  onDecision: (cancelExport: boolean) => Promise<void>;
+}) {
+  return (
+    <ModalDialog
+      labelledBy="export-close-title"
+      className="export-close-dialog"
+      onClose={resolving ? undefined : () => void onDecision(false)}
+    >
+      <h2 id="export-close-title">Export in progress</h2>
+      <p>{copy.message}</p>
+      <div className="dialog-actions">
+        <button
+          className="text-button"
+          type="button"
+          disabled={resolving}
+          onClick={() => void onDecision(false)}
+        >
+          Keep Exporting
+        </button>
+        <button
+          className="danger-button"
+          type="button"
+          disabled={resolving}
+          onClick={() => void onDecision(true)}
+        >
+          {resolving ? "Stopping export…" : copy.destructiveButton}
+        </button>
+      </div>
+    </ModalDialog>
   );
 }
 
