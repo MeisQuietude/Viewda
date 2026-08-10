@@ -25,6 +25,8 @@ Backward-incompatible entries start with **Breaking:**.
   raise the preparation memory limit in Settings.
 - The Data view now has a toggleable schema sidebar with the full nested field
   tree and cancellable, on-demand statistics for the selected column.
+- Data columns now resize live while dragging and can fit one or all visible
+  widths to their loaded content with matching header and cell fonts.
 
 ### Changed
 
