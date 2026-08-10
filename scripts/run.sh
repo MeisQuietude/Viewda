@@ -121,6 +121,14 @@ run_tests() {
   run_frontend_tests
 }
 
+run_native_checks() {
+  (
+    cd native
+    cargo clippy --workspace --all-targets --locked -- -D warnings
+  )
+  run_rust_tests
+}
+
 provision_checked_environment() {
   install_node
   check_release_metadata
@@ -146,13 +154,17 @@ cmd_check() {
   (
     cd native
     cargo fmt --all --check
-    cargo clippy --workspace --all-targets --locked -- -D warnings
   )
-  run_rust_tests
+  run_native_checks
   npm run format:check --prefix native/desktop
   npm run lint --prefix native/desktop
   run_frontend_tests
   npm run build --prefix native/desktop
+}
+
+cmd_check_native() {
+  provision_checked_environment
+  run_native_checks
 }
 
 cmd_test() {
@@ -260,7 +272,7 @@ cmd_doctor() {
 }
 
 usage() {
-  printf 'Usage: scripts/run.sh <setup|check|test|fmt|dev|bundle|doctor>\n' >&2
+  printf 'Usage: scripts/run.sh <setup|check|check-native|test|fmt|dev|bundle|doctor>\n' >&2
 }
 
 if (( $# != 1 )); then
@@ -271,6 +283,7 @@ fi
 case "$1" in
   setup) cmd_setup ;;
   check) cmd_check ;;
+  check-native) cmd_check_native ;;
   test) cmd_test ;;
   fmt) cmd_fmt ;;
   dev) cmd_dev ;;

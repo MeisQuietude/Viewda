@@ -9,6 +9,10 @@ setup:
 check:
     scripts/run.sh check
 
+# Check native code for the host operating system without building installers.
+check-native:
+    scripts/run.sh check-native
+
 # Run Rust and frontend tests.
 test:
     scripts/run.sh test

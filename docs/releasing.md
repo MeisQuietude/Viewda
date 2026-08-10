@@ -26,6 +26,19 @@ draft release. Smoke-test its assets on physical target machines before
 publishing it. Publishing refreshes the Stable and Latest update channels on
 GitHub Pages.
 
+## Testing a branch installer
+
+Open **Actions → Platform builds → Run workflow** and keep **Use workflow
+from** on `main`. Enter any repository branch, tag, or commit in `source_ref`,
+then select the installable target. Linux x64 produces Debian and AppImage
+downloads; macOS targets produce DMG downloads; Windows x64 produces an NSIS
+executable. The Actions archive name contains the resolved commit SHA and
+remains available for seven days.
+
+Manual branch builds never receive the updater signing key and cannot create a
+release. Select `all` to run the same platform and installer gates as the
+nightly rehearsal, without updater companions or release publication.
+
 ## Prereleases
 
 Alpha and beta versions ship through the same steps with a prerelease
@@ -47,10 +60,12 @@ Release notes follow the reader:
 - The first stable release has nothing earlier to diff against: its
   notes describe everything the app does, written for a first install.
 
-## What CI produces
+## What automation produces
 
-CI verifies native Linux x64 AppImage and Debian packages, macOS Apple silicon
-and Intel installers, Universal macOS, and Windows x64. Each directly
-installable format has its own Actions archive with the full commit SHA.
-Updater companions are archived only for release tags; release files use the
-release version instead.
+Pull requests run the complete shared checks on Linux and native Rust checks on
+macOS arm64 and Windows x64. They do not build installers. The nightly platform
+rehearsal and release tags verify Linux x64 AppImage and Debian packages, macOS
+Apple silicon and Intel installers, Universal macOS, and Windows x64. Each
+directly installable format has its own Actions archive with the full commit
+SHA. Updater companions are archived only for release tags; release files use
+the release version instead.
