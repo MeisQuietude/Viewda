@@ -105,15 +105,8 @@ impl DataWindowReader {
                 ),
             };
             let source_indices = validate_projection(schema, source_indices)?;
-            let identity_projection = source_indices.len() == schema.len()
-                && source_indices.iter().copied().eq(0..schema.len());
-            (!identity_projection).then(|| {
-                source_indices
-                    .iter()
-                    .map(|source_index| quote_identifier(&schema[*source_index].name))
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            })
+            let projection = format_projection_clause(schema, &source_indices);
+            (projection != "*").then_some(projection)
         };
 
         self.fetch_projection(row_offset, row_count, projection.as_deref())
@@ -176,6 +169,20 @@ impl DataWindowReader {
         }));
 
         encoded.unwrap_or(Err(DataWindowError::Unsupported))
+    }
+}
+
+fn format_projection_clause(schema: &[SchemaField], source_indices: &[usize]) -> String {
+    let identity_projection =
+        source_indices.len() == schema.len() && source_indices.iter().copied().eq(0..schema.len());
+    if identity_projection {
+        "*".to_owned()
+    } else {
+        source_indices
+            .iter()
+            .map(|source_index| quote_identifier(&schema[*source_index].name))
+            .collect::<Vec<_>>()
+            .join(", ")
     }
 }
 
@@ -290,5 +297,35 @@ mod tests {
             classify_query_error(failure("IO Error: failed to read a block"), true),
             DataWindowError::QueryFailed
         );
+    }
+
+    #[test]
+    fn formats_projection_in_requested_order_with_sql_identifier_quoting() {
+        let schema = [
+            SchemaField {
+                name: "value\"quoted".to_owned(),
+                physical_type: "INT64".to_owned(),
+                logical_type: None,
+                children: Vec::new(),
+            },
+            SchemaField {
+                name: "label".to_owned(),
+                physical_type: "BYTE_ARRAY".to_owned(),
+                logical_type: Some("String".to_owned()),
+                children: Vec::new(),
+            },
+            SchemaField {
+                name: "amount".to_owned(),
+                physical_type: "DOUBLE".to_owned(),
+                logical_type: None,
+                children: Vec::new(),
+            },
+        ];
+
+        assert_eq!(
+            format_projection_clause(&schema, &[1, 0]),
+            "\"label\", \"value\"\"quoted\""
+        );
+        assert_eq!(format_projection_clause(&schema, &[0, 1, 2]), "*");
     }
 }

@@ -12,23 +12,25 @@ export function projectedSourceIndices(
   regions: readonly ColumnRegion[],
   initialColumnCount: number,
 ): number[] {
-  const indices = new Set<number>();
+  const visibleIndices = new Set<number>();
   for (const region of regions) {
     const start = Math.max(0, region.x);
     const end = Math.min(columns.length, start + Math.max(0, region.width));
     for (let visibleIndex = start; visibleIndex < end; visibleIndex += 1) {
       const sourceIndex = columns[visibleIndex]?.sourceIndex;
       if (sourceIndex !== undefined) {
-        indices.add(sourceIndex);
+        visibleIndices.add(sourceIndex);
       }
     }
   }
-  if (indices.size === 0) {
+  if (visibleIndices.size === 0) {
     for (const column of columns.slice(0, Math.max(1, initialColumnCount))) {
-      indices.add(column.sourceIndex);
+      visibleIndices.add(column.sourceIndex);
     }
   }
-  return [...indices].sort((left, right) => left - right);
+  return columns
+    .filter((column) => visibleIndices.has(column.sourceIndex))
+    .map((column) => column.sourceIndex);
 }
 
 export function projectionContains(
