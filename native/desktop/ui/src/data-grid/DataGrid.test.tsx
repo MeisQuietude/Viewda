@@ -120,6 +120,11 @@ beforeEach(() => {
     rowCount: source.rowCount,
   });
   vi.spyOn(desktop, "cancelDataView").mockResolvedValue();
+  vi.spyOn(desktop, "getTextValueSuggestions").mockResolvedValue({
+    values: [],
+    isPartial: false,
+  });
+  vi.spyOn(desktop, "cancelTextValueSuggestions").mockResolvedValue();
   vi.spyOn(desktop, "getColumnStatistics").mockResolvedValue({
     minimum: "1",
     maximum: "9",
@@ -1263,6 +1268,73 @@ describe("DataGrid window rendering", () => {
     await waitFor(() =>
       expect(screen.getByLabelText("Query")).not.toHaveTextContent(
         '"column_0" = -7',
+      ),
+    );
+  });
+
+  it("prepares a new view when only text case matching changes", async () => {
+    const textSource: desktop.SourceSummary = {
+      ...source,
+      schema: [
+        {
+          name: "label",
+          physicalType: "BYTE_ARRAY",
+          logicalType: "String",
+          children: [],
+        },
+      ],
+    };
+    render(<DataGrid source={textSource} />);
+
+    openColumnMenu(0);
+    fireEvent.click(screen.getByRole("menuitem", { name: "Filter…" }));
+    let editor = screen.getByRole("form", { name: "Filter label" });
+    fireEvent.change(within(editor).getByLabelText("Condition"), {
+      target: { value: "textContains" },
+    });
+    fireEvent.change(within(editor).getByLabelText("Value"), {
+      target: { value: "Alpha" },
+    });
+    fireEvent.click(
+      within(editor).getByRole("button", { name: "Add condition" }),
+    );
+
+    await waitFor(() =>
+      expect(desktop.prepareDataView).toHaveBeenLastCalledWith(
+        7,
+        1,
+        [{ columnIndex: 0, operator: "textContains", values: ["Alpha"] }],
+        [],
+        { memoryLimit: "mb384" },
+      ),
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: /contains/ }));
+    fireEvent.click(
+      within(
+        screen.getByRole("dialog", { name: "WHERE conditions" }),
+      ).getByRole("button", { name: "Edit" }),
+    );
+    editor = screen.getByRole("form", { name: "Filter label" });
+    fireEvent.click(within(editor).getByRole("button", { name: "Match case" }));
+    fireEvent.click(
+      within(editor).getByRole("button", { name: "Save condition" }),
+    );
+
+    await waitFor(() =>
+      expect(desktop.prepareDataView).toHaveBeenLastCalledWith(
+        7,
+        2,
+        [
+          {
+            columnIndex: 0,
+            operator: "textContains",
+            values: ["Alpha"],
+            matchCase: true,
+          },
+        ],
+        [],
+        { memoryLimit: "mb384" },
       ),
     );
   });

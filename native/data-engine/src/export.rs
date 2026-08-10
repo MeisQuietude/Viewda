@@ -723,6 +723,7 @@ mod tests {
                 column_index: 0,
                 operator: DataFilterOperator::Range,
                 values: vec!["2".to_owned(), "3".to_owned()],
+                match_case: false,
             }],
             &[],
         )
@@ -768,6 +769,7 @@ mod tests {
                 column_index: 0,
                 operator: DataFilterOperator::Equals,
                 values: vec!["1".to_owned()],
+                match_case: false,
             }],
             &[],
         )
@@ -803,6 +805,7 @@ mod tests {
                 column_index: 0,
                 operator: DataFilterOperator::GreaterThanOrEqual,
                 values: vec!["2".to_owned()],
+                match_case: false,
             }],
             &[DataSort {
                 source_index: 0,

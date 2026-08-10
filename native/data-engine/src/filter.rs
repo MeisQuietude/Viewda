@@ -21,6 +21,9 @@ pub struct DataFilter {
     /// Text representations converted by DuckDB to the column's exact type.
     #[serde(default)]
     pub values: Vec<String>,
+    /// Preserves letter case for substring operations instead of folding it.
+    #[serde(default)]
+    pub match_case: bool,
 }
 
 /// Stable typed operations accepted by the data engine.
@@ -36,6 +39,9 @@ pub enum DataFilterOperator {
     OneOf,
     Range,
     TextContains,
+    NotContains,
+    StartsWith,
+    EndsWith,
     IsNull,
     IsNotNull,
 }
@@ -52,7 +58,7 @@ pub(crate) struct FilterPredicate {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ColumnFilterKind {
+pub(crate) enum ColumnFilterKind {
     Boolean,
     Number,
     Text,
@@ -139,7 +145,19 @@ pub(crate) fn build_filter_predicate_with_names(
             }
             DataFilterOperator::TextContains => {
                 parameters.push(Value::Text(filter.values[0].clone()));
-                format!("contains(CAST({identifier} AS VARCHAR), ?)")
+                text_predicate("contains", &identifier, filter.match_case, false)
+            }
+            DataFilterOperator::NotContains => {
+                parameters.push(Value::Text(filter.values[0].clone()));
+                text_predicate("contains", &identifier, filter.match_case, true)
+            }
+            DataFilterOperator::StartsWith => {
+                parameters.push(Value::Text(filter.values[0].clone()));
+                text_predicate("starts_with", &identifier, filter.match_case, false)
+            }
+            DataFilterOperator::EndsWith => {
+                parameters.push(Value::Text(filter.values[0].clone()));
+                text_predicate("ends_with", &identifier, filter.match_case, false)
             }
             DataFilterOperator::IsNull => format!("{identifier} IS NULL"),
             DataFilterOperator::IsNotNull => format!("{identifier} IS NOT NULL"),
@@ -153,7 +171,7 @@ pub(crate) fn build_filter_predicate_with_names(
     })
 }
 
-fn column_filter_kind(field: &SchemaField) -> ColumnFilterKind {
+pub(crate) fn column_filter_kind(field: &SchemaField) -> ColumnFilterKind {
     if field.physical_type == "GROUP" {
         return ColumnFilterKind::NullOnly;
     }
@@ -206,7 +224,10 @@ fn validate_filter(filter: &DataFilter, kind: ColumnFilterKind) -> Result<(), Fi
         DataFilterOperator::Range => {
             matches!(kind, ColumnFilterKind::Number | ColumnFilterKind::Temporal)
         }
-        DataFilterOperator::TextContains => kind == ColumnFilterKind::Text,
+        DataFilterOperator::TextContains
+        | DataFilterOperator::NotContains
+        | DataFilterOperator::StartsWith
+        | DataFilterOperator::EndsWith => kind == ColumnFilterKind::Text,
         DataFilterOperator::IsNull | DataFilterOperator::IsNotNull => true,
     };
     if !supported {
@@ -220,7 +241,10 @@ fn validate_filter(filter: &DataFilter, kind: ColumnFilterKind) -> Result<(), Fi
         | DataFilterOperator::GreaterThanOrEqual
         | DataFilterOperator::LessThan
         | DataFilterOperator::LessThanOrEqual
-        | DataFilterOperator::TextContains => filter.values.len() == 1,
+        | DataFilterOperator::TextContains
+        | DataFilterOperator::NotContains
+        | DataFilterOperator::StartsWith
+        | DataFilterOperator::EndsWith => filter.values.len() == 1,
         DataFilterOperator::OneOf => (1..=MAX_ONE_OF_VALUES).contains(&filter.values.len()),
         DataFilterOperator::Range => filter.values.len() == 2,
         DataFilterOperator::IsNull | DataFilterOperator::IsNotNull => filter.values.is_empty(),
@@ -231,6 +255,9 @@ fn validate_filter(filter: &DataFilter, kind: ColumnFilterKind) -> Result<(), Fi
             .iter()
             .any(|value| value.len() > MAX_VALUE_BYTES)
     {
+        return Err(FilterBuildError::Invalid);
+    }
+    if filter.match_case && !is_substring_operator(filter.operator) {
         return Err(FilterBuildError::Invalid);
     }
     if kind != ColumnFilterKind::Text && filter.values.iter().any(|value| value.trim().is_empty()) {
@@ -246,6 +273,29 @@ fn validate_filter(filter: &DataFilter, kind: ColumnFilterKind) -> Result<(), Fi
     }
 
     Ok(())
+}
+
+fn is_substring_operator(operator: DataFilterOperator) -> bool {
+    matches!(
+        operator,
+        DataFilterOperator::TextContains
+            | DataFilterOperator::NotContains
+            | DataFilterOperator::StartsWith
+            | DataFilterOperator::EndsWith
+    )
+}
+
+fn text_predicate(function: &str, identifier: &str, match_case: bool, negate: bool) -> String {
+    let expression = if match_case {
+        format!("{function}(CAST({identifier} AS VARCHAR), ?)")
+    } else {
+        format!("{function}(lower(CAST({identifier} AS VARCHAR)), lower(?))")
+    };
+    if negate {
+        format!("NOT {expression}")
+    } else {
+        expression
+    }
 }
 
 pub(crate) fn quote_identifier(identifier: &str) -> String {
@@ -283,6 +333,7 @@ mod tests {
             column_index: 0,
             operator,
             values: values.iter().map(|value| (*value).to_owned()).collect(),
+            match_case: false,
         }
     }
 
@@ -293,11 +344,13 @@ mod tests {
                 column_index: 0,
                 operator: DataFilterOperator::Range,
                 values: vec!["10".to_owned(), "20".to_owned()],
+                match_case: false,
             },
             DataFilter {
                 column_index: 1,
                 operator: DataFilterOperator::TextContains,
                 values: vec!["quiet".to_owned()],
+                match_case: false,
             },
         ];
 
@@ -312,7 +365,7 @@ mod tests {
 
         assert_eq!(
             predicate.sql,
-            "\"value\"\"quoted\" BETWEEN cast_to_type(?, \"value\"\"quoted\") AND cast_to_type(?, \"value\"\"quoted\") AND contains(CAST(\"label\" AS VARCHAR), ?)"
+            "\"value\"\"quoted\" BETWEEN cast_to_type(?, \"value\"\"quoted\") AND cast_to_type(?, \"value\"\"quoted\") AND contains(lower(CAST(\"label\" AS VARCHAR)), lower(?))"
         );
         assert_eq!(
             predicate.parameters,
@@ -330,6 +383,7 @@ mod tests {
             column_index: 0,
             operator: DataFilterOperator::Range,
             values: vec!["a".to_owned(), "z".to_owned()],
+            match_case: false,
         };
 
         assert!(
@@ -359,6 +413,7 @@ mod tests {
                     column_index: 0,
                     operator,
                     values: vec!["1".to_owned()],
+                    match_case: false,
                 };
                 let result = build_filter_predicate(&[field("value", kind)], &[filter]);
 
@@ -390,6 +445,7 @@ mod tests {
                         column_index: 0,
                         operator,
                         values,
+                        match_case: false,
                     };
                     assert!(build_filter_predicate(&[field("value", kind)], &[filter]).is_err());
                 }
@@ -408,6 +464,9 @@ mod tests {
             text_filter(DataFilterOperator::NotEquals, &["alpha"]),
             text_filter(DataFilterOperator::OneOf, &["alpha", "beta"]),
             text_filter(DataFilterOperator::TextContains, &["pha"]),
+            text_filter(DataFilterOperator::NotContains, &["pha"]),
+            text_filter(DataFilterOperator::StartsWith, &["alpha"]),
+            text_filter(DataFilterOperator::EndsWith, &["alpha"]),
         ];
 
         for column in columns {
@@ -497,6 +556,7 @@ mod tests {
                 column_index: 0,
                 operator: DataFilterOperator::IsNotNull,
                 values: Vec::new(),
+                match_case: false,
             })
             .collect::<Vec<_>>();
         assert_eq!(
@@ -508,6 +568,7 @@ mod tests {
             column_index: 0,
             operator: DataFilterOperator::OneOf,
             values: vec!["1".to_owned(); MAX_ONE_OF_VALUES + 1],
+            match_case: false,
         };
         assert_eq!(
             build_filter_predicate(&[column], &[one_of]).err(),
@@ -522,6 +583,7 @@ mod tests {
             column_index: 0,
             operator: DataFilterOperator::Equals,
             values: vec![value],
+            match_case: false,
         };
 
         assert!(
@@ -537,6 +599,47 @@ mod tests {
                 &[filter_with_value("x".repeat(MAX_VALUE_BYTES + 1))],
             )
             .err(),
+            Some(FilterBuildError::Invalid)
+        );
+    }
+
+    #[test]
+    fn validates_substring_arity_and_match_case_scope() {
+        let column = field("label", ColumnFilterKind::Text);
+        for operator in [
+            DataFilterOperator::TextContains,
+            DataFilterOperator::NotContains,
+            DataFilterOperator::StartsWith,
+            DataFilterOperator::EndsWith,
+        ] {
+            let valid = DataFilter {
+                column_index: 0,
+                operator,
+                values: vec!["value".to_owned()],
+                match_case: true,
+            };
+            assert!(build_filter_predicate(std::slice::from_ref(&column), &[valid]).is_ok());
+
+            let invalid = DataFilter {
+                column_index: 0,
+                operator,
+                values: Vec::new(),
+                match_case: false,
+            };
+            assert_eq!(
+                build_filter_predicate(std::slice::from_ref(&column), &[invalid]).err(),
+                Some(FilterBuildError::Invalid)
+            );
+        }
+
+        let invalid_flag = DataFilter {
+            column_index: 0,
+            operator: DataFilterOperator::Equals,
+            values: vec!["value".to_owned()],
+            match_case: true,
+        };
+        assert_eq!(
+            build_filter_predicate(&[column], &[invalid_flag]).err(),
             Some(FilterBuildError::Invalid)
         );
     }

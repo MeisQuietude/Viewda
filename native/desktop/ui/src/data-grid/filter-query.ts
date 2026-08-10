@@ -202,12 +202,29 @@ export function formatFilterCondition(
     case "range":
       return `${identifier} BETWEEN ${literal(filter.values[0])} AND ${literal(filter.values[1])}`;
     case "textContains":
-      return `contains(CAST(${identifier} AS VARCHAR), ${quoteString(filter.values[0] ?? "")})`;
+      return formatTextCondition("contains", filter, identifier);
+    case "notContains":
+      return `NOT ${formatTextCondition("contains", filter, identifier)}`;
+    case "startsWith":
+      return formatTextCondition("starts_with", filter, identifier);
+    case "endsWith":
+      return formatTextCondition("ends_with", filter, identifier);
     case "isNull":
       return `${identifier} IS NULL`;
     case "isNotNull":
       return `${identifier} IS NOT NULL`;
   }
+}
+
+function formatTextCondition(
+  functionName: string,
+  filter: DataFilter,
+  identifier: string,
+): string {
+  const value = quoteString(filter.values[0] ?? "");
+  return filter.matchCase === true
+    ? `${functionName}(CAST(${identifier} AS VARCHAR), ${value})`
+    : `${functionName}(lower(CAST(${identifier} AS VARCHAR)), lower(${value}))`;
 }
 
 function formatFilterLiteral(

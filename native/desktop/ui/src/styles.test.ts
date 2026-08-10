@@ -93,6 +93,31 @@ describe("query row", () => {
 });
 
 describe("filter editor actions", () => {
+  it("keeps suggestion matches readable in both themes", () => {
+    const lightRoot = styles.match(/:root \{([^}]*)\}/s)?.[1];
+    const darkRoot = styles.match(
+      /:root\[data-theme="dark"\] \{([^}]*)\}/s,
+    )?.[1];
+    expect(lightRoot).toBeDefined();
+    expect(darkRoot).toBeDefined();
+    if (lightRoot === undefined || darkRoot === undefined) {
+      throw new Error("Theme variables are missing.");
+    }
+
+    for (const root of [lightRoot, darkRoot]) {
+      const text = readColorVariable(root, "suggestion-match-text");
+      const background = readColorVariable(root, "suggestion-match");
+      expect(contrastRatio(text, background)).toBeGreaterThanOrEqual(4.5);
+    }
+
+    expect(styles).toMatch(
+      /button mark\s*\{\s*color:\s*var\(--suggestion-match-text\);\s*background:\s*var\(--suggestion-match\);\s*\}/,
+    );
+    expect(styles).toMatch(
+      /button\[data-overflow-start\]\[data-overflow-end\]\s*\{[^}]*-webkit-mask-image:\s*linear-gradient\([^}]*mask-image:\s*linear-gradient\(/s,
+    );
+  });
+
   it("keeps the primary action readable on hover in both themes", () => {
     const lightRoot = styles.match(/:root \{([^}]*)\}/s)?.[1];
     const darkRoot = styles.match(

@@ -8,6 +8,8 @@ mod source;
 #[cfg(feature = "query-engine")]
 mod statistics;
 #[cfg(feature = "query-engine")]
+mod suggestions;
+#[cfg(feature = "query-engine")]
 mod view;
 #[cfg(feature = "query-engine")]
 mod window;
@@ -30,6 +32,10 @@ pub use source::{SchemaField, SourceError, SourceSummary, inspect_local_source};
 #[cfg(feature = "query-engine")]
 pub use statistics::{
     ColumnStatistics, ColumnStatisticsError, ColumnStatisticsReader, StatisticsInterruptHandle,
+};
+#[cfg(feature = "query-engine")]
+pub use suggestions::{
+    TextValueSuggestions, TextValueSuggestionsInterruptHandle, TextValueSuggestionsReader,
 };
 #[cfg(feature = "query-engine")]
 pub use view::{

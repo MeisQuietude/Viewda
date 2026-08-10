@@ -1,6 +1,20 @@
-import { useEffect, useId, useRef, useState } from "react";
+import {
+  useEffect,
+  useId,
+  useLayoutEffect,
+  useRef,
+  useState,
+  type ReactNode,
+} from "react";
 
-import type { DataFilter, DataFilterOperator, SchemaField } from "../desktop";
+import {
+  cancelTextValueSuggestions,
+  getTextValueSuggestions,
+  type DataFilter,
+  type DataFilterOperator,
+  type SchemaField,
+  type TextValueSuggestions,
+} from "../desktop";
 import {
   columnFilterKind,
   temporalFormatForField,
@@ -22,6 +36,10 @@ interface OperatorOption {
   value: DataFilterOperator;
   label: string;
 }
+
+const SUGGESTION_DEBOUNCE_MS = 150;
+const MATCH_CASE_DESCRIPTION =
+  "Match case: match uppercase and lowercase exactly";
 
 const OPERATOR_OPTIONS: Record<ColumnFilterKind, OperatorOption[]> = {
   boolean: [
@@ -47,6 +65,9 @@ const OPERATOR_OPTIONS: Record<ColumnFilterKind, OperatorOption[]> = {
     { value: "notEquals", label: "does not equal" },
     { value: "oneOf", label: "is one of" },
     { value: "textContains", label: "contains" },
+    { value: "notContains", label: "does not contain" },
+    { value: "startsWith", label: "starts with" },
+    { value: "endsWith", label: "ends with" },
     { value: "isNull", label: "is null" },
     { value: "isNotNull", label: "is not null" },
   ],
@@ -77,11 +98,15 @@ export function defaultFilterOperator(
 export function FilterEditor({
   request,
   field,
+  sourceGeneration,
+  nextSuggestionRevision,
   onApply,
   onCancel,
 }: {
   request: FilterEditorRequest;
   field: SchemaField;
+  sourceGeneration: number;
+  nextSuggestionRevision: () => number;
   onApply: (filter: DataFilter) => void;
   onCancel: () => void;
 }) {
@@ -108,6 +133,12 @@ export function FilterEditor({
         : ""),
   );
   const [secondValue, setSecondValue] = useState(initialValues[1] ?? "");
+  const [matchCase, setMatchCase] = useState(
+    request.initialFilter?.matchCase ?? false,
+  );
+  const [textValueTouched, setTextValueTouched] = useState(
+    request.initialFilter !== undefined || request.initialValue !== undefined,
+  );
   const editorRef = useRef<HTMLFormElement>(null);
   const temporalFormat =
     kind === "temporal" ? temporalFormatForField(field) : null;
@@ -121,7 +152,24 @@ export function FilterEditor({
     secondValue,
   );
   const values = valueResult.values;
-  const canApply = values !== null;
+  const suggestions = useTextValueSuggestions({
+    enabled:
+      kind === "text" &&
+      operator !== "oneOf" &&
+      operator !== "isNull" &&
+      operator !== "isNotNull",
+    sourceGeneration,
+    columnIndex: request.sourceIndex,
+    prefix: firstValue,
+    operator,
+    nextSuggestionRevision,
+  });
+  const canApply =
+    values !== null &&
+    (kind !== "text" ||
+      operator === "isNull" ||
+      operator === "isNotNull" ||
+      textValueTouched);
   const validationMessage = filterValidationMessage(
     kind,
     operator,
@@ -159,11 +207,14 @@ export function FilterEditor({
       style={{ left: request.left, top: request.top }}
       onSubmit={(event) => {
         event.preventDefault();
-        if (values !== null) {
+        if (canApply && values !== null) {
           onApply({
             columnIndex: request.sourceIndex,
             operator,
             values,
+            ...(isSubstringOperator(operator) && matchCase
+              ? { matchCase: true }
+              : {}),
           });
         }
       }}
@@ -201,8 +252,17 @@ export function FilterEditor({
         operator={operator}
         firstValue={firstValue}
         secondValue={secondValue}
-        setFirstValue={setFirstValue}
+        setFirstValue={(value) => {
+          setFirstValue(value);
+          if (kind === "text") {
+            setTextValueTouched(true);
+          }
+        }}
         setSecondValue={setSecondValue}
+        matchCase={matchCase}
+        setMatchCase={setMatchCase}
+        suggestions={suggestions.result}
+        suggestionsLoading={suggestions.loading}
       />
       {validationMessage !== null && (
         <p className="filter-editor-error" role="alert">
@@ -232,6 +292,10 @@ function FilterValues({
   secondValue,
   setFirstValue,
   setSecondValue,
+  matchCase,
+  setMatchCase,
+  suggestions,
+  suggestionsLoading,
 }: {
   kind: ColumnFilterKind;
   temporalFormat: TemporalFormat | null;
@@ -241,7 +305,13 @@ function FilterValues({
   secondValue: string;
   setFirstValue: (value: string) => void;
   setSecondValue: (value: string) => void;
+  matchCase: boolean;
+  setMatchCase: (value: boolean) => void;
+  suggestions: TextValueSuggestions | null;
+  suggestionsLoading: boolean;
 }) {
+  const matchCaseTooltipId = useId();
+
   if (operator === "isNull" || operator === "isNotNull") {
     return null;
   }
@@ -290,14 +360,42 @@ function FilterValues({
   }
   return (
     <>
-      <FilterInput
-        label="Value"
-        kind={kind}
-        temporalFormat={temporalFormat}
-        temporalHintId={temporalHintId}
-        value={firstValue}
-        onChange={setFirstValue}
-      />
+      <div
+        className={
+          isSubstringOperator(operator) ? "filter-value-row" : undefined
+        }
+      >
+        <FilterInput
+          label="Value"
+          kind={kind}
+          temporalFormat={temporalFormat}
+          temporalHintId={temporalHintId}
+          value={firstValue}
+          onChange={setFirstValue}
+          suggestions={kind === "text" ? suggestions : undefined}
+          suggestionsLoading={kind === "text" ? suggestionsLoading : undefined}
+          suggestionOperator={kind === "text" ? operator : undefined}
+        />
+        {isSubstringOperator(operator) && (
+          <button
+            type="button"
+            className="match-case-toggle"
+            aria-label="Match case"
+            aria-describedby={matchCaseTooltipId}
+            aria-pressed={matchCase}
+            onClick={() => setMatchCase(!matchCase)}
+          >
+            Aa
+            <span
+              id={matchCaseTooltipId}
+              className="match-case-tooltip"
+              role="tooltip"
+            >
+              {MATCH_CASE_DESCRIPTION}
+            </span>
+          </button>
+        )}
+      </div>
       <TemporalFormatHint id={temporalHintId} format={temporalFormat} />
     </>
   );
@@ -310,6 +408,9 @@ function FilterInput({
   temporalHintId,
   value,
   onChange,
+  suggestions,
+  suggestionsLoading,
+  suggestionOperator,
 }: {
   label: string;
   kind: ColumnFilterKind;
@@ -317,6 +418,9 @@ function FilterInput({
   temporalHintId: string;
   value: string;
   onChange: (value: string) => void;
+  suggestions?: TextValueSuggestions | null;
+  suggestionsLoading?: boolean;
+  suggestionOperator?: DataFilterOperator;
 }) {
   if (kind === "boolean") {
     return (
@@ -332,6 +436,18 @@ function FilterInput({
       </label>
     );
   }
+  if (suggestionOperator !== undefined) {
+    return (
+      <TextSuggestionInput
+        label={label}
+        value={value}
+        suggestions={suggestions ?? null}
+        loading={suggestionsLoading ?? false}
+        operator={suggestionOperator}
+        onChange={onChange}
+      />
+    );
+  }
 
   return (
     <label>
@@ -344,6 +460,292 @@ function FilterInput({
         onChange={(event) => onChange(event.target.value)}
       />
     </label>
+  );
+}
+
+function TextSuggestionInput({
+  label,
+  value,
+  suggestions,
+  loading,
+  operator,
+  onChange,
+}: {
+  label: string;
+  value: string;
+  suggestions: TextValueSuggestions | null;
+  loading: boolean;
+  operator: DataFilterOperator;
+  onChange: (value: string) => void;
+}) {
+  const inputId = useId();
+  const suggestionListId = useId();
+  const inputRef = useRef<HTMLInputElement>(null);
+  const suggestionPopupRef = useRef<HTMLDivElement>(null);
+  const suggestionListRef = useRef<HTMLDivElement>(null);
+  const [suggestionsOpen, setSuggestionsOpen] = useState(false);
+  const [openUpward, setOpenUpward] = useState(false);
+  const [activeSuggestionIndex, setActiveSuggestionIndex] = useState(-1);
+  const visibleSuggestions = (suggestions?.values ?? []).filter((suggestion) =>
+    suggestionMatchesInput(suggestion, value, operator),
+  );
+  const showSuggestions = suggestionsOpen && visibleSuggestions.length > 0;
+  const showSuggestionPanel =
+    suggestionsOpen && (loading || suggestions !== null);
+  const emptyMessage =
+    !loading && suggestions !== null && visibleSuggestions.length === 0
+      ? "No matching values"
+      : null;
+  const limitMessage =
+    !loading && suggestions?.isPartial === true && showSuggestions
+      ? `Showing the first ${suggestions.values.length} matches`
+      : null;
+  const selectedSuggestionIndex =
+    activeSuggestionIndex < visibleSuggestions.length
+      ? activeSuggestionIndex
+      : -1;
+
+  useEffect(() => {
+    setActiveSuggestionIndex(-1);
+  }, [suggestions, value]);
+
+  useLayoutEffect(() => {
+    if (!showSuggestionPanel) {
+      return;
+    }
+    const updatePlacement = () => {
+      const inputBounds = inputRef.current?.getBoundingClientRect();
+      const popupBounds = suggestionPopupRef.current?.getBoundingClientRect();
+      if (inputBounds === undefined || popupBounds === undefined) {
+        return;
+      }
+      setOpenUpward(
+        window.innerHeight - inputBounds.bottom < popupBounds.height + 2,
+      );
+    };
+    updatePlacement();
+    window.addEventListener("resize", updatePlacement);
+    return () => window.removeEventListener("resize", updatePlacement);
+  }, [
+    emptyMessage,
+    limitMessage,
+    loading,
+    showSuggestionPanel,
+    visibleSuggestions.length,
+  ]);
+
+  useLayoutEffect(() => {
+    if (!showSuggestions) {
+      return;
+    }
+    suggestionListRef.current
+      ?.querySelectorAll<HTMLButtonElement>('[role="option"]')
+      .forEach(revealFirstSuggestionMatch);
+  }, [operator, showSuggestions, suggestions, value]);
+
+  const selectSuggestion = (suggestion: string) => {
+    onChange(suggestion);
+    setSuggestionsOpen(false);
+  };
+
+  return (
+    <div className="filter-input">
+      <label htmlFor={inputId}>{label}</label>
+      <div className="filter-input-control">
+        <input
+          ref={inputRef}
+          id={inputId}
+          aria-autocomplete="list"
+          aria-busy={loading}
+          aria-controls={suggestionListId}
+          aria-expanded={showSuggestionPanel}
+          aria-activedescendant={
+            showSuggestions && selectedSuggestionIndex >= 0
+              ? `${suggestionListId}-${selectedSuggestionIndex}`
+              : undefined
+          }
+          role="combobox"
+          type="text"
+          autoCapitalize="none"
+          autoComplete="off"
+          autoCorrect="off"
+          spellCheck={false}
+          value={value}
+          onBlur={() => setSuggestionsOpen(false)}
+          onFocus={() => setSuggestionsOpen(true)}
+          onChange={(event) => {
+            onChange(event.target.value);
+            setSuggestionsOpen(true);
+          }}
+          onKeyDown={(event) => {
+            if (event.key === "Escape" && showSuggestionPanel) {
+              event.preventDefault();
+              event.stopPropagation();
+              setSuggestionsOpen(false);
+              setActiveSuggestionIndex(-1);
+              return;
+            }
+            if (visibleSuggestions.length === 0) {
+              return;
+            }
+            if (event.key === "ArrowDown" || event.key === "ArrowUp") {
+              event.preventDefault();
+              setSuggestionsOpen(true);
+              setActiveSuggestionIndex((current) => {
+                const currentIndex =
+                  current < visibleSuggestions.length ? current : -1;
+                if (event.key === "ArrowDown") {
+                  return (currentIndex + 1) % visibleSuggestions.length;
+                }
+                return currentIndex <= 0
+                  ? visibleSuggestions.length - 1
+                  : currentIndex - 1;
+              });
+            } else if (
+              event.key === "Enter" &&
+              showSuggestions &&
+              selectedSuggestionIndex >= 0
+            ) {
+              event.preventDefault();
+              selectSuggestion(visibleSuggestions[selectedSuggestionIndex]!);
+            }
+          }}
+        />
+        {showSuggestionPanel && (
+          <div
+            ref={suggestionPopupRef}
+            className={`filter-suggestion-popup${openUpward ? " is-upward" : ""}`}
+          >
+            {loading && (
+              <div className="filter-suggestion-loading" role="status">
+                <span>Loading suggestions…</span>
+                <div
+                  className="filter-suggestion-progress"
+                  role="progressbar"
+                  aria-label="Loading suggestions"
+                />
+              </div>
+            )}
+            {emptyMessage !== null && (
+              <div className="filter-suggestion-empty" role="status">
+                {emptyMessage}
+              </div>
+            )}
+            <div
+              ref={suggestionListRef}
+              id={suggestionListId}
+              className="filter-suggestion-list"
+              role="listbox"
+            >
+              {visibleSuggestions.map((suggestion, index) => (
+                <button
+                  key={suggestion}
+                  id={`${suggestionListId}-${index}`}
+                  type="button"
+                  role="option"
+                  aria-selected={index === selectedSuggestionIndex}
+                  onMouseEnter={() => setActiveSuggestionIndex(index)}
+                  onPointerDown={(event) => event.preventDefault()}
+                  onClick={() => selectSuggestion(suggestion)}
+                >
+                  {highlightSuggestion(suggestion, value)}
+                </button>
+              ))}
+            </div>
+            {limitMessage !== null && (
+              <div className="filter-suggestion-limit" role="status">
+                {limitMessage}
+              </div>
+            )}
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function suggestionMatchesInput(
+  suggestion: string,
+  input: string,
+  operator: DataFilterOperator,
+): boolean {
+  const candidate = suggestion.toLowerCase();
+  const query = input.toLowerCase();
+  if (
+    operator === "equals" ||
+    operator === "notEquals" ||
+    operator === "textContains" ||
+    operator === "notContains"
+  ) {
+    return candidate.includes(query);
+  }
+  if (operator === "endsWith") {
+    return candidate.endsWith(query);
+  }
+  return candidate.startsWith(query);
+}
+
+function highlightSuggestion(value: string, input: string): ReactNode {
+  if (input.length === 0) {
+    return value;
+  }
+  const candidate = value.toLowerCase();
+  const query = input.toLowerCase();
+  if (candidate.length !== value.length || query.length === 0) {
+    return value;
+  }
+
+  const parts: ReactNode[] = [];
+  let cursor = 0;
+  let matchIndex = candidate.indexOf(query, cursor);
+  while (matchIndex >= 0) {
+    if (matchIndex > cursor) {
+      parts.push(value.slice(cursor, matchIndex));
+    }
+    const matchEnd = matchIndex + query.length;
+    parts.push(
+      <mark key={`${matchIndex}-${matchEnd}`}>
+        {value.slice(matchIndex, matchEnd)}
+      </mark>,
+    );
+    cursor = matchEnd;
+    matchIndex = candidate.indexOf(query, cursor);
+  }
+  if (parts.length === 0) {
+    return value;
+  }
+  if (cursor < value.length) {
+    parts.push(value.slice(cursor));
+  }
+  return parts;
+}
+
+function revealFirstSuggestionMatch(button: HTMLButtonElement) {
+  const maxScrollLeft = Math.max(0, button.scrollWidth - button.clientWidth);
+  const match = button.querySelector("mark");
+  if (!(match instanceof HTMLElement)) {
+    button.scrollLeft = 0;
+    updateSuggestionOverflow(button, maxScrollLeft);
+    return;
+  }
+  const buttonBounds = button.getBoundingClientRect();
+  const matchBounds = match.getBoundingClientRect();
+  const matchLeft = matchBounds.left - buttonBounds.left + button.scrollLeft;
+  button.scrollLeft = Math.min(
+    maxScrollLeft,
+    Math.max(0, matchLeft - (button.clientWidth - matchBounds.width) / 2),
+  );
+  updateSuggestionOverflow(button, maxScrollLeft);
+}
+
+function updateSuggestionOverflow(
+  button: HTMLButtonElement,
+  maxScrollLeft: number,
+) {
+  button.toggleAttribute("data-overflow-start", button.scrollLeft > 0);
+  button.toggleAttribute(
+    "data-overflow-end",
+    button.scrollLeft < maxScrollLeft,
   );
 }
 
@@ -378,7 +780,7 @@ function filterValueResult(
   if ((kind === "number" || kind === "temporal") && values !== null) {
     values = values.map((value) => value.trim());
   }
-  if (values?.some((value) => value.length === 0)) {
+  if (kind !== "text" && values?.some((value) => value.length === 0)) {
     values = null;
   }
   if (
@@ -403,6 +805,98 @@ function filterValueResult(
     }
   }
   return { values, temporalError: null };
+}
+
+function isSubstringOperator(operator: DataFilterOperator): boolean {
+  return (
+    operator === "textContains" ||
+    operator === "notContains" ||
+    operator === "startsWith" ||
+    operator === "endsWith"
+  );
+}
+
+function useTextValueSuggestions({
+  enabled,
+  sourceGeneration,
+  columnIndex,
+  prefix,
+  operator,
+  nextSuggestionRevision,
+}: {
+  enabled: boolean;
+  sourceGeneration: number;
+  columnIndex: number;
+  prefix: string;
+  operator: DataFilterOperator;
+  nextSuggestionRevision: () => number;
+}): { result: TextValueSuggestions | null; loading: boolean } {
+  const [result, setResult] = useState<{
+    result: TextValueSuggestions | null;
+    loading: boolean;
+  }>({ result: null, loading: false });
+  const activeRevisionRef = useRef<number | null>(null);
+
+  useEffect(() => {
+    setResult({ result: null, loading: false });
+  }, [columnIndex, sourceGeneration]);
+
+  useEffect(() => {
+    if (!enabled) {
+      setResult({ result: null, loading: false });
+      activeRevisionRef.current = null;
+      return;
+    }
+
+    setResult((current) => ({ ...current, loading: true }));
+    let revision: number | null = null;
+    let started = false;
+    const timer = window.setTimeout(() => {
+      const currentRevision = nextSuggestionRevision();
+      revision = currentRevision;
+      activeRevisionRef.current = currentRevision;
+      started = true;
+      void getTextValueSuggestions(
+        sourceGeneration,
+        currentRevision,
+        columnIndex,
+        prefix,
+        operator,
+      ).then(
+        (suggestions) => {
+          if (activeRevisionRef.current === currentRevision) {
+            setResult({ result: suggestions, loading: false });
+          }
+        },
+        () => {
+          if (activeRevisionRef.current === currentRevision) {
+            setResult({ result: null, loading: false });
+          }
+        },
+      );
+    }, SUGGESTION_DEBOUNCE_MS);
+
+    return () => {
+      window.clearTimeout(timer);
+      if (revision !== null && activeRevisionRef.current === revision) {
+        activeRevisionRef.current = null;
+      }
+      if (started && revision !== null) {
+        void cancelTextValueSuggestions(sourceGeneration, revision).catch(
+          () => undefined,
+        );
+      }
+    };
+  }, [
+    columnIndex,
+    enabled,
+    nextSuggestionRevision,
+    operator,
+    prefix,
+    sourceGeneration,
+  ]);
+
+  return result;
 }
 
 function filterValidationMessage(
