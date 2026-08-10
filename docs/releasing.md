@@ -26,6 +26,27 @@ draft release. Smoke-test its assets on physical target machines before
 publishing it. Publishing refreshes the Stable and Latest update channels on
 GitHub Pages.
 
+## Prereleases
+
+Alpha and beta versions ship through the same steps with a prerelease
+version such as `1.2.3-beta.1`. Keep the GitHub Release marked as a
+pre-release: the Latest update channel serves it, Stable ignores it. A
+version enters beta when its scope is complete; from then on it takes
+fixes and polish only.
+
+Release notes follow the reader:
+
+- A prerelease section in `CHANGELOG.md` describes the delta from the
+  previous release, prerelease or not. Its readers follow the Latest
+  channel and already have everything older.
+- When the stable version ships, fold its prerelease sections into the
+  stable section: one delta from the previous stable release, with
+  intermediate states collapsed — an entry added in one prerelease and
+  fixed in another appears once, finished. The step-by-step history
+  stays frozen in each prerelease's GitHub Release notes.
+- The first stable release has nothing earlier to diff against: its
+  notes describe everything the app does, written for a first install.
+
 ## What CI produces
 
 CI verifies native Linux x64 AppImage and Debian packages, macOS Apple silicon
