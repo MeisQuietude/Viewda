@@ -8,6 +8,8 @@ Backward-incompatible entries start with **Breaking:**.
 
 ## Unreleased
 
+## 0.1.0-alpha.3 — 2026-08-11
+
 ### Added
 
 - The Data view now exports the current filtered and sorted view or a grid
