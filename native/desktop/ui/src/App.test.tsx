@@ -598,7 +598,10 @@ describe("App", () => {
     });
     const install = vi
       .spyOn(desktop, "installPendingUpdate")
-      .mockReturnValue(new Promise<boolean>(() => {}));
+      .mockImplementation((onProgress) => {
+        onProgress({ percent: 37 });
+        return new Promise<boolean>(() => {});
+      });
 
     render(<App />);
 
@@ -611,7 +614,60 @@ describe("App", () => {
     fireEvent.click(indicator);
 
     expect(install).toHaveBeenCalledOnce();
-    expect(screen.getByRole("button", { name: "updating…" })).toBeDisabled();
+    expect(screen.getByRole("status")).toHaveTextContent("updating…");
+    expect(
+      screen.getByRole("progressbar", { name: "Downloading update" }),
+    ).toHaveAttribute("aria-valuenow", "37");
+  });
+
+  it("shows indeterminate progress when the update size is unknown", async () => {
+    vi.spyOn(desktop, "checkForUpdate").mockResolvedValue({
+      version: "0.1.0",
+      currentVersion: "0.0.1",
+      isDowngrade: false,
+    });
+    vi.spyOn(desktop, "installPendingUpdate").mockReturnValue(
+      new Promise<boolean>(() => {}),
+    );
+
+    render(<App />);
+
+    fireEvent.click(
+      await screen.findByRole("button", { name: "update to 0.1.0" }),
+    );
+
+    const progress = screen.getByRole("progressbar", {
+      name: "Downloading update",
+    });
+    expect(progress).toHaveClass("is-indeterminate");
+    expect(progress).not.toHaveAttribute("aria-valuenow");
+  });
+
+  it("keeps a failed update actionable for retry", async () => {
+    vi.spyOn(desktop, "checkForUpdate").mockResolvedValue({
+      version: "0.1.0",
+      currentVersion: "0.0.1",
+      isDowngrade: false,
+    });
+    const install = vi
+      .spyOn(desktop, "installPendingUpdate")
+      .mockRejectedValueOnce(new Error("download failed"))
+      .mockReturnValue(new Promise<boolean>(() => {}));
+
+    render(<App />);
+
+    fireEvent.click(
+      await screen.findByRole("button", { name: "update to 0.1.0" }),
+    );
+
+    const retry = await screen.findByRole("button", {
+      name: "update to 0.1.0",
+    });
+    expect(retry).toBeEnabled();
+    fireEvent.click(retry);
+
+    expect(install).toHaveBeenCalledTimes(2);
+    expect(screen.getByRole("status")).toHaveTextContent("updating…");
   });
 
   it("keeps an available update when the export cancellation is declined", async () => {
@@ -876,7 +932,7 @@ describe("App", () => {
     expect(screen.queryByRole("status")).not.toBeInTheDocument();
   });
 
-  it("opens the Rust-owned releases list and dismisses post-update status on click", async () => {
+  it("opens the Rust-owned releases list and explicitly dismisses post-update status", async () => {
     vi.useFakeTimers();
     vi.spyOn(desktop, "takePostUpdateState").mockResolvedValue({
       version: "0.1.0-alpha.2",
@@ -892,7 +948,9 @@ describe("App", () => {
     expect(openPage.mock.calls).toEqual([[]]);
     expect(status).toBeInTheDocument();
 
-    fireEvent.click(status);
+    fireEvent.click(
+      screen.getByRole("button", { name: "Dismiss update status" }),
+    );
     expect(status).toHaveClass("is-dismissing");
     act(() => vi.advanceTimersByTime(200));
     expect(screen.queryByRole("status")).not.toBeInTheDocument();
@@ -923,11 +981,16 @@ describe("App", () => {
     vi.useFakeTimers();
     fireEvent.click(indicator);
     expect(install).not.toHaveBeenCalled();
-    expect(
-      screen.getByRole("button", { name: /updating… simulated/i }),
-    ).toBeDisabled();
+    expect(screen.getByRole("status")).toHaveTextContent("updating…simulated");
+    const progress = screen.getByRole("progressbar", {
+      name: "Downloading update",
+    });
+    expect(progress).toHaveAttribute("aria-valuenow", "0");
 
-    act(() => vi.advanceTimersByTime(800));
+    act(() => vi.advanceTimersByTime(160));
+    expect(progress).toHaveAttribute("aria-valuenow", "25");
+
+    act(() => vi.advanceTimersByTime(640));
     expect(screen.getByRole("status")).toHaveTextContent(
       "updated to 99.99.99 · what's new simulated",
     );
@@ -958,13 +1021,19 @@ describe("App", () => {
   it("installs a stable downgrade only after the user chooses it", async () => {
     const install = vi
       .spyOn(desktop, "installPendingUpdate")
-      .mockReturnValue(new Promise<boolean>(() => {}));
+      .mockImplementation((onProgress) => {
+        onProgress({ percent: 63 });
+        return new Promise<boolean>(() => {});
+      });
 
     await openStableDowngrade();
     fireEvent.click(screen.getByRole("button", { name: "Downgrade to 0.1.0" }));
 
     expect(install).toHaveBeenCalledOnce();
     expect(screen.getByRole("button", { name: "Updating…" })).toBeDisabled();
+    expect(
+      screen.getByRole("progressbar", { name: "Downloading update" }),
+    ).toHaveAttribute("aria-valuenow", "63");
   });
 
   it("explains why a Debian package cannot update itself", async () => {

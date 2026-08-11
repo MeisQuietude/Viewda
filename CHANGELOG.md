@@ -8,6 +8,12 @@ Backward-incompatible entries start with **Breaking:**.
 
 ## Unreleased
 
+### Fixed
+
+- In-app updates now show download progress, including stable downgrades, remain
+  retryable after install failures, keep titlebar status vertically centered,
+  and provide an explicit dismiss button after restarting.
+
 ## 0.1.0-alpha.3 — 2026-08-11
 
 ### Added

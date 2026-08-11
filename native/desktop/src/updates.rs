@@ -10,7 +10,7 @@ use std::{
 
 use semver::Version;
 use serde::{Deserialize, Serialize};
-use tauri::{AppHandle, Manager, State};
+use tauri::{AppHandle, Manager, State, ipc::Channel};
 use tauri_plugin_updater::{Update, UpdaterExt};
 use thiserror::Error;
 use viewda_data_engine::SourceError;
@@ -68,6 +68,13 @@ pub struct PostUpdateState {
     pub source_error: Option<SourceError>,
 }
 
+/// Download progress reported while installing a checked update.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct UpdateProgress {
+    pub percent: u8,
+}
+
 /// Stable update failures exposed to the desktop UI.
 #[derive(Debug, Clone, Copy, Error, Serialize)]
 #[serde(tag = "code", rename_all = "camelCase")]
@@ -116,6 +123,42 @@ pub struct PendingUpdate(Mutex<Option<Update>>);
 /// throttle timestamps, and restart markers as independent fields.
 #[derive(Default)]
 pub struct UpdateStateStore(Mutex<()>);
+
+#[derive(Default)]
+struct UpdateProgressTracker {
+    downloaded_bytes: u64,
+    last_percent: Option<u8>,
+}
+
+impl UpdateProgressTracker {
+    fn record_chunk(
+        &mut self,
+        chunk_length: usize,
+        content_length: Option<u64>,
+    ) -> Option<UpdateProgress> {
+        self.downloaded_bytes = self.downloaded_bytes.saturating_add(chunk_length as u64);
+        let content_length = content_length.filter(|length| *length > 0)?;
+        let percent = self
+            .downloaded_bytes
+            .saturating_mul(100)
+            .checked_div(content_length)
+            .unwrap_or_default()
+            .min(100) as u8;
+        self.report(percent)
+    }
+
+    fn finish(&mut self) -> Option<UpdateProgress> {
+        self.report(100)
+    }
+
+    fn report(&mut self, percent: u8) -> Option<UpdateProgress> {
+        if self.last_percent == Some(percent) {
+            return None;
+        }
+        self.last_percent = Some(percent);
+        Some(UpdateProgress { percent })
+    }
+}
 
 impl UpdateStateStore {
     fn read(&self, app: &AppHandle) -> Result<StoredUpdateState, UpdateError> {
@@ -291,6 +334,7 @@ pub(crate) async fn install_pending_update(
     pending: State<'_, PendingUpdate>,
     store: State<'_, UpdateStateStore>,
     opened_source: State<'_, OpenedSource>,
+    on_progress: Channel<UpdateProgress>,
 ) -> Result<(), UpdateError> {
     require_self_updating_package()?;
     let update = pending
@@ -308,7 +352,33 @@ pub(crate) async fn install_pending_update(
     };
     store.mutate(&app, |stored| stored.pending_restart = Some(restart))?;
 
-    if update.download_and_install(|_, _| {}, || {}).await.is_err() {
+    let progress = Mutex::new(UpdateProgressTracker::default());
+    let chunk_progress = on_progress.clone();
+    if update
+        .download_and_install(
+            |chunk_length, content_length| {
+                if let Some(progress) = progress
+                    .lock()
+                    .ok()
+                    .and_then(|mut tracker| tracker.record_chunk(chunk_length, content_length))
+                {
+                    let _ = chunk_progress.send(progress);
+                }
+            },
+            || {
+                if let Some(progress) = progress
+                    .lock()
+                    .ok()
+                    .and_then(|mut tracker| tracker.finish())
+                {
+                    let _ = on_progress.send(progress);
+                }
+            },
+        )
+        .await
+        .is_err()
+    {
+        *pending.0.lock().map_err(|_| UpdateError::Unavailable)? = Some(update);
         store.mutate(&app, |stored| stored.pending_restart = None)?;
         return Err(UpdateError::Unavailable);
     }
@@ -487,6 +557,40 @@ mod tests {
             now
         ));
         assert!(automatic_check_is_due(Some(now + 1), now));
+    }
+
+    #[test]
+    fn download_progress_reports_changed_percentages_and_completion() {
+        let mut progress = UpdateProgressTracker::default();
+
+        assert_eq!(
+            progress.record_chunk(1, Some(400)),
+            Some(UpdateProgress { percent: 0 })
+        );
+        assert_eq!(progress.record_chunk(1, Some(400)), None);
+        assert_eq!(
+            progress.record_chunk(198, Some(400)),
+            Some(UpdateProgress { percent: 50 })
+        );
+        assert_eq!(progress.finish(), Some(UpdateProgress { percent: 100 }));
+        assert_eq!(progress.finish(), None);
+    }
+
+    #[test]
+    fn download_progress_stays_indeterminate_without_a_content_length() {
+        let mut progress = UpdateProgressTracker::default();
+
+        assert_eq!(progress.record_chunk(1024, None), None);
+        assert_eq!(progress.finish(), Some(UpdateProgress { percent: 100 }));
+    }
+
+    #[test]
+    fn update_progress_uses_the_frontend_wire_shape() {
+        assert_eq!(
+            serde_json::to_value(UpdateProgress { percent: 42 })
+                .expect("serializable update progress"),
+            serde_json::json!({ "percent": 42 })
+        );
     }
 
     #[test]

@@ -40,7 +40,7 @@ use tauri_plugin_dialog::{DialogExt, MessageDialogKind};
 use theme::{apply_saved_theme, get_theme_preference, set_theme_preference, sync_system_theme};
 use thiserror::Error;
 use updates::{
-    PendingUpdate, UpdateError, UpdateInfo, UpdateStateStore, check_for_update,
+    PendingUpdate, UpdateError, UpdateInfo, UpdateProgress, UpdateStateStore, check_for_update,
     check_for_update_with_state, discard_pending_update, get_update_settings,
     install_pending_update as install_pending_update_without_restart, open_releases_page,
     set_update_settings, take_post_update_state,
@@ -1536,7 +1536,10 @@ fn finish_shutdown(app: &tauri::AppHandle) {
 }
 
 #[tauri::command]
-async fn install_pending_update(app: tauri::AppHandle) -> Result<bool, UpdateError> {
+async fn install_pending_update(
+    app: tauri::AppHandle,
+    on_progress: tauri::ipc::Channel<UpdateProgress>,
+) -> Result<bool, UpdateError> {
     if !confirm_running_export_cancellation(&app, DataExportShutdownAction::RestartForUpdate).await
     {
         return Ok(false);
@@ -1550,6 +1553,7 @@ async fn install_pending_update(app: tauri::AppHandle) -> Result<bool, UpdateErr
         app.state::<PendingUpdate>(),
         app.state::<UpdateStateStore>(),
         app.state::<OpenedSource>(),
+        on_progress,
     )
     .await;
     if let Err(error) = result {

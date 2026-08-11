@@ -1435,14 +1435,14 @@ button {
 
 .update-indicator {
   display: flex;
-  align-self: baseline;
+  align-self: center;
   align-items: center;
   gap: 7px;
   margin-left: auto;
-  line-height: 28px;
+  line-height: 1.2;
 }
 
-.update-indicator:hover:not(:disabled),
+.update-indicator:not(.is-installing):hover,
 .update-link:hover {
   color: var(--update-accent-strong);
   text-decoration-color: var(--update-accent);
@@ -1463,21 +1463,89 @@ button:focus-visible,
   opacity: 1;
 }
 
+.update-indicator .simulated-badge {
+  margin-left: 0;
+}
+
+.update-progress {
+  position: relative;
+  width: 72px;
+  height: 4px;
+  overflow: hidden;
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--update-accent) 18%, transparent);
+}
+
+.update-progress-value {
+  position: absolute;
+  inset: 0;
+  border-radius: inherit;
+  background: var(--update-accent);
+  transform-origin: left;
+  transition: transform 120ms linear;
+}
+
+.update-progress.is-indeterminate .update-progress-value {
+  width: 38%;
+  animation: update-progress-indeterminate 900ms ease-in-out infinite;
+}
+
+.downgrade-progress {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+  margin-top: 16px;
+  color: #777c7c;
+  font-size: 12px;
+}
+
+@keyframes update-progress-indeterminate {
+  from {
+    transform: translateX(-110%);
+  }
+
+  to {
+    transform: translateX(270%);
+  }
+}
+
 .post-update-status {
   display: flex;
-  align-self: baseline;
+  align-self: center;
   align-items: center;
   margin-left: auto;
   color: #777c7c;
   font-size: 12px;
-  line-height: 28px;
-  cursor: pointer;
+  line-height: 1.2;
   opacity: 1;
   transition: opacity 200ms ease;
 }
 
 .post-update-status.is-dismissing {
   opacity: 0;
+}
+
+.update-dismiss {
+  display: inline-flex;
+  width: 20px;
+  height: 20px;
+  align-items: center;
+  justify-content: center;
+  margin-left: 5px;
+  padding: 0;
+  border: 0;
+  border-radius: 50%;
+  color: #777c7c;
+  background: transparent;
+  font-size: 17px;
+  line-height: 1;
+  cursor: pointer;
+}
+
+.update-dismiss:hover {
+  color: var(--update-accent-strong);
+  background: color-mix(in srgb, var(--update-accent) 9%, transparent);
 }
 
 .simulated-badge {
@@ -1492,6 +1560,13 @@ button:focus-visible,
   line-height: 1.2;
   text-decoration: none;
   text-transform: uppercase;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .update-progress.is-indeterminate .update-progress-value {
+    animation: none;
+    transform: translateX(80%);
+  }
 }
 
 .settings-section {
@@ -2098,6 +2173,8 @@ button:focus-visible,
 
 :root[data-theme="dark"] .update-indicator.is-installing,
 :root[data-theme="dark"] .post-update-status,
+:root[data-theme="dark"] .update-dismiss,
+:root[data-theme="dark"] .downgrade-progress,
 :root[data-theme="dark"] .simulated-badge,
 :root[data-theme="dark"] .settings-section .eyebrow,
 :root[data-theme="dark"] .theme-message,
