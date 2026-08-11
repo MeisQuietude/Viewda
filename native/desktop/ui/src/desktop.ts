@@ -3,7 +3,7 @@
 // or a future web build — replace it without touching the rest of the UI.
 // Note what is absent: no dialog API and no paths. File selection lives
 // entirely in Rust, and the UI only ever receives a path-free summary.
-import { invoke } from "@tauri-apps/api/core";
+import { Channel, invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 
@@ -171,6 +171,10 @@ export interface UpdateInfo {
   version: string;
   currentVersion: string;
   isDowngrade: boolean;
+}
+
+export interface UpdateProgress {
+  percent: number;
 }
 
 export interface DataExportCloseDialog {
@@ -350,8 +354,13 @@ export function discardPendingUpdate(): Promise<void> {
   return invokeUpdate("discard_pending_update");
 }
 
-export function installPendingUpdate(): Promise<boolean> {
-  return invokeUpdate("install_pending_update");
+export function installPendingUpdate(
+  onProgress: (progress: UpdateProgress) => void,
+): Promise<boolean> {
+  const onProgressChannel = new Channel<UpdateProgress>(onProgress);
+  return invokeUpdate("install_pending_update", {
+    onProgress: onProgressChannel,
+  });
 }
 
 export function takePostUpdateState(): Promise<PostUpdateState | null> {

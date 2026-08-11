@@ -13,6 +13,7 @@ import {
   getDataWindow,
   getDataViewStatus,
   getTextValueSuggestions,
+  installPendingUpdate,
   prepareDataView,
   revealDataExport,
   setDataViewSettings,
@@ -20,16 +21,42 @@ import {
   takePostUpdateState,
 } from "./desktop";
 
-const { invokeMock } = vi.hoisted(() => ({ invokeMock: vi.fn() }));
+const { channelHandlers, invokeMock } = vi.hoisted(() => ({
+  channelHandlers: [] as Array<(message: unknown) => void>,
+  invokeMock: vi.fn(),
+}));
 
-vi.mock("@tauri-apps/api/core", () => ({ invoke: invokeMock }));
+vi.mock("@tauri-apps/api/core", () => ({
+  Channel: class {
+    constructor(onmessage: (message: unknown) => void) {
+      channelHandlers.push(onmessage);
+    }
+  },
+  invoke: invokeMock,
+}));
 vi.mock("@tauri-apps/api/event", () => ({ listen: vi.fn() }));
 vi.mock("@tauri-apps/api/window", () => ({
   getCurrentWindow: vi.fn(() => ({ show: vi.fn() })),
 }));
 
 describe("desktop seam", () => {
-  beforeEach(() => vi.clearAllMocks());
+  beforeEach(() => {
+    channelHandlers.length = 0;
+    vi.clearAllMocks();
+  });
+
+  it("passes update progress through the install command channel", async () => {
+    invokeMock.mockResolvedValue(true);
+    const onProgress = vi.fn();
+
+    await expect(installPendingUpdate(onProgress)).resolves.toBe(true);
+    channelHandlers[0]?.({ percent: 42 });
+
+    expect(onProgress).toHaveBeenCalledWith({ percent: 42 });
+    expect(invokeMock).toHaveBeenCalledWith("install_pending_update", {
+      onProgress: expect.anything(),
+    });
+  });
 
   it("reads and persists the preparation memory setting", async () => {
     invokeMock

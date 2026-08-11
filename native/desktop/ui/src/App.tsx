@@ -72,7 +72,12 @@ type SourceMode = "data" | "structure";
 
 type TitlebarUpdate =
   | { kind: "available"; version: string; simulated: boolean }
-  | { kind: "installing"; version: string; simulated: boolean }
+  | {
+      kind: "installing";
+      version: string;
+      simulated: boolean;
+      progress: number | null;
+    }
   | {
       kind: "installed";
       version: string;
@@ -81,7 +86,7 @@ type TitlebarUpdate =
     };
 
 const SIMULATED_UPDATE_VERSION = "99.99.99";
-const SIMULATED_INSTALL_DELAY_MS = 800;
+const SIMULATED_INSTALL_STEP_MS = 160;
 const POST_UPDATE_FADE_DELAY_MS = 59_800;
 const POST_UPDATE_REMOVE_DELAY_MS = 60_000;
 const UPDATE_FADE_DURATION_MS = 200;
@@ -127,6 +132,9 @@ export function App({
   >(null);
   const [checkingUpdates, setCheckingUpdates] = useState(false);
   const [installingDowngrade, setInstallingDowngrade] = useState(false);
+  const [downgradeProgress, setDowngradeProgress] = useState<number | null>(
+    null,
+  );
   const [updateMessage, setUpdateMessage] = useState<string | null>(null);
   const simulatedInstallTimer = useRef<number | null>(null);
   const dismissTimer = useRef<number | null>(null);
@@ -502,7 +510,7 @@ export function App({
   useEffect(
     () => () => {
       if (simulatedInstallTimer.current !== null) {
-        window.clearTimeout(simulatedInstallTimer.current);
+        window.clearInterval(simulatedInstallTimer.current);
       }
       if (dismissTimer.current !== null) {
         window.clearTimeout(dismissTimer.current);
@@ -651,24 +659,45 @@ export function App({
       return;
     }
     const available = titlebarUpdate;
-    setTitlebarUpdate({ ...available, kind: "installing" });
+    setTitlebarUpdate({
+      ...available,
+      kind: "installing",
+      progress: available.simulated ? 0 : null,
+    });
     setUpdateMessage(null);
 
     if (available.simulated) {
-      simulatedInstallTimer.current = window.setTimeout(() => {
-        setTitlebarUpdate({
-          kind: "installed",
-          version: available.version,
-          simulated: true,
-          dismissing: false,
-        });
-        simulatedInstallTimer.current = null;
-      }, SIMULATED_INSTALL_DELAY_MS);
+      let progress = 0;
+      simulatedInstallTimer.current = window.setInterval(() => {
+        if (progress === 100) {
+          setTitlebarUpdate({
+            kind: "installed",
+            version: available.version,
+            simulated: true,
+            dismissing: false,
+          });
+          if (simulatedInstallTimer.current !== null) {
+            window.clearInterval(simulatedInstallTimer.current);
+            simulatedInstallTimer.current = null;
+          }
+          return;
+        }
+        progress += 25;
+        setTitlebarUpdate((current) =>
+          current?.kind === "installing" ? { ...current, progress } : current,
+        );
+      }, SIMULATED_INSTALL_STEP_MS);
       return;
     }
 
     try {
-      const restarting = await installPendingUpdate();
+      const restarting = await installPendingUpdate(({ percent }) => {
+        setTitlebarUpdate((current) =>
+          current?.kind === "installing"
+            ? { ...current, progress: percent }
+            : current,
+        );
+      });
       if (!restarting) {
         setTitlebarUpdate(available);
       }
@@ -680,14 +709,19 @@ export function App({
 
   const installDowngrade = useCallback(async () => {
     setInstallingDowngrade(true);
+    setDowngradeProgress(null);
     setUpdateMessage(null);
     try {
-      const restarting = await installPendingUpdate();
+      const restarting = await installPendingUpdate(({ percent }) => {
+        setDowngradeProgress(percent);
+      });
       if (!restarting) {
         setInstallingDowngrade(false);
+        setDowngradeProgress(null);
       }
     } catch {
       setInstallingDowngrade(false);
+      setDowngradeProgress(null);
       setUpdateMessage("The update could not be installed. Try again.");
     }
   }, []);
@@ -872,6 +906,7 @@ export function App({
         <DowngradeDialog
           update={downgrade}
           installing={installingDowngrade}
+          progress={downgradeProgress}
           onDowngrade={installDowngrade}
           onWait={waitForStable}
         />
@@ -1029,7 +1064,6 @@ function TitlebarUpdateStatus({
       <div
         className={`post-update-status${update.dismissing ? " is-dismissing" : ""}`}
         role="status"
-        onClick={onDismiss}
       >
         <span>updated to {update.version} · </span>
         <button
@@ -1048,19 +1082,36 @@ function TitlebarUpdateStatus({
             <SimulatedBadge />
           </>
         )}
+        <button
+          className="update-dismiss"
+          type="button"
+          aria-label="Dismiss update status"
+          title="Dismiss"
+          onClick={onDismiss}
+        >
+          <span aria-hidden="true">×</span>
+        </button>
       </div>
     );
   }
 
-  const installing = update.kind === "installing";
+  if (update.kind === "installing") {
+    return (
+      <div className="update-indicator is-installing" role="status">
+        <span>updating…</span>
+        {update.simulated && <SimulatedBadge />}
+        <UpdateProgressBar progress={update.progress} />
+      </div>
+    );
+  }
+
   return (
     <button
-      className={`update-indicator${installing ? " is-installing" : ""}`}
+      className="update-indicator"
       type="button"
-      disabled={installing}
       onClick={() => void onActivate()}
     >
-      {installing ? "updating…" : `update to ${update.version}`}
+      update to {update.version}
       {update.simulated && (
         <>
           {" "}
@@ -1338,11 +1389,13 @@ function defaultApplicationDescription(
 function DowngradeDialog({
   update,
   installing,
+  progress,
   onDowngrade,
   onWait,
 }: {
   update: UpdateInfo;
   installing: boolean;
+  progress: number | null;
   onDowngrade: () => Promise<void>;
   onWait: () => Promise<void>;
 }) {
@@ -1357,6 +1410,12 @@ function DowngradeDialog({
         You have {update.currentVersion}. Stable is {update.version}. You can
         downgrade now or keep this version until a newer stable release arrives.
       </p>
+      {installing && (
+        <div className="downgrade-progress" role="status">
+          <span>downloading…</span>
+          <UpdateProgressBar progress={progress} />
+        </div>
+      )}
       <div className="dialog-actions">
         <button
           className="text-button"
@@ -1376,6 +1435,28 @@ function DowngradeDialog({
         </button>
       </div>
     </ModalDialog>
+  );
+}
+
+function UpdateProgressBar({ progress }: { progress: number | null }) {
+  return (
+    <span
+      className={`update-progress${progress === null ? " is-indeterminate" : ""}`}
+      role="progressbar"
+      aria-label="Downloading update"
+      aria-valuemin={0}
+      aria-valuemax={100}
+      aria-valuenow={progress ?? undefined}
+    >
+      <span
+        className="update-progress-value"
+        style={
+          progress === null
+            ? undefined
+            : { transform: `scaleX(${progress / 100})` }
+        }
+      />
+    </span>
   );
 }
 
