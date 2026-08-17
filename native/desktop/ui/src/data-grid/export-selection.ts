@@ -1,10 +1,9 @@
+import type { ExportRowRange } from "../desktop";
 import {
   type CompactSelection,
   type GridSelection,
   type Rectangle,
-} from "@glideapps/glide-data-grid";
-
-import type { ExportRowRange } from "../desktop";
+} from "./grid-model";
 
 export interface ExportSelectionShape {
   columnIndices: number[];
@@ -105,30 +104,11 @@ function compactSelectionRanges(
   selection: CompactSelection,
   upperBound: number,
 ): ExportRowRange[] {
-  const first = selection.first();
-  const last = selection.last();
-  if (first === undefined || last === undefined) {
-    return [];
-  }
-  if (selection.length === last - first + 1) {
-    const start = Math.max(0, Math.min(upperBound, first));
-    const end = Math.max(start, Math.min(upperBound, last + 1));
+  return selection.ranges().flatMap(([rangeStart, rangeEnd]) => {
+    const start = Math.max(0, Math.min(upperBound, rangeStart));
+    const end = Math.max(start, Math.min(upperBound, rangeEnd));
     return start < end ? [{ start, end }] : [];
-  }
-
-  const ranges: ExportRowRange[] = [];
-  for (const index of selection) {
-    if (index < 0 || index >= upperBound) {
-      continue;
-    }
-    const previous = ranges.at(-1);
-    if (previous?.end === index) {
-      previous.end += 1;
-    } else {
-      ranges.push({ start: index, end: index + 1 });
-    }
-  }
-  return ranges;
+  });
 }
 
 function normalizeRanges(ranges: readonly ExportRowRange[]): ExportRowRange[] {

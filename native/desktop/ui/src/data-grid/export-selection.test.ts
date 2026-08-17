@@ -1,10 +1,7 @@
-import {
-  CompactSelection,
-  type GridSelection,
-} from "@glideapps/glide-data-grid";
 import { describe, expect, it } from "vitest";
 
 import { exportSelectionShape } from "./export-selection";
+import { CompactSelection, type GridSelection } from "./grid-model";
 
 describe("exportSelectionShape", () => {
   it("exports the union of multi-rect rows by the union of their columns", () => {
@@ -12,7 +9,7 @@ describe("exportSelectionShape", () => {
       columns: CompactSelection.empty(),
       rows: CompactSelection.empty(),
       current: {
-        cell: [2, 3],
+        cell: { column: 2, row: 3 },
         range: { x: 2, y: 3, width: 3, height: 3 },
         rangeStack: [{ x: 0, y: 1, width: 2, height: 3 }],
       },

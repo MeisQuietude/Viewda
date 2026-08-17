@@ -1,15 +1,12 @@
 import {
-  CompactSelection,
+  CompactSelection as GlideCompactSelection,
   DataEditor,
-  getCopyBufferContents,
-  GridCellKind,
-  type CellArray,
+  GridCellKind as GlideGridCellKind,
   type DataEditorRef,
   type DrawHeaderCallback,
-  type GridCell,
-  type GridColumn,
-  type GridSelection,
-  type Rectangle,
+  type GridCell as GlideGridCell,
+  type GridColumn as GlideGridColumn,
+  type GridSelection as GlideGridSelection,
   type SpriteMap,
   type Theme,
 } from "@glideapps/glide-data-grid";
@@ -51,6 +48,13 @@ import { copyRowLimit } from "./copy-limit";
 import { projectedSourceIndices, projectionContains } from "./column-window";
 import { exportSelectionShape } from "./export-selection";
 import { formatCellValue, usesMonospaceCells } from "./format-cell";
+import {
+  CompactSelection,
+  copyBufferContents,
+  type GridCell,
+  type GridSelection,
+  type Rectangle,
+} from "./grid-model";
 import {
   defaultFilterOperator,
   FilterEditor,
@@ -516,6 +520,10 @@ export function DataGrid({
     () => exportSelectionShape(selection, visibleSourceIndices, gridRowCount),
     [gridRowCount, selection, visibleSourceIndices],
   );
+  const glideSelection = useMemo(
+    () => toGlideSelection(selection),
+    [selection],
+  );
   const whereClause = useMemo(
     () => formatWhereClause(filters, source.schema),
     [filters, source.schema],
@@ -543,7 +551,7 @@ export function DataGrid({
     };
   }, []);
 
-  const columns = useMemo<GridColumn[]>(
+  const columns = useMemo<GlideGridColumn[]>(
     () =>
       visibleColumnStates.map((column) => {
         return {
@@ -587,38 +595,35 @@ export function DataGrid({
         includeRawCopy,
       );
       return {
-        kind: GridCellKind.Text,
-        allowOverlay: false,
-        readonly: true,
-        data: formatted.copyData || formatted.displayData,
+        kind: "text",
         displayData: formatted.displayData,
         copyData: formatted.copyData,
-        contentAlign: formatted.align,
-        style: formatted.faded ? "faded" : "normal",
+        alignment: formatted.align,
+        faded: formatted.faded,
       };
     },
     [visibleColumnStates],
   );
 
   const getCellContent = useCallback(
-    ([column, row]: readonly [number, number]): GridCell => {
+    ([column, row]: readonly [number, number]): GlideGridCell => {
       const current = dataWindowRef.current;
       const sourceIndex = visibleColumnStates[column]?.sourceIndex;
       if (current === null || sourceIndex === undefined) {
-        return loadingCell();
+        return toGlideCell(loadingCell());
       }
       const key =
         (row - current.rowOffset) * source.schema.length + sourceIndex;
       const cached = cellCacheRef.current.get(key);
       if (cached !== undefined) {
-        return cached;
+        return toGlideCell(cached);
       }
       const cell = readCell(current, column, row);
       if (cellCacheRef.current.size >= MAX_CACHED_CELLS) {
         cellCacheRef.current.clear();
       }
       cellCacheRef.current.set(key, cell);
-      return cell;
+      return toGlideCell(cell);
     },
     [readCell, source.schema.length, visibleColumnStates],
   );
@@ -1515,13 +1520,13 @@ export function DataGrid({
           sourceIndex: sampleColumn.sourceIndex,
           displayData: rows.flatMap((row) => {
             const cell = row[0];
-            return cell?.kind === GridCellKind.Text ? [cell.displayData] : [];
+            return cell?.kind === "text" ? [cell.displayData] : [];
           }),
           monospace: sampleMonospace,
         };
       }
 
-      return rows satisfies CellArray;
+      return rows.map((row) => row.map(toGlideCell));
     },
     [
       loadCopyWindow,
@@ -1564,7 +1569,7 @@ export function DataGrid({
       }
       const columnIndices = visibleColumnStates.map((_, index) => index);
       await clipboard.writeText(
-        getCopyBufferContents(cells, columnIndices).textPlain,
+        copyBufferContents(cells, columnIndices).textPlain,
       );
     },
     [
@@ -1598,8 +1603,8 @@ export function DataGrid({
     return () => window.removeEventListener("copy", copyRows, true);
   }, [copyCappedRowSelection, selection, visibleColumnStates.length]);
 
-  const updateSelection = useCallback((next: GridSelection) => {
-    setSelection(next);
+  const updateSelection = useCallback((next: GlideGridSelection) => {
+    setSelection(fromGlideSelection(next));
     setCopyLimit(null);
   }, []);
 
@@ -1632,7 +1637,7 @@ export function DataGrid({
   }, []);
 
   const startColumnResize = useCallback(
-    (_column: GridColumn, _width: number, visibleIndex: number) => {
+    (_column: GlideGridColumn, _width: number, visibleIndex: number) => {
       clearColumnResize();
       columnResizeGestureRef.current = { visibleIndex, moved: false };
       suppressHeaderMenuRef.current = true;
@@ -2340,7 +2345,7 @@ export function DataGrid({
               rangeSelect="multi-rect"
               rowSelect="multi"
               columnSelect="multi"
-              gridSelection={selection}
+              gridSelection={glideSelection}
               onGridSelectionChange={updateSelection}
               getCellContent={getCellContent}
               getCellsForSelection={getCellsForSelection}
@@ -2835,7 +2840,115 @@ function takeCompactSelection(
 }
 
 function loadingCell(): GridCell {
-  return { kind: GridCellKind.Loading, allowOverlay: false };
+  return { kind: "loading" };
+}
+
+function toGlideCell(cell: GridCell): GlideGridCell {
+  if (cell.kind === "loading") {
+    return { kind: GlideGridCellKind.Loading, allowOverlay: false };
+  }
+  return {
+    kind: GlideGridCellKind.Text,
+    allowOverlay: false,
+    readonly: true,
+    data: cell.copyData || cell.displayData,
+    displayData: cell.displayData,
+    copyData: cell.copyData,
+    contentAlign: cell.alignment,
+    style: cell.faded ? "faded" : "normal",
+  };
+}
+
+function fromGlideSelection(selection: GlideGridSelection): GridSelection {
+  return {
+    columns: fromGlideCompactSelection(selection.columns),
+    rows: fromGlideCompactSelection(selection.rows),
+    current:
+      selection.current === undefined
+        ? undefined
+        : {
+            cell: {
+              column: selection.current.cell[0],
+              row: selection.current.cell[1],
+            },
+            range: selection.current.range,
+            rangeStack: [...selection.current.rangeStack],
+          },
+  };
+}
+
+const glideSelectionByLocal = new WeakMap<
+  CompactSelection,
+  GlideCompactSelection
+>();
+const localSelectionByGlide = new WeakMap<
+  GlideCompactSelection,
+  CompactSelection
+>();
+
+function fromGlideCompactSelection(
+  selection: GlideCompactSelection,
+): CompactSelection {
+  const existing = localSelectionByGlide.get(selection);
+  if (existing !== undefined) {
+    return existing;
+  }
+  const first = selection.first();
+  const last = selection.last();
+  if (first === undefined || last === undefined) {
+    const empty = CompactSelection.empty();
+    rememberSelectionConversion(empty, selection);
+    return empty;
+  }
+  if (selection.length === last - first + 1) {
+    const contiguous = CompactSelection.fromSingleSelection([first, last + 1]);
+    rememberSelectionConversion(contiguous, selection);
+    return contiguous;
+  }
+  let result = CompactSelection.empty();
+  for (const index of selection) {
+    result = result.add(index);
+  }
+  rememberSelectionConversion(result, selection);
+  return result;
+}
+
+function toGlideSelection(selection: GridSelection): GlideGridSelection {
+  return {
+    columns: toGlideCompactSelection(selection.columns),
+    rows: toGlideCompactSelection(selection.rows),
+    current:
+      selection.current === undefined
+        ? undefined
+        : {
+            cell: [selection.current.cell.column, selection.current.cell.row],
+            range: selection.current.range,
+            rangeStack: [...selection.current.rangeStack],
+          },
+  };
+}
+
+function toGlideCompactSelection(
+  selection: CompactSelection,
+): GlideCompactSelection {
+  const existing = glideSelectionByLocal.get(selection);
+  if (existing !== undefined) {
+    return existing;
+  }
+  let result = GlideCompactSelection.empty();
+  for (const [start, end] of selection.ranges()) {
+    result = result.add([start, end]);
+  }
+  rememberSelectionConversion(selection, result);
+  return result;
+}
+
+function rememberSelectionConversion(
+  local: CompactSelection,
+  glide: GlideCompactSelection,
+) {
+  glideSelectionByLocal.set(local, glide);
+  localSelectionByGlide.set(glide, local);
 }
 
 function loadedWindowDamage(
