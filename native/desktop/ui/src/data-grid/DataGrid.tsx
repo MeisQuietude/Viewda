@@ -47,6 +47,7 @@ import {
 import { createGridClipboard } from "./grid-clipboard";
 import {
   gridDiagnosticsNoopSink,
+  type GridDataWindowRequestReason,
   type GridDiagnosticsSink,
 } from "./grid-performance-report";
 import { GRID_INITIAL_COLUMNS, GRID_INITIAL_ROWS } from "./grid-layout";
@@ -95,7 +96,21 @@ const SELECT_TOOLTIP_COLUMN_LIMIT = 50;
 const GRID_HEADER_HORIZONTAL_PADDING = 16;
 const GRID_HEADER_ICON_SPACE = 28;
 const GRID_CELL_HORIZONTAL_PADDING = 10;
+// A horizontal fling can expose several projections before it settles. Waiting
+// 120 ms keeps those superseded reads out of DuckDB. Shorten the pause if traces
+// show columns waiting without request churn.
+const PROJECTION_REQUEST_IDLE_MS = 120;
+
+// Missing columns are read for two mounted row spans. That usually covers the
+// next small vertical move without retaining another full Arrow window. Revisit
+// the span when traces show repeated supplements or expensive reads.
+// Both values follow source and memory profiles. Settings can expose named
+// profiles if workloads eventually need different defaults.
+const SUPPLEMENT_WINDOW_MULTIPLIER = 2;
 const DEFAULT_DATA_VIEW_SETTINGS: DataViewSettings = { memoryLimit: "mb384" };
+
+// Detect clipboard support once per webview so copy format stays consistent.
+// There is no user choice here.
 const gridClipboard = createGridClipboard();
 
 function fittedColumnWidth(
@@ -175,7 +190,19 @@ interface VersionedRowRequest {
   revision: number;
   projectionRevision: number;
   sourceIndices: readonly number[];
+  // The row window owns the prefetched rows. The column supplement fills
+  // columns absent from it for the much smaller mounted-row runway.
+  cacheSlot: "rowWindow" | "columnSupplement";
+  reason: GridDataWindowRequestReason;
   traceId: number | null;
+}
+
+interface DesiredRowRequest {
+  rows: RowRequest;
+  supplementRows: RowRequest;
+  revision: number;
+  projectionRevision: number;
+  sourceIndices: readonly number[];
 }
 
 interface ActiveView {
@@ -201,6 +228,7 @@ function requestSatisfiesWindow(
   requested: VersionedRowRequest,
 ): boolean {
   return (
+    candidate.cacheSlot === requested.cacheSlot &&
     candidate.revision === requested.revision &&
     candidate.projectionRevision === requested.projectionRevision &&
     requestSatisfiesRequest(candidate.rows, requested.rows) &&
@@ -208,16 +236,119 @@ function requestSatisfiesWindow(
   );
 }
 
-function requestContainsVisibleWindow(
+function requestCoversDesiredVisible(
   candidate: VersionedRowRequest,
-  requested: VersionedRowRequest,
+  desired: DesiredRowRequest | null,
+  base: ArrowDataWindow | null,
 ): boolean {
+  if (
+    desired === null ||
+    candidate.revision !== desired.revision ||
+    candidate.projectionRevision !== desired.projectionRevision
+  ) {
+    return false;
+  }
+  if (candidate.cacheSlot === "rowWindow") {
+    return (
+      requestContainsVisibleRows(candidate.rows, desired.rows) &&
+      projectionContains(candidate.sourceIndices, desired.sourceIndices)
+    );
+  }
   return (
-    candidate.revision === requested.revision &&
-    candidate.projectionRevision === requested.projectionRevision &&
-    requestContainsVisibleRows(candidate.rows, requested.rows) &&
-    projectionContains(candidate.sourceIndices, requested.sourceIndices)
+    base !== null &&
+    windowSatisfiesRequest(base.rowOffset, base.rowCount, desired.rows) &&
+    !projectionContains(base.sourceIndices, desired.sourceIndices) &&
+    candidate.rows.offset >= base.rowOffset &&
+    candidate.rows.offset + candidate.rows.count <=
+      base.rowOffset + base.rowCount &&
+    requestSatisfiesRequest(candidate.rows, desired.supplementRows) &&
+    projectionContains(
+      [...base.sourceIndices, ...candidate.sourceIndices],
+      desired.sourceIndices,
+    )
   );
+}
+
+function requestFullySatisfiesDesired(
+  candidate: VersionedRowRequest,
+  desired: DesiredRowRequest | null,
+  base: ArrowDataWindow | null,
+): boolean {
+  if (candidate.cacheSlot === "columnSupplement") {
+    return requestCoversDesiredVisible(candidate, desired, base);
+  }
+  return (
+    desired !== null &&
+    candidate.revision === desired.revision &&
+    candidate.projectionRevision === desired.projectionRevision &&
+    requestSatisfiesRequest(candidate.rows, desired.rows) &&
+    projectionContains(candidate.sourceIndices, desired.sourceIndices)
+  );
+}
+
+function windowsSatisfyDesired(
+  base: ArrowDataWindow | null,
+  supplement: ArrowDataWindow | null,
+  desired: DesiredRowRequest,
+): boolean {
+  if (
+    base === null ||
+    !windowSatisfiesRequest(base.rowOffset, base.rowCount, desired.rows)
+  ) {
+    return false;
+  }
+  if (projectionContains(base.sourceIndices, desired.sourceIndices)) {
+    return true;
+  }
+  return (
+    supplement !== null &&
+    windowSatisfiesRequest(
+      supplement.rowOffset,
+      supplement.rowCount,
+      desired.supplementRows,
+    ) &&
+    projectionContains(
+      [...base.sourceIndices, ...supplement.sourceIndices],
+      desired.sourceIndices,
+    )
+  );
+}
+
+function supplementRowRequest(
+  base: ArrowDataWindow,
+  mountedStart: number,
+  mountedCount: number,
+  visibleStart: number,
+  visibleEnd: number,
+): RowRequest {
+  const baseEnd = base.rowOffset + base.rowCount;
+  const requiredStart = Math.max(base.rowOffset, mountedStart);
+  const requiredEnd = Math.max(
+    requiredStart,
+    Math.min(baseEnd, mountedStart + mountedCount),
+  );
+  const requiredCount = requiredEnd - requiredStart;
+  const count = Math.min(
+    base.rowCount,
+    Math.max(requiredCount, requiredCount * SUPPLEMENT_WINDOW_MULTIPLIER),
+  );
+  const preferredOffset =
+    requiredStart - Math.floor((count - requiredCount) / 2);
+  const offset = Math.max(
+    base.rowOffset,
+    Math.min(baseEnd - count, preferredOffset),
+  );
+  return {
+    offset,
+    count,
+    visibleStart,
+    visibleEnd,
+    // The offset/count include a small data runway, but only the actual DOM
+    // rows are required. This avoids a native read on each one-row mount shift
+    // without making diagnostics report a larger rendered window.
+    requiredStart,
+    requiredEnd,
+  };
 }
 
 function viewDefinitionEquals(
@@ -391,12 +522,19 @@ export function DataGrid({
   const gridRef = useRef<ViewdaGridHandle>(null);
   const schemaFocusColumnRef = useRef<number | null>(null);
   const visibleColumnStatesRef = useRef<readonly ColumnState[]>([]);
-  const dataWindowRef = useRef<ArrowDataWindow | null>(null);
+  // The display cache holds one row window and one column supplement. The row
+  // window owns the prefetch range. The supplement holds columns missing from
+  // that window for the mounted rows. Leaving the prefetched range replaces both.
+  // This reuses shared columns while keeping Arrow memory bounded for wide values.
+  const baseWindowRef = useRef<ArrowDataWindow | null>(null);
+  const supplementWindowRef = useRef<ArrowDataWindow | null>(null);
   const visibleViewportRef = useRef<GridViewport | null>(null);
   const copyTailRef = useRef<Promise<void>>(Promise.resolve());
   const copyWindowsRef = useRef(new Map<string, Promise<ArrowDataWindow>>());
   const copyAbortRef = useRef<AbortController | null>(null);
   const pendingRequestRef = useRef<VersionedRowRequest | null>(null);
+  const deferredProjectionRef = useRef<VersionedRowRequest | null>(null);
+  const projectionTimerRef = useRef<number | null>(null);
   const activeRequestRef = useRef<VersionedRowRequest | null>(null);
   const failedRequestRef = useRef<VersionedRowRequest | null>(null);
   const activeViewRef = useRef(activeView);
@@ -405,6 +543,8 @@ export function DataGrid({
   const nextSuggestionRevisionRef = useRef(0);
   const projectionRevisionRef = useRef(0);
   const previousProjectionRef = useRef<readonly number[] | null>(null);
+  const requestedProjectionRef = useRef<readonly number[]>([]);
+  const desiredRequestRef = useRef<DesiredRowRequest | null>(null);
   const scrollStateRef = useRef<ScrollState>({ direction: 0, boundary: 0 });
   const aliveRef = useRef(true);
   const exportStatusFailuresRef = useRef(0);
@@ -555,13 +695,57 @@ export function DataGrid({
 
   const getCellContent = useCallback(
     ({ column, row }: GridAddress): GridCell => {
-      const current = dataWindowRef.current;
-      if (current === null) {
-        return loadingCell();
+      const sourceIndex = visibleColumnStatesRef.current[column]?.sourceIndex;
+      const supplement = supplementWindowRef.current;
+      if (
+        sourceIndex !== undefined &&
+        supplement !== null &&
+        windowContainsRow(supplement, row) &&
+        supplement.sourceColumnOffsets.has(sourceIndex)
+      ) {
+        return readCell(supplement, column, row);
       }
-      return readCell(current, column, row);
+      const base = baseWindowRef.current;
+      return base === null ? loadingCell() : readCell(base, column, row);
     },
     [readCell],
+  );
+
+  const queueRequestTrace = useCallback(
+    (request: VersionedRowRequest) => {
+      if (!diagnostics.isEnabled()) return null;
+      const view = activeViewRef.current;
+      return diagnostics.queueRequest({
+        reason: request.reason,
+        rowOffset: request.rows.offset,
+        rowCount: request.rows.count,
+        projectionCount: request.sourceIndices.length,
+        projectionKey: projectionFingerprint(request.sourceIndices),
+        filtered: view.filters.length > 0,
+        sorted: view.sort.length > 0,
+      });
+    },
+    [diagnostics],
+  );
+
+  const clearDeferredProjection = useCallback(
+    (
+      reason:
+        | "supersededBeforeStart"
+        | "invalidatedBeforeStart"
+        | "satisfiedByCompletedWindow" = "supersededBeforeStart",
+    ) => {
+      if (projectionTimerRef.current !== null) {
+        window.clearTimeout(projectionTimerRef.current);
+        projectionTimerRef.current = null;
+      }
+      diagnostics.disposeRequest(
+        deferredProjectionRef.current?.traceId ?? null,
+        reason,
+      );
+      deferredProjectionRef.current = null;
+    },
+    [diagnostics],
   );
 
   const promoteView = useCallback(
@@ -587,8 +771,11 @@ export function DataGrid({
         "invalidatedBeforeStart",
       );
       pendingRequestRef.current = null;
+      clearDeferredProjection("invalidatedBeforeStart");
       failedRequestRef.current = null;
-      dataWindowRef.current = null;
+      desiredRequestRef.current = null;
+      baseWindowRef.current = null;
+      supplementWindowRef.current = null;
       copyWindowsRef.current.clear();
       copyAbortRef.current?.abort();
       setSelection(emptySelection());
@@ -597,7 +784,7 @@ export function DataGrid({
       setGridMenu(null);
       setContentRevision((current) => current + 1);
     },
-    [diagnostics],
+    [clearDeferredProjection, diagnostics],
   );
 
   const drainRequests = useCallback(async () => {
@@ -625,11 +812,33 @@ export function DataGrid({
           request.rows.offset,
           request.sourceIndices,
         );
+        const desired = desiredRequestRef.current;
+        const base = baseWindowRef.current;
         if (
           !aliveRef.current ||
           request.revision !== activeViewRef.current.revision ||
-          request.projectionRevision !== projectionRevisionRef.current
+          request.projectionRevision !== projectionRevisionRef.current ||
+          !requestCoversDesiredVisible(request, desired, base)
         ) {
+          staleRequest = true;
+          continue;
+        }
+        const fullySatisfiesDesired = requestFullySatisfiesDesired(
+          request,
+          desired,
+          base,
+        );
+        const queuedSuccessor =
+          (pendingRequestRef.current as VersionedRowRequest | null) ??
+          deferredProjectionRef.current;
+        if (
+          !fullySatisfiesDesired &&
+          request.cacheSlot === "rowWindow" &&
+          queuedSuccessor?.cacheSlot === "columnSupplement"
+        ) {
+          // The supplement was planned against the existing base, which still
+          // owns the full row runway. Replacing it with a visible-only base
+          // would invalidate the queued request and lose both prefetch paths.
           staleRequest = true;
           continue;
         }
@@ -643,33 +852,39 @@ export function DataGrid({
           });
           return next.size === current.size ? current : next;
         });
-        const pending = pendingRequestRef.current as VersionedRowRequest | null;
-        if (pending !== null && requestSatisfiesWindow(request, pending)) {
-          diagnostics.disposeRequest(
-            pending.traceId,
-            "satisfiedByCompletedWindow",
-          );
-          pendingRequestRef.current = null;
+        if (fullySatisfiesDesired) {
+          const pending =
+            pendingRequestRef.current as VersionedRowRequest | null;
+          if (pending !== null) {
+            diagnostics.disposeRequest(
+              pending.traceId,
+              "satisfiedByCompletedWindow",
+            );
+            pendingRequestRef.current = null;
+          }
+          clearDeferredProjection("satisfiedByCompletedWindow");
         }
-        const latest = pendingRequestRef.current as VersionedRowRequest | null;
-        if (
-          latest === null ||
-          latest.revision !== request.revision ||
-          requestContainsVisibleWindow(request, latest)
-        ) {
-          dataWindowRef.current = decoded;
-          failedRequestRef.current = null;
-          setContentRevision((current) => current + 1);
-          setLoadError(null);
+        if (request.cacheSlot === "rowWindow") {
+          baseWindowRef.current = decoded;
+          supplementWindowRef.current = null;
         } else {
-          staleRequest = true;
+          supplementWindowRef.current = decoded;
         }
+        failedRequestRef.current = null;
+        setContentRevision((current) => current + 1);
+        setLoadError(null);
       } catch (error) {
         requestOutcome = "failed";
-        if (
-          !aliveRef.current ||
-          request.projectionRevision !== projectionRevisionRef.current
-        ) {
+        const requestIsCurrent =
+          aliveRef.current &&
+          request.revision === activeViewRef.current.revision &&
+          request.projectionRevision === projectionRevisionRef.current &&
+          requestCoversDesiredVisible(
+            request,
+            desiredRequestRef.current,
+            baseWindowRef.current,
+          );
+        if (!requestIsCurrent) {
           staleRequest = true;
         } else if (
           error instanceof DataWindowCommandError &&
@@ -678,36 +893,72 @@ export function DataGrid({
           staleRequest = true;
           try {
             const status = await getDataViewStatus(source.generation);
+            const stillCurrent =
+              aliveRef.current &&
+              request.revision === activeViewRef.current.revision &&
+              request.projectionRevision === projectionRevisionRef.current &&
+              requestCoversDesiredVisible(
+                request,
+                desiredRequestRef.current,
+                baseWindowRef.current,
+              );
             const pending = pendingViewRef.current;
             const active = activeViewRef.current;
-            if (pending?.revision === status.revision) {
+            if (aliveRef.current && pending?.revision === status.revision) {
               promoteView(
                 status.revision,
                 status.rowCount,
                 pending.filters,
                 pending.sort,
               );
-            } else if (active.revision === status.revision) {
-              pendingRequestRef.current = {
+            } else if (
+              aliveRef.current &&
+              stillCurrent &&
+              active.revision === status.revision &&
+              pendingRequestRef.current === null &&
+              deferredProjectionRef.current === null
+            ) {
+              const retry: VersionedRowRequest = {
                 rows: request.rows,
                 revision: active.revision,
                 projectionRevision: request.projectionRevision,
                 sourceIndices: request.sourceIndices,
-                traceId: diagnostics.queueRequest(),
+                cacheSlot: request.cacheSlot,
+                reason: "retry",
+                traceId: null,
               };
-            } else {
+              retry.traceId = queueRequestTrace(retry);
+              pendingRequestRef.current = retry;
+            } else if (
+              aliveRef.current &&
+              stillCurrent &&
+              active.revision !== status.revision &&
+              pendingRequestRef.current === null &&
+              deferredProjectionRef.current === null
+            ) {
               setLoadError({
                 message: "The active data view could not be synchronized.",
               });
             }
           } catch (statusError) {
-            setLoadError(dataViewErrorState(statusError));
+            if (
+              aliveRef.current &&
+              request.revision === activeViewRef.current.revision &&
+              request.projectionRevision === projectionRevisionRef.current &&
+              pendingRequestRef.current === null &&
+              deferredProjectionRef.current === null &&
+              requestCoversDesiredVisible(
+                request,
+                desiredRequestRef.current,
+                baseWindowRef.current,
+              )
+            ) {
+              setLoadError(dataViewErrorState(statusError));
+            }
           }
         } else if (
-          aliveRef.current &&
-          request.revision === activeViewRef.current.revision &&
-          request.projectionRevision === projectionRevisionRef.current &&
-          pendingRequestRef.current === null
+          pendingRequestRef.current === null &&
+          deferredProjectionRef.current === null
         ) {
           failedRequestRef.current = request;
           setLoadError(dataViewErrorState(error));
@@ -721,7 +972,13 @@ export function DataGrid({
         activeRequestRef.current = null;
       }
     }
-  }, [diagnostics, promoteView, source.generation]);
+  }, [
+    clearDeferredProjection,
+    diagnostics,
+    promoteView,
+    queueRequestTrace,
+    source.generation,
+  ]);
 
   const requestRows = useCallback(
     (
@@ -746,59 +1003,218 @@ export function DataGrid({
       if (sourceIndices.length === 0) {
         return;
       }
-      const requestedWindow: VersionedRowRequest = {
+      const previousProjection = requestedProjectionRef.current;
+      const projectionChanged = !sameColumnSet(
+        previousProjection,
+        sourceIndices,
+      );
+      requestedProjectionRef.current = sourceIndices;
+      const base = baseWindowRef.current;
+      const baseContainsRows =
+        base !== null &&
+        windowSatisfiesRequest(base.rowOffset, base.rowCount, request);
+      const mountedRows = visibleViewportRef.current;
+      const mountedStart = mountedRows?.mountedRowStart ?? request.visibleStart;
+      const mountedCount =
+        mountedRows?.mountedRowCount ??
+        request.visibleEnd - request.visibleStart;
+      const supplementRows =
+        baseContainsRows && base !== null
+          ? supplementRowRequest(
+              base,
+              mountedStart,
+              mountedCount,
+              request.visibleStart,
+              request.visibleEnd,
+            )
+          : {
+              offset: mountedStart,
+              count: mountedCount,
+              visibleStart: request.visibleStart,
+              visibleEnd: request.visibleEnd,
+              requiredStart: mountedStart,
+              requiredEnd: mountedStart + mountedCount,
+            };
+      const desired: DesiredRowRequest = {
         rows: request,
+        supplementRows,
         revision: activeView.revision,
         projectionRevision: projectionRevisionRef.current,
         sourceIndices,
+      };
+      // This is the sole authority for whether an async result still belongs on
+      // screen. It is updated before any cache or in-flight early return so a
+      // late away-window result cannot overwrite a viewport that returned to
+      // already cached rows.
+      desiredRequestRef.current = desired;
+      const failed = failedRequestRef.current;
+      if (
+        failed !== null &&
+        !requestCoversDesiredVisible(failed, desired, base)
+      ) {
+        failedRequestRef.current = null;
+        setLoadError(null);
+      }
+      const missingFromBase =
+        base === null
+          ? sourceIndices
+          : sourceIndices.filter(
+              (sourceIndex) => !base.sourceColumnOffsets.has(sourceIndex),
+            );
+      const supplement = supplementWindowRef.current;
+      const supplementContainsRows =
+        supplement !== null &&
+        windowSatisfiesRequest(
+          supplement.rowOffset,
+          supplement.rowCount,
+          supplementRows,
+        );
+      if (windowsSatisfyDesired(base, supplement, desired)) {
+        if (failedRequestRef.current !== null) {
+          failedRequestRef.current = null;
+          setLoadError(null);
+        }
+        const pending = pendingRequestRef.current;
+        if (pending !== null) {
+          diagnostics.disposeRequest(pending.traceId, "supersededBeforeStart");
+          pendingRequestRef.current = null;
+        }
+        clearDeferredProjection();
+        return;
+      }
+      const cacheSlot = baseContainsRows ? "columnSupplement" : "rowWindow";
+      const requestedRows =
+        cacheSlot === "columnSupplement" ? supplementRows : request;
+      const requestedWindow: VersionedRowRequest = {
+        rows: requestedRows,
+        revision: activeView.revision,
+        projectionRevision: projectionRevisionRef.current,
+        sourceIndices:
+          cacheSlot === "columnSupplement" ? missingFromBase : sourceIndices,
+        cacheSlot,
+        reason:
+          base === null
+            ? "initial"
+            : cacheSlot === "columnSupplement"
+              ? projectionChanged
+                ? supplement !== null && !supplementContainsRows
+                  ? "rowAndColumnWindow"
+                  : "columnProjection"
+                : "rowWindow"
+              : projectionChanged
+                ? "rowAndColumnWindow"
+                : "rowWindow",
         traceId: null,
       };
-      const current = dataWindowRef.current;
+      const pending = pendingRequestRef.current;
+      const active = activeRequestRef.current;
       if (
-        current !== null &&
-        windowSatisfiesRequest(current.rowOffset, current.rowCount, request) &&
-        projectionContains(current.sourceIndices, sourceIndices)
+        active !== null &&
+        requestFullySatisfiesDesired(active, desired, base)
       ) {
+        if (pending !== null) {
+          diagnostics.disposeRequest(pending.traceId, "supersededBeforeStart");
+          pendingRequestRef.current = null;
+        }
+        clearDeferredProjection();
         return;
       }
-      const pending = pendingRequestRef.current;
       if (
         pending !== null &&
-        requestSatisfiesWindow(pending, requestedWindow)
+        requestFullySatisfiesDesired(pending, desired, base)
       ) {
+        clearDeferredProjection();
         return;
       }
-      const active = activeRequestRef.current;
-      if (active !== null && requestSatisfiesWindow(active, requestedWindow)) {
+      const deferred = deferredProjectionRef.current;
+      if (
+        deferred !== null &&
+        requestSatisfiesWindow(deferred, requestedWindow)
+      ) {
+        if (pending !== null) {
+          diagnostics.disposeRequest(pending.traceId, "supersededBeforeStart");
+          pendingRequestRef.current = null;
+        }
         return;
       }
+      if (cacheSlot === "columnSupplement" && projectionChanged) {
+        clearDeferredProjection();
+        if (pending !== null) {
+          diagnostics.disposeRequest(pending.traceId, "supersededBeforeStart");
+          pendingRequestRef.current = null;
+        }
+        requestedWindow.traceId = queueRequestTrace(requestedWindow);
+        deferredProjectionRef.current = requestedWindow;
+        // Projection changes do not affect scroll geometry. Waiting for a brief
+        // horizontal idle period keeps an obsolete sparse read from owning the
+        // native engine mutex when a row movement immediately follows. A row-
+        // only supplement is queued below without delay so continuous vertical
+        // scrolling cannot leave the newly mounted rows loading indefinitely.
+        projectionTimerRef.current = window.setTimeout(() => {
+          projectionTimerRef.current = null;
+          const deferred = deferredProjectionRef.current;
+          deferredProjectionRef.current = null;
+          if (deferred === null) return;
+          if (
+            !requestFullySatisfiesDesired(
+              deferred,
+              desiredRequestRef.current,
+              baseWindowRef.current,
+            )
+          ) {
+            diagnostics.disposeRequest(
+              deferred.traceId,
+              "supersededBeforeStart",
+            );
+            return;
+          }
+          pendingRequestRef.current = deferred;
+          void drainRequests();
+        }, PROJECTION_REQUEST_IDLE_MS);
+        return;
+      }
+      clearDeferredProjection();
       if (pending !== null) {
         diagnostics.disposeRequest(pending.traceId, "supersededBeforeStart");
       }
-      requestedWindow.traceId = diagnostics.queueRequest();
+      requestedWindow.traceId = queueRequestTrace(requestedWindow);
       pendingRequestRef.current = requestedWindow;
       void drainRequests();
     },
-    [diagnostics, drainRequests],
+    [clearDeferredProjection, diagnostics, drainRequests, queueRequestTrace],
   );
 
   const retryWindow = useCallback(() => {
     const failed = failedRequestRef.current;
+    const desired = desiredRequestRef.current;
+    const base = baseWindowRef.current;
     if (
       failed === null ||
-      failed.revision !== activeViewRef.current.revision ||
-      failed.projectionRevision !== projectionRevisionRef.current
+      !requestCoversDesiredVisible(failed, desired, base) ||
+      (desired !== null &&
+        windowsSatisfyDesired(base, supplementWindowRef.current, desired))
+    ) {
+      return;
+    }
+    if (
+      activeRequestRef.current !== null ||
+      pendingRequestRef.current !== null ||
+      deferredProjectionRef.current !== null
     ) {
       return;
     }
     failedRequestRef.current = null;
     pendingRequestRef.current = {
       ...failed,
-      traceId: diagnostics.queueRequest(),
+      reason: "retry",
+      traceId: null,
     };
+    pendingRequestRef.current.traceId = queueRequestTrace(
+      pendingRequestRef.current,
+    );
     setLoadError(null);
     void drainRequests();
-  }, [diagnostics, drainRequests]);
+  }, [drainRequests, queueRequestTrace]);
 
   const reloadActiveWindow = useCallback(() => {
     const active = activeViewRef.current;
@@ -808,7 +1224,10 @@ export function DataGrid({
       "invalidatedBeforeStart",
     );
     pendingRequestRef.current = null;
-    dataWindowRef.current = null;
+    clearDeferredProjection("invalidatedBeforeStart");
+    desiredRequestRef.current = null;
+    baseWindowRef.current = null;
+    supplementWindowRef.current = null;
     setContentRevision((current) => current + 1);
     if (active.rowCount === 0) {
       return;
@@ -818,7 +1237,7 @@ export function DataGrid({
       visible?.rowStart ?? 0,
       visible?.rowCount ?? Math.min(GRID_INITIAL_ROWS, active.rowCount),
     );
-  }, [diagnostics, requestRows]);
+  }, [clearDeferredProjection, diagnostics, requestRows]);
 
   useEffect(() => {
     const previous = previousProjectionRef.current;
@@ -843,14 +1262,17 @@ export function DataGrid({
       "invalidatedBeforeStart",
     );
     pendingRequestRef.current = null;
+    clearDeferredProjection("invalidatedBeforeStart");
     failedRequestRef.current = null;
-    dataWindowRef.current = null;
+    desiredRequestRef.current = null;
+    baseWindowRef.current = null;
+    supplementWindowRef.current = null;
     copyWindowsRef.current.clear();
     setLoadError(null);
     setSelection(clearColumnSelection);
     setCopyLimit(null);
     setContentRevision((current) => current + 1);
-  }, [diagnostics, visibleSourceIndices]);
+  }, [clearDeferredProjection, diagnostics, visibleSourceIndices]);
 
   useEffect(() => {
     setHeaderMenu((current) =>
@@ -887,9 +1309,10 @@ export function DataGrid({
         "invalidatedBeforeStart",
       );
       pendingRequestRef.current = null;
+      clearDeferredProjection("invalidatedBeforeStart");
       failedRequestRef.current = null;
     };
-  }, [diagnostics]);
+  }, [clearDeferredProjection, diagnostics]);
 
   useEffect(() => {
     if (activeView.rowCount > 0) {
@@ -1581,6 +2004,7 @@ export function DataGrid({
               formatCellValue(
                 windowValue(dataWindow, column.sourceIndex, row),
                 dataType,
+                false,
               ).displayData,
             );
           }
@@ -1748,7 +2172,14 @@ export function DataGrid({
   const openFilterForCell = useCallback(
     (sourceIndex: number, row: number, bounds: Rectangle) => {
       const field = source.schema[sourceIndex];
-      const current = dataWindowRef.current;
+      const supplement = supplementWindowRef.current;
+      const base = baseWindowRef.current;
+      const current =
+        supplement !== null &&
+        windowContainsRow(supplement, row) &&
+        supplement.sourceColumnOffsets.has(sourceIndex)
+          ? supplement
+          : base;
       if (
         field === undefined ||
         current === null ||
@@ -2726,6 +3157,30 @@ function sameColumnOrder(
   current: readonly number[],
 ): boolean {
   return previous.every((sourceIndex, index) => sourceIndex === current[index]);
+}
+
+function sameColumnSet(
+  previous: readonly number[],
+  current: readonly number[],
+): boolean {
+  return (
+    previous.length === current.length && projectionContains(previous, current)
+  );
+}
+
+function projectionFingerprint(sourceIndices: readonly number[]): string {
+  let hash = 0x811c9dc5;
+  let contiguous = true;
+  for (let index = 0; index < sourceIndices.length; index += 1) {
+    const sourceIndex = sourceIndices[index] ?? 0;
+    hash = Math.imul(hash ^ sourceIndex, 0x01000193) >>> 0;
+    if (index > 0 && sourceIndex !== (sourceIndices[index - 1] ?? 0) + 1) {
+      contiguous = false;
+    }
+  }
+  return `${sourceIndices[0] ?? "-"}:${sourceIndices.at(-1) ?? "-"}:${
+    contiguous ? "c" : "s"
+  }:${hash.toString(16).padStart(8, "0")}`;
 }
 
 function loadingCell(): GridCell {

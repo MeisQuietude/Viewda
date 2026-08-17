@@ -8,6 +8,7 @@ import {
   columnOffsets,
   deriveVerticalLayout,
   hystereticColumnWindow,
+  hystereticRowAnchor,
   logicalToPhysical,
   logicalTopAfterRowSteps,
   normalizeWheelDelta,
@@ -101,6 +102,47 @@ describe("grid column geometry", () => {
     expect(rowMarkerWidth(1)).toBe(48);
     expect(rowMarkerWidth(3_514_000)).toBe(80);
     expect(rowMarkerWidth(1_000_000_000)).toBe(107);
+  });
+});
+
+describe("grid row geometry", () => {
+  it("moves the DOM window one row while keeping its coordinate anchor", () => {
+    const initialMounted = visibleRowRange(280, 84, 28, 1_000, 3);
+    const anchor = hystereticRowAnchor(initialMounted, null);
+
+    expect(initialMounted).toEqual({ start: 7, end: 16 });
+    for (const [top, expectedStart] of [
+      [308, 8],
+      [336, 9],
+      [364, 10],
+    ] as const) {
+      const mounted = visibleRowRange(top, 84, 28, 1_000, 3);
+      expect(mounted.start).toBe(expectedStart);
+      expect(hystereticRowAnchor(mounted, anchor)).toBe(anchor);
+    }
+  });
+
+  it("keeps an anchor when a tall mounted window shifts by one row", () => {
+    const anchor = hystereticRowAnchor({ start: 100, end: 180 }, null);
+
+    expect(hystereticRowAnchor({ start: 101, end: 181 }, anchor)).toBe(anchor);
+    expect(hystereticRowAnchor({ start: 165, end: 245 }, anchor)).toBe(165);
+  });
+
+  it("reanchors a fast jump without exposing logical-size coordinates", () => {
+    const mounted = visibleRowRange(
+      28_000_000_000 - 84,
+      84,
+      28,
+      1_000_000_000,
+      3,
+    );
+    const anchor = hystereticRowAnchor(mounted, 0);
+
+    expect(mounted.end).toBe(1_000_000_000);
+    expect(mounted.end - mounted.start).toBeLessThanOrEqual(6);
+    expect(anchor).toBe(mounted.start);
+    expect(anchor).toBeGreaterThan(999_999_990);
   });
 });
 

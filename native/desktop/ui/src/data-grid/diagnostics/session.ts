@@ -13,16 +13,45 @@ import {
 } from "./episodes";
 import { NumericSamples, roundHertz, roundMilliseconds } from "./samples";
 
+// Reports use fixed thresholds so recordings remain comparable across machines.
+
+// A 250 ms pause ends a reported gesture. This is deliberately longer than the
+// renderer's axis lock because one report episode may contain several bursts.
 const SCROLL_GESTURE_IDLE_MS = 250;
+
+// The report flags both display-relative misses and absolute stalls over 50 ms.
 const LONG_SCROLL_FRAME_INTERVAL_MS = 50;
+
+// Sixty idle rAF intervals give a stable refresh-rate estimate in about a second
+// on a 60 Hz display.
 const REFERENCE_INTERVAL_LIMIT = 60;
+
+// Before that sample is ready, 25 ms allows 1.5 frames on a 60 Hz display.
 const FALLBACK_FRAME_BUDGET_MS = 25;
+
+// A data-window call over 50 ms is slow enough to explain a visible stall and
+// earns a diagnostic episode.
 const DATA_WINDOW_SLOW_MS = 50;
+
+// The last 64 terminal requests usually cover the lead-up to a stall without
+// making copied reports unwieldy.
+const RECENT_DATA_WINDOW_LIMIT = 64;
+
+// Only the bounded `first:last:shape:hash` fingerprint may enter a copied report.
+// Keep this in sync with projectionFingerprint(); it is a privacy boundary.
+const PROJECTION_FINGERPRINT_PATTERN = /^(?:\d+|-):(?:\d+|-):[cs]:[\da-f]{8}$/;
+
 // Async work can outlive a recording. Monotonic module-level ids prevent a
 // late request, frame, or commit token from colliding with a newer session.
 let nextRequestToken = 1;
 let nextFrameToken = 1;
 let nextCommitToken = 1;
+
+function sanitizeProjectionFingerprint(value: string): string {
+  // Reports are copied outside the app. Accept only the fixed-size fingerprint
+  // produced by the grid so a diagnostics sink cannot leak arbitrary metadata.
+  return PROJECTION_FINGERPRINT_PATTERN.test(value) ? value : "";
+}
 
 export interface GridPerformanceStart {
   runtime: {
@@ -96,6 +125,19 @@ export type GridPendingRequestDisposal =
 
 export type GridReactCommitSource = "input" | "measurement";
 
+export type GridDataWindowRequestReason =
+  "initial" | "rowWindow" | "columnProjection" | "rowAndColumnWindow" | "retry";
+
+export interface GridDataWindowRequest {
+  reason: GridDataWindowRequestReason;
+  rowOffset: number;
+  rowCount: number;
+  projectionCount: number;
+  projectionKey: string;
+  filtered: boolean;
+  sorted: boolean;
+}
+
 export interface GridDiagnosticsSink {
   isEnabled(): boolean;
   startWheel(): number | null;
@@ -115,7 +157,7 @@ export interface GridDiagnosticsSink {
   ): number | null;
   nextAnimationFrame(commitToken: number | null, timeStamp: number): void;
   viewport(frameId: number | null, viewport: GridPerformanceViewport): void;
-  queueRequest(): number | null;
+  queueRequest(request?: GridDataWindowRequest): number | null;
   disposeRequest(id: number | null, reason: GridPendingRequestDisposal): void;
   startRequest(id: number | null): void;
   finishRequest(
@@ -140,6 +182,22 @@ interface GridPerformanceClock {
 interface PendingRequest {
   queuedAt: number;
   startedAt: number | null;
+  metadata: GridDataWindowRequest | null;
+}
+
+interface CompletedRequest {
+  relativeMs: number;
+  reason: GridDataWindowRequestReason;
+  rowOffset: number;
+  rowCount: number;
+  projectionCount: number;
+  projectionKey: string;
+  filtered: boolean;
+  sorted: boolean;
+  queueWaitMs: number | null;
+  durationMs: number | null;
+  outcome: "completed" | "failed" | GridPendingRequestDisposal;
+  stale: boolean;
 }
 
 type GridViewportSnapshot = Pick<
@@ -301,6 +359,7 @@ class GridPerformanceSession {
   private readonly requestQueueWaitMs = new NumericSamples();
   private readonly requestDurationMs = new NumericSamples();
   private readonly pendingRequests = new Map<number, PendingRequest>();
+  private readonly recentRequests: CompletedRequest[] = [];
   private pendingRequestLifecycle = emptyRequestLifecycle();
   private readonly frames = new Map<number, DiagnosticFrame>();
   private readonly diagnosticEpisodes = new DiagnosticEpisodeCollector();
@@ -659,7 +718,7 @@ class GridPerformanceSession {
     );
   }
 
-  queueRequest(): number {
+  queueRequest(metadata?: GridDataWindowRequest): number {
     const id = nextRequestToken;
     nextRequestToken += 1;
     this.requestsQueued += 1;
@@ -667,14 +726,27 @@ class GridPerformanceSession {
     this.pendingRequests.set(id, {
       queuedAt: this.clock.now(),
       startedAt: null,
+      metadata:
+        metadata === undefined
+          ? null
+          : {
+              ...metadata,
+              projectionKey: sanitizeProjectionFingerprint(
+                metadata.projectionKey,
+              ),
+            },
     });
     return id;
   }
 
   disposeRequest(id: number | null, reason: GridPendingRequestDisposal) {
-    if (id !== null && this.pendingRequests.delete(id)) {
+    if (id !== null) {
+      const request = this.pendingRequests.get(id);
+      if (request === undefined) return;
+      this.pendingRequests.delete(id);
       this.requestDisposals[reason] += 1;
       this.pendingRequestLifecycle[reason] += 1;
+      this.recordRequest(request, reason, false);
     }
   }
 
@@ -705,6 +777,7 @@ class GridPerformanceSession {
     const duration =
       request.startedAt === null ? null : this.clock.now() - request.startedAt;
     if (duration !== null) this.requestDurationMs.add(duration);
+    this.recordRequest(request, outcome, stale);
     if (stale || (duration !== null && duration > DATA_WINDOW_SLOW_MS)) {
       const frame = this.createFrame(this.clock.now());
       frame.requestLifecycle = this.takeRequestLifecycle();
@@ -788,6 +861,7 @@ class GridPerformanceSession {
           pendingRequestDisposals: this.requestDisposals,
           queueWaitMs: this.requestQueueWaitMs.report(),
           requestDurationMs: this.requestDurationMs.report(),
+          recentRequests: this.recentRequests,
         },
         diagnostics: {
           frameOverBudgetThresholdMs: roundMilliseconds(
@@ -829,6 +903,33 @@ class GridPerformanceSession {
 
   private axisMeasurements(axis: GridPerformanceAxis) {
     return axis === "horizontal" ? this.horizontalScroll : this.verticalScroll;
+  }
+
+  private recordRequest(
+    request: PendingRequest,
+    outcome: "completed" | "failed" | GridPendingRequestDisposal,
+    stale: boolean,
+  ) {
+    const metadata = request.metadata;
+    if (metadata === null) return;
+    const now = this.clock.now();
+    this.recentRequests.push({
+      relativeMs: roundMilliseconds(Math.max(0, now - this.startedAt)),
+      ...metadata,
+      queueWaitMs:
+        request.startedAt === null
+          ? null
+          : roundMilliseconds(request.startedAt - request.queuedAt),
+      durationMs:
+        request.startedAt === null
+          ? null
+          : roundMilliseconds(now - request.startedAt),
+      outcome,
+      stale,
+    });
+    if (this.recentRequests.length > RECENT_DATA_WINDOW_LIMIT) {
+      this.recentRequests.shift();
+    }
   }
 
   private frameOverBudgetThresholdMs(): number {
@@ -992,7 +1093,8 @@ export function createGridPerformanceRecorder(clock: GridPerformanceClock) {
         : session?.nextAnimationFrame(commitToken, timeStamp),
     viewport: (frameId: number | null, viewport: GridPerformanceViewport) =>
       session?.viewport(frameId, viewport),
-    queueRequest: () => session?.queueRequest() ?? null,
+    queueRequest: (request?: GridDataWindowRequest) =>
+      session?.queueRequest(request) ?? null,
     disposeRequest: (id: number | null, reason: GridPendingRequestDisposal) =>
       session?.disposeRequest(id, reason),
     startRequest: (id: number | null) => session?.startRequest(id),

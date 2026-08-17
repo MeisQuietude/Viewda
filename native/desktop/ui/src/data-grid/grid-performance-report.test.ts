@@ -94,7 +94,15 @@ describe("grid performance report", () => {
     const frame = recording.measurementStart(18);
     recording.viewport(frame, viewport);
     recording.measurementEnd(frame, 21, false);
-    const request = recording.queueRequest();
+    const request = recording.queueRequest({
+      reason: "columnProjection",
+      rowOffset: 512,
+      rowCount: 512,
+      projectionCount: 3,
+      projectionKey: "8:10:c:41f7db30",
+      filtered: true,
+      sorted: false,
+    });
     advance(5);
     recording.startRequest(request);
     advance(25);
@@ -146,6 +154,22 @@ describe("grid performance report", () => {
         pendingAtStop: 0,
         queueWaitMs: { count: 1, p50: 5 },
         requestDurationMs: { count: 1, p50: 25 },
+        recentRequests: [
+          {
+            relativeMs: 30,
+            reason: "columnProjection",
+            rowOffset: 512,
+            rowCount: 512,
+            projectionCount: 3,
+            projectionKey: "8:10:c:41f7db30",
+            filtered: true,
+            sorted: false,
+            queueWaitMs: 5,
+            durationMs: 25,
+            outcome: "completed",
+            stale: false,
+          },
+        ],
       },
     });
   });
@@ -626,6 +650,30 @@ describe("grid performance report", () => {
     });
   });
 
+  it("bounds the ordered data-window trace", () => {
+    const { recording } = recorder();
+    recording.start(metadata);
+    for (let offset = 0; offset < 70; offset += 1) {
+      const request = recording.queueRequest({
+        reason: "rowWindow",
+        rowOffset: offset,
+        rowCount: 1,
+        projectionCount: 1,
+        projectionKey: "0:0:c:050c5d1f",
+        filtered: false,
+        sorted: true,
+      });
+      recording.startRequest(request);
+      recording.finishRequest(request, "completed", false);
+    }
+
+    const recent = JSON.parse(recording.stop() ?? "null").dataWindows
+      .recentRequests;
+    expect(recent).toHaveLength(64);
+    expect(recent[0]).toMatchObject({ rowOffset: 6, sorted: true });
+    expect(recent.at(-1)).toMatchObject({ rowOffset: 69 });
+  });
+
   it("keeps diagnostic episodes bounded and free of unknown payloads", () => {
     const { recording } = recorder();
     const sentinel = "/private/SECRET_COLUMN_VALUE.parquet";
@@ -645,6 +693,17 @@ describe("grid performance report", () => {
       pinnedColumnCount: 0,
       columnName: sentinel,
     } as never);
+    const unsafeRequest = recording.queueRequest({
+      reason: "initial",
+      rowOffset: 0,
+      rowCount: 1,
+      projectionCount: 1,
+      projectionKey: sentinel,
+      filtered: false,
+      sorted: false,
+    });
+    recording.startRequest(unsafeRequest);
+    recording.finishRequest(unsafeRequest, "completed", false);
     for (let index = 0; index < 509; index += 1) {
       recording.wheel(
         wheel({

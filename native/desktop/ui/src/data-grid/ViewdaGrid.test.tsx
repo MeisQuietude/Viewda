@@ -23,6 +23,8 @@ import {
   type GridDiagnosticsController,
 } from "./grid-performance-report";
 
+// Exceeds every fake extent so probe tests exercise clamped read-back. The value
+// is unrelated to the production sentinel. Increase it if a fake extent grows.
 const OVERSIZED_TEST_EXTENT = 1_000_000_000;
 let diagnosticsController: GridDiagnosticsController | null = null;
 
@@ -121,6 +123,11 @@ function wheelEvent(init: WheelEventInit, timeStamp: number): WheelEvent {
   });
   Object.defineProperty(event, "timeStamp", { value: timeStamp });
   return event;
+}
+
+function transformY(element: HTMLElement | null): number {
+  const match = element?.style.transform.match(/^translateY\((-?[\d.]+)px\)$/);
+  return Number(match?.[1] ?? 0);
 }
 
 function props(overrides: Partial<ViewdaGridProps> = {}): ViewdaGridProps {
@@ -890,7 +897,7 @@ describe("ViewdaGrid foundation", () => {
     expect(getCellContent.mock.calls.length).toBeLessThanOrEqual(40 * 6);
   });
 
-  it("reads only the newly mounted row after one native row step", () => {
+  it("mounts one row per native step while preserving overlapping row transforms", () => {
     const frames: FrameRequestCallback[] = [];
     vi.spyOn(window, "requestAnimationFrame").mockImplementation((callback) => {
       frames.push(callback);
@@ -903,6 +910,10 @@ describe("ViewdaGrid foundation", () => {
     ) as HTMLElement;
     frames.length = 0;
     getCellContent.mockClear();
+    const stableRow = container.querySelector<HTMLElement>(
+      '.viewda-grid-row[aria-rowindex="3"]',
+    );
+    const initialTransform = stableRow?.style.transform;
 
     scrollport.scrollTop = 28;
     fireEvent.scroll(scrollport);
@@ -912,6 +923,21 @@ describe("ViewdaGrid foundation", () => {
     expect(
       new Set(getCellContent.mock.calls.map(([address]) => address.row)),
     ).toEqual(new Set([6]));
+    expect(container.querySelector('.viewda-grid-row[aria-rowindex="3"]')).toBe(
+      stableRow,
+    );
+    expect(stableRow?.style.transform).toBe(initialTransform);
+    getCellContent.mockClear();
+
+    scrollport.scrollTop = 56;
+    fireEvent.scroll(scrollport);
+    act(() => frames.shift()?.(16));
+
+    expect(getCellContent).toHaveBeenCalledTimes(8);
+    expect(
+      new Set(getCellContent.mock.calls.map(([address]) => address.row)),
+    ).toEqual(new Set([7]));
+    expect(stableRow?.style.transform).toBe(initialTransform);
   });
 
   it("keeps root focus semantics when the active cell is recycled", () => {
@@ -1598,10 +1624,76 @@ describe("ViewdaGrid foundation", () => {
     const firstVisibleRow = screen
       .getByRole("rowheader", { name: "3" })
       .closest<HTMLElement>(".viewda-grid-row");
+    const rowLayer = container.querySelector<HTMLElement>(
+      ".viewda-grid-visible-rows",
+    );
     expect(firstVisibleRow).not.toBeNull();
+    expect(transformY(rowLayer) + transformY(firstVisibleRow)).toBe(
+      quantizedScrollTop,
+    );
+  });
+
+  it("keeps overlapping compressed rows stable through a bounded coordinate anchor", () => {
+    const frames: FrameRequestCallback[] = [];
+    vi.spyOn(window, "requestAnimationFrame").mockImplementation((callback) => {
+      frames.push(callback);
+      return frames.length;
+    });
+    const ref = createRef<ViewdaGridHandle>();
+    const getCellContent = vi.fn(props().getCellContent);
+    const { container } = render(
+      <ViewdaGrid
+        ref={ref}
+        {...props({
+          rowCount: 3_514_000,
+          getCellContent,
+          measurementPort: measurementPort(420, 84, 1_000_000),
+        })}
+      />,
+    );
+    const scrollport = container.querySelector(
+      ".viewda-grid-body-scrollport",
+    ) as HTMLElement;
+    act(() => ref.current?.scrollToRow(100));
+    act(() => frames.shift()?.(0));
+    const stableRow = container.querySelector<HTMLElement>(
+      '.viewda-grid-row[aria-rowindex="102"]',
+    );
+    const initialTransform = stableRow?.style.transform;
+    const rowLayer = container.querySelector<HTMLElement>(
+      ".viewda-grid-visible-rows",
+    );
+    const firstVisibleRow = screen
+      .getByRole("rowheader", { name: "101" })
+      .closest<HTMLElement>(".viewda-grid-row");
+    expect(transformY(rowLayer) + transformY(firstVisibleRow)).toBeCloseTo(
+      scrollport.scrollTop,
+      5,
+    );
+    expect(Number.isInteger(transformY(rowLayer))).toBe(false);
+    expect(Math.abs(transformY(rowLayer))).toBeLessThan(4_000);
+    frames.length = 0;
+    getCellContent.mockClear();
+
+    for (let step = 0; step < 3; step += 1) {
+      act(() =>
+        scrollport.dispatchEvent(wheelEvent({ deltaY: 28 }, step * 16)),
+      );
+      act(() => frames.shift()?.(step * 16));
+      expect(getCellContent).toHaveBeenCalledTimes((step + 1) * 8);
+    }
+
     expect(
-      Number.parseFloat(firstVisibleRow?.style.transform.slice(11) ?? "NaN"),
-    ).toBe(quantizedScrollTop);
+      container.querySelector('.viewda-grid-row[aria-rowindex="102"]'),
+    ).toBe(stableRow);
+    expect(stableRow?.style.transform).toBe(initialTransform);
+
+    act(() => ref.current?.scrollToRow(3_513_997));
+    act(() => frames.shift()?.(64));
+    expect(
+      container.querySelectorAll(".viewda-grid-row").length,
+    ).toBeGreaterThan(0);
+    expect(Math.abs(transformY(rowLayer))).toBeLessThanOrEqual(1_000_000);
   });
 
   it("preserves a compressed scrollToRow command through resize readback", () => {
@@ -1642,9 +1734,10 @@ describe("ViewdaGrid foundation", () => {
     const firstRow = container.querySelector<HTMLElement>(
       '.viewda-grid-row[aria-rowindex="2"]',
     );
-    expect(
-      Number.parseFloat(firstRow?.style.transform.slice(11) ?? "0"),
-    ).toBeCloseTo(-28, 2);
+    const rowLayer = container.querySelector<HTMLElement>(
+      ".viewda-grid-visible-rows",
+    );
+    expect(transformY(rowLayer) + transformY(firstRow)).toBeCloseTo(-28, 2);
     expect(onViewportChange).toHaveBeenLastCalledWith(
       expect.objectContaining({ rowStart: 1 }),
     );

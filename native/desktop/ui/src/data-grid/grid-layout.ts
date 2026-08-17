@@ -1,10 +1,33 @@
+// Grid geometry assumes 28 px rows. Any density feature needs matching
+// typography and scroll geometry.
 export const GRID_ROW_HEIGHT = 28;
+
+// Three spare rows on each side hide ordinary mount latency. Blank edges during
+// a fling call for more; expensive mount frames call for fewer.
 export const GRID_OVERSCAN_ROWS = 3;
+
+// Compressed coordinates keep the same origin for 64 rows. This preserves memo
+// hits for overlapping rows without letting CSS coordinates grow unbounded.
+// Webview limits and frame traces decide this value, so it stays internal.
+export const GRID_ROW_ANCHOR_RUNWAY_ROWS = 64;
+
+// Four spare columns on each side keep a horizontal fling ahead of mounting.
+// Adjust this only when traces show blank edges or costly wide-cell mounts.
 export const GRID_OVERSCAN_COLUMNS = 4;
+
+// The first request cannot wait for layout. A 64-by-8 window fills a normal
+// startup viewport until the first measurement replaces it. These defaults stay
+// internal because they affect only the first frame.
 export const GRID_INITIAL_ROWS = 64;
 export const GRID_INITIAL_COLUMNS = 8;
 
+// A touchpad gesture gets an axis only when one direction is 1.5× stronger.
+// This filters accidental diagonal movement.
 const WHEEL_AXIS_DOMINANCE = 1.5;
+
+// After 150 ms without input, the next wheel event starts a new gesture.
+// Platform testing should drive both thresholds. Settings can offer a few tested
+// input modes if users need control.
 const WHEEL_GESTURE_IDLE_MS = 150;
 
 export interface GridSize {
@@ -211,6 +234,23 @@ export function visibleRowRange(
     Math.ceil((logicalTop + viewportHeight) / rowHeight) + overscan,
   );
   return { start, end: Math.max(start, end) };
+}
+
+export function hystereticRowAnchor(
+  mounted: IndexRange,
+  anchor: number | null,
+  runwayRows = GRID_ROW_ANCHOR_RUNWAY_ROWS,
+): number {
+  // The DOM window follows the viewport one row at a time. Only its coordinate
+  // origin is hysteretic, which keeps overlapping row transforms stable without
+  // mounting a multi-row batch when a short overscan boundary is crossed. The
+  // runway bounds anchor drift, not viewport height: tall viewports may contain
+  // more rows than the runway while their relative coordinates remain bounded
+  // by viewport span plus runway.
+  if (anchor !== null && Math.abs(mounted.start - anchor) <= runwayRows) {
+    return anchor;
+  }
+  return mounted.start;
 }
 
 export function normalizeWheelDelta(

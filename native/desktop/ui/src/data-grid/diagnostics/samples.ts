@@ -1,3 +1,6 @@
+// Percentiles retain the latest 2,048 values, or about 34 seconds at 60 Hz.
+// Count and max still cover the whole recording. A fixed limit bounds memory and
+// keeps reports comparable.
 const SAMPLE_LIMIT = 2_048;
 
 export class NumericSamples {

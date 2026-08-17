@@ -1,5 +1,8 @@
 import { roundMilliseconds } from "./samples";
 
+// A report keeps the 12 worst episodes. Each one contains at most eight frames:
+// three before its trigger and two after it. The fixed budget keeps reports
+// comparable and small enough to share.
 const EPISODE_LIMIT = 12;
 const FRAME_LIMIT = 8;
 const PRE_CONTEXT = 3;

@@ -6,7 +6,7 @@ import {
   waitFor,
   within,
 } from "@testing-library/react";
-import { int32, TimeUnit, timestamp, utf8 } from "@uwdata/flechette";
+import { int32, list, TimeUnit, timestamp, utf8 } from "@uwdata/flechette";
 import { act } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -131,7 +131,8 @@ beforeEach(() => {
       );
       return {
         rowOffset,
-        rowCount: 512,
+        rowCount:
+          vi.mocked(desktop.getDataWindow).mock.calls.at(-1)?.[3] ?? 512,
         sourceIndices,
         sourceColumnOffsets,
         table: {
@@ -202,6 +203,18 @@ afterEach(() => {
 });
 
 describe("DataGrid window rendering", () => {
+  it("does not build request diagnostics while recording is inactive", async () => {
+    diagnosticsController = createGridPerformanceController();
+    const queueRequest = vi.spyOn(diagnosticsController.sink, "queueRequest");
+
+    render(
+      <DataGrid source={source} diagnostics={diagnosticsController.sink} />,
+    );
+
+    await waitFor(() => expect(desktop.getDataWindow).toHaveBeenCalledOnce());
+    expect(queueRequest).not.toHaveBeenCalled();
+  });
+
   it("increments content revision when a viewport window loads", async () => {
     render(<DataGrid source={source} />);
 
@@ -289,8 +302,8 @@ describe("DataGrid window rendering", () => {
         7,
         0,
         0,
-        512,
-        [0, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16],
+        10,
+        [8, 9, 10, 11, 12, 13, 14, 15, 16],
       ),
     );
 
@@ -317,14 +330,21 @@ describe("DataGrid window rendering", () => {
         7,
         0,
         0,
-        512,
-        [0, 12, 13, 14, 15, 16, 17, 18, 19],
+        10,
+        [12, 13, 14, 15, 16, 17, 18, 19],
       ),
+    );
+    expect(gridMock.props?.getCellContent({ row: 0, column: 0 }).kind).toBe(
+      "text",
+    );
+    expect(gridMock.props?.getCellContent({ row: 0, column: 12 }).kind).toBe(
+      "text",
     );
     expect(desktop.prepareDataView).not.toHaveBeenCalled();
   });
 
   it("loads only viewport and frozen columns from a prepared view", async () => {
+    diagnosticsController = createGridPerformanceController();
     const wideSource = {
       ...source,
       schema: Array.from({ length: 20 }, (_, index) => ({
@@ -332,8 +352,20 @@ describe("DataGrid window rendering", () => {
         name: `column_${index}`,
       })),
     };
-    render(<DataGrid source={wideSource} />);
+    render(
+      <DataGrid source={wideSource} diagnostics={diagnosticsController.sink} />,
+    );
     await waitFor(() => expect(desktop.getDataWindow).toHaveBeenCalledOnce());
+    diagnosticsController.start({
+      runtime: {
+        appVersion: "test",
+        queryEngineVersion: "test",
+        userAgent: "test",
+        platform: "test",
+        theme: "light",
+      },
+      source: { sizeBytes: 1, rowCount: 10_000, columnCount: 20 },
+    });
 
     addNumberFilter("1");
     await waitFor(() =>
@@ -359,9 +391,27 @@ describe("DataGrid window rendering", () => {
         7,
         1,
         0,
-        37,
-        [0, 10, 11, 12, 13],
+        10,
+        [10, 11, 12, 13],
       ),
+    );
+    const recentRequests = JSON.parse(diagnosticsController.stop() ?? "null")
+      .dataWindows.recentRequests;
+    expect(recentRequests).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          reason: "initial",
+          filtered: true,
+          sorted: false,
+          projectionKey: "0:7:c:6bf6a41d",
+        }),
+        expect.objectContaining({
+          reason: "columnProjection",
+          filtered: true,
+          sorted: false,
+          projectionKey: "10:13:c:7a1f3ce5",
+        }),
+      ]),
     );
   });
 
@@ -1396,12 +1446,17 @@ describe("DataGrid window rendering", () => {
     ).toBe(112);
   });
 
-  it("auto-fits one column with its rendered font", async () => {
+  it("auto-fits one column from a bounded preview in its rendered font", async () => {
     const fittingSource: desktop.SourceSummary = {
       ...source,
       rowCount: 2,
       schema: [{ ...source.schema[0]!, name: "number" }],
     };
+    const nestedValue = ["x".repeat(1_000), "unread"];
+    const unreadTail = vi.fn(() => {
+      throw new Error("auto-fit traversed beyond the display preview");
+    });
+    Object.defineProperty(nestedValue, 1, { get: unreadTail });
     decodeArrowWindow.mockImplementation(
       (
         _bytes: ArrayBuffer,
@@ -1413,8 +1468,8 @@ describe("DataGrid window rendering", () => {
         sourceIndices,
         sourceColumnOffsets: new Map([[0, 0]]),
         table: {
-          schema: { fields: [{ type: int32() }] },
-          getChildAt: () => ({ at: () => 123_456 }),
+          schema: { fields: [{ type: list(utf8()) }] },
+          getChildAt: () => ({ at: () => nestedValue }),
         } as unknown as ArrowDataWindow["table"],
       }),
     );
@@ -1444,6 +1499,7 @@ describe("DataGrid window rendering", () => {
         : 0,
     ).toBe(260);
     expect(context.font).toContain("ui-monospace");
+    expect(unreadTail).not.toHaveBeenCalled();
   });
 
   it("maps renderer sort intents to source columns", async () => {
@@ -2025,7 +2081,7 @@ describe("DataGrid window rendering", () => {
     await waitFor(() => expect(gridMock.revisionChanged).toHaveBeenCalled());
   });
 
-  it("coalesces vertical movement behind an unresolved horizontal window", async () => {
+  it("defers horizontal projection work and prioritizes the latest row window", async () => {
     diagnosticsController = createGridPerformanceController();
     const horizontalWindow = deferred<ArrayBuffer>();
     const latestWindow = deferred<ArrayBuffer>();
@@ -2061,6 +2117,8 @@ describe("DataGrid window rendering", () => {
         rowStart: 0,
         rowCount: 3,
         columnIndices: [20, 21],
+        mountedRowStart: 0,
+        mountedRowCount: 31,
       });
       reportViewport({
         rowStart: 1_000,
@@ -2078,7 +2136,7 @@ describe("DataGrid window rendering", () => {
     expect(desktop.getDataWindow).toHaveBeenLastCalledWith(
       7,
       0,
-      0,
+      936,
       expect.any(Number),
       [20, 21],
     );
@@ -2103,9 +2161,10 @@ describe("DataGrid window rendering", () => {
     await waitFor(() =>
       expect(gridMock.revisionChanged).toHaveBeenCalledOnce(),
     );
-    expect(
-      JSON.parse(diagnosticsController.stop() ?? "null").dataWindows,
-    ).toMatchObject({
+    const dataWindows = JSON.parse(
+      diagnosticsController.stop() ?? "null",
+    ).dataWindows;
+    expect(dataWindows).toMatchObject({
       queued: 3,
       started: 2,
       completed: 2,
@@ -2117,6 +2176,442 @@ describe("DataGrid window rendering", () => {
         invalidatedBeforeStart: 0,
       },
     });
+    expect(dataWindows.recentRequests).toEqual([
+      expect.objectContaining({
+        reason: "columnProjection",
+        rowOffset: 0,
+        projectionKey: "20:21:c:ec9472a2",
+        outcome: "supersededBeforeStart",
+      }),
+      expect.objectContaining({
+        reason: "rowWindow",
+        rowOffset: 936,
+        projectionKey: "20:21:c:ec9472a2",
+        stale: true,
+      }),
+      expect.objectContaining({
+        reason: "rowWindow",
+        projectionKey: "20:21:c:ec9472a2",
+        outcome: "completed",
+        stale: false,
+      }),
+    ]);
+  });
+
+  it("keeps only the latest row window behind an active projection supplement", async () => {
+    const projectionWindow = deferred<ArrayBuffer>();
+    const rowWindow = deferred<ArrayBuffer>();
+    const wideSource = {
+      ...source,
+      schema: Array.from({ length: 40 }, (_, index) => ({
+        name: `column_${index}`,
+        physicalType: "INT32",
+        logicalType: null,
+        children: [],
+      })),
+    };
+    render(<DataGrid source={wideSource} />);
+    await waitFor(() => expect(desktop.getDataWindow).toHaveBeenCalledOnce());
+    vi.mocked(desktop.getDataWindow).mockClear();
+    vi.mocked(desktop.getDataWindow)
+      .mockReturnValueOnce(projectionWindow.promise)
+      .mockReturnValueOnce(rowWindow.promise);
+
+    act(() => {
+      reportViewport({
+        rowStart: 0,
+        rowCount: 3,
+        columnIndices: [20, 21],
+        mountedRowStart: 0,
+        mountedRowCount: 31,
+      });
+    });
+    await waitFor(() => expect(desktop.getDataWindow).toHaveBeenCalledOnce());
+    expect(desktop.getDataWindow).toHaveBeenLastCalledWith(
+      7,
+      0,
+      0,
+      62,
+      [20, 21],
+    );
+
+    act(() => {
+      reportViewport({
+        rowStart: 1_000,
+        rowCount: 3,
+        columnIndices: [20, 21],
+      });
+      reportViewport({
+        rowStart: 2_000,
+        rowCount: 3,
+        columnIndices: [20, 21],
+      });
+    });
+    expect(desktop.getDataWindow).toHaveBeenCalledOnce();
+
+    await act(async () => projectionWindow.resolve(new ArrayBuffer(1)));
+    await waitFor(() => expect(desktop.getDataWindow).toHaveBeenCalledTimes(2));
+    expect(desktop.getDataWindow).toHaveBeenLastCalledWith(
+      7,
+      0,
+      expect.any(Number),
+      512,
+      [20, 21],
+    );
+    expect(
+      vi.mocked(desktop.getDataWindow).mock.calls.at(-1)?.[2],
+    ).toBeGreaterThan(1_000);
+
+    await act(async () => rowWindow.resolve(new ArrayBuffer(2)));
+    expect(desktop.getDataWindow).toHaveBeenCalledTimes(2);
+  });
+
+  it("preserves the usable base when an away request loses to a returning supplement", async () => {
+    const awayWindow = deferred<ArrayBuffer>();
+    const returningSupplement = deferred<ArrayBuffer>();
+    const wideSource = {
+      ...source,
+      schema: Array.from({ length: 40 }, (_, index) => ({
+        ...source.schema[0]!,
+        name: `column_${index}`,
+      })),
+    };
+    render(<DataGrid source={wideSource} />);
+    await waitFor(() => expect(desktop.getDataWindow).toHaveBeenCalledOnce());
+    vi.mocked(desktop.getDataWindow).mockClear();
+    vi.mocked(desktop.getDataWindow)
+      .mockReturnValueOnce(awayWindow.promise)
+      .mockReturnValueOnce(returningSupplement.promise);
+
+    act(() => {
+      reportViewport({
+        rowStart: 1_000,
+        rowCount: 3,
+        columnIndices: [0, 1],
+      });
+      reportViewport({
+        rowStart: 10,
+        rowCount: 3,
+        columnIndices: [0, 20],
+        mountedRowStart: 10,
+        mountedRowCount: 5,
+      });
+    });
+    expect(desktop.getDataWindow).toHaveBeenCalledOnce();
+    await act(
+      () =>
+        new Promise<void>((resolve) => {
+          window.setTimeout(resolve, 150);
+        }),
+    );
+    gridMock.revisionChanged.mockReset();
+
+    await act(async () => awayWindow.resolve(new ArrayBuffer(1)));
+
+    await waitFor(() => expect(desktop.getDataWindow).toHaveBeenCalledTimes(2));
+    expect(desktop.getDataWindow).toHaveBeenLastCalledWith(7, 0, 8, 10, [20]);
+    expect(gridMock.revisionChanged).not.toHaveBeenCalled();
+
+    await act(async () => returningSupplement.resolve(new ArrayBuffer(2)));
+    await waitFor(() =>
+      expect(gridMock.revisionChanged).toHaveBeenCalledOnce(),
+    );
+    expect(gridMock.props?.getCellContent({ row: 10, column: 0 }).kind).toBe(
+      "text",
+    );
+    expect(gridMock.props?.getCellContent({ row: 10, column: 20 }).kind).toBe(
+      "text",
+    );
+  });
+
+  it("loads row-only projection supplements without horizontal debounce", async () => {
+    const verticalSupplement = deferred<ArrayBuffer>();
+    const wideSource = {
+      ...source,
+      schema: Array.from({ length: 40 }, (_, index) => ({
+        ...source.schema[0]!,
+        name: `column_${index}`,
+      })),
+    };
+    render(<DataGrid source={wideSource} />);
+    await waitFor(() => expect(desktop.getDataWindow).toHaveBeenCalledOnce());
+
+    act(() => {
+      reportViewport({
+        rowStart: 0,
+        rowCount: 3,
+        columnIndices: [0, 20],
+        mountedRowStart: 0,
+        mountedRowCount: 31,
+      });
+    });
+    await waitFor(() => expect(desktop.getDataWindow).toHaveBeenCalledTimes(2));
+    await waitFor(() =>
+      expect(gridMock.props?.getCellContent({ row: 0, column: 20 }).kind).toBe(
+        "text",
+      ),
+    );
+    vi.mocked(desktop.getDataWindow).mockClear();
+    vi.mocked(desktop.getDataWindow).mockReturnValueOnce(
+      verticalSupplement.promise,
+    );
+    gridMock.revisionChanged.mockReset();
+
+    act(() => {
+      reportViewport({
+        rowStart: 40,
+        rowCount: 3,
+        columnIndices: [0, 20],
+        mountedRowStart: 37,
+        mountedRowCount: 31,
+      });
+    });
+
+    expect(desktop.getDataWindow).toHaveBeenCalledOnce();
+    expect(desktop.getDataWindow).toHaveBeenLastCalledWith(7, 0, 22, 62, [20]);
+    expect(gridMock.props?.getCellContent({ row: 67, column: 20 }).kind).toBe(
+      "loading",
+    );
+
+    await act(async () => verticalSupplement.resolve(new ArrayBuffer(3)));
+    await waitFor(() =>
+      expect(gridMock.props?.getCellContent({ row: 67, column: 20 }).kind).toBe(
+        "text",
+      ),
+    );
+    vi.mocked(desktop.getDataWindow).mockClear();
+
+    act(() => {
+      reportViewport({
+        rowStart: 41,
+        rowCount: 3,
+        columnIndices: [0, 20],
+        mountedRowStart: 38,
+        mountedRowCount: 31,
+      });
+    });
+    expect(desktop.getDataWindow).not.toHaveBeenCalled();
+  });
+
+  it("drops queued away windows after returning to cached rows", async () => {
+    const activeAway = deferred<ArrayBuffer>();
+    render(<DataGrid source={source} />);
+    await waitFor(() => expect(desktop.getDataWindow).toHaveBeenCalledOnce());
+    vi.mocked(desktop.getDataWindow).mockClear();
+    vi.mocked(desktop.getDataWindow).mockReturnValueOnce(activeAway.promise);
+
+    act(() => {
+      reportViewport({ rowStart: 1_000, rowCount: 3, columnIndices: [0, 1] });
+      reportViewport({ rowStart: 2_000, rowCount: 3, columnIndices: [0, 1] });
+      reportViewport({ rowStart: 10, rowCount: 3, columnIndices: [0, 1] });
+    });
+    expect(desktop.getDataWindow).toHaveBeenCalledOnce();
+    gridMock.revisionChanged.mockReset();
+
+    await act(async () => activeAway.resolve(new ArrayBuffer(1)));
+
+    expect(desktop.getDataWindow).toHaveBeenCalledOnce();
+    expect(gridMock.revisionChanged).not.toHaveBeenCalled();
+    expect(gridMock.props?.getCellContent({ row: 10, column: 0 }).kind).toBe(
+      "text",
+    );
+  });
+
+  it("applies an active visible window without dropping its queued prefetch", async () => {
+    const activeWindow = deferred<ArrayBuffer>();
+    render(<DataGrid source={source} />);
+    await waitFor(() => expect(desktop.getDataWindow).toHaveBeenCalledOnce());
+    vi.mocked(desktop.getDataWindow).mockClear();
+    vi.mocked(desktop.getDataWindow).mockReturnValueOnce(activeWindow.promise);
+
+    act(() => {
+      reportViewport({ rowStart: 1_000, rowCount: 3, columnIndices: [0, 1] });
+      reportViewport({ rowStart: 2_000, rowCount: 3, columnIndices: [0, 1] });
+      reportViewport({ rowStart: 1_000, rowCount: 3, columnIndices: [0, 1] });
+    });
+    expect(desktop.getDataWindow).toHaveBeenCalledOnce();
+    gridMock.revisionChanged.mockReset();
+
+    await act(async () => activeWindow.resolve(new ArrayBuffer(1)));
+
+    await waitFor(() => expect(gridMock.revisionChanged).toHaveBeenCalled());
+    await waitFor(() => expect(desktop.getDataWindow).toHaveBeenCalledTimes(2));
+    const calls = vi.mocked(desktop.getDataWindow).mock.calls;
+    expect(calls[1]?.[2]).toBeLessThan(calls[0]?.[2] ?? 0);
+    expect(gridMock.props?.getCellContent({ row: 1_000, column: 0 }).kind).toBe(
+      "text",
+    );
+  });
+
+  it("keeps horizontal debounce across repeated viewports in one mounted range", async () => {
+    const wideSource = {
+      ...source,
+      schema: Array.from({ length: 40 }, (_, index) => ({
+        ...source.schema[0]!,
+        name: `column_${index}`,
+      })),
+    };
+    render(<DataGrid source={wideSource} />);
+    await waitFor(() => expect(desktop.getDataWindow).toHaveBeenCalledOnce());
+    vi.mocked(desktop.getDataWindow).mockClear();
+    vi.useFakeTimers();
+    try {
+      act(() => {
+        reportViewport({
+          rowStart: 0,
+          rowCount: 3,
+          columnIndices: [0, 20],
+          mountedRowStart: 0,
+          mountedRowCount: 31,
+        });
+      });
+      await act(async () => vi.advanceTimersByTimeAsync(60));
+      act(() => {
+        reportViewport({
+          rowStart: 1,
+          rowCount: 3,
+          columnIndices: [0, 20],
+          mountedRowStart: 0,
+          mountedRowCount: 31,
+        });
+      });
+      await act(async () => vi.advanceTimersByTimeAsync(59));
+      expect(desktop.getDataWindow).not.toHaveBeenCalled();
+
+      await act(async () => vi.advanceTimersByTimeAsync(1));
+      expect(desktop.getDataWindow).toHaveBeenCalledOnce();
+      expect(desktop.getDataWindow).toHaveBeenLastCalledWith(7, 0, 0, 62, [20]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("ignores an obsolete window failure after returning to cached rows", async () => {
+    const activeAway = deferred<ArrayBuffer>();
+    render(<DataGrid source={source} />);
+    await waitFor(() => expect(desktop.getDataWindow).toHaveBeenCalledOnce());
+    vi.mocked(desktop.getDataWindow).mockClear();
+    vi.mocked(desktop.getDataWindow).mockReturnValueOnce(activeAway.promise);
+
+    act(() => {
+      reportViewport({ rowStart: 1_000, rowCount: 3, columnIndices: [0, 1] });
+      reportViewport({ rowStart: 10, rowCount: 3, columnIndices: [0, 1] });
+    });
+    await act(async () => activeAway.reject(new Error("obsolete failure")));
+
+    expect(screen.queryByRole("button", { name: "Retry window" })).toBeNull();
+    expect(screen.queryByText(/could not be loaded/i)).toBeNull();
+    expect(gridMock.props?.getCellContent({ row: 10, column: 0 }).kind).toBe(
+      "text",
+    );
+  });
+
+  it("clears a failed supplement after returning to a base-only projection", async () => {
+    const failedSupplement = deferred<ArrayBuffer>();
+    const wideSource = {
+      ...source,
+      schema: Array.from({ length: 40 }, (_, index) => ({
+        ...source.schema[0]!,
+        name: `column_${index}`,
+      })),
+    };
+    render(<DataGrid source={wideSource} />);
+    await waitFor(() => expect(desktop.getDataWindow).toHaveBeenCalledOnce());
+    vi.mocked(desktop.getDataWindow).mockClear();
+    vi.mocked(desktop.getDataWindow).mockReturnValueOnce(
+      failedSupplement.promise,
+    );
+
+    act(() => {
+      reportViewport({ rowStart: 0, rowCount: 3, columnIndices: [0, 20] });
+    });
+    await waitFor(() => expect(desktop.getDataWindow).toHaveBeenCalledOnce());
+    act(() => {
+      reportViewport({ rowStart: 0, rowCount: 3, columnIndices: [0] });
+    });
+    await act(async () =>
+      failedSupplement.reject(new Error("obsolete supplement")),
+    );
+
+    expect(screen.queryByRole("button", { name: "Retry window" })).toBeNull();
+    expect(screen.queryByText(/could not be loaded/i)).toBeNull();
+    expect(gridMock.props?.getCellContent({ row: 0, column: 0 }).kind).toBe(
+      "text",
+    );
+  });
+
+  it("does not let an old viewChanged result replace a promoted view request", async () => {
+    const oldWindow = deferred<ArrayBuffer>();
+    const promotedWindow = deferred<ArrayBuffer>();
+    render(<DataGrid source={source} />);
+    await waitFor(() => expect(desktop.getDataWindow).toHaveBeenCalledOnce());
+    vi.mocked(desktop.getDataWindow).mockClear();
+    vi.mocked(desktop.getDataViewStatus).mockClear();
+    vi.mocked(desktop.getDataWindow)
+      .mockReturnValueOnce(oldWindow.promise)
+      .mockReturnValueOnce(promotedWindow.promise);
+
+    act(() => {
+      reportViewport({ rowStart: 1_000, rowCount: 3, columnIndices: [0, 1] });
+    });
+    addNumberFilter("1");
+    await waitFor(() => expect(gridMock.props?.rowCount).toBe(37));
+    expect(desktop.getDataWindow).toHaveBeenCalledOnce();
+    gridMock.revisionChanged.mockReset();
+
+    await act(async () =>
+      oldWindow.reject(new desktop.DataWindowCommandError("viewChanged")),
+    );
+
+    await waitFor(() => expect(desktop.getDataWindow).toHaveBeenCalledTimes(2));
+    expect(desktop.getDataWindow).toHaveBeenLastCalledWith(
+      7,
+      1,
+      expect.any(Number),
+      expect.any(Number),
+      [0, 1],
+    );
+    expect(desktop.getDataViewStatus).not.toHaveBeenCalled();
+
+    await act(async () => promotedWindow.resolve(new ArrayBuffer(2)));
+    await waitFor(() =>
+      expect(gridMock.revisionChanged).toHaveBeenCalledOnce(),
+    );
+  });
+
+  it("does not let same-view recovery replace a newer row request", async () => {
+    const obsoleteWindow = deferred<ArrayBuffer>();
+    const currentWindow = deferred<ArrayBuffer>();
+    render(<DataGrid source={source} />);
+    await waitFor(() => expect(desktop.getDataWindow).toHaveBeenCalledOnce());
+    vi.mocked(desktop.getDataWindow).mockClear();
+    vi.mocked(desktop.getDataViewStatus).mockClear();
+    vi.mocked(desktop.getDataWindow)
+      .mockReturnValueOnce(obsoleteWindow.promise)
+      .mockReturnValueOnce(currentWindow.promise);
+
+    act(() => {
+      reportViewport({ rowStart: 1_000, rowCount: 3, columnIndices: [0, 1] });
+      reportViewport({ rowStart: 2_000, rowCount: 3, columnIndices: [0, 1] });
+    });
+    expect(desktop.getDataWindow).toHaveBeenCalledOnce();
+
+    await act(async () =>
+      obsoleteWindow.reject(new desktop.DataWindowCommandError("viewChanged")),
+    );
+
+    await waitFor(() => expect(desktop.getDataWindow).toHaveBeenCalledTimes(2));
+    expect(
+      vi.mocked(desktop.getDataWindow).mock.calls.at(-1)?.[2],
+    ).toBeGreaterThan(1_000);
+    expect(desktop.getDataViewStatus).not.toHaveBeenCalled();
+
+    await act(async () => currentWindow.resolve(new ArrayBuffer(2)));
+    await waitFor(() =>
+      expect(
+        gridMock.props?.getCellContent({ row: 2_000, column: 0 }).kind,
+      ).toBe("text"),
+    );
   });
 
   it("interrupts active preparation when the grid closes", async () => {
@@ -3129,10 +3624,12 @@ function copyFromGrid() {
 
 function deferred<T>() {
   let resolvePromise!: (value: T | PromiseLike<T>) => void;
-  const promise = new Promise<T>((resolve) => {
+  let rejectPromise!: (reason?: unknown) => void;
+  const promise = new Promise<T>((resolve, reject) => {
     resolvePromise = resolve;
+    rejectPromise = reject;
   });
-  return { promise, resolve: resolvePromise };
+  return { promise, resolve: resolvePromise, reject: rejectPromise };
 }
 
 function desktopSelection(index?: number): CompactSelection {

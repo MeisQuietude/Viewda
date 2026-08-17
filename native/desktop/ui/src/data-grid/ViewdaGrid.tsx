@@ -26,6 +26,7 @@ import {
   GRID_OVERSCAN_ROWS,
   GRID_ROW_HEIGHT,
   hystereticColumnWindow,
+  hystereticRowAnchor,
   logicalToPhysical,
   logicalTopAfterRowSteps,
   normalizeWheelDelta,
@@ -59,8 +60,17 @@ import {
   type GridWheelOutcome,
 } from "./grid-performance-report";
 
+// Small grids fit every supported webview, so probing below one million CSS
+// pixels only adds layout work. Lower this if a supported webview clamps sooner.
 const PROBE_TRIGGER_HEIGHT = 1_000_000;
+
+// The probe writes an unreachable scroll position and reads the clamp back.
+// This sentinel only needs to exceed every supported webview's native extent.
 const OVERSIZED_PROBE_EXTENT = 1_000_000_000;
+
+// Selection starts auto-scroll within two row heights of an edge. Small
+// viewports cap the zone at one quarter of their height. Settings can offer slow
+// and fast drag presets if users need control.
 const DRAG_AUTO_SCROLL_EDGE = GRID_ROW_HEIGHT * 2;
 
 export interface GridViewport {
@@ -239,6 +249,8 @@ export const ViewdaGrid = forwardRef<ViewdaGridHandle, ViewdaGridProps>(
       ColumnWindow["mounted"] | null
     >(null);
     const columnWindowRef = useRef<ColumnWindow | null>(null);
+    const [rowAnchor, setRowAnchor] = useState<number | null>(null);
+    const rowAnchorRef = useRef<number | null>(null);
     const [safeExtent, setSafeExtent] = useState<{
       vertical: number;
       horizontal: number;
@@ -382,6 +394,24 @@ export const ViewdaGrid = forwardRef<ViewdaGridHandle, ViewdaGridProps>(
       return mountedChanged;
     }, []);
 
+    const commitRowAnchor = useCallback(
+      (logicalTop: number, viewportHeight: number) => {
+        const mounted = visibleRowRange(
+          logicalTop,
+          viewportHeight,
+          GRID_ROW_HEIGHT,
+          rowCount,
+          GRID_OVERSCAN_ROWS,
+        );
+        const next = hystereticRowAnchor(mounted, rowAnchorRef.current);
+        if (rowAnchorRef.current === next) return false;
+        rowAnchorRef.current = next;
+        setRowAnchor(next);
+        return true;
+      },
+      [rowCount],
+    );
+
     const writePhysicalTop = useCallback((physicalTop: number) => {
       const scrollport = scrollportRef.current;
       if (scrollport === null) {
@@ -469,6 +499,8 @@ export const ViewdaGrid = forwardRef<ViewdaGridHandle, ViewdaGridProps>(
               height: read.height,
               devicePixelRatio: read.devicePixelRatio,
             }) || reactWorkScheduled;
+          reactWorkScheduled =
+            commitRowAnchor(next.logicalTop, read.height) || reactWorkScheduled;
           const previousColumnWindow = columnWindowRef.current;
           const nextColumnWindow = hystereticColumnWindow(
             scrollingOffsets,
@@ -515,6 +547,7 @@ export const ViewdaGrid = forwardRef<ViewdaGridHandle, ViewdaGridProps>(
       commitScrollState,
       commitColumnWindow,
       commitGeometry,
+      commitRowAnchor,
       diagnostics,
       layout,
       markerWidth,
@@ -537,6 +570,7 @@ export const ViewdaGrid = forwardRef<ViewdaGridHandle, ViewdaGridProps>(
         height: read.height,
         devicePixelRatio: read.devicePixelRatio,
       });
+      commitRowAnchor(scrollStateRef.current.logicalTop, read.height);
       commitColumnWindow(
         hystereticColumnWindow(
           scrollingOffsets,
@@ -563,6 +597,7 @@ export const ViewdaGrid = forwardRef<ViewdaGridHandle, ViewdaGridProps>(
       pinnedWidth,
       commitColumnWindow,
       commitGeometry,
+      commitRowAnchor,
       scheduleMeasurement,
       scrollingOffsets,
       syncHorizontalScroll,
@@ -619,6 +654,7 @@ export const ViewdaGrid = forwardRef<ViewdaGridHandle, ViewdaGridProps>(
       rowCount,
       0,
     );
+    const coordinateRowAnchor = hystereticRowAnchor(renderedRows, rowAnchor);
 
     const publishViewport = useCallback(
       (
@@ -816,12 +852,19 @@ export const ViewdaGrid = forwardRef<ViewdaGridHandle, ViewdaGridProps>(
         if (!positionsDiffer(current.logicalTop, next.logicalTop)) {
           return false;
         }
+        commitRowAnchor(next.logicalTop, geometryRef.current.height);
         commitScrollState(next);
         writePhysicalTop(next.physicalTop);
         scheduleMeasurement();
         return true;
       },
-      [commitScrollState, layout, scheduleMeasurement, writePhysicalTop],
+      [
+        commitRowAnchor,
+        commitScrollState,
+        layout,
+        scheduleMeasurement,
+        writePhysicalTop,
+      ],
     );
 
     useEffect(() => {
@@ -996,11 +1039,18 @@ export const ViewdaGrid = forwardRef<ViewdaGridHandle, ViewdaGridProps>(
           logicalTop,
           physicalTop: logicalToPhysical(logicalTop, layout),
         };
+        commitRowAnchor(next.logicalTop, geometryRef.current.height);
         commitScrollState(next);
         writePhysicalTop(next.physicalTop);
         scheduleMeasurement();
       },
-      [commitScrollState, layout, scheduleMeasurement, writePhysicalTop],
+      [
+        commitRowAnchor,
+        commitScrollState,
+        layout,
+        scheduleMeasurement,
+        writePhysicalTop,
+      ],
     );
 
     const scrollToColumn = useCallback(
@@ -1601,6 +1651,12 @@ export const ViewdaGrid = forwardRef<ViewdaGridHandle, ViewdaGridProps>(
       [pinnedIndices, scrollingIndices],
     );
 
+    // Keep the shared layer translation near the physical viewport. Using
+    // `physicalTop - logicalTop` directly would create an enormous negative CSS
+    // coordinate in compressed mode, while absolute logical row positions can
+    // exceed the webview's reliable layout range. The coordinate anchor changes
+    // on a wider runway than the actual DOM window, so overlapping memoized rows
+    // keep stable transforms while rows still mount one at a time.
     const rows = [];
     for (let row = renderedRows.start; row < renderedRows.end; row += 1) {
       rows.push(
@@ -1617,11 +1673,7 @@ export const ViewdaGrid = forwardRef<ViewdaGridHandle, ViewdaGridProps>(
           markerWidth={markerWidth}
           pinnedLeftByColumn={pinnedLeftByColumn}
           ariaColumnByColumn={ariaColumnByColumn}
-          physicalTop={
-            effectiveScrollState.physicalTop +
-            row * GRID_ROW_HEIGHT -
-            effectiveScrollState.logicalTop
-          }
+          anchoredTop={(row - coordinateRowAnchor) * GRID_ROW_HEIGHT}
           selection={selection}
           contentRevision={contentRevision}
           getCellContent={getCellContent}
@@ -1715,7 +1767,14 @@ export const ViewdaGrid = forwardRef<ViewdaGridHandle, ViewdaGridProps>(
           />
           <div
             className="viewda-grid-visible-rows"
-            style={{ width: totalWidth }}
+            style={{
+              width: totalWidth,
+              transform: `translateY(${
+                effectiveScrollState.physicalTop +
+                coordinateRowAnchor * GRID_ROW_HEIGHT -
+                effectiveScrollState.logicalTop
+              }px)`,
+            }}
           >
             {rows}
           </div>
@@ -1752,7 +1811,7 @@ const GridRow = memo(function GridRow({
   markerWidth,
   pinnedLeftByColumn,
   ariaColumnByColumn,
-  physicalTop,
+  anchoredTop,
   selection,
   contentRevision,
   getCellContent,
@@ -1767,7 +1826,7 @@ const GridRow = memo(function GridRow({
   markerWidth: number;
   pinnedLeftByColumn: ReadonlyMap<number, number>;
   ariaColumnByColumn: ReadonlyMap<number, number>;
-  physicalTop: number;
+  anchoredTop: number;
   selection: GridSelection;
   contentRevision: number;
   getCellContent(address: GridAddress): GridCell;
@@ -1781,7 +1840,7 @@ const GridRow = memo(function GridRow({
       style={{
         width: "100%",
         minWidth: "100%",
-        transform: `translateY(${physicalTop}px)`,
+        transform: `translateY(${anchoredTop}px)`,
       }}
     >
       <div

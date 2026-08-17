@@ -67,7 +67,26 @@
  *   request lifecycle. Stale may overlap a terminal outcome. Disposal reasons
  *   explain queued requests intentionally removed before start.
  * - `queueWaitMs` is queue to start. `requestDurationMs` is start to terminal
- *   outcome. A request that never starts has no duration sample.
+ *   outcome. A request that never starts has no duration sample. Projection
+ *   queue time includes the intentional horizontal idle debounce, so it is not
+ *   by itself evidence that the main thread or native engine was blocked.
+ * - `recentRequests` keeps the latest 64 terminal requests. `reason` separates
+ *   the first base window of a view, row movement, horizontal projection
+ *   changes, combined movement, and retries. A projection-only request covers
+ *   a small bounded data runway around the mounted DOM rows rather than the
+ *   larger base prefetch window. Row offset/count identify that requested
+ *   logical slice. Projection count plus the fixed-size key (first/last source
+ *   index, contiguous/sparse marker, and stable 32-bit fingerprint) distinguish
+ *   projection shapes without recording names, paths, values, or an unbounded
+ *   index list. Filter/sort flags show whether a prepared view served the
+ *   request. `relativeMs` is the terminal event's offset from recording start.
+ *   `outcome` is either the native call result or the reason a queued call was
+ *   disposed before it started. `stale` means a completed or failed native call
+ *   no longer matched the authoritative viewport at its terminal boundary, so
+ *   it intentionally overlaps `completed` or `failed`. Queue and execution
+ *   durations distinguish scheduler delay from engine work. This bounded trace
+ *   complements aggregate percentiles: it preserves the order and shape needed
+ *   to explain a stall.
  *
  * Diagnostic episodes
  * - `frameOverBudgetThresholdMs` is 1.5 × idle rAF p50 after reference sampling,
@@ -98,6 +117,8 @@ export {
   gridDiagnosticsNoopSink,
   type GridDiagnosticsController,
   type GridDiagnosticsSink,
+  type GridDataWindowRequest,
+  type GridDataWindowRequestReason,
   type GridReactCommitSource,
   type GridWheelOutcome,
 } from "./diagnostics/session";
