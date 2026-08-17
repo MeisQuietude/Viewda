@@ -14,6 +14,10 @@ import * as desktop from "../desktop";
 import { DataGrid } from "./DataGrid";
 import type { ArrowDataWindow } from "./arrow-window";
 import { CompactSelection, type GridSelection } from "./grid-model";
+import {
+  createGridPerformanceController,
+  type GridDiagnosticsController,
+} from "./grid-performance-report";
 import type {
   GridViewport,
   ViewdaGridHandle,
@@ -32,6 +36,7 @@ const gridMock = vi.hoisted(() => ({
 
 const decodeArrowWindow = vi.hoisted(() => vi.fn());
 const clipboardWrite = vi.fn();
+let diagnosticsController: GridDiagnosticsController | null = null;
 
 vi.mock("./ViewdaGrid", async () => {
   const React = await import("react");
@@ -186,6 +191,8 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+  diagnosticsController?.dispose();
+  diagnosticsController = null;
   cleanup();
   document.documentElement.style.removeProperty("--font-ui");
   document.documentElement.style.removeProperty("--font-mono");
@@ -2019,6 +2026,7 @@ describe("DataGrid window rendering", () => {
   });
 
   it("coalesces vertical movement behind an unresolved horizontal window", async () => {
+    diagnosticsController = createGridPerformanceController();
     const horizontalWindow = deferred<ArrayBuffer>();
     const latestWindow = deferred<ArrayBuffer>();
     const wideSource = {
@@ -2030,8 +2038,20 @@ describe("DataGrid window rendering", () => {
         children: [],
       })),
     };
-    render(<DataGrid source={wideSource} />);
+    render(
+      <DataGrid source={wideSource} diagnostics={diagnosticsController.sink} />,
+    );
     await waitFor(() => expect(desktop.getDataWindow).toHaveBeenCalledOnce());
+    diagnosticsController.start({
+      runtime: {
+        appVersion: "test",
+        queryEngineVersion: "test",
+        userAgent: "test",
+        platform: "test",
+        theme: "light",
+      },
+      source: { sizeBytes: 1, rowCount: 10_000, columnCount: 40 },
+    });
     vi.mocked(desktop.getDataWindow).mockClear();
     vi.mocked(desktop.getDataWindow)
       .mockReturnValueOnce(horizontalWindow.promise)
@@ -2083,6 +2103,20 @@ describe("DataGrid window rendering", () => {
     await waitFor(() =>
       expect(gridMock.revisionChanged).toHaveBeenCalledOnce(),
     );
+    expect(
+      JSON.parse(diagnosticsController.stop() ?? "null").dataWindows,
+    ).toMatchObject({
+      queued: 3,
+      started: 2,
+      completed: 2,
+      stale: 1,
+      pendingAtStop: 0,
+      pendingRequestDisposals: {
+        supersededBeforeStart: 1,
+        satisfiedByCompletedWindow: 0,
+        invalidatedBeforeStart: 0,
+      },
+    });
   });
 
   it("interrupts active preparation when the grid closes", async () => {

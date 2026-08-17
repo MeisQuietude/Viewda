@@ -45,6 +45,10 @@ import {
   type Rectangle,
 } from "./grid-model";
 import { createGridClipboard } from "./grid-clipboard";
+import {
+  gridDiagnosticsNoopSink,
+  type GridDiagnosticsSink,
+} from "./grid-performance-report";
 import { GRID_INITIAL_COLUMNS, GRID_INITIAL_ROWS } from "./grid-layout";
 import { boundedSelectionScope, selectColumn } from "./grid-selection";
 import { gridFontStrings } from "./grid-typography";
@@ -171,6 +175,7 @@ interface VersionedRowRequest {
   revision: number;
   projectionRevision: number;
   sourceIndices: readonly number[];
+  traceId: number | null;
 }
 
 interface ActiveView {
@@ -322,9 +327,11 @@ function ViewErrorAlert({
 export function DataGrid({
   source,
   viewSettings = DEFAULT_DATA_VIEW_SETTINGS,
+  diagnostics = gridDiagnosticsNoopSink,
 }: {
   source: SourceSummary;
   viewSettings?: DataViewSettings;
+  diagnostics?: GridDiagnosticsSink;
 }) {
   const [columnStates, setColumnStates] = useState<ColumnState[]>(() =>
     source.schema.map((field, sourceIndex) => ({
@@ -575,6 +582,10 @@ export function DataGrid({
       setPendingView(null);
       setLoadError(null);
       setViewError(null);
+      diagnostics.disposeRequest(
+        pendingRequestRef.current?.traceId ?? null,
+        "invalidatedBeforeStart",
+      );
       pendingRequestRef.current = null;
       failedRequestRef.current = null;
       dataWindowRef.current = null;
@@ -586,7 +597,7 @@ export function DataGrid({
       setGridMenu(null);
       setContentRevision((current) => current + 1);
     },
-    [],
+    [diagnostics],
   );
 
   const drainRequests = useCallback(async () => {
@@ -598,6 +609,9 @@ export function DataGrid({
       const request = pendingRequestRef.current;
       pendingRequestRef.current = null;
       activeRequestRef.current = request;
+      diagnostics.startRequest(request.traceId);
+      let requestOutcome: "completed" | "failed" = "completed";
+      let staleRequest = false;
       try {
         const bytes = await getDataWindow(
           source.generation,
@@ -616,6 +630,7 @@ export function DataGrid({
           request.revision !== activeViewRef.current.revision ||
           request.projectionRevision !== projectionRevisionRef.current
         ) {
+          staleRequest = true;
           continue;
         }
         setMonospaceColumns((current) => {
@@ -630,6 +645,10 @@ export function DataGrid({
         });
         const pending = pendingRequestRef.current as VersionedRowRequest | null;
         if (pending !== null && requestSatisfiesWindow(request, pending)) {
+          diagnostics.disposeRequest(
+            pending.traceId,
+            "satisfiedByCompletedWindow",
+          );
           pendingRequestRef.current = null;
         }
         const latest = pendingRequestRef.current as VersionedRowRequest | null;
@@ -642,55 +661,67 @@ export function DataGrid({
           failedRequestRef.current = null;
           setContentRevision((current) => current + 1);
           setLoadError(null);
+        } else {
+          staleRequest = true;
         }
       } catch (error) {
+        requestOutcome = "failed";
         if (
-          aliveRef.current &&
-          request.projectionRevision === projectionRevisionRef.current
+          !aliveRef.current ||
+          request.projectionRevision !== projectionRevisionRef.current
         ) {
-          if (
-            error instanceof DataWindowCommandError &&
-            error.code === "viewChanged"
-          ) {
-            try {
-              const status = await getDataViewStatus(source.generation);
-              const pending = pendingViewRef.current;
-              const active = activeViewRef.current;
-              if (pending?.revision === status.revision) {
-                promoteView(
-                  status.revision,
-                  status.rowCount,
-                  pending.filters,
-                  pending.sort,
-                );
-              } else if (active.revision === status.revision) {
-                pendingRequestRef.current = {
-                  rows: request.rows,
-                  revision: active.revision,
-                  projectionRevision: request.projectionRevision,
-                  sourceIndices: request.sourceIndices,
-                };
-              } else {
-                setLoadError({
-                  message: "The active data view could not be synchronized.",
-                });
-              }
-            } catch (statusError) {
-              setLoadError(dataViewErrorState(statusError));
+          staleRequest = true;
+        } else if (
+          error instanceof DataWindowCommandError &&
+          error.code === "viewChanged"
+        ) {
+          staleRequest = true;
+          try {
+            const status = await getDataViewStatus(source.generation);
+            const pending = pendingViewRef.current;
+            const active = activeViewRef.current;
+            if (pending?.revision === status.revision) {
+              promoteView(
+                status.revision,
+                status.rowCount,
+                pending.filters,
+                pending.sort,
+              );
+            } else if (active.revision === status.revision) {
+              pendingRequestRef.current = {
+                rows: request.rows,
+                revision: active.revision,
+                projectionRevision: request.projectionRevision,
+                sourceIndices: request.sourceIndices,
+                traceId: diagnostics.queueRequest(),
+              };
+            } else {
+              setLoadError({
+                message: "The active data view could not be synchronized.",
+              });
             }
-          } else if (
-            request.revision === activeViewRef.current.revision &&
-            pendingRequestRef.current === null
-          ) {
-            failedRequestRef.current = request;
-            setLoadError(dataViewErrorState(error));
+          } catch (statusError) {
+            setLoadError(dataViewErrorState(statusError));
           }
+        } else if (
+          aliveRef.current &&
+          request.revision === activeViewRef.current.revision &&
+          request.projectionRevision === projectionRevisionRef.current &&
+          pendingRequestRef.current === null
+        ) {
+          failedRequestRef.current = request;
+          setLoadError(dataViewErrorState(error));
         }
       } finally {
+        diagnostics.finishRequest(
+          request.traceId,
+          requestOutcome,
+          staleRequest,
+        );
         activeRequestRef.current = null;
       }
     }
-  }, [promoteView, source.generation]);
+  }, [diagnostics, promoteView, source.generation]);
 
   const requestRows = useCallback(
     (
@@ -720,6 +751,7 @@ export function DataGrid({
         revision: activeView.revision,
         projectionRevision: projectionRevisionRef.current,
         sourceIndices,
+        traceId: null,
       };
       const current = dataWindowRef.current;
       if (
@@ -740,10 +772,14 @@ export function DataGrid({
       if (active !== null && requestSatisfiesWindow(active, requestedWindow)) {
         return;
       }
+      if (pending !== null) {
+        diagnostics.disposeRequest(pending.traceId, "supersededBeforeStart");
+      }
+      requestedWindow.traceId = diagnostics.queueRequest();
       pendingRequestRef.current = requestedWindow;
       void drainRequests();
     },
-    [drainRequests],
+    [diagnostics, drainRequests],
   );
 
   const retryWindow = useCallback(() => {
@@ -756,14 +792,21 @@ export function DataGrid({
       return;
     }
     failedRequestRef.current = null;
-    pendingRequestRef.current = failed;
+    pendingRequestRef.current = {
+      ...failed,
+      traceId: diagnostics.queueRequest(),
+    };
     setLoadError(null);
     void drainRequests();
-  }, [drainRequests]);
+  }, [diagnostics, drainRequests]);
 
   const reloadActiveWindow = useCallback(() => {
     const active = activeViewRef.current;
     failedRequestRef.current = null;
+    diagnostics.disposeRequest(
+      pendingRequestRef.current?.traceId ?? null,
+      "invalidatedBeforeStart",
+    );
     pendingRequestRef.current = null;
     dataWindowRef.current = null;
     setContentRevision((current) => current + 1);
@@ -775,7 +818,7 @@ export function DataGrid({
       visible?.rowStart ?? 0,
       visible?.rowCount ?? Math.min(GRID_INITIAL_ROWS, active.rowCount),
     );
-  }, [requestRows]);
+  }, [diagnostics, requestRows]);
 
   useEffect(() => {
     const previous = previousProjectionRef.current;
@@ -795,6 +838,10 @@ export function DataGrid({
       return;
     }
     projectionRevisionRef.current += 1;
+    diagnostics.disposeRequest(
+      pendingRequestRef.current?.traceId ?? null,
+      "invalidatedBeforeStart",
+    );
     pendingRequestRef.current = null;
     failedRequestRef.current = null;
     dataWindowRef.current = null;
@@ -803,7 +850,7 @@ export function DataGrid({
     setSelection(clearColumnSelection);
     setCopyLimit(null);
     setContentRevision((current) => current + 1);
-  }, [visibleSourceIndices]);
+  }, [diagnostics, visibleSourceIndices]);
 
   useEffect(() => {
     setHeaderMenu((current) =>
@@ -835,10 +882,14 @@ export function DataGrid({
     return () => {
       aliveRef.current = false;
       copyAbortRef.current?.abort();
+      diagnostics.disposeRequest(
+        pendingRequestRef.current?.traceId ?? null,
+        "invalidatedBeforeStart",
+      );
       pendingRequestRef.current = null;
       failedRequestRef.current = null;
     };
-  }, []);
+  }, [diagnostics]);
 
   useEffect(() => {
     if (activeView.rowCount > 0) {
@@ -2093,6 +2144,7 @@ export function DataGrid({
           <div className="grid-container">
             <ViewdaGrid
               ref={gridRef}
+              diagnostics={diagnostics}
               columns={columns}
               rowCount={gridRowCount}
               selection={selection}

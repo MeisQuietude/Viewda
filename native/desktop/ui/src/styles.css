@@ -26,6 +26,7 @@
   --suggestion-match: #f2c94c;
   --suggestion-match-text: #1b1d1e;
   --error-text: #8f342c;
+  --success-text: #2d7445;
   --danger-action: #a94336;
   --danger-action-hover: #91382e;
   font-family: var(--font-ui);
@@ -1977,6 +1978,200 @@ button:focus-visible,
   margin-top: 10px;
 }
 
+.grid-performance-debug {
+  display: grid;
+  gap: 8px;
+  margin-top: 12px;
+}
+
+.grid-performance-debug p {
+  margin: 0;
+}
+
+.grid-performance-debug .text-button {
+  width: fit-content;
+}
+
+.grid-performance-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.grid-performance-debug textarea {
+  width: 100%;
+  min-height: 120px;
+  resize: vertical;
+  border: 1px solid rgb(27 29 30 / 14%);
+  border-radius: 5px;
+  color: var(--grid-text);
+  background: var(--grid-cell);
+  font: 10px/1.4 var(--font-mono);
+}
+
+.grid-performance-recording-status {
+  position: fixed;
+  z-index: 9;
+  right: 12px;
+  bottom: 12px;
+  max-width: calc(100% - 24px);
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  padding: 6px;
+  border: 1px solid var(--grid-border);
+  border-radius: 8px;
+  color: var(--grid-text-muted);
+  background: var(--grid-header);
+  box-shadow: 0 8px 28px rgb(10 12 12 / 16%);
+  font-size: 12px;
+}
+
+.grid-performance-recording-status.is-completed {
+  width: max-content;
+}
+
+.grid-performance-recording-status time {
+  min-width: 3ch;
+  color: var(--grid-text);
+  font: 12px/1 var(--font-mono);
+  font-variant-numeric: tabular-nums;
+}
+
+.grid-performance-recording-status .text-button {
+  min-height: 28px;
+  margin-left: 2px;
+}
+
+.grid-performance-recording-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--danger-action);
+}
+
+.grid-performance-icon-button {
+  position: relative;
+  display: grid;
+  flex: none;
+  place-items: center;
+  width: 28px;
+  height: 28px;
+  padding: 0;
+  border: 0;
+  border-radius: 5px;
+  cursor: pointer;
+}
+
+.grid-performance-status-actions {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.grid-performance-icon-button svg {
+  width: 15px;
+  height: 15px;
+  stroke: currentcolor;
+  stroke-width: 1.5;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
+.grid-performance-copy {
+  color: var(--grid-header);
+  background: var(--grid-text);
+}
+
+.grid-performance-copy:hover {
+  background: color-mix(in srgb, var(--grid-text) 88%, var(--grid-header));
+}
+
+.grid-performance-copy-icons {
+  display: grid;
+  place-items: center;
+}
+
+.grid-performance-copy-icons svg {
+  grid-area: 1 / 1;
+  transition:
+    opacity 140ms ease,
+    transform 140ms ease;
+}
+
+.grid-performance-copy-check {
+  opacity: 0;
+  transform: scale(0.65);
+}
+
+.grid-performance-copy.is-copied {
+  color: var(--success-text);
+  background: color-mix(in srgb, var(--success-text) 14%, var(--grid-header));
+}
+
+.grid-performance-copy.is-copied .grid-performance-copy-glyph {
+  opacity: 0;
+  transform: scale(0.65);
+}
+
+.grid-performance-copy.is-copied .grid-performance-copy-check {
+  opacity: 1;
+  transform: scale(1);
+}
+
+.grid-performance-record-again,
+.grid-performance-dismiss {
+  color: var(--grid-text-muted);
+  background: transparent;
+}
+
+.grid-performance-record-again:hover,
+.grid-performance-dismiss:hover {
+  color: var(--grid-text);
+  background: var(--grid-header-hover);
+}
+
+.grid-performance-dismiss {
+  margin-left: 5px;
+  font: 18px/1 var(--font-ui);
+}
+
+.grid-performance-dismiss::before {
+  position: absolute;
+  top: 6px;
+  bottom: 6px;
+  left: -5px;
+  border-left: 1px solid var(--grid-border);
+  content: "";
+  pointer-events: none;
+}
+
+.grid-performance-copy-error {
+  flex: 1 0 100%;
+  max-width: 320px;
+  color: var(--error-text);
+  line-height: 1.3;
+}
+
+.grid-performance-live {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+  white-space: nowrap;
+  border: 0;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .grid-performance-copy-icons svg {
+    transition: none;
+  }
+}
+
 .dialog-actions {
   display: flex;
   align-items: center;
@@ -2422,6 +2617,7 @@ button:focus-visible,
   --suggestion-match: #705600;
   --suggestion-match-text: #fffef9;
   --error-text: #f1a198;
+  --success-text: #77cf91;
 }
 
 :root[data-theme="dark"] .titlebar {

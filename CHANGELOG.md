@@ -8,6 +8,12 @@ Backward-incompatible entries start with **Breaking:**.
 
 ## Unreleased
 
+### Added
+
+- Debug settings can record and copy a size-limited grid scrolling performance
+  report without file paths or cell values. A floating control can stop or
+  restart recording and copy the completed report without reopening Settings.
+
 ### Changed
 
 - Data column headers now keep sorting on the left and filtering on the right;

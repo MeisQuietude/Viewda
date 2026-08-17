@@ -18,9 +18,17 @@ import {
   type ViewdaGridProps,
 } from "./ViewdaGrid";
 import type { GridColumn } from "./grid-model";
+import {
+  createGridPerformanceController,
+  type GridDiagnosticsController,
+} from "./grid-performance-report";
+
 const OVERSIZED_TEST_EXTENT = 1_000_000_000;
+let diagnosticsController: GridDiagnosticsController | null = null;
 
 afterEach(() => {
+  diagnosticsController?.dispose();
+  diagnosticsController = null;
   cleanup();
   Reflect.deleteProperty(HTMLElement.prototype, "setPointerCapture");
   Reflect.deleteProperty(HTMLElement.prototype, "hasPointerCapture");
@@ -28,6 +36,24 @@ afterEach(() => {
   Reflect.deleteProperty(document, "elementFromPoint");
   vi.restoreAllMocks();
 });
+
+function createDiagnostics() {
+  diagnosticsController = createGridPerformanceController();
+  return diagnosticsController;
+}
+
+function startDiagnostics(controller: GridDiagnosticsController) {
+  controller.start({
+    runtime: {
+      appVersion: "test",
+      queryEngineVersion: "test",
+      userAgent: "test",
+      platform: "test",
+      theme: "light",
+    },
+    source: { sizeBytes: 1, rowCount: 1_000_000_000, columnCount: 40 },
+  });
+}
 
 function installPointerCapture() {
   const captures = new Set<number>();
@@ -562,6 +588,236 @@ describe("ViewdaGrid foundation", () => {
     expect(
       new Set(getCellContent.mock.calls.map(([address]) => address.column)),
     ).toEqual(new Set([8, 9, 10]));
+  });
+
+  it("publishes exact visible columns without rerendering a stable mounted window", () => {
+    const frames: FrameRequestCallback[] = [];
+    vi.spyOn(window, "requestAnimationFrame").mockImplementation((callback) => {
+      frames.push(callback);
+      return frames.length;
+    });
+    const diagnostics = createDiagnostics();
+    const getCellContent = vi.fn(props().getCellContent);
+    const onViewportChange = vi.fn();
+    const gridProps = props({
+      diagnostics: diagnostics.sink,
+      getCellContent,
+      onViewportChange,
+    });
+    startDiagnostics(diagnostics);
+    const { container } = render(<ViewdaGrid {...gridProps} />);
+    const horizontalScrollport = container.querySelector(
+      ".viewda-grid-horizontal-scrollport",
+    ) as HTMLElement;
+    onViewportChange.mockClear();
+    getCellContent.mockClear();
+    frames.length = 0;
+
+    horizontalScrollport.scrollLeft = 201;
+    fireEvent.scroll(horizontalScrollport);
+    act(() => frames.pop()?.(16));
+
+    expect(getCellContent).not.toHaveBeenCalled();
+    expect(onViewportChange).toHaveBeenCalledOnce();
+    expect(onViewportChange.mock.calls[0]?.[0]).toMatchObject({
+      columnIndices: [2, 3, 4, 5],
+      mountedColumnIndices: [0, 1, 2, 3, 4, 5, 6, 7],
+    });
+    const report = JSON.parse(diagnostics.stop() ?? "null");
+    expect(
+      report.grid.visibleColumnChanges - report.grid.mountedColumnChanges,
+    ).toBe(1);
+  });
+
+  it("records a snapshot when horizontal movement stays within the mounted window", () => {
+    const frames: FrameRequestCallback[] = [];
+    vi.spyOn(window, "requestAnimationFrame").mockImplementation((callback) => {
+      frames.push(callback);
+      return frames.length;
+    });
+    const diagnostics = createDiagnostics();
+    const gridProps = props({ diagnostics: diagnostics.sink });
+    const { container, rerender } = render(<ViewdaGrid {...gridProps} />);
+    const horizontalScrollport = container.querySelector(
+      ".viewda-grid-horizontal-scrollport",
+    ) as HTMLElement;
+    const bodyScrollport = container.querySelector(
+      ".viewda-grid-body-scrollport",
+    ) as HTMLElement;
+    frames.length = 0;
+    startDiagnostics(diagnostics);
+    act(() =>
+      horizontalScrollport.dispatchEvent(wheelEvent({ deltaX: 10 }, 1)),
+    );
+    act(() => frames.pop()?.(16));
+    rerender(<ViewdaGrid {...gridProps} contentRevision={1} />);
+
+    const report = JSON.parse(diagnostics.stop() ?? "null");
+    expect(bodyScrollport.scrollLeft).toBe(10);
+    expect(report.grid.configuration).not.toBeNull();
+    expect(report.grid.maximumDomCells).toBeGreaterThan(0);
+    expect(report.grid.visibleViewportChanges).toBe(1);
+    expect(report.timing.inputToReactCommitMs.count).toBe(0);
+  });
+
+  it("does not inspect rendered cells while diagnostics are inactive", () => {
+    const frames: FrameRequestCallback[] = [];
+    vi.spyOn(window, "requestAnimationFrame").mockImplementation((callback) => {
+      frames.push(callback);
+      return frames.length;
+    });
+    const diagnostics = createDiagnostics();
+    const { container } = render(
+      <ViewdaGrid {...props({ diagnostics: diagnostics.sink })} />,
+    );
+    const root = container.querySelector(".viewda-grid") as HTMLElement;
+    const scrollport = container.querySelector(
+      ".viewda-grid-body-scrollport",
+    ) as HTMLElement;
+    const inspectCells = vi.spyOn(root, "querySelectorAll");
+    frames.length = 0;
+
+    act(() => scrollport.dispatchEvent(wheelEvent({ deltaY: 28 }, 0)));
+    act(() => frames.shift()?.(16));
+
+    expect(inspectCells).not.toHaveBeenCalledWith(".viewda-grid-cell");
+
+    startDiagnostics(diagnostics);
+    act(() => scrollport.dispatchEvent(wheelEvent({ deltaY: 28 }, 200)));
+
+    expect(inspectCells).toHaveBeenCalledWith(".viewda-grid-cell");
+  });
+
+  it("reports wheel outcomes from the rendered scroll boundaries", () => {
+    const diagnostics = createDiagnostics();
+    const { container } = render(
+      <ViewdaGrid {...props({ diagnostics: diagnostics.sink })} />,
+    );
+    const horizontalTrack = container.querySelector(
+      ".viewda-grid-horizontal-scrollport",
+    ) as HTMLElement;
+    const scrollport = container.querySelector(
+      ".viewda-grid-body-scrollport",
+    ) as HTMLElement;
+    let scrollLeft = 833;
+    Object.defineProperty(scrollport, "scrollLeft", {
+      configurable: true,
+      get: () => scrollLeft,
+      set: (value: number) => {
+        scrollLeft = Math.max(0, Math.min(833, value));
+      },
+    });
+    startDiagnostics(diagnostics);
+    act(() => {
+      horizontalTrack.dispatchEvent(wheelEvent({ deltaX: 10 }, 0));
+      scrollport.dispatchEvent(wheelEvent({ deltaY: 7 }, 200));
+    });
+
+    const report = JSON.parse(diagnostics.stop() ?? "null");
+    expect(report.wheel).toMatchObject({
+      movedEvents: 0,
+      horizontal: {
+        movedEvents: 0,
+        outcomes: { atEndBoundary: 1 },
+      },
+      vertical: {
+        movedEvents: 0,
+        outcomes: { accumulatingWholeRow: 1 },
+      },
+    });
+  });
+
+  it("reports only the vertical movement applied by a final partial row", () => {
+    const frames: FrameRequestCallback[] = [];
+    vi.spyOn(window, "requestAnimationFrame").mockImplementation((callback) => {
+      frames.push(callback);
+      return frames.length;
+    });
+    const diagnostics = createDiagnostics();
+    const { container } = render(
+      <ViewdaGrid
+        {...props({
+          rowCount: 4,
+          measurementPort: measurementPort(420, 70),
+          diagnostics: diagnostics.sink,
+        })}
+      />,
+    );
+    const scrollport = container.querySelector(
+      ".viewda-grid-body-scrollport",
+    ) as HTMLElement;
+    frames.length = 0;
+    scrollport.scrollTop = 30;
+    fireEvent.scroll(scrollport);
+    act(() => frames.shift()?.(0));
+    startDiagnostics(diagnostics);
+    act(() => scrollport.dispatchEvent(wheelEvent({ deltaY: 84 }, 10)));
+
+    const report = JSON.parse(diagnostics.stop() ?? "null");
+    expect(report.wheel.vertical).toMatchObject({
+      requestedPixels: 84,
+      appliedRowSteps: 12 / 28,
+      outcomes: { appliedMovement: 1 },
+    });
+  });
+
+  it("uses the newest frame when older measurement and newer input share a commit", () => {
+    const frames: FrameRequestCallback[] = [];
+    vi.spyOn(window, "requestAnimationFrame").mockImplementation((callback) => {
+      frames.push(callback);
+      return frames.length;
+    });
+    let now = 1_000;
+    vi.spyOn(performance, "now").mockImplementation(() => now);
+    const diagnostics = createDiagnostics();
+    const { container } = render(
+      <ViewdaGrid
+        {...props({
+          columns: Array.from({ length: 40 }, (_, index) => column(index)),
+          rowCount: 1_000_000_000,
+          measurementPort: measurementPort(420, 84, 1_000_000),
+          diagnostics: diagnostics.sink,
+        })}
+      />,
+    );
+    const scrollport = container.querySelector(
+      ".viewda-grid-body-scrollport",
+    ) as HTMLElement;
+    const horizontalTrack = container.querySelector(
+      ".viewda-grid-horizontal-scrollport",
+    ) as HTMLElement;
+    frames.length = 0;
+    startDiagnostics(diagnostics);
+    act(() => {
+      horizontalTrack.dispatchEvent(wheelEvent({ deltaX: 800 }, 1_000));
+      now = 1_002;
+      frames.pop()?.(1_001);
+      scrollport.dispatchEvent(wheelEvent({ deltaY: 28 }, 1_003));
+    });
+    now = 1_006;
+    act(() => frames.pop()?.(1_006));
+
+    const report = JSON.parse(diagnostics.stop() ?? "null");
+    expect(report.timing).toMatchObject({
+      measurementFrames: 1,
+      measurementFramesAwaitingReactCommit: 1,
+      measurementToReactCommitMs: { count: 1 },
+      inputToReactCommitMs: { count: 1 },
+      commitToNextAnimationFrameMs: { count: 1 },
+    });
+    expect(report.grid.visibleViewportChanges).toBe(1);
+    const diagnosticFrames = report.diagnostics.diagnosticEpisodes.flatMap(
+      (episode: { frames: unknown[] }) => episode.frames,
+    );
+    const nextFrameOwner = diagnosticFrames.find(
+      (frame: { commitToNextAnimationFrame: { count: number } }) =>
+        frame.commitToNextAnimationFrame.count === 1,
+    );
+    expect(nextFrameOwner.frameId).toBe(
+      Math.max(
+        ...diagnosticFrames.map((frame: { frameId: number }) => frame.frameId),
+      ),
+    );
   });
 
   it("keeps column commits and DOM bounded across the horizontal extent", () => {

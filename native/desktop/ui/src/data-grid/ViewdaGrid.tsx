@@ -52,6 +52,13 @@ import type {
   GridSelection,
   Rectangle,
 } from "./grid-model";
+import {
+  gridDiagnosticsNoopSink,
+  type GridDiagnosticsSink,
+  type GridReactCommitSource,
+  type GridWheelOutcome,
+} from "./grid-performance-report";
+
 const PROBE_TRIGGER_HEIGHT = 1_000_000;
 const OVERSIZED_PROBE_EXTENT = 1_000_000_000;
 const DRAG_AUTO_SCROLL_EDGE = GRID_ROW_HEIGHT * 2;
@@ -103,6 +110,7 @@ export interface ViewdaGridProps {
   ): void;
   onEscape?(): void;
   measurementPort?: GridMeasurementPort;
+  diagnostics?: GridDiagnosticsSink;
 }
 
 interface ResizeGesture {
@@ -147,6 +155,17 @@ const cachedScrollExtents = new WeakMap<
   ReturnType<GridMeasurementPort["probeScrollExtent"]>
 >();
 
+/**
+ * Browser-coupled rendering and input boundary for the Data view.
+ *
+ * Logical vertical coordinates remain authoritative for wheel, keyboard, and
+ * programmatic navigation. The browser owns physical coordinates only when a
+ * user moves the native thumb; read-back of our own write must not replace the
+ * logical position in compressed mode. Horizontally, the body scrollport owns
+ * `scrollLeft`; the visible scrollbar and header mirror that value immediately.
+ * Scroll and ResizeObserver notifications share one measurement rAF so each
+ * frame reads one coherent geometry snapshot before publishing React state.
+ */
 export const ViewdaGrid = forwardRef<ViewdaGridHandle, ViewdaGridProps>(
   function ViewdaGrid(
     {
@@ -167,6 +186,7 @@ export const ViewdaGrid = forwardRef<ViewdaGridHandle, ViewdaGridProps>(
       onHorizontalExtentChange,
       onEscape,
       measurementPort = browserMeasurementPort,
+      diagnostics = gridDiagnosticsNoopSink,
     },
     forwardedRef,
   ) {
@@ -179,9 +199,30 @@ export const ViewdaGrid = forwardRef<ViewdaGridHandle, ViewdaGridProps>(
     const selectionDragRef = useRef<SelectionDrag | null>(null);
     const autoScrollFrameRef = useRef<number | null>(null);
     const suppressClickRef = useRef(false);
+    // Distinguishes quantized read-back of our logical command from external
+    // physical input such as a compressed scrollbar-thumb drag.
     const expectedPhysicalTopRef = useRef<number | null>(null);
     const wheelGestureRef = useRef<WheelGestureState | null>(null);
     const frameRef = useRef<number | null>(null);
+    const diagnosticFrameRefs = useRef<{
+      input: Set<number>;
+      measurement: Set<number>;
+    }>({ input: new Set(), measurement: new Set() });
+    const diagnosticAnimationFramesRef = useRef(new Set<number>());
+    const recordCurrentGridSnapshotRef = useRef<
+      (
+        geometry: GridSize & { devicePixelRatio: number },
+        frameId?: number | null,
+        columnWindow?: ColumnWindow,
+      ) => void
+    >(() => undefined);
+    const publishViewportRef = useRef<
+      (
+        logicalTop: number,
+        viewportHeight: number,
+        columnWindow: ColumnWindow,
+      ) => void
+    >(() => undefined);
     const initialViewportRef = useRef<GridViewport | null>(null);
     const didSendInitialViewportRef = useRef(false);
     const onViewportChangeRef = useRef(onViewportChange);
@@ -193,7 +234,11 @@ export const ViewdaGrid = forwardRef<ViewdaGridHandle, ViewdaGridProps>(
       height: 0,
       devicePixelRatio: 1,
     });
-    const [columnWindow, setColumnWindow] = useState<ColumnWindow | null>(null);
+    const geometryRef = useRef(geometry);
+    const [mountedColumnRange, setMountedColumnRange] = useState<
+      ColumnWindow["mounted"] | null
+    >(null);
+    const columnWindowRef = useRef<ColumnWindow | null>(null);
     const [safeExtent, setSafeExtent] = useState<{
       vertical: number;
       horizontal: number;
@@ -308,10 +353,33 @@ export const ViewdaGrid = forwardRef<ViewdaGridHandle, ViewdaGridProps>(
 
     const commitScrollState = useCallback((next: VerticalScrollState) => {
       if (sameScrollState(scrollStateRef.current, next)) {
-        return;
+        return false;
       }
       scrollStateRef.current = next;
       setScrollState(next);
+      return true;
+    }, []);
+
+    const commitGeometry = useCallback(
+      (next: GridSize & { devicePixelRatio: number }) => {
+        if (sameGeometry(geometryRef.current, next)) {
+          return false;
+        }
+        geometryRef.current = next;
+        setGeometry(next);
+        return true;
+      },
+      [],
+    );
+
+    const commitColumnWindow = useCallback((next: ColumnWindow) => {
+      const mountedChanged = !sameRange(
+        columnWindowRef.current?.mounted ?? null,
+        next.mounted,
+      );
+      columnWindowRef.current = next;
+      if (mountedChanged) setMountedColumnRange(next.mounted);
+      return mountedChanged;
     }, []);
 
     const writePhysicalTop = useCallback((physicalTop: number) => {
@@ -338,6 +406,8 @@ export const ViewdaGrid = forwardRef<ViewdaGridHandle, ViewdaGridProps>(
         scrollport.scrollLeft = requestedLeft;
       }
       const actualLeft = scrollport.scrollLeft;
+      // Browser-clamped body scrollLeft is authoritative. Mirror it before the
+      // measurement rAF so header, cells, and the exposed track move together.
       if (!samePosition(horizontalTrack.scrollLeft, actualLeft)) {
         horizontalTrack.scrollLeft = actualLeft;
       }
@@ -367,10 +437,12 @@ export const ViewdaGrid = forwardRef<ViewdaGridHandle, ViewdaGridProps>(
       if (frameRef.current !== null) {
         return;
       }
-      frameRef.current = window.requestAnimationFrame(() => {
+      frameRef.current = window.requestAnimationFrame((timeStamp) => {
         frameRef.current = null;
+        const diagnosticFrame = diagnostics.measurementStart(timeStamp);
         const scrollport = scrollportRef.current;
         const horizontalTrack = horizontalTrackRef.current;
+        let reactWorkScheduled = false;
         if (scrollport !== null && horizontalTrack !== null) {
           syncHorizontalScroll();
           const read = measurementPort.read(scrollport);
@@ -390,29 +462,60 @@ export const ViewdaGrid = forwardRef<ViewdaGridHandle, ViewdaGridProps>(
                   layout,
                   ownWrite,
                 );
-          commitScrollState(next);
-          setGeometry((current) =>
-            sameGeometry(current, read)
-              ? current
-              : {
-                  width: read.width,
-                  height: read.height,
-                  devicePixelRatio: read.devicePixelRatio,
-                },
+          reactWorkScheduled = commitScrollState(next);
+          reactWorkScheduled =
+            commitGeometry({
+              width: read.width,
+              height: read.height,
+              devicePixelRatio: read.devicePixelRatio,
+            }) || reactWorkScheduled;
+          const previousColumnWindow = columnWindowRef.current;
+          const nextColumnWindow = hystereticColumnWindow(
+            scrollingOffsets,
+            read.scrollLeft,
+            Math.max(0, read.width - markerWidth - pinnedWidth),
+            GRID_OVERSCAN_COLUMNS,
+            previousColumnWindow,
           );
-          setColumnWindow((current) =>
-            hystereticColumnWindow(
-              scrollingOffsets,
-              read.scrollLeft,
-              Math.max(0, read.width - markerWidth - pinnedWidth),
-              GRID_OVERSCAN_COLUMNS,
-              current,
-            ),
+          const visibleColumnChanged = !sameRange(
+            previousColumnWindow?.visible ?? null,
+            nextColumnWindow.visible,
+          );
+          const mountedColumnChanged = commitColumnWindow(nextColumnWindow);
+          reactWorkScheduled = mountedColumnChanged || reactWorkScheduled;
+          if (visibleColumnChanged && !mountedColumnChanged) {
+            publishViewportRef.current(
+              next.logicalTop,
+              read.height,
+              nextColumnWindow,
+            );
+          }
+          if (diagnosticFrame !== null && !reactWorkScheduled) {
+            recordCurrentGridSnapshotRef.current(
+              read,
+              diagnosticFrame,
+              nextColumnWindow,
+            );
+          }
+        }
+        if (diagnosticFrame !== null) {
+          if (reactWorkScheduled && diagnosticFrame !== null) {
+            diagnosticFrameRefs.current.measurement.add(diagnosticFrame);
+          }
+          diagnostics.measurementEnd(
+            diagnosticFrame,
+            performance.now(),
+            reactWorkScheduled ||
+              (diagnosticFrame !== null &&
+                diagnosticFrameRefs.current.input.has(diagnosticFrame)),
           );
         }
       });
     }, [
       commitScrollState,
+      commitColumnWindow,
+      commitGeometry,
+      diagnostics,
       layout,
       markerWidth,
       measurementPort,
@@ -429,22 +532,18 @@ export const ViewdaGrid = forwardRef<ViewdaGridHandle, ViewdaGridProps>(
       }
       syncHorizontalScroll();
       const read = measurementPort.read(scrollport);
-      setGeometry((current) =>
-        sameGeometry(current, read)
-          ? current
-          : {
-              width: read.width,
-              height: read.height,
-              devicePixelRatio: read.devicePixelRatio,
-            },
-      );
-      setColumnWindow((current) =>
+      commitGeometry({
+        width: read.width,
+        height: read.height,
+        devicePixelRatio: read.devicePixelRatio,
+      });
+      commitColumnWindow(
         hystereticColumnWindow(
           scrollingOffsets,
           read.scrollLeft,
           Math.max(0, read.width - markerWidth - pinnedWidth),
           GRID_OVERSCAN_COLUMNS,
-          current,
+          columnWindowRef.current,
         ),
       );
       const disconnect = measurementPort.observe(
@@ -462,6 +561,8 @@ export const ViewdaGrid = forwardRef<ViewdaGridHandle, ViewdaGridProps>(
       markerWidth,
       measurementPort,
       pinnedWidth,
+      commitColumnWindow,
+      commitGeometry,
       scheduleMeasurement,
       scrollingOffsets,
       syncHorizontalScroll,
@@ -473,17 +574,17 @@ export const ViewdaGrid = forwardRef<ViewdaGridHandle, ViewdaGridProps>(
     );
     const hasHorizontalOverflow =
       scrollingViewportWidth > 0 && scrollingWidth > scrollingViewportWidth;
-    const effectiveColumnWindow =
-      columnWindow ??
-      hystereticColumnWindow(
-        scrollingOffsets,
-        0,
-        scrollingViewportWidth,
-        GRID_OVERSCAN_COLUMNS,
-        null,
-      );
-    const renderedScrollingRange = effectiveColumnWindow.mounted;
-    const visibleScrollingRange = effectiveColumnWindow.visible;
+    const initialColumnWindow = hystereticColumnWindow(
+      scrollingOffsets,
+      0,
+      scrollingViewportWidth,
+      GRID_OVERSCAN_COLUMNS,
+      null,
+    );
+    const renderedScrollingRange =
+      mountedColumnRange ?? initialColumnWindow.mounted;
+    const visibleScrollingRange =
+      columnWindowRef.current?.visible ?? initialColumnWindow.visible;
     const visibleScrollingIndices = useMemo(
       () =>
         scrollingIndices.slice(
@@ -496,25 +597,9 @@ export const ViewdaGrid = forwardRef<ViewdaGridHandle, ViewdaGridProps>(
         scrollingIndices,
       ],
     );
-    const viewportScrollingIndices = useMemo(
-      () =>
-        scrollingIndices.slice(
-          visibleScrollingRange.start,
-          visibleScrollingRange.end,
-        ),
-      [
-        scrollingIndices,
-        visibleScrollingRange.end,
-        visibleScrollingRange.start,
-      ],
-    );
     const renderedColumnIndices = useMemo(
       () => [...pinnedIndices, ...visibleScrollingIndices],
       [pinnedIndices, visibleScrollingIndices],
-    );
-    const viewportColumnIndices = useMemo(
-      () => [...pinnedIndices, ...viewportScrollingIndices],
-      [pinnedIndices, viewportScrollingIndices],
     );
     const renderedColumnSet = useMemo(
       () => new Set(renderedColumnIndices),
@@ -535,23 +620,193 @@ export const ViewdaGrid = forwardRef<ViewdaGridHandle, ViewdaGridProps>(
       0,
     );
 
+    const publishViewport = useCallback(
+      (
+        logicalTop: number,
+        viewportHeight: number,
+        nextColumnWindow: ColumnWindow,
+      ) => {
+        const nextVisibleRows = visibleRowRange(
+          logicalTop,
+          viewportHeight,
+          GRID_ROW_HEIGHT,
+          rowCount,
+          0,
+        );
+        const nextMountedRows = visibleRowRange(
+          logicalTop,
+          viewportHeight,
+          GRID_ROW_HEIGHT,
+          rowCount,
+          GRID_OVERSCAN_ROWS,
+        );
+        onViewportChangeRef.current({
+          rowStart: nextVisibleRows.start,
+          rowCount: nextVisibleRows.end - nextVisibleRows.start,
+          columnIndices: [
+            ...pinnedIndices,
+            ...scrollingIndices.slice(
+              nextColumnWindow.visible.start,
+              nextColumnWindow.visible.end,
+            ),
+          ],
+          mountedRowStart: nextMountedRows.start,
+          mountedRowCount: nextMountedRows.end - nextMountedRows.start,
+          mountedColumnIndices: [
+            ...pinnedIndices,
+            ...scrollingIndices.slice(
+              nextColumnWindow.mounted.start,
+              nextColumnWindow.mounted.end,
+            ),
+          ],
+        });
+      },
+      [pinnedIndices, rowCount, scrollingIndices],
+    );
+    useLayoutEffect(() => {
+      publishViewportRef.current = publishViewport;
+    }, [publishViewport]);
+
+    const recordCurrentGridSnapshot = useCallback(
+      (
+        snapshotGeometry: GridSize & { devicePixelRatio: number },
+        frameId: number | null = null,
+        snapshotColumnWindow?: ColumnWindow,
+      ) => {
+        // Snapshot construction includes a bounded DOM count. Keep it entirely
+        // outside the normal scroll path when no recording consumes it.
+        if (!diagnostics.isEnabled()) {
+          return;
+        }
+        const measuredColumnWindow = snapshotColumnWindow ?? {
+          visible: visibleScrollingRange,
+          mounted: renderedScrollingRange,
+        };
+        diagnostics.configure({
+          viewportWidth: snapshotGeometry.width,
+          viewportHeight: snapshotGeometry.height,
+          devicePixelRatio: snapshotGeometry.devicePixelRatio,
+          verticalMode: deriveVerticalLayout(
+            rowCount,
+            GRID_ROW_HEIGHT,
+            snapshotGeometry.height,
+            extent.vertical,
+          ).mode,
+          rowHeight: GRID_ROW_HEIGHT,
+          rowCount,
+          columnCount: columns.length,
+          pinnedColumnCount: pinnedIndices.length,
+        });
+        diagnostics.viewport(frameId, {
+          visibleRowStart: visibleRows.start,
+          visibleRowCount: visibleRows.end - visibleRows.start,
+          visibleScrollingColumnStart: measuredColumnWindow.visible.start,
+          visibleScrollingColumnCount:
+            measuredColumnWindow.visible.end -
+            measuredColumnWindow.visible.start,
+          mountedRowStart: renderedRows.start,
+          mountedRowCount: renderedRows.end - renderedRows.start,
+          mountedScrollingColumnStart: measuredColumnWindow.mounted.start,
+          mountedScrollingColumnCount:
+            measuredColumnWindow.mounted.end -
+            measuredColumnWindow.mounted.start,
+          renderedColumnCount: renderedColumnIndices.length,
+          renderedCellCount:
+            rootRef.current?.querySelectorAll(".viewda-grid-cell").length ?? 0,
+        });
+      },
+      [
+        columns.length,
+        diagnostics,
+        extent.vertical,
+        pinnedIndices.length,
+        renderedColumnIndices.length,
+        renderedRows.end,
+        renderedRows.start,
+        renderedScrollingRange.end,
+        renderedScrollingRange.start,
+        rowCount,
+        visibleRows.end,
+        visibleRows.start,
+        visibleScrollingRange.end,
+        visibleScrollingRange.start,
+      ],
+    );
+    useLayoutEffect(() => {
+      recordCurrentGridSnapshotRef.current = recordCurrentGridSnapshot;
+    }, [recordCurrentGridSnapshot]);
+
+    useLayoutEffect(() => {
+      const frames = diagnosticFrameRefs.current;
+      if (frames.input.size === 0 && frames.measurement.size === 0) {
+        return;
+      }
+      if (!diagnostics.isEnabled()) {
+        frames.input.clear();
+        frames.measurement.clear();
+        return;
+      }
+      // Frame ids bridge input/measurement callbacks to the React commit that
+      // they scheduled. The following rAF is an observable boundary, not a
+      // claim that the browser has painted the frame.
+      const measurementFrames = new Set(frames.measurement);
+      const pending = new Set([...frames.input, ...frames.measurement]);
+      frames.input.clear();
+      frames.measurement.clear();
+      if (pending.size === 0) {
+        return;
+      }
+      const committedAt = performance.now();
+      let primaryFrame: number | null = null;
+      for (const frame of pending) {
+        if (primaryFrame === null || frame > primaryFrame) primaryFrame = frame;
+      }
+      let commitToken: number | null = null;
+      for (const frame of pending) {
+        const source: GridReactCommitSource = measurementFrames.has(frame)
+          ? "measurement"
+          : "input";
+        const token = diagnostics.reactCommit(
+          frame,
+          committedAt,
+          source,
+          frame === primaryFrame,
+        );
+        if (frame === primaryFrame) commitToken = token;
+      }
+      recordCurrentGridSnapshotRef.current(geometryRef.current, primaryFrame);
+      if (commitToken !== null) {
+        const animationFrame = window.requestAnimationFrame((timeStamp) => {
+          diagnosticAnimationFramesRef.current.delete(animationFrame);
+          diagnostics.nextAnimationFrame(commitToken, timeStamp);
+        });
+        diagnosticAnimationFramesRef.current.add(animationFrame);
+      }
+    });
+
+    useEffect(
+      () => () => {
+        for (const animationFrame of diagnosticAnimationFramesRef.current) {
+          window.cancelAnimationFrame(animationFrame);
+        }
+        diagnosticAnimationFramesRef.current.clear();
+      },
+      [],
+    );
+
     useEffect(() => {
-      onViewportChangeRef.current({
-        rowStart: visibleRows.start,
-        rowCount: visibleRows.end - visibleRows.start,
-        columnIndices: viewportColumnIndices,
-        mountedRowStart: renderedRows.start,
-        mountedRowCount: renderedRows.end - renderedRows.start,
-        mountedColumnIndices: renderedColumnIndices,
+      publishViewport(effectiveScrollState.logicalTop, geometry.height, {
+        visible: visibleScrollingRange,
+        mounted: renderedScrollingRange,
       });
+      recordCurrentGridSnapshot(geometry);
     }, [
+      effectiveScrollState.logicalTop,
       geometry,
-      renderedColumnIndices,
-      renderedRows.end,
-      renderedRows.start,
-      viewportColumnIndices,
-      visibleRows.end,
-      visibleRows.start,
+      publishViewport,
+      recordCurrentGridSnapshot,
+      renderedScrollingRange,
+      visibleScrollingRange,
     ]);
 
     const applyLogicalDelta = useCallback(
@@ -578,6 +833,7 @@ export const ViewdaGrid = forwardRef<ViewdaGridHandle, ViewdaGridProps>(
         if (event.ctrlKey) {
           return;
         }
+        const diagnosticWheelStartedAt = diagnostics.startWheel();
         const shiftedHorizontalDelta = event.shiftKey
           ? event.deltaX !== 0
             ? event.deltaX
@@ -613,6 +869,10 @@ export const ViewdaGrid = forwardRef<ViewdaGridHandle, ViewdaGridProps>(
           GRID_ROW_HEIGHT,
         );
         wheelGestureRef.current = advance.state;
+        const decision = advance.state.axis ?? "ambiguous";
+        let appliedHorizontalPixels = 0;
+        let verticalTarget: number | null = null;
+        let outcome: GridWheelOutcome | null = null;
         if (advance.horizontalDelta !== 0) {
           const previousLeft = scrollport.scrollLeft;
           const actualLeft = syncHorizontalScroll(
@@ -622,27 +882,89 @@ export const ViewdaGrid = forwardRef<ViewdaGridHandle, ViewdaGridProps>(
             actualLeft !== null &&
             positionsDiffer(previousLeft, actualLeft)
           ) {
+            appliedHorizontalPixels = actualLeft - previousLeft;
             scheduleMeasurement();
           }
-        } else if (advance.rowSteps !== 0) {
+        }
+        if (decision === "horizontal") {
+          if (advance.horizontalDelta === 0) {
+            outcome = "axisLockedNoise";
+          } else if (scrollingWidth <= scrollingViewportWidth) {
+            outcome = "noScrollableExtent";
+          } else if (appliedHorizontalPixels !== 0) {
+            outcome = "appliedMovement";
+          } else {
+            outcome =
+              advance.horizontalDelta < 0 ? "atStartBoundary" : "atEndBoundary";
+          }
+        } else if (decision === "vertical") {
           const logicalTop = scrollStateRef.current.logicalTop;
-          const target = logicalTopAfterRowSteps(
+          verticalTarget = logicalTopAfterRowSteps(
             logicalTop,
             advance.rowSteps,
             GRID_ROW_HEIGHT,
             layout.logicalMax,
           );
-          applyLogicalDelta(target - logicalTop);
+          if (verticalDelta === 0) {
+            outcome = "axisLockedNoise";
+          } else if (layout.logicalMax <= 0) {
+            outcome = "noScrollableExtent";
+          } else if (advance.rowSteps === 0) {
+            outcome = "accumulatingWholeRow";
+          } else if (positionsDiffer(logicalTop, verticalTarget)) {
+            outcome = "appliedMovement";
+          } else {
+            outcome =
+              advance.rowSteps < 0 ? "atStartBoundary" : "atEndBoundary";
+          }
+        }
+        const appliedVerticalRowSteps =
+          outcome === "appliedMovement" && verticalTarget !== null
+            ? (verticalTarget - scrollStateRef.current.logicalTop) /
+              GRID_ROW_HEIGHT
+            : 0;
+        if (
+          decision === "vertical" &&
+          outcome === "appliedMovement" &&
+          verticalTarget !== null
+        ) {
+          const logicalTop = scrollStateRef.current.logicalTop;
+          applyLogicalDelta(verticalTarget - logicalTop);
+        }
+        if (diagnosticWheelStartedAt !== null) {
+          const diagnosticFrame = diagnostics.wheel(diagnosticWheelStartedAt, {
+            timeStamp: event.timeStamp,
+            decision,
+            consumed: true,
+            takeover: advance.takeover,
+            requestedHorizontalPixels:
+              decision === "horizontal" ? advance.horizontalDelta : 0,
+            appliedHorizontalPixels,
+            requestedVerticalPixels:
+              decision === "vertical" ? verticalDelta : 0,
+            appliedVerticalRowSteps,
+            outcome,
+          });
+          if (
+            decision === "vertical" &&
+            outcome === "appliedMovement" &&
+            diagnosticFrame !== null
+          ) {
+            diagnosticFrameRefs.current.input.add(diagnosticFrame);
+          }
         }
       };
       root.addEventListener("wheel", handleWheel, { passive: false });
       return () => root.removeEventListener("wheel", handleWheel);
     }, [
       applyLogicalDelta,
+      diagnostics,
       layout.logicalMax,
       geometry.height,
       geometry.width,
       scheduleMeasurement,
+      scrollingViewportWidth,
+      scrollingWidth,
       syncHorizontalScroll,
     ]);
 
@@ -1834,4 +2156,11 @@ function sameGeometry(
     left.height === right.height &&
     left.devicePixelRatio === right.devicePixelRatio
   );
+}
+
+function sameRange(
+  left: ColumnWindow["mounted"] | null,
+  right: ColumnWindow["mounted"],
+): boolean {
+  return left !== null && left.start === right.start && left.end === right.end;
 }
