@@ -16,12 +16,23 @@ describe("font stacks", () => {
   });
 
   it("reuses the monospace stack instead of copying its font list", () => {
-    expect(styles.match(/font-family:\s*var\(--font-mono\);/g)).toHaveLength(7);
+    expect(styles.match(/font-family:\s*var\(--font-mono\);/g)).toHaveLength(8);
     expect(styles).not.toMatch(/font-family:\s*ui-monospace/);
   });
 });
 
 describe("color theme", () => {
+  it("does not let pinned positioning hide selection and hover colors", () => {
+    const pinnedRule = styles.match(
+      /\.viewda-grid-cell\.is-pinned\s*\{([^}]*)\}/s,
+    )?.[1];
+    expect(pinnedRule).toBeDefined();
+    expect(pinnedRule).not.toMatch(/background:/);
+    expect(styles).toMatch(
+      /\.viewda-grid-cell\.is-selected,[^{]*\{\s*background:\s*var\(--grid-selection\);/s,
+    );
+  });
+
   it("keeps statistics errors readable in the dark sidebar", () => {
     const darkRoot = styles.match(
       /:root\[data-theme="dark"\] \{([^}]*)\}/s,

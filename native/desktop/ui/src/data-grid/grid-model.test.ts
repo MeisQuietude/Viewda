@@ -58,12 +58,12 @@ describe("copyBufferContents", () => {
     ).toBe('"tab\tvalue"\t"line\n""quoted"""');
   });
 
-  it("escapes HTML and preserves line breaks inside table cells", () => {
+  it("escapes HTML and preserves whitespace inside table cells", () => {
     expect(
-      copyBufferContents([[cell("<value>\nnext"), cell("A & B")]], [1, 0])
+      copyBufferContents([[cell("<value>  one\nnext"), cell("A & B")]], [1, 0])
         .textHtml,
     ).toBe(
-      "<table><tbody><tr><td>A &amp; B</td><td>&lt;value&gt;<br>next</td></tr></tbody></table>",
+      '<table><tbody><tr><td style="white-space: pre-wrap">A &amp; B</td><td style="white-space: pre-wrap">&lt;value&gt;  one<br>next</td></tr></tbody></table>',
     );
   });
 });

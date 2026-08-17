@@ -182,6 +182,256 @@ button {
   flex: 1;
 }
 
+.viewda-grid {
+  display: flex;
+  min-width: 0;
+  min-height: 0;
+  overflow: hidden;
+  color: var(--grid-text);
+  background: var(--grid-cell);
+  outline: none;
+  flex: 1;
+  flex-direction: column;
+  font-family: var(--font-ui);
+  font-size: 12px;
+  user-select: none;
+}
+
+.viewda-grid:focus-visible {
+  outline: 2px solid var(--grid-selection-strong);
+  outline-offset: -2px;
+}
+
+.viewda-grid-header {
+  position: relative;
+  z-index: 4;
+  min-width: 0;
+  height: 32px;
+  overflow: hidden;
+  border-bottom: 1px solid var(--grid-border);
+  background: var(--grid-header);
+  flex: 0 0 32px;
+  contain: layout paint;
+}
+
+.viewda-grid-corner,
+.viewda-grid-column-header {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  box-sizing: border-box;
+  border-right: 1px solid var(--grid-border-soft);
+  background: var(--grid-header);
+}
+
+.viewda-grid-corner {
+  left: 0;
+  z-index: 3;
+}
+
+.viewda-grid-column-header {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  gap: 4px;
+  padding: 0 24px 0 4px;
+  color: var(--grid-text-muted);
+  font-weight: 600;
+}
+
+.viewda-grid-column-header:hover,
+.viewda-grid-column-header.is-pending {
+  background: var(--grid-header-hover);
+}
+
+.viewda-grid-column-header.is-pinned {
+  z-index: 2;
+}
+
+.viewda-grid-header-title {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.viewda-grid-sort,
+.viewda-grid-filter {
+  display: grid;
+  width: 18px;
+  height: 22px;
+  padding: 0;
+  border: 0;
+  border-radius: 3px;
+  color: var(--grid-text-faint);
+  background: transparent;
+  flex: 0 0 auto;
+  place-content: center;
+  font: inherit;
+  cursor: pointer;
+}
+
+.viewda-grid-sort:hover,
+.viewda-grid-filter:hover {
+  color: var(--grid-text);
+  background: var(--grid-selection);
+}
+
+.viewda-grid-sort {
+  position: relative;
+}
+
+.viewda-grid-sort-priority {
+  position: absolute;
+  right: -4px;
+  bottom: 0;
+  min-width: 10px;
+  height: 10px;
+  border-radius: 5px;
+  color: var(--grid-selection-text);
+  background: var(--grid-selection-strong);
+  font-size: 8px;
+  line-height: 10px;
+  text-align: center;
+}
+
+.viewda-grid-filter {
+  position: absolute;
+  right: 4px;
+}
+
+.viewda-grid-resize-handle {
+  position: absolute;
+  z-index: 2;
+  top: 0;
+  right: -3px;
+  bottom: 0;
+  width: 7px;
+  cursor: col-resize;
+}
+
+.viewda-grid-resize-handle:hover {
+  border-right: 2px solid var(--grid-selection-strong);
+}
+
+.viewda-grid-body-scrollport {
+  position: relative;
+  min-width: 0;
+  min-height: 0;
+  overflow: auto;
+  overflow-anchor: none;
+  flex: 1;
+}
+
+.viewda-grid-spacer {
+  pointer-events: none;
+}
+
+.viewda-grid-visible-rows {
+  position: absolute;
+  inset: 0;
+  min-width: 100%;
+  overflow-anchor: none;
+  pointer-events: none;
+}
+
+.viewda-grid-row {
+  position: absolute;
+  top: 0;
+  left: 0;
+  display: flex;
+  height: 28px;
+  pointer-events: auto;
+  contain: layout paint style;
+}
+
+.viewda-grid-row-marker,
+.viewda-grid-cell {
+  box-sizing: border-box;
+  height: 28px;
+  overflow: hidden;
+  border-right: 1px solid var(--grid-border-soft);
+  border-bottom: 1px solid var(--grid-border-soft);
+  background: var(--grid-cell);
+  flex: 0 0 auto;
+  line-height: 27px;
+  text-overflow: ellipsis;
+  white-space: pre;
+}
+
+.viewda-grid-row-marker {
+  position: sticky;
+  z-index: 3;
+  padding: 0 8px;
+  color: var(--grid-text-faint);
+  background: var(--grid-header);
+  text-align: right;
+  cursor: default;
+}
+
+.viewda-grid-row-marker:hover,
+.viewda-grid-cell:hover {
+  background: var(--grid-header-hover);
+}
+
+.viewda-grid-cell {
+  padding: 0 10px;
+}
+
+.viewda-grid-cell.is-left {
+  text-align: left;
+}
+
+.viewda-grid-cell.is-right {
+  text-align: right;
+}
+
+.viewda-grid-cell.is-center {
+  text-align: center;
+}
+
+.viewda-grid-cell.is-monospace {
+  font-family: var(--font-mono);
+}
+
+.viewda-grid-cell.is-faded {
+  color: var(--grid-text-faint);
+  background: var(--grid-cell-muted);
+}
+
+.viewda-grid-cell.is-loading {
+  color: transparent;
+}
+
+.viewda-grid-cell.is-loading::after {
+  display: block;
+  width: min(60%, 96px);
+  height: 7px;
+  margin-top: 10px;
+  border-radius: 4px;
+  background: var(--grid-border-soft);
+  content: "";
+}
+
+.viewda-grid-cell.is-selected,
+.viewda-grid-row-marker.is-selected {
+  background: var(--grid-selection);
+}
+
+.viewda-grid-cell.is-active {
+  outline: 2px solid var(--grid-selection-strong);
+  outline-offset: -2px;
+}
+
+.viewda-grid-cell.is-pinned {
+  z-index: 2;
+}
+
+.viewda-grid-row-scroll-offset {
+  height: 1px;
+  flex: 0 0 auto;
+}
+
 .grid-controls {
   display: flex;
   min-height: 32px;

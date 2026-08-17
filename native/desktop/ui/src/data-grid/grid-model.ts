@@ -94,6 +94,8 @@ export class CompactSelection implements Iterable<number> {
 export interface GridSelection {
   columns: CompactSelection;
   rows: CompactSelection;
+  columnAnchor?: number;
+  rowAnchor?: number;
   current?: {
     cell: GridAddress;
     range: Rectangle;
@@ -122,6 +124,8 @@ export interface GridColumn {
   title: string;
   width: number;
   monospace: boolean;
+  pinned: boolean;
+  pending: boolean;
   sort: {
     direction: "neutral" | "ascending" | "descending";
     priority?: number;
@@ -148,7 +152,7 @@ export function copyBufferContents(
     textHtml: `<table><tbody>${copyRows
       .map(
         (row) =>
-          `<tr>${row.map((value) => `<td>${escapeHtml(value).replaceAll(/\r\n?|\n/g, "<br>")}</td>`).join("")}</tr>`,
+          `<tr>${row.map((value) => `<td style="white-space: pre-wrap">${escapeHtml(value).replaceAll(/\r\n?|\n/g, "<br>")}</td>`).join("")}</tr>`,
       )
       .join("")}</tbody></table>`,
   };
