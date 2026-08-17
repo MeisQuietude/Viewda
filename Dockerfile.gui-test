@@ -88,9 +88,12 @@ FROM debian:13.6-slim@sha256:3a39a0592364683e6bab97937b72cad5a8fa6dcbbee90edb3bb
 # - WebKitWebDriver (webkit2gtk-driver) controls the packaged webview;
 # - Xvfb provides the headless X11 display;
 # - xdotool drives native windows, menus, dialogs, and shortcuts;
+# - xclip inspects clipboard MIME targets and contents during copy checks;
 # - scrot captures the full X11 display, including native UI;
 # - curl performs HTTP readiness checks and direct WebDriver calls;
+# - dbus-daemon gives AT-SPI and Orca an isolated desktop session bus;
 # - jq creates/parses state, session metadata, and WebDriver payloads;
+# - orca exercises the packaged app through the Linux accessibility stack;
 # - python3 supports non-trivial test automation without host dependencies;
 # - procps supports run-scoped process inspection;
 # - tini forwards signals to the whole process group and reaps children.
@@ -104,12 +107,15 @@ RUN --mount=type=cache,id=viewda-apt-archives,target=/var/cache/apt,sharing=lock
     && apt-get install --yes --no-install-recommends \
       ca-certificates \
       curl \
+      dbus-daemon \
       jq \
+      orca \
       procps \
       python3 \
       scrot \
       tini \
       webkit2gtk-driver \
+      xclip \
       xdotool \
       xvfb
 
@@ -123,6 +129,7 @@ runtime=/run/viewda
 app="$runtime/Viewda.AppImage"
 xvfb_pid=
 driver_pid=
+dbus_pid=
 
 # `tini -g` also forwards Docker's signal to descendants; this trap handles files
 # and direct children during both normal exit and `docker stop`.
@@ -133,6 +140,9 @@ cleanup() {
   fi
   if [ -n "$xvfb_pid" ]; then
     kill -TERM "$xvfb_pid" 2>/dev/null || true
+  fi
+  if [ -n "$dbus_pid" ]; then
+    kill -TERM "$dbus_pid" 2>/dev/null || true
   fi
   wait 2>/dev/null || true
   find "$runtime" -mindepth 1 -maxdepth 1 -exec rm -rf -- {} +
@@ -171,6 +181,22 @@ if [ -f "$VIEWDA_BASELINE" ]; then
     > "$XDG_CONFIG_HOME/io.github.meisquietude.viewda/recents.json"
 fi
 
+# AT-SPI clients and the webview share one run-scoped D-Bus session. A fixed
+# address lets later `docker exec` commands join the same accessibility session.
+dbus-daemon --session --address="$DBUS_SESSION_BUS_ADDRESS" --nofork --nopidfile > "$runtime/dbus.log" 2>&1 &
+dbus_pid=$!
+
+attempt=0
+dbus_socket=${DBUS_SESSION_BUS_ADDRESS#unix:path=}
+while [ ! -S "$dbus_socket" ]; do
+  attempt=$((attempt + 1))
+  if [ "$attempt" -ge 100 ] || ! kill -0 "$dbus_pid" 2>/dev/null; then
+    echo "D-Bus session did not start" >&2
+    exit 1
+  fi
+  sleep 0.1
+done
+
 # Xvfb is reachable only inside the container. Wait for its Unix socket, then
 # start tauri-driver and use its HTTP /status endpoint as the readiness signal.
 Xvfb "$DISPLAY" -screen 0 "$VIEWDA_SCREEN" -nolisten tcp -ac > "$runtime/xvfb.log" 2>&1 &
@@ -207,9 +233,10 @@ jq -nc \
   --arg webdriver_url "http://127.0.0.1:$VIEWDA_WEBDRIVER_PORT" \
   --arg display "$DISPLAY" \
   --arg application "$app" \
+  --arg dbus_session_bus_address "$DBUS_SESSION_BUS_ADDRESS" \
   --arg evidence "$VIEWDA_EVIDENCE" \
   --arg artifact_source "$VIEWDA_ARTIFACT_SOURCE" \
-  '{webdriver_url:$webdriver_url,display:$display,application:$application,evidence:$evidence,artifact_source:$artifact_source}' \
+  '{webdriver_url:$webdriver_url,display:$display,application:$application,dbus_session_bus_address:$dbus_session_bus_address,evidence:$evidence,artifact_source:$artifact_source}' \
   | tee "$runtime/session.json"
 touch /run/viewda/ready
 wait "$driver_pid"
@@ -241,8 +268,11 @@ ENV VIEWDA_APP=/artifact/Viewda.AppImage \
     VIEWDA_THEME=system \
     VIEWDA_WEBDRIVER_PORT=4444 \
     APPIMAGE_EXTRACT_AND_RUN=1 \
+    DBUS_SESSION_BUS_ADDRESS=unix:path=/run/viewda/runtime/dbus \
     DISPLAY=:99 \
+    GSETTINGS_BACKEND=memory \
     HOME=/home/tester \
+    NO_AT_BRIDGE=0 \
     TAURI_WEBVIEW_AUTOMATION=true \
     TMPDIR=/run/viewda/tmp \
     XDG_CACHE_HOME=/run/viewda/cache \

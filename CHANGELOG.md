@@ -8,8 +8,21 @@ Backward-incompatible entries start with **Breaking:**.
 
 ## Unreleased
 
+### Changed
+
+- Data column headers now keep sorting on the left and filtering on the right;
+  right-click a header to pin or hide its column.
+- Vertical wheel and touchpad scrolling in the Data view now moves by whole
+  rows and keeps diagonal gestures on their dominant axis.
+- Null values and the fit-width action in the Data view now use quieter visual
+  treatment while remaining easy to distinguish.
+
 ### Fixed
 
+- The Data view's vertical scrollbar now starts below the column headers instead
+  of covering them.
+- The Data view's horizontal scrollbar now starts after row numbers and pinned
+  columns instead of running underneath them.
 - In-app updates now show download progress, including stable downgrades, remain
   retryable after install failures, keep titlebar status vertically centered,
   and provide an explicit dismiss button after restarting.

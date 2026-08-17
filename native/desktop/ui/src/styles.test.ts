@@ -22,7 +22,7 @@ describe("font stacks", () => {
 });
 
 describe("color theme", () => {
-  it("does not let pinned positioning hide selection and hover colors", () => {
+  it("does not let pinned positioning hide selection colors", () => {
     const pinnedRule = styles.match(
       /\.viewda-grid-cell\.is-pinned\s*\{([^}]*)\}/s,
     )?.[1];
@@ -30,6 +30,22 @@ describe("color theme", () => {
     expect(pinnedRule).not.toMatch(/background:/);
     expect(styles).toMatch(
       /\.viewda-grid-cell\.is-selected,[^{]*\{\s*background:\s*var\(--grid-selection\);/s,
+    );
+  });
+
+  it("keeps row markers interactive without highlighting hovered data cells", () => {
+    expect(styles).toMatch(
+      /\.viewda-grid-row-marker:hover\s*\{\s*background:\s*var\(--grid-header-hover\);/s,
+    );
+    expect(styles).not.toMatch(/\.viewda-grid-cell:hover/);
+  });
+
+  it("reserves a visible cross-platform horizontal scrollbar lane", () => {
+    expect(styles).toMatch(
+      /\.viewda-grid-horizontal-scrollport\s*\{[^}]*height:\s*14px;[^}]*overflow-x:\s*scroll;[^}]*flex:\s*0 0 14px;/s,
+    );
+    expect(styles).toMatch(
+      /\.viewda-grid-horizontal-scrollport::-webkit-scrollbar-thumb\s*\{[^}]*background:\s*var\(--grid-text-faint\);/s,
     );
   });
 
@@ -63,6 +79,54 @@ describe("color theme", () => {
       /\.export-progress\.is-error\s*\{\s*color:\s*var\(--error-text\);\s*\}/,
     );
   });
+
+  it("keeps null cells subtle and independent of column typography", () => {
+    const darkRoot = styles.match(
+      /:root\[data-theme="dark"\] \{([^}]*)\}/s,
+    )?.[1];
+    expect(darkRoot).toBeDefined();
+    if (darkRoot === undefined) {
+      throw new Error("Dark theme variables are missing.");
+    }
+    const normal = readColorVariable(darkRoot, "grid-cell");
+    const muted = readColorVariable(darkRoot, "grid-cell-muted");
+    const header = readColorVariable(darkRoot, "grid-header");
+    expect(muted).toBe("#191b1c");
+    expect(muted).not.toBe(normal);
+    expect(muted).not.toBe(header);
+    expect(
+      Math.abs(relativeLuminance(muted) - relativeLuminance(normal)),
+    ).toBeLessThan(
+      Math.abs(relativeLuminance(muted) - relativeLuminance(header)),
+    );
+    expect(styles).toMatch(
+      /\.viewda-grid-cell\.is-faded\s*\{[^}]*color:\s*var\(--grid-text-faint\);[^}]*background:\s*var\(--grid-cell-muted\);[^}]*font-family:\s*var\(--font-ui\);/s,
+    );
+    expect(styles.indexOf(".viewda-grid-cell.is-faded")).toBeGreaterThan(
+      styles.indexOf(".viewda-grid-cell.is-monospace"),
+    );
+  });
+});
+
+describe("grid layout containment", () => {
+  it("gives the virtualized grid a bounded flex parent", () => {
+    expect(styles).toMatch(
+      /\.grid-container\s*\{[^}]*display:\s*flex;[^}]*min-height:\s*0;[^}]*overflow:\s*hidden;/s,
+    );
+  });
+
+  it("moves only the scrolling header outside native body layout", () => {
+    const headerRule = styles.match(
+      /\.viewda-grid-scrolling-headers\s*\{([^}]*)\}/s,
+    )?.[1];
+    const rowRule = styles.match(
+      /\.viewda-grid-row-scrolling-cells\s*\{([^}]*)\}/s,
+    )?.[1];
+    expect(headerRule).toMatch(/will-change:\s*transform;/);
+    expect(rowRule).toBeDefined();
+    expect(rowRule).not.toMatch(/transform|will-change/);
+    expect(styles).not.toContain("--viewda-grid-scroll-left");
+  });
 });
 
 describe("schema field layout", () => {
@@ -95,7 +159,7 @@ describe("query row", () => {
       /\.query-where,\s*\.query-order,\s*\.query-select\s*\{[^}]*overflow:\s*hidden;[^}]*text-overflow:\s*ellipsis;[^}]*white-space:\s*nowrap;/s,
     );
     expect(styles).toMatch(
-      /\.where-popup\s*\{[^}]*max-height:[^}]*overflow:\s*auto;[^}]*white-space:\s*normal;/s,
+      /\.where-popup\s*\{[^}]*position:\s*fixed;[^}]*max-height:[^}]*overflow:\s*auto;[^}]*white-space:\s*normal;/s,
     );
     expect(styles).toMatch(
       /\.sort-popup\s*\{[^}]*max-height:[^}]*overflow:\s*auto;[^}]*color:\s*var\(--grid-text\);[^}]*background:\s*var\(--grid-header\);[^}]*white-space:\s*normal;/s,
@@ -121,6 +185,15 @@ describe("query row", () => {
     expect(darkRoot).toBeDefined();
     expect(darkRoot).toMatch(/--grid-text:\s*#[0-9a-f]{6};/i);
     expect(darkRoot).toMatch(/--grid-text-faint:\s*#[0-9a-f]{6};/i);
+  });
+
+  it("keeps the fit-width action faint with a restrained hover", () => {
+    expect(styles).toMatch(
+      /\.query-fit-widths\s*\{[^}]*color:\s*var\(--grid-text-faint\);/s,
+    );
+    expect(styles).toMatch(
+      /\.query-fit-widths:hover\s*\{\s*color:\s*var\(--grid-text-muted\);\s*background:\s*var\(--grid-selection\);/s,
+    );
   });
 
   it("distinguishes selected columns and sizes their types by content", () => {

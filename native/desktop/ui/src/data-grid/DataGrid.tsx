@@ -1,15 +1,3 @@
-import {
-  CompactSelection as GlideCompactSelection,
-  DataEditor,
-  GridCellKind as GlideGridCellKind,
-  type DataEditorRef,
-  type DrawHeaderCallback,
-  type GridCell as GlideGridCell,
-  type GridColumn as GlideGridColumn,
-  type GridSelection as GlideGridSelection,
-  type SpriteMap,
-  type Theme,
-} from "@glideapps/glide-data-grid";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import {
@@ -36,7 +24,6 @@ import {
   type SourceSummary,
 } from "../desktop";
 import { loadBundledEmojiFont } from "../fonts";
-import { THEME_CHANGED_EVENT } from "../theme";
 import {
   decodeArrowWindow,
   windowContainsRow,
@@ -51,10 +38,16 @@ import { formatCellValue, usesMonospaceCells } from "./format-cell";
 import {
   CompactSelection,
   copyBufferContents,
+  type GridAddress,
   type GridCell,
+  type GridColumn,
   type GridSelection,
   type Rectangle,
 } from "./grid-model";
+import { createGridClipboard } from "./grid-clipboard";
+import { GRID_INITIAL_COLUMNS, GRID_INITIAL_ROWS } from "./grid-layout";
+import { boundedSelectionScope, selectColumn } from "./grid-selection";
+import { gridFontStrings } from "./grid-typography";
 import {
   defaultFilterOperator,
   FilterEditor,
@@ -79,47 +72,42 @@ import {
   type ScrollState,
 } from "./row-window";
 import { SchemaSidebar } from "./SchemaSidebar";
-import { nextSort, sortedColumnIcon } from "./sort";
+import { nextSort } from "./sort";
 import { ColumnPicker } from "./ColumnPicker";
+import {
+  ViewdaGrid,
+  type GridViewport,
+  type ViewdaGridHandle,
+} from "./ViewdaGrid";
 
-import "@glideapps/glide-data-grid/dist/index.css";
-
-const ROW_HEIGHT = 28;
-const HEADER_HEIGHT = 32;
-const INITIAL_ROWS = 64;
-const INITIAL_COLUMNS = 8;
 const COPY_CHUNK_ROWS = 512;
 const EXPORT_STATUS_POLL_MS = 1_000;
-const MAX_CACHED_CELLS = 20_000;
 const MIN_COLUMN_WIDTH = 112;
 const MAX_COLUMN_WIDTH = 500;
-const SORT_HEADER_HITBOX_START = 4;
-const SORT_HEADER_HITBOX_END = 32;
 const WHERE_POPUP_MARGIN = 16;
 const WHERE_POPUP_MAX_WIDTH = 680;
 const WHERE_POPUP_OFFSET = -42;
 const SELECT_TOOLTIP_COLUMN_LIMIT = 50;
-const GRID_HEADER_FONT_STYLE = "600 12px";
-const GRID_BASE_FONT_STYLE = "12px";
 const GRID_HEADER_HORIZONTAL_PADDING = 16;
 const GRID_HEADER_ICON_SPACE = 28;
 const GRID_CELL_HORIZONTAL_PADDING = 10;
 const DEFAULT_DATA_VIEW_SETTINGS: DataViewSettings = { memoryLimit: "mb384" };
+const gridClipboard = createGridClipboard();
 
 function fittedColumnWidth(
   title: string,
   displayData: readonly string[],
-  headerFontFamily: string,
-  cellFontFamily: string,
+  headerFont: string,
+  cellFont: string,
   context: CanvasRenderingContext2D | null,
 ) {
   if (context !== null) {
-    context.font = `${GRID_HEADER_FONT_STYLE} ${headerFontFamily}`;
+    context.font = headerFont;
   }
   const headerTextWidth = context?.measureText(title).width ?? title.length * 8;
   let contentWidth = 0;
   if (context !== null) {
-    context.font = `${GRID_BASE_FONT_STYLE} ${cellFontFamily}`;
+    context.font = cellFont;
   }
   for (const value of displayData) {
     const line = value.split("\n", 1)[0] ?? "";
@@ -145,59 +133,12 @@ function fittedColumnWidth(
   );
 }
 
-function sortHeaderSprite(
-  direction: "neutral" | "ascending" | "descending",
-  priority?: number,
-): SpriteMap[string] {
-  return ({ bgColor, fgColor }) => {
-    const arrow =
-      direction === "neutral"
-        ? '<path d="M7 7l3-3 3 3M10 4v12M7 13l3 3 3-3"/>'
-        : direction === "ascending"
-          ? '<path d="M6.5 9.5 10 6l3.5 3.5M10 6v9"/>'
-          : '<path d="M6.5 10.5 10 14l3.5-3.5M10 5v9"/>';
-    const badge =
-      priority === undefined
-        ? ""
-        : `<circle cx="15.5" cy="15.5" r="4" fill="${bgColor}" stroke="none"/><text x="15.5" y="17.4" fill="${fgColor}" stroke="none" text-anchor="middle" font-family="sans-serif" font-size="${priority >= 10 ? 5 : 6}" font-weight="700">${priority}</text>`;
-    return `<svg width="20" height="20" viewBox="0 0 20 20" fill="none" xmlns="http://www.w3.org/2000/svg"><g stroke="${bgColor}" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">${arrow}</g>${badge}</svg>`;
-  };
-}
-
-const sortHeaderIcons: SpriteMap = {
-  "viewda-sort-neutral": sortHeaderSprite("neutral"),
-  "viewda-sort-ascending": sortHeaderSprite("ascending"),
-  "viewda-sort-descending": sortHeaderSprite("descending"),
-};
-for (let priority = 1; priority <= 32; priority += 1) {
-  sortHeaderIcons[`viewda-sort-ascending-${priority}`] = sortHeaderSprite(
-    "ascending",
-    priority,
-  );
-  sortHeaderIcons[`viewda-sort-descending-${priority}`] = sortHeaderSprite(
-    "descending",
-    priority,
-  );
-}
-
 interface ColumnState {
   sourceIndex: number;
   title: string;
   width: number;
   pinned: boolean;
   hidden: boolean;
-}
-
-interface ColumnFitSample {
-  revision: number;
-  sourceIndex: number;
-  displayData: readonly string[];
-  monospace: boolean;
-}
-
-interface ColumnResizeGesture {
-  visibleIndex: number;
-  moved: boolean;
 }
 
 interface HeaderMenu {
@@ -208,10 +149,17 @@ interface HeaderMenu {
 
 interface GridMenu {
   bounds: Rectangle;
-  cell: readonly [number, number];
+  row: number;
+  sourceIndex: number;
   left: number;
   top: number;
 }
+
+type GridFilterAnchor = { kind: "header" } | { kind: "cell"; row: number };
+
+type FilterEditorState = FilterEditorRequest & {
+  gridAnchor?: GridFilterAnchor;
+};
 
 interface ExportUiError {
   action: "export" | "reveal" | "status";
@@ -394,6 +342,9 @@ export function DataGrid({
     () => new Set(),
   );
   const [loadError, setLoadError] = useState<ViewErrorState | null>(null);
+  const [horizontalExtentError, setHorizontalExtentError] = useState<
+    string | null
+  >(null);
   const [viewError, setViewError] = useState<ViewErrorState | null>(null);
   const [selection, setSelection] = useState<GridSelection>(() =>
     emptySelection(),
@@ -406,7 +357,7 @@ export function DataGrid({
   );
   const [exportStarting, setExportStarting] = useState(false);
   const [exportError, setExportError] = useState<ExportUiError | null>(null);
-  const [filterEditor, setFilterEditor] = useState<FilterEditorRequest | null>(
+  const [filterEditor, setFilterEditor] = useState<FilterEditorState | null>(
     null,
   );
   const [activeView, setActiveView] = useState<ActiveView>(() => ({
@@ -415,11 +366,14 @@ export function DataGrid({
     sort: [],
     rowCount: source.rowCount,
   }));
-  const [gridInstanceKey, setGridInstanceKey] = useState(0);
+  const [contentRevision, setContentRevision] = useState(0);
   const [pendingView, setPendingView] = useState<PendingView | null>(null);
   const [selectPopupOpen, setSelectPopupOpen] = useState(false);
   const [wherePopupOpen, setWherePopupOpen] = useState(false);
-  const [wherePopupLeft, setWherePopupLeft] = useState(WHERE_POPUP_OFFSET);
+  const [wherePopupPosition, setWherePopupPosition] = useState({
+    left: WHERE_POPUP_MARGIN,
+    top: WHERE_POPUP_MARGIN,
+  });
   const [sortPopupOpen, setSortPopupOpen] = useState(false);
   const [sortDraft, setSortDraft] = useState<SortColumn[]>([]);
   const [sidebarOpen, setSidebarOpen] = useState(false);
@@ -427,15 +381,14 @@ export function DataGrid({
     number | null
   >(null);
   const [schemaFocusRequest, setSchemaFocusRequest] = useState(0);
-  const gridRef = useRef<DataEditorRef>(null);
-  const gridCanvasRef = useRef<HTMLDivElement>(null);
+  const gridRef = useRef<ViewdaGridHandle>(null);
   const schemaFocusColumnRef = useRef<number | null>(null);
   const visibleColumnStatesRef = useRef<readonly ColumnState[]>([]);
   const dataWindowRef = useRef<ArrowDataWindow | null>(null);
-  const visibleRegionsRef = useRef<readonly Rectangle[]>([]);
-  const cellCacheRef = useRef(new Map<number, GridCell>());
+  const visibleViewportRef = useRef<GridViewport | null>(null);
   const copyTailRef = useRef<Promise<void>>(Promise.resolve());
   const copyWindowsRef = useRef(new Map<string, Promise<ArrowDataWindow>>());
+  const copyAbortRef = useRef<AbortController | null>(null);
   const pendingRequestRef = useRef<VersionedRowRequest | null>(null);
   const activeRequestRef = useRef<VersionedRowRequest | null>(null);
   const failedRequestRef = useRef<VersionedRowRequest | null>(null);
@@ -448,14 +401,11 @@ export function DataGrid({
   const scrollStateRef = useRef<ScrollState>({ direction: 0, boundary: 0 });
   const aliveRef = useRef(true);
   const exportStatusFailuresRef = useRef(0);
-  const suppressHeaderMenuRef = useRef(false);
-  const suppressHeaderMenuTimerRef = useRef<number | null>(null);
-  const columnResizeGestureRef = useRef<ColumnResizeGesture | null>(null);
-  const columnFitSampleRef = useRef<ColumnFitSample | null>(null);
   const columnFitRequestRef = useRef(0);
   const menuRef = useRef<HTMLDivElement>(null);
   const gridMenuRef = useRef<HTMLDivElement>(null);
   const selectPopupRef = useRef<HTMLDivElement>(null);
+  const wherePopupAnchorRef = useRef<HTMLDivElement>(null);
   const wherePopupRef = useRef<HTMLDivElement>(null);
   const sortPopupRef = useRef<HTMLDivElement>(null);
 
@@ -468,17 +418,6 @@ export function DataGrid({
   );
   visibleColumnStatesRef.current = visibleColumnStates;
   const hiddenCount = columnStates.length - visibleColumnStates.length;
-  const pinnedCount = visibleColumnStates.filter(
-    (column) => column.pinned,
-  ).length;
-  const gridTheme = useGridTheme();
-  const drawGridHeader = useCallback<DrawHeaderCallback>(
-    ({ ctx }, drawContent) => {
-      ctx.font = `${GRID_HEADER_FONT_STYLE} ${gridTheme.fontFamily}`;
-      drawContent();
-    },
-    [gridTheme.fontFamily],
-  );
   activeViewRef.current = activeView;
 
   const nextSuggestionRevision = useCallback(() => {
@@ -493,6 +432,7 @@ export function DataGrid({
     () => visibleColumnStates.map((column) => column.sourceIndex),
     [visibleColumnStates],
   );
+  const visibleProjectionKey = visibleSourceIndices.join(",");
   const selectTitle = useMemo(() => {
     if (hiddenCount === 0) {
       return "*";
@@ -520,10 +460,6 @@ export function DataGrid({
     () => exportSelectionShape(selection, visibleSourceIndices, gridRowCount),
     [gridRowCount, selection, visibleSourceIndices],
   );
-  const glideSelection = useMemo(
-    () => toGlideSelection(selection),
-    [selection],
-  );
   const whereClause = useMemo(
     () => formatWhereClause(filters, source.schema),
     [filters, source.schema],
@@ -541,9 +477,7 @@ export function DataGrid({
     let alive = true;
     void loadBundledEmojiFont(fonts).then((loaded) => {
       if (alive && loaded) {
-        gridRef.current?.updateCells(
-          visibleRegionDamage(visibleRegionsRef.current),
-        );
+        setContentRevision((current) => current + 1);
       }
     });
     return () => {
@@ -551,26 +485,33 @@ export function DataGrid({
     };
   }, []);
 
-  const columns = useMemo<GlideGridColumn[]>(
+  const columns = useMemo<GridColumn[]>(
     () =>
       visibleColumnStates.map((column) => {
+        const displayedSort = pendingView?.sort ?? sort;
+        const sortIndex = displayedSort.findIndex(
+          (entry) => entry.sourceIndex === column.sourceIndex,
+        );
         return {
           id: String(column.sourceIndex),
           title: column.title,
-          icon: sortedColumnIcon(sort, column.sourceIndex),
           width: column.width,
-          hasMenu: true,
-          themeOverride: monospaceColumns.has(column.sourceIndex)
-            ? { fontFamily: gridTheme.monospaceFontFamily }
-            : undefined,
+          monospace: monospaceColumns.has(column.sourceIndex),
+          pinned: column.pinned,
+          pending: pendingView !== null && sortIndex >= 0,
+          sort: {
+            direction:
+              sortIndex < 0
+                ? "neutral"
+                : (displayedSort[sortIndex]?.direction ?? "ascending"),
+            priority:
+              displayedSort.length > 1 && sortIndex >= 0
+                ? sortIndex + 1
+                : undefined,
+          },
         };
       }),
-    [
-      gridTheme.monospaceFontFamily,
-      monospaceColumns,
-      sort,
-      visibleColumnStates,
-    ],
+    [monospaceColumns, pendingView, sort, visibleColumnStates],
   );
 
   const readCell = useCallback(
@@ -606,26 +547,14 @@ export function DataGrid({
   );
 
   const getCellContent = useCallback(
-    ([column, row]: readonly [number, number]): GlideGridCell => {
+    ({ column, row }: GridAddress): GridCell => {
       const current = dataWindowRef.current;
-      const sourceIndex = visibleColumnStates[column]?.sourceIndex;
-      if (current === null || sourceIndex === undefined) {
-        return toGlideCell(loadingCell());
+      if (current === null) {
+        return loadingCell();
       }
-      const key =
-        (row - current.rowOffset) * source.schema.length + sourceIndex;
-      const cached = cellCacheRef.current.get(key);
-      if (cached !== undefined) {
-        return toGlideCell(cached);
-      }
-      const cell = readCell(current, column, row);
-      if (cellCacheRef.current.size >= MAX_CACHED_CELLS) {
-        cellCacheRef.current.clear();
-      }
-      cellCacheRef.current.set(key, cell);
-      return toGlideCell(cell);
+      return readCell(current, column, row);
     },
-    [readCell, source.schema.length, visibleColumnStates],
+    [readCell],
   );
 
   const promoteView = useCallback(
@@ -636,15 +565,6 @@ export function DataGrid({
       sort: SortColumn[],
     ) => {
       const next = { revision, rowCount, filters, sort };
-      const visible = visibleRegionsRef.current[0];
-      if (
-        visible !== undefined &&
-        clampedVisibleStart(rowCount, visible.y, visible.height) !== visible.y
-      ) {
-        // Glide's virtual scroller retains its logical offset when rows shrink below the
-        // current viewport. Remount only in that case so the canvas can reach the clamped row.
-        setGridInstanceKey((current) => current + 1);
-      }
       nextViewRevisionRef.current = Math.max(
         nextViewRevisionRef.current,
         revision,
@@ -658,14 +578,13 @@ export function DataGrid({
       pendingRequestRef.current = null;
       failedRequestRef.current = null;
       dataWindowRef.current = null;
-      cellCacheRef.current.clear();
       copyWindowsRef.current.clear();
+      copyAbortRef.current?.abort();
       setSelection(emptySelection());
       setCopyLimit(null);
+      setHeaderMenu(null);
       setGridMenu(null);
-      gridRef.current?.updateCells(
-        visibleRegionDamage(visibleRegionsRef.current),
-      );
+      setContentRevision((current) => current + 1);
     },
     [],
   );
@@ -721,59 +640,51 @@ export function DataGrid({
         ) {
           dataWindowRef.current = decoded;
           failedRequestRef.current = null;
-          cellCacheRef.current.clear();
-          gridRef.current?.updateCells(
-            loadedWindowDamage(decoded, visibleRegionsRef.current),
-          );
+          setContentRevision((current) => current + 1);
           setLoadError(null);
         }
       } catch (error) {
         if (
-          !aliveRef.current ||
-          request.projectionRevision !== projectionRevisionRef.current
-        ) {
-          continue;
-        }
-        if (
-          error instanceof DataWindowCommandError &&
-          error.code === "viewChanged"
-        ) {
-          try {
-            const status = await getDataViewStatus(source.generation);
-            const pending = pendingViewRef.current;
-            const active = activeViewRef.current;
-            if (pending?.revision === status.revision) {
-              promoteView(
-                status.revision,
-                status.rowCount,
-                pending.filters,
-                pending.sort,
-              );
-            } else if (active.revision === status.revision) {
-              pendingRequestRef.current = {
-                rows: request.rows,
-                revision: active.revision,
-                projectionRevision: request.projectionRevision,
-                sourceIndices: request.sourceIndices,
-              };
-            } else {
-              setLoadError({
-                message: "The active data view could not be synchronized.",
-              });
-            }
-          } catch (statusError) {
-            setLoadError(dataViewErrorState(statusError));
-          }
-          continue;
-        }
-        if (
           aliveRef.current &&
-          request.revision === activeViewRef.current.revision &&
-          request.projectionRevision === projectionRevisionRef.current &&
-          pendingRequestRef.current === null
+          request.projectionRevision === projectionRevisionRef.current
         ) {
-          failedRequestRef.current = request;
-          setLoadError(dataViewErrorState(error));
+          if (
+            error instanceof DataWindowCommandError &&
+            error.code === "viewChanged"
+          ) {
+            try {
+              const status = await getDataViewStatus(source.generation);
+              const pending = pendingViewRef.current;
+              const active = activeViewRef.current;
+              if (pending?.revision === status.revision) {
+                promoteView(
+                  status.revision,
+                  status.rowCount,
+                  pending.filters,
+                  pending.sort,
+                );
+              } else if (active.revision === status.revision) {
+                pendingRequestRef.current = {
+                  rows: request.rows,
+                  revision: active.revision,
+                  projectionRevision: request.projectionRevision,
+                  sourceIndices: request.sourceIndices,
+                };
+              } else {
+                setLoadError({
+                  message: "The active data view could not be synchronized.",
+                });
+              }
+            } catch (statusError) {
+              setLoadError(dataViewErrorState(statusError));
+            }
+          } else if (
+            request.revision === activeViewRef.current.revision &&
+            pendingRequestRef.current === null
+          ) {
+            failedRequestRef.current = request;
+            setLoadError(dataViewErrorState(error));
+          }
         }
       } finally {
         activeRequestRef.current = null;
@@ -798,8 +709,8 @@ export function DataGrid({
       const activeView = activeViewRef.current;
       const sourceIndices = projectedSourceIndices(
         visibleColumnStatesRef.current,
-        visibleRegionsRef.current,
-        INITIAL_COLUMNS,
+        visibleViewportRef.current?.mountedColumnIndices ?? [],
+        GRID_INITIAL_COLUMNS,
       );
       if (sourceIndices.length === 0) {
         return;
@@ -855,14 +766,14 @@ export function DataGrid({
     failedRequestRef.current = null;
     pendingRequestRef.current = null;
     dataWindowRef.current = null;
-    cellCacheRef.current.clear();
+    setContentRevision((current) => current + 1);
     if (active.rowCount === 0) {
       return;
     }
-    const visible = visibleRegionsRef.current[0];
+    const visible = visibleViewportRef.current;
     requestRows(
-      visible?.y ?? 0,
-      visible?.height ?? Math.min(INITIAL_ROWS, active.rowCount),
+      visible?.rowStart ?? 0,
+      visible?.rowCount ?? Math.min(GRID_INITIAL_ROWS, active.rowCount),
     );
   }, [requestRows]);
 
@@ -872,6 +783,7 @@ export function DataGrid({
     if (previous === null) {
       return;
     }
+    copyAbortRef.current?.abort();
     if (
       previous.length === visibleSourceIndices.length &&
       projectionContains(previous, visibleSourceIndices)
@@ -879,7 +791,6 @@ export function DataGrid({
       if (!sameColumnOrder(previous, visibleSourceIndices)) {
         setSelection(clearColumnSelection);
         setCopyLimit(null);
-        setGridMenu(null);
       }
       return;
     }
@@ -887,51 +798,77 @@ export function DataGrid({
     pendingRequestRef.current = null;
     failedRequestRef.current = null;
     dataWindowRef.current = null;
-    cellCacheRef.current.clear();
     copyWindowsRef.current.clear();
     setLoadError(null);
     setSelection(clearColumnSelection);
     setCopyLimit(null);
-    setGridMenu(null);
-    gridRef.current?.updateCells(
-      visibleRegionDamage(visibleRegionsRef.current),
-    );
+    setContentRevision((current) => current + 1);
   }, [visibleSourceIndices]);
 
   useEffect(() => {
-    aliveRef.current = true;
-    if (activeView.rowCount > 0) {
-      const visible = visibleRegionsRef.current[0];
-      const visibleCount =
-        visible?.height ?? Math.min(INITIAL_ROWS, activeView.rowCount);
-      const visibleStart = clampedVisibleStart(
-        activeView.rowCount,
-        visible?.y ?? 0,
-        visibleCount,
-      );
-      if (visible !== undefined && visibleStart !== visible.y) {
-        visibleRegionsRef.current = visibleRegionsRef.current.map((region) => ({
-          ...region,
-          y: visibleStart,
-          height: Math.min(region.height, activeView.rowCount - visibleStart),
-        }));
-        scrollStateRef.current = { direction: 0, boundary: visibleStart };
-        gridRef.current?.scrollTo(0, visibleStart, "vertical", 0, 0, {
-          vAlign: "start",
-        });
+    setHeaderMenu((current) =>
+      current !== null &&
+      visibleColumnIndex(current.sourceIndex, visibleColumnStates) >= 0
+        ? current
+        : null,
+    );
+    setGridMenu((current) =>
+      current !== null &&
+      visibleColumnIndex(current.sourceIndex, visibleColumnStates) >= 0
+        ? current
+        : null,
+    );
+    setFilterEditor((current) => {
+      if (current?.gridAnchor === undefined) {
+        return current;
       }
-      requestRows(visibleStart, visibleCount);
-    }
+      return visibleColumnIndex(current.sourceIndex, visibleColumnStates) >= 0
+        ? current
+        : null;
+    });
+  }, [visibleColumnStates]);
+
+  // Keep liveness scoped to component lifetime: a view change can make the child
+  // report its new viewport before the request effect runs.
+  useEffect(() => {
+    aliveRef.current = true;
     return () => {
       aliveRef.current = false;
+      copyAbortRef.current?.abort();
       pendingRequestRef.current = null;
       failedRequestRef.current = null;
     };
+  }, []);
+
+  useEffect(() => {
+    if (activeView.rowCount > 0) {
+      const visible = visibleViewportRef.current;
+      const visibleCount =
+        visible?.rowCount ?? Math.min(GRID_INITIAL_ROWS, activeView.rowCount);
+      const visibleStart = clampedVisibleStart(
+        activeView.rowCount,
+        visible?.rowStart ?? 0,
+        visibleCount,
+      );
+      if (visible !== null && visibleStart !== visible.rowStart) {
+        visibleViewportRef.current = {
+          ...visible,
+          rowStart: visibleStart,
+          rowCount: Math.min(
+            visible.rowCount,
+            activeView.rowCount - visibleStart,
+          ),
+        };
+        scrollStateRef.current = { direction: 0, boundary: visibleStart };
+        gridRef.current?.scrollToRow(visibleStart);
+      }
+      requestRows(visibleStart, visibleCount);
+    }
   }, [
     activeView.revision,
     activeView.rowCount,
     requestRows,
-    visibleColumnStates,
+    visibleProjectionKey,
   ]);
 
   useEffect(
@@ -1126,7 +1063,11 @@ export function DataGrid({
       return;
     }
     const closePopup = (event: PointerEvent) => {
-      if (!wherePopupRef.current?.contains(event.target as Node)) {
+      const target = event.target as Node;
+      if (
+        !wherePopupAnchorRef.current?.contains(target) &&
+        !wherePopupRef.current?.contains(target)
+      ) {
         setWherePopupOpen(false);
       }
     };
@@ -1216,11 +1157,8 @@ export function DataGrid({
     if (visibleIndex < 0) {
       return;
     }
-    gridRef.current?.scrollTo(visibleIndex, 0, "horizontal", 16);
-    setSelection({
-      columns: CompactSelection.fromSingleSelection(visibleIndex),
-      rows: CompactSelection.empty(),
-    });
+    gridRef.current?.scrollToColumn(visibleIndex, 16);
+    setSelection(selectColumn(emptySelection(), visibleIndex, false, false));
   }, [schemaFocusRequest]);
 
   const applyView = useCallback(
@@ -1253,6 +1191,7 @@ export function DataGrid({
       const request = { revision, filters: nextFilters, sort: nextSort };
       pendingViewRef.current = request;
       setPendingView(request);
+      copyAbortRef.current?.abort();
       failedRequestRef.current = null;
       setSelection(emptySelection());
       setCopyLimit(null);
@@ -1450,165 +1389,88 @@ export function DataGrid({
     [source.generation],
   );
 
-  const getCellsForSelection = useCallback(
-    (rectangle: Rectangle, abortSignal: AbortSignal) => async () => {
-      const revision = activeViewRef.current.revision;
-      const selectedColumns = visibleColumnStates.slice(
-        rectangle.x,
-        rectangle.x + rectangle.width,
-      );
-      const selectedSourceIndices = selectedColumns.map(
-        (column) => column.sourceIndex,
-      );
-      const rows: GridCell[][] = [];
-      const rowLimit = copyRowLimit(
-        selection.columns.length > 0
-          ? selection.columns.length
-          : rectangle.width,
-      );
-      const requestedEnd = Math.min(
-        gridRowCount,
-        rectangle.y + rectangle.height,
-      );
-      const end = Math.min(requestedEnd, rectangle.y + rowLimit);
-      let sampleMonospace = false;
-      if (end < requestedEnd) {
-        setCopyLimit(rowLimit);
-      }
-
-      for (let offset = rectangle.y; offset < end;) {
-        if (abortSignal.aborted) {
-          return [];
-        }
-        const window = await loadCopyWindow(
-          offset,
-          selectedSourceIndices,
-          abortSignal,
-        );
-        const sampleSourceIndex = selectedSourceIndices[0];
-        const sampleType =
-          sampleSourceIndex === undefined
-            ? undefined
-            : windowDataType(window, sampleSourceIndex);
-        if (sampleType !== undefined) {
-          sampleMonospace = usesMonospaceCells(sampleType);
-        }
-        const windowEnd = Math.min(end, window.rowOffset + window.rowCount);
-        for (let row = offset; row < windowEnd; row += 1) {
-          rows.push(
-            selectedColumns.map((_, column) =>
-              readCell(window, column, row, selectedColumns, true),
-            ),
-          );
-        }
-        if (windowEnd <= offset) {
-          break;
-        }
-        offset = windowEnd;
-      }
-
-      const sampleColumn = selectedColumns[0];
-      if (
-        rectangle.width === 1 &&
-        sampleColumn !== undefined &&
-        revision === activeViewRef.current.revision
-      ) {
-        // Glide reports double-click auto-fit through onColumnResize after
-        // loading this selection, without a paired resize start event.
-        columnFitSampleRef.current = {
-          revision,
-          sourceIndex: sampleColumn.sourceIndex,
-          displayData: rows.flatMap((row) => {
-            const cell = row[0];
-            return cell?.kind === "text" ? [cell.displayData] : [];
-          }),
-          monospace: sampleMonospace,
-        };
-      }
-
-      return rows.map((row) => row.map(toGlideCell));
-    },
-    [
-      loadCopyWindow,
-      readCell,
-      selection.columns.length,
-      gridRowCount,
-      visibleColumnStates,
-    ],
-  );
-
-  const copyCappedRowSelection = useCallback(
-    async (rowLimit: number) => {
-      const selectedRows = takeCompactSelection(selection.rows, rowLimit);
-      const rowsByWindow = new Map<number, number[]>();
-      for (const row of selectedRows) {
-        const offset = Math.floor(row / COPY_CHUNK_ROWS) * COPY_CHUNK_ROWS;
-        const rows = rowsByWindow.get(offset) ?? [];
-        rows.push(row);
-        rowsByWindow.set(offset, rows);
-      }
-      const abortController = new AbortController();
+  const loadCopyCells = useCallback(
+    async (
+      rows: readonly number[],
+      columnIndices: readonly number[],
+      abortSignal: AbortSignal,
+    ): Promise<GridCell[][]> => {
+      const selectedColumns = columnIndices.flatMap((index) => {
+        const column = visibleColumnStates[index];
+        return column === undefined ? [] : [column];
+      });
+      const sourceIndices = selectedColumns.map((column) => column.sourceIndex);
+      const windows = new Map<number, ArrowDataWindow>();
       const cells: GridCell[][] = [];
-      for (const rows of rowsByWindow.values()) {
-        const dataWindow = await loadCopyWindow(
-          rows[0] ?? 0,
-          visibleSourceIndices,
-          abortController.signal,
-        );
-        for (const row of rows) {
-          cells.push(
-            visibleColumnStates.map((_, column) =>
-              readCell(dataWindow, column, row, visibleColumnStates, true),
-            ),
-          );
+      for (const row of rows) {
+        if (abortSignal.aborted) {
+          throw new DOMException("Copy was cancelled.", "AbortError");
         }
+        const offset = Math.floor(row / COPY_CHUNK_ROWS) * COPY_CHUNK_ROWS;
+        let dataWindow = windows.get(offset);
+        if (dataWindow === undefined) {
+          dataWindow = await loadCopyWindow(row, sourceIndices, abortSignal);
+          windows.set(offset, dataWindow);
+        }
+        cells.push(
+          selectedColumns.map((_, column) =>
+            readCell(dataWindow, column, row, selectedColumns, true),
+          ),
+        );
       }
-      const clipboard = window.navigator.clipboard;
-      if (clipboard?.writeText === undefined) {
-        throw new Error("The system clipboard is unavailable.");
-      }
-      const columnIndices = visibleColumnStates.map((_, index) => index);
-      await clipboard.writeText(
-        copyBufferContents(cells, columnIndices).textPlain,
-      );
+      return cells;
     },
-    [
-      loadCopyWindow,
-      readCell,
-      selection.rows,
-      visibleColumnStates,
-      visibleSourceIndices,
-    ],
+    [loadCopyWindow, readCell, visibleColumnStates],
   );
 
-  useEffect(() => {
-    const copyRows = (event: ClipboardEvent) => {
-      const rowLimit = copyRowLimit(visibleColumnStates.length);
-      if (
-        selection.current !== undefined ||
-        selection.rows.length <= rowLimit ||
-        !gridCanvasRef.current?.contains(document.activeElement)
-      ) {
+  const copySelection = useCallback(
+    (event: ClipboardEvent) => {
+      const shape = copySelectionShape(
+        selection,
+        gridRowCount,
+        visibleColumnStates.length,
+      );
+      if (shape === null) {
         return;
       }
       event.preventDefault();
-      event.stopImmediatePropagation();
-      setCopyLimit(rowLimit);
-      void copyCappedRowSelection(rowLimit).catch(() => {
-        failedRequestRef.current = null;
-        setLoadError({ message: "The selected rows could not be copied." });
-      });
-    };
-    window.addEventListener("copy", copyRows, true);
-    return () => window.removeEventListener("copy", copyRows, true);
-  }, [copyCappedRowSelection, selection, visibleColumnStates.length]);
+      copyAbortRef.current?.abort();
+      const abortController = new AbortController();
+      copyAbortRef.current = abortController;
+      setCopyLimit(shape.truncated ? shape.rowLimit : null);
+      const contents = loadCopyCells(
+        shape.rows,
+        shape.columnIndices,
+        abortController.signal,
+      ).then((cells) =>
+        copyBufferContents(
+          cells,
+          shape.columnIndices.map((_, index) => index),
+        ),
+      );
+      void gridClipboard
+        .write(contents)
+        .catch((error: unknown) => {
+          if (!(error instanceof DOMException && error.name === "AbortError")) {
+            failedRequestRef.current = null;
+            setLoadError({ message: "The selection could not be copied." });
+          }
+        })
+        .finally(() => {
+          if (copyAbortRef.current === abortController) {
+            copyAbortRef.current = null;
+          }
+        });
+    },
+    [gridRowCount, loadCopyCells, selection, visibleColumnStates.length],
+  );
 
-  const updateSelection = useCallback((next: GlideGridSelection) => {
-    setSelection(fromGlideSelection(next));
+  const updateSelection = useCallback((next: GridSelection) => {
+    setSelection(next);
     setCopyLimit(null);
   }, []);
 
-  const resizeColumn = useCallback((width: number, visibleIndex: number) => {
+  const resizeColumn = useCallback((visibleIndex: number, width: number) => {
     const sourceIndex =
       visibleColumnStatesRef.current[visibleIndex]?.sourceIndex;
     if (sourceIndex === undefined) {
@@ -1627,93 +1489,13 @@ export function DataGrid({
     );
   }, []);
 
-  const clearColumnResize = useCallback(() => {
-    if (suppressHeaderMenuTimerRef.current !== null) {
-      window.clearTimeout(suppressHeaderMenuTimerRef.current);
-      suppressHeaderMenuTimerRef.current = null;
-    }
-    columnResizeGestureRef.current = null;
-    suppressHeaderMenuRef.current = false;
-  }, []);
-
-  const startColumnResize = useCallback(
-    (_column: GlideGridColumn, _width: number, visibleIndex: number) => {
-      clearColumnResize();
-      columnResizeGestureRef.current = { visibleIndex, moved: false };
-      suppressHeaderMenuRef.current = true;
-      setHeaderMenu(null);
-    },
-    [clearColumnResize],
-  );
-
-  const resizeOrFitColumn = useCallback(
-    (width: number, visibleIndex: number) => {
-      const gesture = columnResizeGestureRef.current;
-      if (gesture !== null) {
-        if (visibleIndex === gesture.visibleIndex) {
-          gesture.moved = true;
-        }
-        if (gesture.moved) {
-          resizeColumn(width, visibleIndex);
-        }
-        return;
-      }
-
-      const column = visibleColumnStatesRef.current[visibleIndex];
-      const sample = columnFitSampleRef.current;
-      if (
-        column === undefined ||
-        sample === null ||
-        sample.revision !== activeViewRef.current.revision ||
-        sample.sourceIndex !== column.sourceIndex
-      ) {
-        resizeColumn(width, visibleIndex);
-        return;
-      }
-
-      const context = document.createElement("canvas").getContext("2d");
-      resizeColumn(
-        fittedColumnWidth(
-          column.title,
-          sample.displayData,
-          gridTheme.fontFamily,
-          sample.monospace
-            ? gridTheme.monospaceFontFamily
-            : gridTheme.fontFamily,
-          context,
-        ),
-        visibleIndex,
+  const updateHorizontalExtent = useCallback(
+    (exceeded: boolean, totalWidth: number, safeExtent: number) => {
+      setHorizontalExtentError(
+        exceeded
+          ? `The projected columns are ${Math.ceil(totalWidth - safeExtent).toLocaleString("en-US")} pixels wider than this webview can scroll.`
+          : null,
       );
-    },
-    [gridTheme.fontFamily, gridTheme.monospaceFontFamily, resizeColumn],
-  );
-
-  const finishColumnResize = useCallback(
-    (width: number, visibleIndex: number) => {
-      // Glide clamps its unset internal width to the minimum on mouseup, so an
-      // end event is valid only after the primary column emitted a resize.
-      if (columnResizeGestureRef.current?.moved === true) {
-        resizeColumn(width, visibleIndex);
-      }
-      columnResizeGestureRef.current = null;
-      if (suppressHeaderMenuTimerRef.current !== null) {
-        window.clearTimeout(suppressHeaderMenuTimerRef.current);
-      }
-      // Glide clears its resize state before the browser dispatches the click
-      // synthesized from mouseup, so keep the menu guard through this event turn.
-      suppressHeaderMenuTimerRef.current = window.setTimeout(() => {
-        suppressHeaderMenuRef.current = false;
-        suppressHeaderMenuTimerRef.current = null;
-      }, 0);
-    },
-    [resizeColumn],
-  );
-
-  useEffect(
-    () => () => {
-      if (suppressHeaderMenuTimerRef.current !== null) {
-        window.clearTimeout(suppressHeaderMenuTimerRef.current);
-      }
     },
     [],
   );
@@ -1726,6 +1508,7 @@ export function DataGrid({
       sampleCount = 0,
     ) => {
       const context = document.createElement("canvas").getContext("2d");
+      const fonts = gridFontStrings(getComputedStyle(document.documentElement));
       const widths = new Map<number, number>();
       for (const column of visibleColumns) {
         const dataType =
@@ -1756,10 +1539,10 @@ export function DataGrid({
           fittedColumnWidth(
             column.title,
             displayData,
-            gridTheme.fontFamily,
+            fonts.header,
             dataType !== undefined && usesMonospaceCells(dataType)
-              ? gridTheme.monospaceFontFamily
-              : gridTheme.fontFamily,
+              ? fonts.monospaceCell
+              : fonts.cell,
             context,
           ),
         );
@@ -1771,7 +1554,7 @@ export function DataGrid({
         }),
       );
     },
-    [gridTheme.fontFamily, gridTheme.monospaceFontFamily],
+    [],
   );
 
   const setColumnVisibility = useCallback(
@@ -1791,64 +1574,81 @@ export function DataGrid({
     [],
   );
 
-  const fitVisibleColumnWidths = useCallback(() => {
-    const visibleColumns = visibleColumnStatesRef.current;
-    if (visibleColumns.length === 0) {
-      return;
-    }
-    const view = activeViewRef.current;
-    const request = columnFitRequestRef.current + 1;
-    columnFitRequestRef.current = request;
-    if (view.rowCount === 0) {
-      applyFittedColumnWidths(visibleColumns, null);
-      return;
-    }
+  const fitColumnWidths = useCallback(
+    (visibleColumns: readonly ColumnState[]) => {
+      if (visibleColumns.length === 0) {
+        return;
+      }
+      const view = activeViewRef.current;
+      const request = columnFitRequestRef.current + 1;
+      columnFitRequestRef.current = request;
+      if (view.rowCount === 0) {
+        applyFittedColumnWidths(visibleColumns, null);
+        return;
+      }
 
-    const visibleRegion = visibleRegionsRef.current[0];
-    const firstVisibleRow = visibleRegion?.y ?? 0;
-    const sampleOffset = Math.min(
-      Math.max(0, firstVisibleRow),
-      view.rowCount - 1,
-    );
-    const sampleCount = Math.min(
-      Math.max(1, visibleRegion?.height ?? INITIAL_ROWS),
-      view.rowCount - sampleOffset,
-    );
-    const sourceIndices = visibleColumns
-      .map((column) => column.sourceIndex)
-      .sort((left, right) => left - right);
-    void getDataWindow(
-      source.generation,
-      view.revision,
-      sampleOffset,
-      sampleCount,
-      sourceIndices,
-    )
-      .then((bytes) => decodeArrowWindow(bytes, sampleOffset, sourceIndices))
-      .then((dataWindow) => {
-        if (
-          aliveRef.current &&
-          request === columnFitRequestRef.current &&
-          view.revision === activeViewRef.current.revision
-        ) {
-          applyFittedColumnWidths(
-            visibleColumns,
-            dataWindow,
-            sampleOffset,
-            sampleCount,
-          );
-        }
-      })
-      .catch((error: unknown) => {
-        if (
-          aliveRef.current &&
-          request === columnFitRequestRef.current &&
-          view.revision === activeViewRef.current.revision
-        ) {
-          setLoadError(dataViewErrorState(error));
-        }
-      });
-  }, [applyFittedColumnWidths, source.generation]);
+      const visibleRegion = visibleViewportRef.current;
+      const firstVisibleRow = visibleRegion?.rowStart ?? 0;
+      const sampleOffset = Math.min(
+        Math.max(0, firstVisibleRow),
+        view.rowCount - 1,
+      );
+      const sampleCount = Math.min(
+        Math.max(1, visibleRegion?.rowCount ?? GRID_INITIAL_ROWS),
+        view.rowCount - sampleOffset,
+      );
+      const sourceIndices = visibleColumns
+        .map((column) => column.sourceIndex)
+        .sort((left, right) => left - right);
+      void getDataWindow(
+        source.generation,
+        view.revision,
+        sampleOffset,
+        sampleCount,
+        sourceIndices,
+      )
+        .then((bytes) => decodeArrowWindow(bytes, sampleOffset, sourceIndices))
+        .then((dataWindow) => {
+          if (
+            aliveRef.current &&
+            request === columnFitRequestRef.current &&
+            view.revision === activeViewRef.current.revision
+          ) {
+            applyFittedColumnWidths(
+              visibleColumns,
+              dataWindow,
+              sampleOffset,
+              sampleCount,
+            );
+          }
+        })
+        .catch((error: unknown) => {
+          if (
+            aliveRef.current &&
+            request === columnFitRequestRef.current &&
+            view.revision === activeViewRef.current.revision
+          ) {
+            setLoadError(dataViewErrorState(error));
+          }
+        });
+    },
+    [applyFittedColumnWidths, source.generation],
+  );
+
+  const fitVisibleColumnWidths = useCallback(
+    () => fitColumnWidths(visibleColumnStatesRef.current),
+    [fitColumnWidths],
+  );
+
+  const fitColumnWidth = useCallback(
+    (visibleIndex: number) => {
+      const column = visibleColumnStatesRef.current[visibleIndex];
+      if (column !== undefined) {
+        fitColumnWidths([column]);
+      }
+    },
+    [fitColumnWidths],
+  );
 
   const showAllColumns = useCallback(() => {
     setColumnStates((current) =>
@@ -1895,13 +1695,10 @@ export function DataGrid({
   }, []);
 
   const openFilterForCell = useCallback(
-    ([visibleColumn, row]: readonly [number, number], bounds: Rectangle) => {
-      const sourceIndex = visibleColumnStates[visibleColumn]?.sourceIndex;
-      const field =
-        sourceIndex === undefined ? undefined : source.schema[sourceIndex];
+    (sourceIndex: number, row: number, bounds: Rectangle) => {
+      const field = source.schema[sourceIndex];
       const current = dataWindowRef.current;
       if (
-        sourceIndex === undefined ||
         field === undefined ||
         current === null ||
         !windowContainsRow(current, row)
@@ -1930,9 +1727,10 @@ export function DataGrid({
               ? "isNotNull"
               : defaultFilterOperator(kind),
         initialValue,
+        gridAnchor: { kind: "cell", row },
       });
     },
-    [source.schema, visibleColumnStates],
+    [source.schema],
   );
 
   const menuColumn =
@@ -1972,9 +1770,15 @@ export function DataGrid({
     setSelectPopupOpen(false);
     setSortPopupOpen(false);
     if (!wherePopupOpen) {
-      const anchorLeft = wherePopupRef.current?.getBoundingClientRect().left;
-      if (anchorLeft !== undefined) {
-        setWherePopupLeft(clampedPopupLeft(anchorLeft, window.innerWidth));
+      const bounds = wherePopupAnchorRef.current?.getBoundingClientRect();
+      if (bounds !== undefined) {
+        setWherePopupPosition(
+          clampedWherePopupPosition(
+            bounds,
+            window.innerWidth,
+            window.innerHeight,
+          ),
+        );
       }
     }
     setWherePopupOpen((open) => !open);
@@ -2026,7 +1830,7 @@ export function DataGrid({
           </div>
           <span className="query-keyword">FROM</span>
           <span className="query-slot">this</span>
-          <div ref={wherePopupRef} className="query-where-wrap">
+          <div ref={wherePopupAnchorRef} className="query-where-wrap">
             <span className="query-keyword">WHERE</span>
             <button
               className={`query-where ${whereClause.length === 0 ? "query-empty-slot" : ""}`}
@@ -2036,57 +1840,6 @@ export function DataGrid({
             >
               {whereClause || "⋯"}
             </button>
-            {wherePopupOpen && (
-              <div
-                className="where-popup"
-                role="dialog"
-                aria-label="WHERE conditions"
-                style={{ left: wherePopupLeft }}
-              >
-                {filters.length === 0 ? (
-                  <p>No WHERE conditions.</p>
-                ) : (
-                  <ol>
-                    {filters.map((filter, index) => {
-                      const field = source.schema[filter.columnIndex];
-                      if (field === undefined) {
-                        return null;
-                      }
-                      const condition = formatFilterCondition(filter, field);
-                      return (
-                        <li key={`${index}:${filter.columnIndex}`}>
-                          <code>{condition}</code>
-                          <span className="where-condition-actions">
-                            <button
-                              type="button"
-                              onClick={(event) =>
-                                editFilter(index, event.currentTarget)
-                              }
-                            >
-                              Edit
-                            </button>
-                            <button
-                              type="button"
-                              aria-label={`Remove filter ${condition}`}
-                              onClick={() =>
-                                changeFilters(
-                                  filters.filter(
-                                    (_condition, conditionIndex) =>
-                                      conditionIndex !== index,
-                                  ),
-                                )
-                              }
-                            >
-                              Remove
-                            </button>
-                          </span>
-                        </li>
-                      );
-                    })}
-                  </ol>
-                )}
-              </div>
-            )}
           </div>
           <div ref={sortPopupRef} className="query-order-wrap">
             <span className="query-keyword">ORDER BY</span>
@@ -2298,6 +2051,12 @@ export function DataGrid({
           }}
         />
       )}
+      {horizontalExtentError !== null && (
+        <ViewErrorAlert
+          error={{ message: horizontalExtentError }}
+          onDismiss={() => setHorizontalExtentError(null)}
+        />
+      )}
       {viewError !== null && (
         <ViewErrorAlert
           key={viewError.diagnostics ?? viewError.message}
@@ -2331,101 +2090,69 @@ export function DataGrid({
             <p>This file has no rows.</p>
           </div>
         ) : (
-          <div ref={gridCanvasRef} className="grid-canvas">
-            <DataEditor
-              key={gridInstanceKey}
+          <div className="grid-container">
+            <ViewdaGrid
               ref={gridRef}
               columns={columns}
-              rows={gridRowCount}
-              width="100%"
-              height="100%"
-              rowHeight={ROW_HEIGHT}
-              headerHeight={HEADER_HEIGHT}
-              rowMarkers={{ kind: "clickable-number", startIndex: 1 }}
-              rangeSelect="multi-rect"
-              rowSelect="multi"
-              columnSelect="multi"
-              gridSelection={glideSelection}
-              onGridSelectionChange={updateSelection}
+              rowCount={gridRowCount}
+              selection={selection}
+              contentRevision={contentRevision}
+              onSelectionChange={updateSelection}
               getCellContent={getCellContent}
-              getCellsForSelection={getCellsForSelection}
-              drawHeader={drawGridHeader}
-              headerIcons={sortHeaderIcons}
-              copyHeaders={false}
-              freezeColumns={pinnedCount}
-              fixedShadowX={false}
-              fixedShadowY={false}
-              overscrollX={0}
-              overscrollY={0}
-              preventDiagonalScrolling
-              smoothScrollX
-              smoothScrollY={false}
-              minColumnWidth={MIN_COLUMN_WIDTH}
-              maxColumnWidth={MAX_COLUMN_WIDTH}
-              theme={gridTheme}
-              onCellContextMenu={(cell, event) => {
-                event.preventDefault();
+              onCopy={copySelection}
+              onCellContextMenu={(cell, bounds) => {
+                const sourceIndex =
+                  visibleColumnStates[cell.column]?.sourceIndex;
+                if (sourceIndex === undefined) {
+                  return;
+                }
                 setHeaderMenu(null);
                 setGridMenu({
-                  bounds: event.bounds,
-                  cell,
+                  bounds,
+                  row: cell.row,
+                  sourceIndex,
                   left: Math.max(
                     4,
-                    Math.min(
-                      event.bounds.x + event.localEventX,
-                      window.innerWidth - 318,
-                    ),
+                    Math.min(bounds.x + bounds.width, window.innerWidth - 318),
                   ),
                   top: Math.max(
                     4,
-                    Math.min(
-                      event.bounds.y + event.localEventY,
-                      window.innerHeight - 148,
-                    ),
+                    Math.min(bounds.y, window.innerHeight - 148),
                   ),
                 });
               }}
-              onHeaderClicked={(visibleIndex, event) => {
-                clearColumnResize();
-                if (
-                  event.isEdge ||
-                  event.localEventX < SORT_HEADER_HITBOX_START ||
-                  event.localEventX >= SORT_HEADER_HITBOX_END
-                ) {
-                  return;
-                }
+              onSort={(visibleIndex, additive) => {
                 const sourceIndex =
                   visibleColumnStates[visibleIndex]?.sourceIndex;
                 if (sourceIndex !== undefined) {
                   const currentSort =
                     pendingViewRef.current?.sort ?? activeViewRef.current.sort;
-                  changeSort(
-                    nextSort(
-                      currentSort,
-                      sourceIndex,
-                      event.shiftKey || event.metaKey || event.ctrlKey,
+                  changeSort(nextSort(currentSort, sourceIndex, additive));
+                }
+              }}
+              onFilter={(visibleIndex, bounds) => {
+                const sourceIndex =
+                  visibleColumnStates[visibleIndex]?.sourceIndex;
+                if (sourceIndex !== undefined) {
+                  setHeaderMenu(null);
+                  setFilterEditor({
+                    sourceIndex,
+                    left: Math.max(
+                      4,
+                      Math.min(bounds.x, window.innerWidth - 292),
                     ),
-                  );
+                    top: Math.max(
+                      4,
+                      Math.min(
+                        bounds.y + bounds.height,
+                        window.innerHeight - 268,
+                      ),
+                    ),
+                    gridAnchor: { kind: "header" },
+                  });
                 }
               }}
-              onVisibleRegionChanged={(range, _tx, _ty, extras) => {
-                visibleRegionsRef.current = [
-                  range,
-                  ...(extras.freezeRegions ?? []),
-                ];
-                requestRows(range.y, range.height);
-              }}
-              onColumnResize={(_column, width, visibleIndex) =>
-                resizeOrFitColumn(width, visibleIndex)
-              }
-              onColumnResizeStart={startColumnResize}
-              onColumnResizeEnd={(_column, width, visibleIndex) =>
-                finishColumnResize(width, visibleIndex)
-              }
-              onHeaderMenuClick={(visibleIndex, bounds) => {
-                if (suppressHeaderMenuRef.current) {
-                  return;
-                }
+              onHeaderContextMenu={(visibleIndex, bounds) => {
                 const sourceIndex =
                   visibleColumnStates[visibleIndex]?.sourceIndex;
                 if (sourceIndex !== undefined) {
@@ -2446,10 +2173,113 @@ export function DataGrid({
                   });
                 }
               }}
+              onViewportChange={(viewport) => {
+                visibleViewportRef.current = viewport;
+                requestRows(viewport.rowStart, viewport.rowCount);
+                setHeaderMenu((current) =>
+                  current !== null &&
+                  gridAnchorIsMounted(
+                    current.sourceIndex,
+                    undefined,
+                    visibleColumnStates,
+                    viewport,
+                  )
+                    ? current
+                    : null,
+                );
+                setGridMenu((current) =>
+                  current !== null &&
+                  gridAnchorIsMounted(
+                    current.sourceIndex,
+                    current.row,
+                    visibleColumnStates,
+                    viewport,
+                  )
+                    ? current
+                    : null,
+                );
+                setFilterEditor((current) => {
+                  if (current?.gridAnchor === undefined) {
+                    return current;
+                  }
+                  const row =
+                    current.gridAnchor.kind === "cell"
+                      ? current.gridAnchor.row
+                      : undefined;
+                  return gridAnchorIsMounted(
+                    current.sourceIndex,
+                    row,
+                    visibleColumnStates,
+                    viewport,
+                  )
+                    ? current
+                    : null;
+                });
+              }}
+              onColumnResize={resizeColumn}
+              onColumnAutoFit={fitColumnWidth}
+              onHorizontalExtentChange={updateHorizontalExtent}
+              onEscape={() => {
+                setHeaderMenu(null);
+                setGridMenu(null);
+                setFilterEditor(null);
+              }}
             />
           </div>
         )}
       </div>
+      {wherePopupOpen && (
+        <div
+          ref={wherePopupRef}
+          className="where-popup"
+          role="dialog"
+          aria-label="WHERE conditions"
+          style={wherePopupPosition}
+        >
+          {filters.length === 0 ? (
+            <p>No WHERE conditions.</p>
+          ) : (
+            <ol>
+              {filters.map((filter, index) => {
+                const field = source.schema[filter.columnIndex];
+                if (field === undefined) {
+                  return null;
+                }
+                const condition = formatFilterCondition(filter, field);
+                return (
+                  <li key={`${index}:${filter.columnIndex}`}>
+                    <code>{condition}</code>
+                    <span className="where-condition-actions">
+                      <button
+                        type="button"
+                        onClick={(event) =>
+                          editFilter(index, event.currentTarget)
+                        }
+                      >
+                        Edit
+                      </button>
+                      <button
+                        type="button"
+                        aria-label={`Remove filter ${condition}`}
+                        onClick={() =>
+                          changeFilters(
+                            filters.filter(
+                              (_condition, conditionIndex) =>
+                                conditionIndex !== index,
+                            ),
+                          )
+                        }
+                      >
+                        Remove
+                      </button>
+                    </span>
+                  </li>
+                );
+              })}
+            </ol>
+          )}
+        </div>
+      )}
       {headerMenu !== null && menuColumn !== undefined && (
         <div
           ref={menuRef}
@@ -2458,26 +2288,6 @@ export function DataGrid({
           aria-label={`${menuColumn.title} column`}
           style={{ left: headerMenu.left, top: headerMenu.top }}
         >
-          <button
-            type="button"
-            role="menuitem"
-            onClick={() => {
-              setFilterEditor({
-                sourceIndex: menuColumn.sourceIndex,
-                left: Math.max(
-                  4,
-                  Math.min(headerMenu.left, window.innerWidth - 292),
-                ),
-                top: Math.max(
-                  4,
-                  Math.min(headerMenu.top, window.innerHeight - 268),
-                ),
-              });
-              setHeaderMenu(null);
-            }}
-          >
-            Filter…
-          </button>
           <button
             type="button"
             role="menuitem"
@@ -2516,7 +2326,11 @@ export function DataGrid({
             type="button"
             role="menuitem"
             onClick={() => {
-              openFilterForCell(gridMenu.cell, gridMenu.bounds);
+              openFilterForCell(
+                gridMenu.sourceIndex,
+                gridMenu.row,
+                gridMenu.bounds,
+              );
               setGridMenu(null);
             }}
           >
@@ -2809,13 +2623,50 @@ function emptySelection(): GridSelection {
 }
 
 function clearColumnSelection(selection: GridSelection): GridSelection {
-  if (selection.current === undefined && selection.columns.length === 0) {
+  if (
+    selection.current === undefined &&
+    selection.columns.length === 0 &&
+    selection.columnAnchor === undefined
+  ) {
     return selection;
   }
-  return {
+  const cleared: GridSelection = {
     columns: CompactSelection.empty(),
     rows: selection.rows,
   };
+  if (selection.rowAnchor !== undefined) {
+    cleared.rowAnchor = selection.rowAnchor;
+  }
+  return cleared;
+}
+
+function gridAnchorIsMounted(
+  sourceIndex: number,
+  row: number | undefined,
+  visibleColumns: readonly ColumnState[],
+  viewport: GridViewport,
+): boolean {
+  const visibleIndex = visibleColumnIndex(sourceIndex, visibleColumns);
+  if (visibleIndex < 0) {
+    return false;
+  }
+  if (!viewport.mountedColumnIndices.includes(visibleIndex)) {
+    return false;
+  }
+  return (
+    row === undefined ||
+    (row >= viewport.mountedRowStart &&
+      row < viewport.mountedRowStart + viewport.mountedRowCount)
+  );
+}
+
+function visibleColumnIndex(
+  sourceIndex: number,
+  visibleColumns: readonly ColumnState[],
+): number {
+  return visibleColumns.findIndex(
+    (column) => column.sourceIndex === sourceIndex,
+  );
 }
 
 function sameColumnOrder(
@@ -2825,171 +2676,45 @@ function sameColumnOrder(
   return previous.every((sourceIndex, index) => sourceIndex === current[index]);
 }
 
-function takeCompactSelection(
-  selection: CompactSelection,
-  limit: number,
-): number[] {
-  const rows: number[] = [];
-  for (const row of selection) {
-    rows.push(row);
-    if (rows.length === limit) {
-      break;
-    }
-  }
-  return rows;
-}
-
 function loadingCell(): GridCell {
   return { kind: "loading" };
 }
 
-function toGlideCell(cell: GridCell): GlideGridCell {
-  if (cell.kind === "loading") {
-    return { kind: GlideGridCellKind.Loading, allowOverlay: false };
-  }
-  return {
-    kind: GlideGridCellKind.Text,
-    allowOverlay: false,
-    readonly: true,
-    data: cell.copyData || cell.displayData,
-    displayData: cell.displayData,
-    copyData: cell.copyData,
-    contentAlign: cell.alignment,
-    style: cell.faded ? "faded" : "normal",
-  };
+interface CopySelectionShape {
+  rows: number[];
+  columnIndices: number[];
+  rowLimit: number;
+  truncated: boolean;
 }
 
-function fromGlideSelection(selection: GlideGridSelection): GridSelection {
-  return {
-    columns: fromGlideCompactSelection(selection.columns),
-    rows: fromGlideCompactSelection(selection.rows),
-    current:
-      selection.current === undefined
-        ? undefined
-        : {
-            cell: {
-              column: selection.current.cell[0],
-              row: selection.current.cell[1],
-            },
-            range: selection.current.range,
-            rangeStack: [...selection.current.rangeStack],
-          },
-  };
-}
-
-const glideSelectionByLocal = new WeakMap<
-  CompactSelection,
-  GlideCompactSelection
->();
-const localSelectionByGlide = new WeakMap<
-  GlideCompactSelection,
-  CompactSelection
->();
-
-function fromGlideCompactSelection(
-  selection: GlideCompactSelection,
-): CompactSelection {
-  const existing = localSelectionByGlide.get(selection);
-  if (existing !== undefined) {
-    return existing;
+function copySelectionShape(
+  selection: GridSelection,
+  rowCount: number,
+  columnCount: number,
+): CopySelectionShape | null {
+  if (rowCount === 0 || columnCount === 0) {
+    return null;
   }
-  const first = selection.first();
-  const last = selection.last();
-  if (first === undefined || last === undefined) {
-    const empty = CompactSelection.empty();
-    rememberSelectionConversion(empty, selection);
-    return empty;
+  const scope = boundedSelectionScope(selection, rowCount, columnCount);
+  if (scope === null) {
+    return null;
   }
-  if (selection.length === last - first + 1) {
-    const contiguous = CompactSelection.fromSingleSelection([first, last + 1]);
-    rememberSelectionConversion(contiguous, selection);
-    return contiguous;
-  }
-  let result = CompactSelection.empty();
-  for (const index of selection) {
-    result = result.add(index);
-  }
-  rememberSelectionConversion(result, selection);
-  return result;
-}
-
-function toGlideSelection(selection: GridSelection): GlideGridSelection {
-  return {
-    columns: toGlideCompactSelection(selection.columns),
-    rows: toGlideCompactSelection(selection.rows),
-    current:
-      selection.current === undefined
-        ? undefined
-        : {
-            cell: [selection.current.cell.column, selection.current.cell.row],
-            range: selection.current.range,
-            rangeStack: [...selection.current.rangeStack],
-          },
-  };
-}
-
-function toGlideCompactSelection(
-  selection: CompactSelection,
-): GlideCompactSelection {
-  const existing = glideSelectionByLocal.get(selection);
-  if (existing !== undefined) {
-    return existing;
-  }
-  let result = GlideCompactSelection.empty();
-  for (const [start, end] of selection.ranges()) {
-    result = result.add([start, end]);
-  }
-  rememberSelectionConversion(selection, result);
-  return result;
-}
-
-function rememberSelectionConversion(
-  local: CompactSelection,
-  glide: GlideCompactSelection,
-) {
-  glideSelectionByLocal.set(local, glide);
-  localSelectionByGlide.set(glide, local);
-}
-
-function loadedWindowDamage(
-  window: ArrowDataWindow,
-  visibleRegions: readonly Rectangle[],
-): { cell: readonly [number, number] }[] {
-  const damaged = new Map<string, { cell: readonly [number, number] }>();
-  const windowEnd = window.rowOffset + window.rowCount;
-
-  for (const region of visibleRegions) {
-    const rowStart = Math.max(window.rowOffset, region.y);
-    const rowEnd = Math.min(windowEnd, region.y + region.height);
-    const columnStart = Math.max(0, region.x);
-    const columnEnd = Math.max(columnStart, region.x + region.width);
-    for (let row = rowStart; row < rowEnd; row += 1) {
-      for (let column = columnStart; column < columnEnd; column += 1) {
-        const cell = [column, row] as const;
-        damaged.set(`${column}:${row}`, { cell });
-      }
+  const rowLimit = copyRowLimit(scope.columnIndices.length);
+  const rows: number[] = [];
+  for (const [start, end] of scope.rowRanges) {
+    for (let row = start; row < end && rows.length < rowLimit; row += 1) {
+      rows.push(row);
     }
   }
-
-  return [...damaged.values()];
-}
-
-function visibleRegionDamage(
-  visibleRegions: readonly Rectangle[],
-): { cell: readonly [number, number] }[] {
-  return visibleRegions.flatMap((region) => {
-    const damage: { cell: readonly [number, number] }[] = [];
-    for (let row = region.y; row < region.y + region.height; row += 1) {
-      for (
-        let column = region.x;
-        column < region.x + region.width;
-        column += 1
-      ) {
-        damage.push({ cell: [column, row] });
-      }
-    }
-    return damage;
-  });
+  if (rows.length === 0) {
+    return null;
+  }
+  return {
+    rows,
+    columnIndices: scope.columnIndices,
+    rowLimit,
+    truncated: scope.rowCount > rows.length,
+  };
 }
 
 function dataWindowErrorMessage(error: unknown): string {
@@ -3081,64 +2806,26 @@ function formatDataViewResourceDiagnostics(
   ].join("\n");
 }
 
-function clampedPopupLeft(anchorLeft: number, viewportWidth: number): number {
+function clampedWherePopupPosition(
+  anchor: Pick<DOMRect, "left" | "bottom">,
+  viewportWidth: number,
+  viewportHeight: number,
+): { left: number; top: number } {
   const popupWidth = Math.min(
     WHERE_POPUP_MAX_WIDTH,
     Math.max(0, viewportWidth - WHERE_POPUP_MARGIN * 2),
   );
-  const viewportLeft = Math.max(
-    WHERE_POPUP_MARGIN,
-    Math.min(
-      anchorLeft + WHERE_POPUP_OFFSET,
-      viewportWidth - WHERE_POPUP_MARGIN - popupWidth,
-    ),
-  );
-  return viewportLeft - anchorLeft;
-}
-
-interface ViewdaGridTheme extends Partial<Theme> {
-  readonly fontFamily: string;
-  readonly monospaceFontFamily: string;
-}
-
-function useGridTheme(): ViewdaGridTheme {
-  const [theme, setTheme] = useState<ViewdaGridTheme>(readGridTheme);
-
-  useEffect(() => {
-    const updateTheme = () => setTheme(readGridTheme());
-    window.addEventListener(THEME_CHANGED_EVENT, updateTheme);
-    return () => window.removeEventListener(THEME_CHANGED_EVENT, updateTheme);
-  }, []);
-
-  return theme;
-}
-
-function readGridTheme(): ViewdaGridTheme {
-  const styles = getComputedStyle(document.documentElement);
-  const value = (name: string) => styles.getPropertyValue(name).trim();
   return {
-    accentColor: value("--grid-selection-strong"),
-    accentFg: value("--grid-selection-text"),
-    accentLight: value("--grid-selection"),
-    bgCell: value("--grid-cell"),
-    bgCellMedium: value("--grid-cell-muted"),
-    bgHeader: value("--grid-header"),
-    bgHeaderHasFocus: value("--grid-header-active"),
-    bgHeaderHovered: value("--grid-header-hover"),
-    borderColor: value("--grid-border"),
-    horizontalBorderColor: value("--grid-border-soft"),
-    headerBottomBorderColor: value("--grid-border"),
-    textDark: value("--grid-text"),
-    textMedium: value("--grid-text-muted"),
-    textLight: value("--grid-text-faint"),
-    textHeader: value("--grid-text-muted"),
-    textHeaderSelected: value("--grid-text"),
-    baseFontStyle: GRID_BASE_FONT_STYLE,
-    headerFontStyle: GRID_HEADER_FONT_STYLE,
-    fontFamily: value("--font-ui"),
-    monospaceFontFamily: value("--font-mono"),
-    cellHorizontalPadding: 10,
-    cellVerticalPadding: 4,
-    roundingRadius: 0,
+    left: Math.max(
+      WHERE_POPUP_MARGIN,
+      Math.min(
+        anchor.left + WHERE_POPUP_OFFSET,
+        viewportWidth - WHERE_POPUP_MARGIN - popupWidth,
+      ),
+    ),
+    top: Math.max(
+      WHERE_POPUP_MARGIN,
+      Math.min(anchor.bottom + 8, viewportHeight - WHERE_POPUP_MARGIN),
+    ),
   };
 }

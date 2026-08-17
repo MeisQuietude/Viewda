@@ -8,6 +8,8 @@
   --font-mono:
     ui-monospace, "SFMono-Regular", Consolas, "Apple Color Emoji",
     "Segoe UI Emoji", "Noto Color Emoji", monospace, "Noto Emoji";
+  --grid-font-size: 12px;
+  --grid-header-font-weight: 600;
   --grid-cell: #f4f3ef;
   --grid-cell-muted: #f7f7f3;
   --grid-header: #fffef9;
@@ -174,7 +176,8 @@ button {
   flex: 1;
 }
 
-.grid-canvas {
+.grid-container {
+  display: flex;
   min-width: 0;
   min-height: 0;
   overflow: hidden;
@@ -193,7 +196,7 @@ button {
   flex: 1;
   flex-direction: column;
   font-family: var(--font-ui);
-  font-size: 12px;
+  font-size: var(--grid-font-size);
   user-select: none;
 }
 
@@ -236,7 +239,7 @@ button {
   gap: 4px;
   padding: 0 24px 0 4px;
   color: var(--grid-text-muted);
-  font-weight: 600;
+  font-weight: var(--grid-header-font-weight);
 }
 
 .viewda-grid-column-header:hover,
@@ -246,6 +249,12 @@ button {
 
 .viewda-grid-column-header.is-pinned {
   z-index: 2;
+}
+
+.viewda-grid-scrolling-headers {
+  position: absolute;
+  inset: 0;
+  will-change: transform;
 }
 
 .viewda-grid-header-title {
@@ -318,12 +327,43 @@ button {
   position: relative;
   min-width: 0;
   min-height: 0;
-  overflow: auto;
+  overflow-x: hidden;
+  overflow-y: auto;
   overflow-anchor: none;
   flex: 1;
 }
 
 .viewda-grid-spacer {
+  width: 1px;
+  pointer-events: none;
+}
+
+.viewda-grid-horizontal-scrollport {
+  min-width: 0;
+  height: 14px;
+  overflow-x: scroll;
+  overflow-y: hidden;
+  background: var(--grid-header);
+  scrollbar-color: var(--grid-text-faint) var(--grid-header);
+  flex: 0 0 14px;
+}
+
+.viewda-grid-horizontal-scrollport::-webkit-scrollbar {
+  height: 14px;
+}
+
+.viewda-grid-horizontal-scrollport::-webkit-scrollbar-track {
+  background: var(--grid-header);
+}
+
+.viewda-grid-horizontal-scrollport::-webkit-scrollbar-thumb {
+  border: 3px solid var(--grid-header);
+  border-radius: 7px;
+  background: var(--grid-text-faint);
+}
+
+.viewda-grid-horizontal-spacer {
+  height: 1px;
   pointer-events: none;
 }
 
@@ -369,8 +409,7 @@ button {
   cursor: default;
 }
 
-.viewda-grid-row-marker:hover,
-.viewda-grid-cell:hover {
+.viewda-grid-row-marker:hover {
   background: var(--grid-header-hover);
 }
 
@@ -397,6 +436,7 @@ button {
 .viewda-grid-cell.is-faded {
   color: var(--grid-text-faint);
   background: var(--grid-cell-muted);
+  font-family: var(--font-ui);
 }
 
 .viewda-grid-cell.is-loading {
@@ -425,6 +465,10 @@ button {
 
 .viewda-grid-cell.is-pinned {
   z-index: 2;
+}
+
+.viewda-grid-row-scrolling-cells {
+  display: flex;
 }
 
 .viewda-grid-row-scroll-offset {
@@ -725,9 +769,13 @@ button {
 }
 
 .query-count button:hover,
-.query-fit-widths:hover,
 .query-clear:hover:not(:disabled) {
   color: var(--grid-text);
+  background: var(--grid-selection);
+}
+
+.query-fit-widths:hover {
+  color: var(--grid-text-muted);
   background: var(--grid-selection);
 }
 
@@ -740,6 +788,7 @@ button {
 
 .query-fit-widths {
   display: grid;
+  color: var(--grid-text-faint);
   place-items: center;
 }
 
@@ -754,9 +803,8 @@ button {
 }
 
 .where-popup {
-  position: absolute;
+  position: fixed;
   z-index: 24;
-  top: calc(100% + 8px);
   width: min(680px, calc(100vw - 32px));
   max-height: min(420px, calc(100vh - 120px));
   overflow: auto;
@@ -2359,7 +2407,7 @@ button:focus-visible,
   color-scheme: dark;
   color: #f0f0eb;
   --grid-cell: #141617;
-  --grid-cell-muted: #242728;
+  --grid-cell-muted: #191b1c;
   --grid-header: #242728;
   --grid-header-active: #333738;
   --grid-header-hover: #2a2d2e;

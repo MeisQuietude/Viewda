@@ -6,16 +6,7 @@ const columns = [6, 2, 9, 4, 1].map((sourceIndex) => ({ sourceIndex }));
 
 describe("projected data windows", () => {
   it("combines the viewport and frozen columns into one canonical projection", () => {
-    expect(
-      projectedSourceIndices(
-        columns,
-        [
-          { x: 2, width: 2 },
-          { x: 0, width: 1 },
-        ],
-        2,
-      ),
-    ).toEqual([6, 9, 4]);
+    expect(projectedSourceIndices(columns, [2, 3, 0], 2)).toEqual([6, 9, 4]);
   });
 
   it("uses a small leading projection until the grid reports its viewport", () => {
