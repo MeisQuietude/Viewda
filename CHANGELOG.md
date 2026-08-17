@@ -29,6 +29,9 @@ Backward-incompatible entries start with **Breaking:**.
   of covering them.
 - The Data view's horizontal scrollbar now starts after row numbers and pinned
   columns instead of running underneath them.
+- Scrollbars remain visible while idle on Linux.
+- Native application menus remain readable when Viewda uses dark theme on
+  Linux.
 - In-app updates now show download progress, including stable downgrades, remain
   retryable after install failures, keep titlebar status vertically centered,
   and provide an explicit dismiss button after restarting.
