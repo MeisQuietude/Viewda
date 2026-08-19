@@ -63,6 +63,7 @@ updating itself:
 
 ```sh
 brew tap meisquietude/viewda https://github.com/MeisQuietude/Viewda
+brew trust --cask meisquietude/viewda/viewda
 brew install --cask viewda
 ```
 
