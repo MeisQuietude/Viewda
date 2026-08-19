@@ -277,7 +277,7 @@ require_changelog_section() {
 }
 
 write_release_notes() {
-  local version=$1 output=$2 changes
+  local version=$1 output=$2 changes installation
   require_changelog_section "$version"
   changes=$(
     awk -v heading="## ${version} — " '
@@ -291,14 +291,24 @@ write_release_notes() {
     exit 1
   fi
 
+  # Copied from the README verbatim so the two can never drift apart.
+  installation=$(
+    awk '
+      $0 == "## Installation" { capture = 1; next }
+      capture && /^## / { exit }
+      capture { print }
+    ' README.md
+  )
+  if [[ -z "${installation//[[:space:]]/}" ]]; then
+    printf 'README.md has no Installation section.\n' >&2
+    exit 1
+  fi
+
   {
     if [[ "$version" == *-* ]]; then
       printf '> This is an alpha release. Expect incomplete features.\n\n'
     fi
-    printf '## Installation notes\n\n'
-    printf -- '- **macOS:** the app is ad hoc signed and not notarized. After the first rejected launch, use System Settings → Privacy & Security → Open Anyway.\n'
-    printf -- '- **Windows:** the installer is not code-signed; SmartScreen may require More info → Run anyway.\n'
-    printf -- '- **Linux:** use the AppImage for in-app updates. The `.deb` package is a manual-update fallback.\n\n'
+    printf '## Installation\n%s\n\n' "$installation"
     printf '## Changes\n%s\n' "$changes"
   } > "$output"
 }
