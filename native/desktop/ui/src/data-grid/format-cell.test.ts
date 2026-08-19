@@ -2,6 +2,7 @@ import {
   binary,
   int64,
   list,
+  map,
   struct,
   TimeUnit,
   timestamp,
@@ -76,6 +77,53 @@ describe("formatCellValue", () => {
       faded: false,
     });
     expect(usesMonospaceCells(type)).toBe(true);
+  });
+
+  it("stops formatting nested display values after the visible preview", () => {
+    const type = list(utf8());
+    const value = ["x".repeat(1_000), "unread"];
+    Object.defineProperty(value, 1, {
+      get: () => {
+        throw new Error("the preview traversed beyond its character budget");
+      },
+    });
+
+    const presentation = formatCellValue(value, type, false);
+
+    expect(presentation.displayData).toHaveLength(120);
+    expect(presentation.displayData.endsWith("…")).toBe(true);
+    expect(presentation.copyData).toBe("");
+  });
+
+  it("matches full formatting for deeply nested values within the preview budget", () => {
+    let value: unknown = 1;
+    for (let depth = 0; depth < 40; depth += 1) value = [value];
+
+    const full = formatCellValue(value, list(utf8()));
+    const displayOnly = formatCellValue(value, list(utf8()), false);
+
+    expect(displayOnly.displayData).toBe(full.displayData);
+    expect(displayOnly.copyData).toBe("");
+  });
+
+  it("matches full formatting for maps with bigint and binary values", () => {
+    const value = new Map<unknown, unknown>([
+      ["count", 7n],
+      ["bytes", new Uint8Array([1, 2, 3])],
+    ]);
+    const type = map(utf8(), utf8());
+
+    expect(formatCellValue(value, type, false).displayData).toBe(
+      formatCellValue(value, type).displayData,
+    );
+  });
+
+  it("keeps large nested copy data complete when its display is truncated", () => {
+    const value = Array.from({ length: 200 }, (_, index) => `value-${index}`);
+    const presentation = formatCellValue(value, list(utf8()));
+
+    expect(presentation.displayData.endsWith("…")).toBe(true);
+    expect(presentation.copyData).toBe(JSON.stringify(value));
   });
 
   it("preserves emoji sequences in display and copy text", () => {

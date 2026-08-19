@@ -1,9 +1,76 @@
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 
-import { describe, expect, it } from "vitest";
+import { afterAll, describe, expect, it } from "vitest";
 
 const styles = readFileSync(resolve("ui/src/styles.css"), "utf8");
+const parsedStyleElement = document.createElement("style");
+parsedStyleElement.textContent = styles;
+document.head.append(parsedStyleElement);
+afterAll(() => parsedStyleElement.remove());
+
+function declaration(
+  selector: string,
+  property: string,
+  mediaCondition?: string,
+): string {
+  const sheet = parsedStyleElement.sheet;
+  if (sheet === null) {
+    throw new Error("Stylesheet could not be parsed.");
+  }
+  const rules =
+    mediaCondition === undefined
+      ? Array.from(sheet.cssRules).filter(
+          (rule) => rule.type === CSSRule.STYLE_RULE,
+        )
+      : Array.from(sheet.cssRules).flatMap((rule) =>
+          rule.type === CSSRule.MEDIA_RULE &&
+          (rule as CSSMediaRule).conditionText === mediaCondition
+            ? Array.from((rule as CSSMediaRule).cssRules)
+            : [],
+        );
+  const value = rules
+    .filter(
+      (candidate) =>
+        candidate.type === CSSRule.STYLE_RULE &&
+        (candidate as CSSStyleRule).selectorText
+          .split(",")
+          .map((part) => part.trim())
+          .includes(selector),
+    )
+    .map((rule) =>
+      (rule as CSSStyleRule).style.getPropertyValue(property).trim(),
+    )
+    .filter(Boolean)
+    .at(-1);
+  if (value === undefined || value === "") {
+    throw new Error(`Missing ${property} for ${selector}.`);
+  }
+  return value;
+}
+
+function hasSelector(selector: string): boolean {
+  const sheet = parsedStyleElement.sheet;
+  if (sheet === null) return false;
+  return Array.from(sheet.cssRules).some(
+    (rule) =>
+      rule.type === CSSRule.STYLE_RULE &&
+      (rule as CSSStyleRule).selectorText
+        .split(",")
+        .map((part) => part.trim())
+        .includes(selector),
+  );
+}
+
+function expectDeclarations(
+  selector: string,
+  expected: Record<string, string>,
+  mediaCondition?: string,
+) {
+  for (const [property, value] of Object.entries(expected)) {
+    expect(declaration(selector, property, mediaCondition)).toBe(value);
+  }
+}
 
 describe("font stacks", () => {
   it("keeps native emoji ahead of generic fonts and the bundled fallback last", () => {
@@ -16,12 +83,127 @@ describe("font stacks", () => {
   });
 
   it("reuses the monospace stack instead of copying its font list", () => {
-    expect(styles.match(/font-family:\s*var\(--font-mono\);/g)).toHaveLength(7);
+    expect(declaration(".viewda-grid-cell.is-monospace", "font-family")).toBe(
+      "var(--font-mono)",
+    );
     expect(styles).not.toMatch(/font-family:\s*ui-monospace/);
   });
 });
 
+describe("grid performance status", () => {
+  it("keeps the floating shell compact and bounded on narrow windows", () => {
+    expectDeclarations(".grid-performance-recording-status", {
+      right: "12px",
+      bottom: "12px",
+      "max-width": "calc(100% - 24px)",
+      display: "flex",
+      "flex-wrap": "wrap",
+      gap: "6px",
+      padding: "6px",
+    });
+    expectDeclarations(".grid-performance-recording-status.is-completed", {
+      width: "max-content",
+    });
+    expectDeclarations(".grid-performance-copy-error", {
+      flex: "1 0 100%",
+      "max-width": "320px",
+    });
+  });
+
+  it("uses equal icon hit targets and separates the final dismiss action", () => {
+    expectDeclarations(".grid-performance-icon-button", {
+      display: "grid",
+      width: "28px",
+      height: "28px",
+    });
+    expectDeclarations(".grid-performance-status-actions", {
+      display: "flex",
+      gap: "4px",
+    });
+    expectDeclarations(".grid-performance-dismiss", {
+      "margin-left": "5px",
+      color: "var(--grid-text-muted)",
+      background: "transparent",
+    });
+    expectDeclarations(".grid-performance-dismiss::before", { left: "-5px" });
+    expect(
+      declaration(".grid-performance-dismiss::before", "border-left"),
+    ).toContain("var(--grid-border)");
+    expectDeclarations(".grid-performance-record-again", {
+      color: "var(--grid-text-muted)",
+      background: "transparent",
+    });
+  });
+
+  it("swaps the copy glyph without changing its geometry", () => {
+    expectDeclarations(".grid-performance-copy", {
+      color: "var(--grid-header)",
+      background: "var(--grid-text)",
+    });
+    expectDeclarations(".grid-performance-copy-icons svg", {
+      "grid-area": "1 / 1",
+    });
+    expect(
+      declaration(".grid-performance-copy-icons svg", "transition"),
+    ).toMatch(/opacity 140ms ease,\s*transform 140ms ease/);
+    expectDeclarations(".grid-performance-copy.is-copied", {
+      color: "var(--success-text)",
+    });
+    expectDeclarations(
+      ".grid-performance-copy.is-copied .grid-performance-copy-check",
+      { opacity: "1", transform: "scale(1)" },
+    );
+    expectDeclarations(
+      ".grid-performance-copy-icons svg",
+      { transition: "none" },
+      "(prefers-reduced-motion: reduce)",
+    );
+  });
+
+  it("hides success text visually while leaving copy failures visible", () => {
+    expectDeclarations(".grid-performance-live", {
+      position: "absolute",
+      width: "1px",
+      height: "1px",
+      overflow: "hidden",
+      clip: "rect(0px)",
+    });
+    expectDeclarations(".grid-performance-copy-error", {
+      color: "var(--error-text)",
+      "line-height": "1.3",
+    });
+  });
+});
+
 describe("color theme", () => {
+  it("does not let pinned positioning hide selection colors", () => {
+    expect(() =>
+      declaration(".viewda-grid-cell.is-pinned", "background"),
+    ).toThrow("Missing background");
+    expect(declaration(".viewda-grid-cell.is-selected", "background")).toBe(
+      "var(--grid-selection)",
+    );
+  });
+
+  it("keeps row markers interactive without highlighting hovered data cells", () => {
+    expect(declaration(".viewda-grid-row-marker:hover", "background")).toBe(
+      "var(--grid-header-hover)",
+    );
+    expect(hasSelector(".viewda-grid-cell:hover")).toBe(false);
+  });
+
+  it("reserves a visible cross-platform horizontal scrollbar lane", () => {
+    expectDeclarations(".viewda-grid-horizontal-scrollport", {
+      height: "14px",
+      "overflow-x": "scroll",
+      flex: "0 0 14px",
+    });
+    expectDeclarations(
+      ".viewda-grid-horizontal-scrollport::-webkit-scrollbar-thumb",
+      { background: "var(--grid-text-faint)" },
+    );
+  });
+
   it("keeps statistics errors readable in the dark sidebar", () => {
     const darkRoot = styles.match(
       /:root\[data-theme="dark"\] \{([^}]*)\}/s,
@@ -51,6 +233,56 @@ describe("color theme", () => {
     expect(styles).toMatch(
       /\.export-progress\.is-error\s*\{\s*color:\s*var\(--error-text\);\s*\}/,
     );
+  });
+
+  it("keeps null cells subtle and independent of column typography", () => {
+    const root = ':root[data-theme="dark"]';
+    const normal = declaration(root, "--grid-cell");
+    const muted = declaration(root, "--grid-cell-muted");
+    const header = declaration(root, "--grid-header");
+    expect(muted).toBe("#191b1c");
+    expect(muted).not.toBe(normal);
+    expect(muted).not.toBe(header);
+    expect(
+      Math.abs(relativeLuminance(muted) - relativeLuminance(normal)),
+    ).toBeLessThan(
+      Math.abs(relativeLuminance(muted) - relativeLuminance(header)),
+    );
+    expectDeclarations(".viewda-grid-cell.is-faded", {
+      color: "var(--grid-text-faint)",
+      background: "var(--grid-cell-muted)",
+      "font-family": "var(--font-ui)",
+    });
+    const fadedMonospaceCell = document.createElement("div");
+    fadedMonospaceCell.className = "viewda-grid-cell is-monospace is-faded";
+    document.body.append(fadedMonospaceCell);
+    expect(getComputedStyle(fadedMonospaceCell).fontFamily).toBe(
+      "var(--font-ui)",
+    );
+    fadedMonospaceCell.remove();
+  });
+});
+
+describe("grid layout containment", () => {
+  it("gives the virtualized grid a bounded flex parent", () => {
+    expectDeclarations(".grid-container", {
+      display: "flex",
+      "min-height": "0px",
+      overflow: "hidden",
+    });
+  });
+
+  it("moves only the scrolling header outside native body layout", () => {
+    expect(declaration(".viewda-grid-scrolling-headers", "will-change")).toBe(
+      "transform",
+    );
+    expect(() =>
+      declaration(".viewda-grid-row-scrolling-cells", "transform"),
+    ).toThrow("Missing transform");
+    expect(() =>
+      declaration(".viewda-grid-row-scrolling-cells", "will-change"),
+    ).toThrow("Missing will-change");
+    expect(styles).not.toContain("--viewda-grid-scroll-left");
   });
 });
 
@@ -84,7 +316,7 @@ describe("query row", () => {
       /\.query-where,\s*\.query-order,\s*\.query-select\s*\{[^}]*overflow:\s*hidden;[^}]*text-overflow:\s*ellipsis;[^}]*white-space:\s*nowrap;/s,
     );
     expect(styles).toMatch(
-      /\.where-popup\s*\{[^}]*max-height:[^}]*overflow:\s*auto;[^}]*white-space:\s*normal;/s,
+      /\.where-popup\s*\{[^}]*position:\s*fixed;[^}]*max-height:[^}]*overflow:\s*auto;[^}]*white-space:\s*normal;/s,
     );
     expect(styles).toMatch(
       /\.sort-popup\s*\{[^}]*max-height:[^}]*overflow:\s*auto;[^}]*color:\s*var\(--grid-text\);[^}]*background:\s*var\(--grid-header\);[^}]*white-space:\s*normal;/s,
@@ -110,6 +342,16 @@ describe("query row", () => {
     expect(darkRoot).toBeDefined();
     expect(darkRoot).toMatch(/--grid-text:\s*#[0-9a-f]{6};/i);
     expect(darkRoot).toMatch(/--grid-text-faint:\s*#[0-9a-f]{6};/i);
+  });
+
+  it("keeps the fit-width action faint with a restrained hover", () => {
+    expectDeclarations(".query-fit-widths", {
+      color: "var(--grid-text-faint)",
+    });
+    expectDeclarations(".query-fit-widths:hover", {
+      color: "var(--grid-text-muted)",
+      background: "var(--grid-selection)",
+    });
   });
 
   it("distinguishes selected columns and sizes their types by content", () => {

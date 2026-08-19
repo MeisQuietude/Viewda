@@ -2,25 +2,16 @@ interface SourceColumn {
   sourceIndex: number;
 }
 
-interface ColumnRegion {
-  x: number;
-  width: number;
-}
-
 export function projectedSourceIndices(
   columns: readonly SourceColumn[],
-  regions: readonly ColumnRegion[],
+  visibleColumnIndices: readonly number[],
   initialColumnCount: number,
 ): number[] {
   const visibleIndices = new Set<number>();
-  for (const region of regions) {
-    const start = Math.max(0, region.x);
-    const end = Math.min(columns.length, start + Math.max(0, region.width));
-    for (let visibleIndex = start; visibleIndex < end; visibleIndex += 1) {
-      const sourceIndex = columns[visibleIndex]?.sourceIndex;
-      if (sourceIndex !== undefined) {
-        visibleIndices.add(sourceIndex);
-      }
+  for (const visibleIndex of visibleColumnIndices) {
+    const sourceIndex = columns[visibleIndex]?.sourceIndex;
+    if (sourceIndex !== undefined) {
+      visibleIndices.add(sourceIndex);
     }
   }
   if (visibleIndices.size === 0) {

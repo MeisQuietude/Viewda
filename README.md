@@ -34,19 +34,21 @@ a file someone just handed you.
 
 - **Opens local Parquet files**, from the app or straight from your file
   manager, and keeps recent ones a click away.
-- **Shows the data**: every row of the file, values exactly as stored, any
-  selection ready to copy as TSV.
-- **Shows the structure**: size, row counts, row groups and the nested schema
-  as the file really stores it.
+- **Shows the data**: typed values across every row, with visual filters,
+  multi-column sorting, resizable columns and selectable ranges.
+- **Copies and exports data**: copy grid selections or export a selection or
+  the current filtered and sorted view to CSV.
+- **Shows the structure**: size, row counts, row groups, the nested schema and
+  on-demand column statistics.
 
 ## What it will do
 
 - **Open and read everything**: any size, local or over SSH; the data and
   the file's anatomy — schema, statistics, metadata down to row groups.
-- **Sort, filter and search** without writing code — and full SQL with
-  history when you want it.
-- **Take the data with you**: copy or export the selection, the filtered
-  view or the whole file — CSV, JSON, Markdown or Parquet.
+- **Search and query**: full-text search and full SQL with history when visual
+  filters and sorting are not enough.
+- **Take the data anywhere**: add JSON, Markdown and Parquet export alongside
+  CSV.
 - **Withstand broken files** and help debug them: everything readable
   opens, the damage gets named.
 
@@ -70,8 +72,8 @@ Download the latest build from
 ## Under the hood
 
 A Rust core owns the data — windowed reads, metadata, SQL (DuckDB,
-arrow-rs) — and streams Arrow columns to a thin React UI on a canvas grid,
-in a Tauri shell. Between them sits one transport-agnostic engine protocol:
+arrow-rs) — and streams Arrow columns to a virtualized React DOM grid in a
+Tauri shell. Between them sits one transport-agnostic engine protocol:
 shell, engine and UI can each be swapped without rewriting the rest.
 
 ## Contributing

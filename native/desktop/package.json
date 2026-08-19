@@ -14,14 +14,10 @@
   },
   "dependencies": {
     "@fontsource/noto-emoji": "5.3.0",
-    "@glideapps/glide-data-grid": "6.0.3",
     "@tauri-apps/api": "2.11.1",
     "@uwdata/flechette": "2.5.0",
-    "lodash": "4.18.1",
-    "marked": "4.3.0",
     "react": "19.2.8",
-    "react-dom": "19.2.8",
-    "react-responsive-carousel": "3.2.23"
+    "react-dom": "19.2.8"
   },
   "devDependencies": {
     "@eslint/js": "10.0.1",
@@ -41,11 +37,5 @@
     "typescript-eslint": "8.65.0",
     "vite": "8.1.5",
     "vitest": "4.1.10"
-  },
-  "overrides": {
-    "@glideapps/glide-data-grid": {
-      "react": "$react",
-      "react-dom": "$react-dom"
-    }
   }
 }

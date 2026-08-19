@@ -59,11 +59,13 @@ export function formatCellValue(
   }
 
   if (isNested(type)) {
-    const raw = stringifyNested(value);
-    const preview =
-      raw.length <= NESTED_PREVIEW_LIMIT
-        ? raw
-        : `${raw.slice(0, NESTED_PREVIEW_LIMIT - 1)}…`;
+    // Normal rendering needs only the bounded preview. Avoid walking the rest of
+    // a large nested value on the main thread; copy/export explicitly opts into
+    // the complete, lossless representation below.
+    const raw = includeRawCopy ? stringifyNested(value) : "";
+    const preview = includeRawCopy
+      ? truncateNestedPreview(raw)
+      : stringifyNestedPreview(value);
     return presentation(preview, raw, false, false);
   }
 
@@ -140,6 +142,98 @@ function stringifyNested(value: unknown): string {
       return nestedValue;
     }) ?? "null"
   );
+}
+
+function truncateNestedPreview(raw: string): string {
+  return raw.length <= NESTED_PREVIEW_LIMIT
+    ? raw
+    : `${raw.slice(0, NESTED_PREVIEW_LIMIT - 1)}…`;
+}
+
+function stringifyNestedPreview(value: unknown): string {
+  let output = "";
+  let truncated = false;
+
+  const append = (text: string) => {
+    const remaining = NESTED_PREVIEW_LIMIT - 1 - output.length;
+    if (remaining <= 0) {
+      truncated = true;
+      return false;
+    }
+    if (text.length > remaining) {
+      output += text.slice(0, remaining);
+      truncated = true;
+      return false;
+    }
+    output += text;
+    return true;
+  };
+
+  const write = (nestedValue: unknown): boolean => {
+    if (typeof nestedValue === "bigint") {
+      return append(JSON.stringify(nestedValue.toString()));
+    }
+    if (nestedValue instanceof Uint8Array) {
+      return append(
+        JSON.stringify(`binary · ${formatByteSize(nestedValue.byteLength)}`),
+      );
+    }
+    if (typeof nestedValue === "string") {
+      return append(JSON.stringify(nestedValue.slice(0, NESTED_PREVIEW_LIMIT)));
+    }
+    if (nestedValue === null || typeof nestedValue !== "object") {
+      const encoded = JSON.stringify(nestedValue);
+      return append(encoded ?? "null");
+    }
+
+    const objectLike =
+      !Array.isArray(nestedValue) && !(nestedValue instanceof Map);
+    if (!append(objectLike ? "{" : "[")) return false;
+    let first = true;
+    const keys: Iterable<unknown> = objectLike
+      ? ownEnumerableKeys(nestedValue)
+      : nestedValue instanceof Map
+        ? nestedValue.keys()
+        : nestedValue.keys();
+    for (const key of keys) {
+      const item =
+        nestedValue instanceof Map
+          ? nestedValue.get(key)
+          : (nestedValue as Record<PropertyKey, unknown>)[key as PropertyKey];
+      if (!first && !append(",")) return false;
+      first = false;
+      if (objectLike) {
+        if (
+          !append(
+            `${JSON.stringify(String(key).slice(0, NESTED_PREVIEW_LIMIT))}:`,
+          )
+        ) {
+          return false;
+        }
+        if (!write(item)) return false;
+      } else if (nestedValue instanceof Map) {
+        if (!append("[")) return false;
+        if (!write(key) || !append(",") || !write(item)) {
+          return false;
+        }
+        if (!append("]")) return false;
+      } else if (!write(item)) {
+        return false;
+      }
+    }
+    return append(objectLike ? "}" : "]");
+  };
+
+  write(value);
+  return truncated ? `${output}…` : output;
+}
+
+function* ownEnumerableKeys(value: object): Iterable<string> {
+  // Object.keys allocates every field name before the preview writer can stop.
+  // A lazy iterator keeps work proportional to the bounded visible prefix.
+  for (const key in value) {
+    if (Object.hasOwn(value, key)) yield key;
+  }
 }
 
 function bytesToBase64(bytes: Uint8Array): string {

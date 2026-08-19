@@ -1,5 +1,8 @@
 //! Persisted appearance preference and native window theme synchronization.
 
+#[cfg(target_os = "linux")]
+use std::cell::RefCell;
+
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Manager, State, Theme, window::Color};
 use thiserror::Error;
@@ -9,6 +12,15 @@ use crate::updates::{UpdateError, UpdateStateStore};
 const MAIN_WINDOW_LABEL: &str = "main";
 const LIGHT_BACKGROUND: Color = Color(0xf4, 0xf3, 0xef, 0xff);
 const DARK_BACKGROUND: Color = Color(0x14, 0x16, 0x17, 0xff);
+#[cfg(target_os = "linux")]
+const LIGHT_MENU_FOREGROUND: &str = "#1b1d1e";
+#[cfg(target_os = "linux")]
+const DARK_MENU_FOREGROUND: &str = "#f0f0eb";
+
+#[cfg(target_os = "linux")]
+thread_local! {
+    static LINUX_MENU_PROVIDER: RefCell<Option<gtk::CssProvider>> = const { RefCell::new(None) };
+}
 
 /// User-selected application appearance.
 #[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq, Serialize)]
@@ -90,6 +102,47 @@ pub(crate) fn apply_saved_theme(app: &AppHandle, store: &UpdateStateStore) {
     let _ = apply_native_theme(app, preference);
 }
 
+#[cfg(target_os = "linux")]
+fn configure_linux_native_controls(theme: EffectiveTheme) {
+    use gtk::prelude::{CssProviderExt, GtkSettingsExt};
+
+    if let Some(settings) = gtk::Settings::default() {
+        // WebKitGTK otherwise fades an idle horizontal thumb completely,
+        // making the grid's dedicated scrollbar lane look non-interactive.
+        settings.set_gtk_overlay_scrolling(false);
+    }
+
+    let Some(screen) = gtk::gdk::Screen::default() else {
+        return;
+    };
+    let foreground = match theme {
+        EffectiveTheme::Light => LIGHT_MENU_FOREGROUND,
+        EffectiveTheme::Dark => DARK_MENU_FOREGROUND,
+    };
+    // Tauri queues the native theme update, so a GTK symbolic color loaded
+    // here can resolve against the previous theme and retain that color.
+    let css = format!("menubar > menuitem > box > label {{ color: {foreground}; }}");
+    LINUX_MENU_PROVIDER.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        if let Some(provider) = slot.as_ref() {
+            let _ = provider.load_from_data(css.as_bytes());
+            return;
+        }
+
+        let provider = gtk::CssProvider::new();
+        if provider.load_from_data(css.as_bytes()).is_ok() {
+            // Muda nests each top-level GtkAccelLabel inside a GtkBox. Match
+            // that exact chain so submenu labels keep their native colors.
+            gtk::StyleContext::add_provider_for_screen(
+                &screen,
+                &provider,
+                gtk::STYLE_PROVIDER_PRIORITY_APPLICATION,
+            );
+            *slot = Some(provider);
+        }
+    });
+}
+
 fn apply_native_theme(app: &AppHandle, preference: ThemePreference) -> Result<(), ThemeError> {
     let window = app
         .get_webview_window(MAIN_WINDOW_LABEL)
@@ -105,14 +158,16 @@ fn apply_native_theme(app: &AppHandle, preference: ThemePreference) -> Result<()
             .map(effective_theme)
             .map_err(|_| ThemeError::Unavailable)?,
     };
-    window
-        .set_background_color(Some(background_color(effective_theme)))
-        .map_err(|_| ThemeError::Unavailable)
+    set_background(app, effective_theme)
 }
 
 fn set_background(app: &AppHandle, effective_theme: EffectiveTheme) -> Result<(), ThemeError> {
-    app.get_webview_window(MAIN_WINDOW_LABEL)
-        .ok_or(ThemeError::Unavailable)?
+    let window = app
+        .get_webview_window(MAIN_WINDOW_LABEL)
+        .ok_or(ThemeError::Unavailable)?;
+    #[cfg(target_os = "linux")]
+    configure_linux_native_controls(effective_theme);
+    window
         .set_background_color(Some(background_color(effective_theme)))
         .map_err(|_| ThemeError::Unavailable)
 }

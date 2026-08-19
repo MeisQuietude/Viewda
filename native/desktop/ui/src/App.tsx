@@ -52,6 +52,7 @@ import {
   UpdateCommandError,
 } from "./desktop";
 import { SchemaTreeNode } from "./SchemaTree";
+import { GridPerformanceDebug } from "./data-grid/GridPerformanceDebug";
 import {
   applyDocumentTheme,
   SYSTEM_THEME_QUERY,
@@ -149,7 +150,7 @@ export function App({
       );
       if (themePreference === "system") {
         void syncSystemTheme(effectiveTheme).catch(() => {
-          // DOM and canvas still follow the live OS theme if native sync fails.
+          // Application content still follows the live OS theme if native sync fails.
         });
       }
     };
@@ -795,130 +796,145 @@ export function App({
   }, []);
 
   return (
-    <main className="app-shell">
-      <header className="titlebar">
-        <span className={`file-context${source === null ? " is-empty" : ""}`}>
-          {source?.displayName ?? "No file open"}
-        </span>
-        {source !== null && (
-          <ModeSwitch mode={sourceMode} onMode={setSourceMode} />
-        )}
-        <TitlebarUpdateStatus
-          update={titlebarUpdate}
-          onActivate={installAvailableUpdate}
-          onDismiss={dismissPostUpdate}
-          onReleasePage={showReleasePage}
-        />
-      </header>
+    <GridPerformanceDebug
+      engine={readiness.kind === "ready" ? readiness.engine : null}
+      source={source}
+    >
+      {({ diagnostics, settings: gridPerformanceDebug }) => (
+        <main className="app-shell">
+          <header className="titlebar">
+            <span
+              className={`file-context${source === null ? " is-empty" : ""}`}
+            >
+              {source?.displayName ?? "No file open"}
+            </span>
+            {source !== null && (
+              <ModeSwitch mode={sourceMode} onMode={setSourceMode} />
+            )}
+            <TitlebarUpdateStatus
+              update={titlebarUpdate}
+              onActivate={installAvailableUpdate}
+              onDismiss={dismissPostUpdate}
+              onReleasePage={showReleasePage}
+            />
+          </header>
 
-      <div className={`workspace${source === null ? " is-empty" : ""}`}>
-        {source === null ? (
-          <section className="empty-state" aria-label="Open a Parquet file">
-            {readiness.kind === "loading" && (
-              <>
-                <OpenButton disabled opening={false} onOpen={openSource} />
-                <p className="empty-message">Starting the local data engine…</p>
-              </>
-            )}
-            {readiness.kind === "ready" && (
-              <>
-                <OpenButton opening={opening} onOpen={openSource} />
-                <RecentFiles
-                  entries={recentSources}
-                  opening={opening}
-                  onOpen={openRecent}
-                />
-                <p className="empty-message">
-                  Your data never leaves this machine.
-                </p>
-              </>
-            )}
-            {readiness.kind === "error" && (
-              <p className="empty-message status-error" role="alert">
-                The local data engine could not start. Restart Viewda and try
-                again.
-              </p>
-            )}
-            <ShortcutHints modifier={shortcutModifier} />
-            {sourceError !== null && <SourceErrorMessage code={sourceError} />}
-          </section>
-        ) : (
-          <>
-            <div className="mode-panel" hidden={sourceMode !== "data"}>
-              <div className="data-mode">
+          <div className={`workspace${source === null ? " is-empty" : ""}`}>
+            {source === null ? (
+              <section className="empty-state" aria-label="Open a Parquet file">
+                {readiness.kind === "loading" && (
+                  <>
+                    <OpenButton disabled opening={false} onOpen={openSource} />
+                    <p className="empty-message">
+                      Starting the local data engine…
+                    </p>
+                  </>
+                )}
+                {readiness.kind === "ready" && (
+                  <>
+                    <OpenButton opening={opening} onOpen={openSource} />
+                    <RecentFiles
+                      entries={recentSources}
+                      opening={opening}
+                      onOpen={openRecent}
+                    />
+                    <p className="empty-message">
+                      Your data never leaves this machine.
+                    </p>
+                  </>
+                )}
+                {readiness.kind === "error" && (
+                  <p className="empty-message status-error" role="alert">
+                    The local data engine could not start. Restart Viewda and
+                    try again.
+                  </p>
+                )}
+                <ShortcutHints modifier={shortcutModifier} />
                 {sourceError !== null && (
                   <SourceErrorMessage code={sourceError} />
                 )}
-                <Suspense
-                  fallback={
-                    <p className="data-grid-loading" role="status">
-                      Loading data grid…
-                    </p>
-                  }
+              </section>
+            ) : (
+              <>
+                <div className="mode-panel" hidden={sourceMode !== "data"}>
+                  <div className="data-mode">
+                    {sourceError !== null && (
+                      <SourceErrorMessage code={sourceError} />
+                    )}
+                    <Suspense
+                      fallback={
+                        <p className="data-grid-loading" role="status">
+                          Loading data grid…
+                        </p>
+                      }
+                    >
+                      <DataGrid
+                        key={source.generation}
+                        source={source}
+                        viewSettings={dataViewSettings}
+                        diagnostics={diagnostics}
+                      />
+                    </Suspense>
+                  </div>
+                </div>
+                <div
+                  className="mode-panel structure-mode-panel"
+                  hidden={sourceMode !== "structure"}
                 >
-                  <DataGrid
-                    key={source.generation}
+                  <SourceDetails
+                    opening={opening}
                     source={source}
-                    viewSettings={dataViewSettings}
+                    sourceError={sourceError}
+                    onOpen={openSource}
                   />
-                </Suspense>
-              </div>
-            </div>
-            <div
-              className="mode-panel structure-mode-panel"
-              hidden={sourceMode !== "structure"}
-            >
-              <SourceDetails
-                opening={opening}
-                source={source}
-                sourceError={sourceError}
-                onOpen={openSource}
-              />
-            </div>
-          </>
-        )}
-      </div>
+                </div>
+              </>
+            )}
+          </div>
 
-      {settingsOpen && updateSettings !== null && (
-        <SettingsDialog
-          defaultApplication={defaultApplication}
-          defaultApplicationMessage={defaultApplicationMessage}
-          settings={updateSettings}
-          dataViewSettings={dataViewSettings}
-          dataViewSettingsMessage={dataViewSettingsMessage}
-          themePreference={themePreference}
-          themeMessage={themeMessage}
-          engine={readiness.kind === "ready" ? readiness.engine : null}
-          checking={checkingUpdates}
-          message={updateMessage}
-          onAutomaticChecks={changeAutomaticChecks}
-          onDataViewMemory={changeDataViewMemory}
-          onChannel={changeUpdateChannel}
-          onTheme={changeThemePreference}
-          onCheck={runUpdateCheck}
-          onClose={() => setSettingsOpen(false)}
-          onMakeDefault={makeDefaultApplication}
-          onSimulate={simulateUpdate}
-          changingDefaultApplication={changingDefaultApplication}
-        />
+          {settingsOpen && updateSettings !== null && (
+            <SettingsDialog
+              defaultApplication={defaultApplication}
+              defaultApplicationMessage={defaultApplicationMessage}
+              settings={updateSettings}
+              dataViewSettings={dataViewSettings}
+              dataViewSettingsMessage={dataViewSettingsMessage}
+              themePreference={themePreference}
+              themeMessage={themeMessage}
+              engine={readiness.kind === "ready" ? readiness.engine : null}
+              checking={checkingUpdates}
+              message={updateMessage}
+              onAutomaticChecks={changeAutomaticChecks}
+              onDataViewMemory={changeDataViewMemory}
+              onChannel={changeUpdateChannel}
+              onTheme={changeThemePreference}
+              onCheck={runUpdateCheck}
+              onClose={() => setSettingsOpen(false)}
+              onMakeDefault={makeDefaultApplication}
+              onSimulate={simulateUpdate}
+              gridPerformanceDebug={gridPerformanceDebug}
+              changingDefaultApplication={changingDefaultApplication}
+            />
+          )}
+          {downgrade !== null && (
+            <DowngradeDialog
+              update={downgrade}
+              installing={installingDowngrade}
+              progress={downgradeProgress}
+              onDowngrade={installDowngrade}
+              onWait={waitForStable}
+            />
+          )}
+          {dataExportCloseDialog !== null && (
+            <ExportCloseDialog
+              copy={dataExportCloseDialog}
+              resolving={resolvingDataExportClose}
+              onDecision={resolveExportClose}
+            />
+          )}
+        </main>
       )}
-      {downgrade !== null && (
-        <DowngradeDialog
-          update={downgrade}
-          installing={installingDowngrade}
-          progress={downgradeProgress}
-          onDowngrade={installDowngrade}
-          onWait={waitForStable}
-        />
-      )}
-      {dataExportCloseDialog !== null && (
-        <ExportCloseDialog
-          copy={dataExportCloseDialog}
-          resolving={resolvingDataExportClose}
-          onDecision={resolveExportClose}
-        />
-      )}
-    </main>
+    </GridPerformanceDebug>
   );
 }
 
@@ -1145,6 +1161,7 @@ function SettingsDialog({
   onClose,
   onMakeDefault,
   onSimulate,
+  gridPerformanceDebug,
   changingDefaultApplication,
 }: {
   defaultApplication: DefaultApplicationStatus | null;
@@ -1165,6 +1182,7 @@ function SettingsDialog({
   onClose: () => void;
   onMakeDefault: () => Promise<void>;
   onSimulate: () => void;
+  gridPerformanceDebug: ReactNode;
   changingDefaultApplication: boolean;
 }) {
   return (
@@ -1320,6 +1338,7 @@ function SettingsDialog({
         <button className="text-button" type="button" onClick={onSimulate}>
           Simulate update flow
         </button>
+        {gridPerformanceDebug}
       </details>
       <div className="dialog-actions">
         <button className="dialog-close" type="button" onClick={onClose}>

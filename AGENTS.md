@@ -1,7 +1,7 @@
 # Viewda
 
 A free, offline, cross-platform Apache Parquet viewer. Tauri shell, Rust
-core (DuckDB, arrow-rs), React UI on a canvas grid.
+core (DuckDB, arrow-rs), React UI with a virtualized DOM grid.
 
 Rules that apply to every task:
 

@@ -593,9 +593,12 @@ jobs:
 
   macos-universal:
     if: >-
-      github.event_name != 'workflow_dispatch' ||
+      always() &&
+      needs.source.result == 'success' &&
+      needs.macos.result == 'success' &&
+      (github.event_name != 'workflow_dispatch' ||
       inputs.platform == 'all' ||
-      inputs.platform == 'macos-universal'
+      inputs.platform == 'macos-universal')
     name: macOS Universal derived artifact
     needs: [source, macos]
     runs-on: macos-26
@@ -984,10 +987,13 @@ jobs:
 
   linux-e2e:
     if: >-
-      github.event_name != 'workflow_dispatch' ||
+      always() &&
+      needs.source.result == 'success' &&
+      needs.linux.result == 'success' &&
+      (github.event_name != 'workflow_dispatch' ||
       inputs.platform == 'all' ||
-      inputs.platform == 'linux-x64'
-    name: Linux downloaded-artifact smoke
+      inputs.platform == 'linux-x64')
+    name: Linux downloaded-artifact acceptance
     needs: [source, linux]
     runs-on: ubuntu-24.04
     steps:

@@ -157,18 +157,17 @@ async function waitForText(selector, expected) {
 async function inspectGridCell(columnName, rowIndex) {
   return webdriver("POST", `/session/${sessionId}/execute/sync`, {
     script: `
-      const canvas = document.querySelector('[data-testid="data-grid-canvas"]');
-      if (!(canvas instanceof HTMLCanvasElement)) return null;
-      const grid = canvas.querySelector('[role="grid"]');
-      const header = Array.from(grid?.querySelectorAll('[role="columnheader"]') ?? [])
-        .find((element) => element instanceof HTMLElement && element.innerText === arguments[0]);
+      const grid = document.querySelector('[role="grid"]');
+      if (!(grid instanceof HTMLElement)) return null;
+      const header = Array.from(grid.querySelectorAll('[role="columnheader"]'))
+        .find((element) => element.getAttribute('aria-label') === arguments[0]);
       if (!(header instanceof HTMLElement)) return null;
       const columnIndex = header.getAttribute('aria-colindex');
       const row = grid.querySelector('[role="row"][aria-rowindex="' + (arguments[1] + 2) + '"]');
       const cell = row?.querySelector('[role="gridcell"][aria-colindex="' + columnIndex + '"]');
       if (!(cell instanceof HTMLElement)) return null;
-      const style = getComputedStyle(canvas);
-      const rect = canvas.getBoundingClientRect();
+      const style = getComputedStyle(grid);
+      const rect = grid.getBoundingClientRect();
       return {
         text: cell.innerText,
         visible:
@@ -199,6 +198,67 @@ async function waitForGridCell(columnName, rowIndex, expected) {
   throw new Error(
     `Timed out waiting for grid cell ${columnName}[${rowIndex}]; last observed state: ${JSON.stringify(observed)}`,
   );
+}
+
+async function waitForAttribute(selector, attribute, expected) {
+  const deadline = Date.now() + 15_000;
+  let observed = null;
+
+  while (Date.now() < deadline) {
+    observed = await webdriver("POST", `/session/${sessionId}/execute/sync`, {
+      script: `return document.querySelector(arguments[0])?.getAttribute(arguments[1]) ?? null;`,
+      args: [selector, attribute],
+    }).catch(() => null);
+    if (observed === expected) {
+      return;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 250));
+  }
+
+  throw new Error(
+    `Timed out waiting for ${selector} ${attribute}=${expected}; last observed value: ${JSON.stringify(observed)}`,
+  );
+}
+
+async function inspectGrid() {
+  return webdriver("POST", `/session/${sessionId}/execute/sync`, {
+    script: `
+      const grid = document.querySelector('[role="grid"]');
+      const header = grid?.querySelector(':scope > .viewda-grid-header');
+      const scrollport = grid?.querySelector(':scope > .viewda-grid-body-scrollport');
+      if (!(grid instanceof HTMLElement) ||
+          !(header instanceof HTMLElement) ||
+          !(scrollport instanceof HTMLElement)) return null;
+      const bodyRows = Array.from(
+        scrollport.querySelectorAll('.viewda-grid-row[role="row"]'),
+      );
+      const headerBounds = header.getBoundingClientRect();
+      const scrollportBounds = scrollport.getBoundingClientRect();
+      return {
+        gridBounds: {
+          width: grid.getBoundingClientRect().width,
+          height: grid.getBoundingClientRect().height,
+        },
+        scrollportBounds: {
+          width: scrollport.getBoundingClientRect().width,
+          height: scrollport.getBoundingClientRect().height,
+        },
+        scrollbarStartsBelowHeader:
+          Math.abs(headerBounds.bottom - scrollportBounds.top) < 1,
+        bodyRowCount: bodyRows.length,
+        cellCount: scrollport.querySelectorAll('[role="gridcell"]').length,
+        descendantCount: grid.querySelectorAll('*').length,
+        rowShapes: bodyRows.map((row) => ({
+          rowHeaders: row.querySelectorAll(':scope > [role="rowheader"]').length,
+          cells: row.querySelectorAll('[role="gridcell"]').length,
+        })),
+        filterControls: header.querySelectorAll('[data-action="filter"]').length,
+        resizeHandles: header.querySelectorAll('[data-action="resize"]').length,
+        canvases: grid.querySelectorAll('canvas').length,
+      };
+    `,
+    args: [],
+  });
 }
 
 async function runSession(assertions) {
@@ -272,10 +332,131 @@ try {
     assert.equal(clickedRecent, true);
     await waitForText(".file-context", /^people\.parquet$/);
     await waitForGridCell("name", 0, /^Ada$/);
+
+    const grid = await inspectGrid();
+    assert.ok(grid);
+    assert.equal(grid.scrollbarStartsBelowHeader, true);
+    assert.ok(grid.gridBounds.width > 0 && grid.gridBounds.height > 0);
+    assert.ok(
+      grid.scrollportBounds.width > 0 && grid.scrollportBounds.height > 0,
+    );
+    assert.equal(grid.bodyRowCount, 3);
+    assert.equal(grid.cellCount, 6);
+    assert.ok(grid.descendantCount < 80);
+    assert.deepEqual(grid.rowShapes, [
+      { rowHeaders: 1, cells: 2 },
+      { rowHeaders: 1, cells: 2 },
+      { rowHeaders: 1, cells: 2 },
+    ]);
+    assert.equal(grid.filterControls, 2);
+    assert.equal(grid.resizeHandles, 2);
+    assert.equal(grid.canvases, 0);
+
+    const selectedRow = await webdriver(
+      "POST",
+      `/session/${sessionId}/execute/sync`,
+      {
+        script: `
+          const marker = document.querySelector('[role="rowheader"][aria-rowindex="2"]');
+          if (!(marker instanceof HTMLElement)) return null;
+          marker.click();
+          const row = marker.parentElement;
+          return {
+            marker: marker.getAttribute('aria-selected'),
+            cells: Array.from(row?.querySelectorAll('[role="gridcell"]') ?? [],
+              (cell) => cell.getAttribute('aria-selected')),
+          };
+        `,
+        args: [],
+      },
+    );
+    assert.deepEqual(selectedRow, { marker: "true", cells: ["true", "true"] });
+
+    const openedHeaderMenu = await webdriver(
+      "POST",
+      `/session/${sessionId}/execute/sync`,
+      {
+        script: `
+          const header = document.querySelector('[role="columnheader"][data-column="0"]');
+          if (!(header instanceof HTMLElement)) return false;
+          header.dispatchEvent(new MouseEvent('contextmenu', {
+            bubbles: true,
+            cancelable: true,
+            clientX: 80,
+            clientY: 80,
+          }));
+          return true;
+        `,
+        args: [],
+      },
+    );
+    assert.equal(openedHeaderMenu, true);
+    await waitForText(
+      '[role="menu"][aria-label="id column"]',
+      /Pin column\s+Hide column/,
+    );
+    await webdriver("POST", `/session/${sessionId}/execute/sync`, {
+      script: `document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));`,
+      args: [],
+    });
+
+    const clickSort = async () => {
+      const clicked = await webdriver(
+        "POST",
+        `/session/${sessionId}/execute/sync`,
+        {
+          script: `
+            const sort = document.querySelector(
+              '[role="columnheader"][data-column="0"] [data-action="sort"]',
+            );
+            if (!(sort instanceof HTMLButtonElement)) return false;
+            sort.click();
+            return true;
+          `,
+          args: [],
+        },
+      );
+      assert.equal(clicked, true);
+    };
+    await clickSort();
+    await waitForAttribute(
+      '[role="columnheader"][data-column="0"]',
+      "aria-sort",
+      "ascending",
+    );
+    await waitForText(".query-count", /^3 rows$/);
+    await waitForGridCell("name", 0, /^Ada$/);
+    const selectionAfterSort = await webdriver(
+      "POST",
+      `/session/${sessionId}/execute/sync`,
+      {
+        script: `
+          const marker = document.querySelector('[role="rowheader"][aria-rowindex="2"]');
+          return {
+            marker: marker?.getAttribute('aria-selected') ?? null,
+            cells: Array.from(marker?.parentElement?.querySelectorAll('[role="gridcell"]') ?? [],
+              (cell) => cell.getAttribute('aria-selected')),
+          };
+        `,
+        args: [],
+      },
+    );
+    assert.deepEqual(selectionAfterSort, {
+      marker: "false",
+      cells: ["false", "false"],
+    });
+    await clickSort();
+    await waitForAttribute(
+      '[role="columnheader"][data-column="0"]',
+      "aria-sort",
+      "descending",
+    );
+    await waitForText(".query-count", /^3 rows$/);
+    await waitForGridCell("name", 0, /^Lin$/);
   });
 
   process.stdout.write(
-    "Downloaded Viewda artifact preserved its empty state and rendered a known Parquet cell.\n",
+    "Downloaded Viewda artifact passed the shell, DOM grid geometry, interaction, and data gates.\n",
   );
 } finally {
   await rm(fixtureDirectory, { recursive: true, force: true });

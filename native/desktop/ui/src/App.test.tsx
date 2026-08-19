@@ -997,6 +997,149 @@ describe("App", () => {
     expect(install).not.toHaveBeenCalled();
   });
 
+  it("keeps a stopped grid performance report available for automation and copy fallback", async () => {
+    const clipboardWrite = vi
+      .fn()
+      .mockRejectedValueOnce(new Error("blocked"))
+      .mockResolvedValue(undefined);
+    Object.defineProperty(navigator, "clipboard", {
+      configurable: true,
+      value: { writeText: clipboardWrite },
+    });
+    render(<App />);
+    let dialog = await openSettings();
+    let now = 1_000;
+    let timerCallback: (() => void) | null = null;
+    vi.spyOn(performance, "now").mockImplementation(() => now);
+    vi.spyOn(window, "setInterval").mockImplementation((handler) => {
+      timerCallback = typeof handler === "function" ? handler : null;
+      return 1 as unknown as ReturnType<typeof window.setInterval>;
+    });
+    const clearRecordingInterval = vi
+      .spyOn(window, "clearInterval")
+      .mockImplementation(() => undefined);
+    fireEvent.click(
+      within(dialog).getByText("Debug — for Viewda developers", {
+        selector: "summary",
+      }),
+    );
+    fireEvent.click(
+      within(dialog).getByRole("button", { name: "Start recording" }),
+    );
+    expect(within(dialog).getByRole("status")).toHaveTextContent(
+      "Recording grid performance",
+    );
+
+    fireEvent.click(within(dialog).getByRole("button", { name: "Close" }));
+    const recordingStatus = screen.getByLabelText("Grid performance recording");
+    expect(recordingStatus).toHaveTextContent(
+      "Recording grid performance0:00Stop recording",
+    );
+    now = 66_000;
+    act(() => timerCallback?.());
+    expect(recordingStatus).toHaveTextContent(
+      "Recording grid performance1:05Stop recording",
+    );
+    fireEvent.click(
+      within(recordingStatus).getByRole("button", { name: "Stop recording" }),
+    );
+    expect(clearRecordingInterval).toHaveBeenCalledWith(1);
+    const completedStatus = screen.getByLabelText(
+      "Grid performance recording completed",
+    );
+    expect(completedStatus).not.toHaveTextContent(
+      "Grid performance report ready",
+    );
+    const duration = within(completedStatus).getByLabelText(
+      "Recording duration 1 minute 5 seconds",
+    );
+    expect(duration.tagName).toBe("TIME");
+    expect(duration).toHaveTextContent("1:05");
+    expect(within(completedStatus).queryByText("Copy report")).toBeNull();
+    expect(within(completedStatus).queryByText("Record again")).toBeNull();
+    const copyReport = within(completedStatus).getByRole("button", {
+      name: "Copy report",
+    });
+    const recordAgain = within(completedStatus).getByRole("button", {
+      name: "Record again",
+    });
+    expect(copyReport).toHaveAttribute("title", "Copy report");
+    expect(recordAgain).toHaveAttribute("title", "Record again");
+    expect(copyReport).not.toHaveClass("is-copied");
+    expect(
+      copyReport.querySelector(".grid-performance-copy-glyph"),
+    ).toBeInTheDocument();
+    expect(
+      copyReport.querySelector(".grid-performance-copy-check"),
+    ).toBeInTheDocument();
+    const completedActions = within(completedStatus).getAllByRole("button");
+    expect(completedActions).toHaveLength(3);
+    const dismiss = completedActions[completedActions.length - 1];
+    if (dismiss === undefined) {
+      throw new Error("Completed performance actions are missing.");
+    }
+    expect(dismiss).toHaveAccessibleName("Dismiss performance report");
+    expect(dismiss).toHaveAttribute("title", "Dismiss performance report");
+
+    fireEvent.click(copyReport);
+    const copyError = await within(completedStatus).findByRole("status");
+    expect(copyError).toHaveTextContent(
+      "Copy failed; report remains available in Settings.",
+    );
+    expect(copyError).toHaveClass("grid-performance-copy-error");
+    expect(copyError).toBeVisible();
+
+    fireEvent.click(copyReport);
+    await waitFor(() => expect(copyReport).toHaveClass("is-copied"));
+    const copySuccess = within(completedStatus).getByRole("status");
+    expect(copySuccess).toHaveTextContent("Report copied.");
+    expect(copySuccess).toHaveClass("grid-performance-live");
+    expect(copySuccess).not.toHaveClass("grid-performance-copy-error");
+
+    fireEvent.click(dismiss);
+    expect(
+      screen.queryByLabelText("Grid performance recording completed"),
+    ).not.toBeInTheDocument();
+    dialog = await openSettings();
+    fireEvent.click(
+      within(dialog).getByText("Debug — for Viewda developers", {
+        selector: "summary",
+      }),
+    );
+    const report = within(dialog).getByLabelText("Grid performance report");
+    expect(report).toHaveAttribute("readonly");
+    expect(JSON.parse((report as HTMLTextAreaElement).value)).toMatchObject({
+      schemaVersion: 1,
+      runtime: {
+        appVersion: "0.0.1",
+        queryEngineVersion: "v1.5.5",
+        theme: "light",
+      },
+      grid: { maximumDomCells: 0 },
+      wheel: { inputEvents: 0 },
+    });
+
+    fireEvent.click(
+      within(dialog).getByRole("button", { name: "Copy report" }),
+    );
+    await waitFor(() => expect(clipboardWrite).toHaveBeenCalledTimes(3));
+    expect(await within(dialog).findByRole("status")).toHaveTextContent(
+      "Report copied",
+    );
+    expect(within(dialog).getByLabelText("Grid performance report")).toBe(
+      report,
+    );
+    fireEvent.click(
+      within(dialog).getByRole("button", { name: "Record again" }),
+    );
+    expect(
+      screen.getByLabelText("Grid performance recording"),
+    ).toHaveTextContent("0:00");
+    expect(
+      within(dialog).queryByLabelText("Grid performance report"),
+    ).not.toBeInTheDocument();
+  });
+
   it("asks whether to downgrade or wait when moving from latest to stable", async () => {
     const discard = vi.spyOn(desktop, "discardPendingUpdate");
 
