@@ -4,9 +4,6 @@ A free, fully offline, cross-platform Apache Parquet viewer. Double-click a
 file bigger than your RAM — it opens in under a second, in an interface that
 belongs on your desktop.
 
-> **Status: early alpha.** Published builds are available under
-> [GitHub Releases](https://github.com/MeisQuietude/Viewda/releases).
-
 ## Why
 
 A Parquet file is made for machines: columnar, compressed, binary. Superb
@@ -40,6 +37,8 @@ a file someone just handed you.
   the current filtered and sorted view to CSV.
 - **Shows the structure**: size, row counts, row groups, the nested schema and
   on-demand column statistics.
+- **Matches your desktop**: follows the system theme or forces Light or Dark,
+  native window chrome included.
 
 ## What it will do
 
@@ -70,8 +69,8 @@ brew install --cask viewda
 Or download a DMG: Apple silicon for an M-series Mac, Intel for an older
 Intel Mac, or Universal if unsure. Open it and drag Viewda to Applications.
 
-Either way, prereleases are ad hoc signed, not notarized; if macOS blocks
-the first launch, choose System Settings → Privacy & Security → Open Anyway.
+Either way, builds are not notarized yet; if macOS blocks the first launch,
+choose System Settings → Privacy & Security → Open Anyway.
 
 ### Windows x64
 
