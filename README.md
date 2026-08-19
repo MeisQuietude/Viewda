@@ -54,20 +54,37 @@ a file someone just handed you.
 
 ## Installation
 
-Download the latest build from
-[GitHub Releases](https://github.com/MeisQuietude/Viewda/releases):
+Every build below comes from
+[GitHub Releases](https://github.com/MeisQuietude/Viewda/releases).
 
-- **macOS:** choose Apple silicon for an M-series Mac, Intel for an older Intel
-  Mac, or Universal if unsure. Open the DMG and drag Viewda to Applications.
-  Prereleases are ad hoc signed, not notarized; if macOS blocks the first
-  launch, choose System Settings → Privacy & Security → Open Anyway.
-- **Windows x64:** download and run the Windows x64 `.exe`. It is not
-  code-signed yet, so SmartScreen may require **More info → Run anyway**.
-- **Linux x64:** download the AppImage, run
-  `chmod +x Viewda_*.AppImage`, then open it. The AppImage is recommended
-  because it supports in-app updates. The `.deb` package is a manual-update
-  fallback and is not recommended for most users. AppImage file associations
-  require integration through appimaged or AppImageLauncher.
+### macOS
+
+Install with Homebrew — it picks the right architecture, and the app keeps
+updating itself:
+
+```sh
+brew tap meisquietude/viewda https://github.com/MeisQuietude/Viewda
+brew install --cask viewda
+```
+
+Or download a DMG: Apple silicon for an M-series Mac, Intel for an older
+Intel Mac, or Universal if unsure. Open it and drag Viewda to Applications.
+
+Either way, prereleases are ad hoc signed, not notarized; if macOS blocks
+the first launch, choose System Settings → Privacy & Security → Open Anyway.
+
+### Windows x64
+
+Download and run the `.exe`. It is not code-signed yet, so SmartScreen may
+require **More info → Run anyway**.
+
+### Linux x64
+
+Download the AppImage, run `chmod +x Viewda_*.AppImage`, then open it. The
+AppImage is recommended because it supports in-app updates. The `.deb`
+package is a manual-update fallback and is not recommended for most users.
+AppImage file associations require integration through appimaged or
+AppImageLauncher.
 
 ## Under the hood
 

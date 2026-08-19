@@ -10,6 +10,10 @@ Backward-incompatible entries start with **Breaking:**.
 
 ### Added
 
+- Viewda can be installed with Homebrew on macOS:
+  `brew tap meisquietude/viewda https://github.com/MeisQuietude/Viewda`, then
+  `brew install --cask viewda`. In-app updates keep working; `brew upgrade`
+  leaves Viewda to update itself.
 - Debug settings can record and copy a size-limited grid scrolling performance
   report without file paths or cell values. A floating control can stop or
   restart recording and copy the completed report without reopening Settings.
