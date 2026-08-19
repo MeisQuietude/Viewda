@@ -1,0 +1,50 @@
+name: Bump Homebrew cask
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: viewda-homebrew-cask
+  cancel-in-progress: false
+
+jobs:
+  bump:
+    name: Point the cask at the released version
+    runs-on: ubuntu-24.04
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      # The deploy key bypasses the pull-request ruleset on main, and unlike
+      # GITHUB_TOKEN its pushes still trigger CI on the bumped commit.
+      - name: Check out main with the push deploy key
+        uses: actions/checkout@v6
+        with:
+          ref: main
+          ssh-key: ${{ secrets.CASK_BUMP_DEPLOY_KEY }}
+
+      - name: Install the pinned Node.js
+        run: scripts/install-node.sh
+
+      - name: Update the cask
+        id: bump
+        # The assignment stands alone so a bump failure fails the step;
+        # substituting directly into echo's arguments would swallow it.
+        run: |
+          tag=$(scripts/bump-homebrew-cask.sh)
+          echo "tag=${tag}" >> "$GITHUB_OUTPUT"
+
+      - name: Push the bump to main
+        run: |
+          if git diff --quiet; then
+            echo "Cask already points at ${{ steps.bump.outputs.tag }}."
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit -am "chore: point Homebrew cask at ${{ steps.bump.outputs.tag }}"
+          git push origin main
