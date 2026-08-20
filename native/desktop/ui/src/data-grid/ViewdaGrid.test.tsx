@@ -518,6 +518,53 @@ describe("ViewdaGrid foundation", () => {
     );
   });
 
+  it("keeps the scroll position while its panel is hidden", () => {
+    const frames: FrameRequestCallback[] = [];
+    vi.spyOn(window, "requestAnimationFrame").mockImplementation((callback) => {
+      frames.push(callback);
+      return frames.length;
+    });
+    let resize: (() => void) | undefined;
+    let visible = true;
+    const port: GridMeasurementPort = {
+      ...measurementPort(420, 84),
+      // A hidden panel reports a zero viewport, and the browser forgets the
+      // scroll offset of a box it destroyed.
+      read: (scrollport) => ({
+        width: visible ? 420 : 0,
+        height: visible ? 84 : 0,
+        scrollTop: visible ? scrollport.scrollTop : 0,
+        scrollLeft: 0,
+        devicePixelRatio: 1,
+      }),
+      observe: (_element, callback) => {
+        resize = callback;
+        return () => undefined;
+      },
+    };
+    const { container } = render(
+      <ViewdaGrid {...props({ measurementPort: port })} />,
+    );
+    const scrollport = container.querySelector(
+      ".viewda-grid-body-scrollport",
+    ) as HTMLElement;
+    scrollport.scrollTop = 4_200;
+    fireEvent.scroll(scrollport);
+    act(() => frames.shift()?.(0));
+    expect(scrollport.scrollTop).toBe(4_200);
+
+    visible = false;
+    scrollport.scrollTop = 0;
+    act(() => resize?.());
+    act(() => frames.shift()?.(0));
+
+    visible = true;
+    act(() => resize?.());
+    act(() => frames.shift()?.(0));
+
+    expect(scrollport.scrollTop).toBe(4_200);
+  });
+
   it("reports viewport shapes once and uses the latest callback", async () => {
     let resize: (() => void) | undefined;
     let scrollLeft = 0;

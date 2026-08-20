@@ -212,6 +212,7 @@ export const ViewdaGrid = forwardRef<ViewdaGridHandle, ViewdaGridProps>(
     // Distinguishes quantized read-back of our logical command from external
     // physical input such as a compressed scrollbar-thumb drag.
     const expectedPhysicalTopRef = useRef<number | null>(null);
+    const hiddenScrollportRef = useRef(false);
     const wheelGestureRef = useRef<WheelGestureState | null>(null);
     const frameRef = useRef<number | null>(null);
     const diagnosticFrameRefs = useRef<{
@@ -480,18 +481,30 @@ export const ViewdaGrid = forwardRef<ViewdaGridHandle, ViewdaGridProps>(
           const ownWrite =
             expected !== null && samePosition(expected, read.scrollTop);
           expectedPhysicalTopRef.current = null;
+          // A grid inside a `hidden` panel has no scroll box: the browser reports
+          // a zero viewport and drops scrollTop. The retained position stays
+          // authoritative across the hidden phase and is written back on return,
+          // so switching panels keeps the reader on the same rows.
+          const hidden = read.height === 0;
+          const restored = !hidden && hiddenScrollportRef.current;
+          hiddenScrollportRef.current = hidden;
           const next =
-            layout.mode === "native"
-              ? {
-                  logicalTop: read.scrollTop,
-                  physicalTop: read.scrollTop,
-                }
-              : applyPhysicalScroll(
-                  scrollStateRef.current,
-                  read.scrollTop,
-                  layout,
-                  ownWrite,
-                );
+            hidden || restored
+              ? scrollStateRef.current
+              : layout.mode === "native"
+                ? {
+                    logicalTop: read.scrollTop,
+                    physicalTop: read.scrollTop,
+                  }
+                : applyPhysicalScroll(
+                    scrollStateRef.current,
+                    read.scrollTop,
+                    layout,
+                    ownWrite,
+                  );
+          if (restored) {
+            writePhysicalTop(next.physicalTop);
+          }
           reactWorkScheduled = commitScrollState(next);
           reactWorkScheduled =
             commitGeometry({
@@ -555,6 +568,7 @@ export const ViewdaGrid = forwardRef<ViewdaGridHandle, ViewdaGridProps>(
       pinnedWidth,
       scrollingOffsets,
       syncHorizontalScroll,
+      writePhysicalTop,
     ]);
 
     useLayoutEffect(() => {
