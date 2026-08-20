@@ -50,9 +50,9 @@ use viewda_data_engine::{
     ColumnStatistics, ColumnStatisticsError, ColumnStatisticsReader, DataFilter,
     DataFilterOperator, DataSort, DataViewBuilder, DataViewError, DataViewInterruptHandle,
     DataViewResourceDiagnostics, DataWindowError, DataWindowReader, EngineError, EngineStatus,
-    PreparedDataView, SchemaField, SourceError, SourceSummary, StatisticsInterruptHandle,
-    TextValueSuggestions, TextValueSuggestionsInterruptHandle, TextValueSuggestionsReader,
-    engine_status, inspect_local_source,
+    PreparedDataView, SourceError, SourceSummary, StatisticsInterruptHandle, TextValueSuggestions,
+    TextValueSuggestionsInterruptHandle, TextValueSuggestionsReader, engine_status,
+    inspect_local_source,
 };
 
 const OPEN_SOURCE_MENU_ID: &str = "open-local-source";
@@ -137,6 +137,7 @@ struct DataExportCloseDialogCopy {
 #[derive(Clone, Copy)]
 enum DataExportShutdownAction {
     Close,
+    CloseSource,
     RestartForUpdate,
 }
 
@@ -144,28 +145,66 @@ enum DataExportShutdownAction {
 pub(crate) struct OpenedSource {
     state: Arc<Mutex<OpenedSourceState>>,
     recents: RecentSourcesStore,
-    data_views: DataViewJobs,
     data_exports: DataExportJobs,
-    text_suggestions: TextValueSuggestionJobs,
 }
 
 #[derive(Default)]
 struct OpenedSourceState {
     generation: u64,
-    session: Option<OpenedSourceSession>,
+    /// Open sessions in most-recently-used order; the first one is the active source.
+    sessions: Vec<OpenedSourceSession>,
     blocks_restore: bool,
 }
 
+impl OpenedSourceState {
+    fn session(&self, generation: u64) -> Option<&OpenedSourceSession> {
+        self.sessions
+            .iter()
+            .find(|session| session.generation == generation)
+    }
+
+    fn session_mut(&mut self, generation: u64) -> Option<&mut OpenedSourceSession> {
+        self.sessions
+            .iter_mut()
+            .find(|session| session.generation == generation)
+    }
+
+    /// Tells a window without sources apart from a source that has since been closed.
+    fn missing_session<T>(&self, no_source_open: T, source_changed: T) -> T {
+        if self.sessions.is_empty() {
+            no_source_open
+        } else {
+            source_changed
+        }
+    }
+
+    fn activate(&mut self, generation: u64) -> bool {
+        let Some(index) = self
+            .sessions
+            .iter()
+            .position(|session| session.generation == generation)
+        else {
+            return false;
+        };
+        let session = self.sessions.remove(index);
+        self.sessions.insert(0, session);
+        true
+    }
+}
+
+/// One opened source with the reading state and the jobs that belong to it.
 struct OpenedSourceSession {
     generation: u64,
     path: PathBuf,
-    schema: Vec<SchemaField>,
-    source_row_count: u64,
+    summary: SourceSummary,
     view_revision: u64,
     view: Option<PreparedDataView>,
     reader: DataWindowReader,
     text_suggestion_reader: Option<Arc<TextValueSuggestionsReader>>,
-    statistics_cache: HashMap<(u64, usize), ColumnStatistics>,
+    statistics_cache: HashMap<usize, ColumnStatistics>,
+    data_view_jobs: DataViewJobsState,
+    text_suggestion_jobs: TextValueSuggestionJobsState,
+    statistics_job: Option<Arc<ColumnStatisticsJob>>,
 }
 
 impl OpenedSourceSession {
@@ -182,21 +221,28 @@ impl OpenedSourceSession {
             .map(Arc::clone)
             .ok_or(DataWindowError::QueryEngineUnavailable)
     }
-}
 
-#[derive(Default)]
-struct DataViewJobs {
-    state: Mutex<DataViewJobsState>,
+    /// Interrupts every job this session owns; each command then reports cancellation.
+    fn cancel_jobs(&mut self) {
+        if let Some(job) = self.data_view_jobs.active.take() {
+            job.cancel();
+        }
+        if let Some(job) = self.text_suggestion_jobs.active.take() {
+            job.cancel();
+        }
+        if let Some(job) = self.statistics_job.take() {
+            job.cancel();
+        }
+    }
 }
 
 #[derive(Default)]
 struct DataViewJobsState {
-    watermark: Option<(u64, u64)>,
+    watermark: Option<u64>,
     active: Option<ActiveDataViewJob>,
 }
 
 struct ActiveDataViewJob {
-    generation: u64,
     view_revision: u64,
     interrupt: Arc<DataViewInterruptHandle>,
 }
@@ -211,13 +257,14 @@ fn register_data_view_job(
     jobs: &mut DataViewJobsState,
     next: ActiveDataViewJob,
 ) -> Result<(), DataWindowError> {
-    if jobs.watermark.is_some_and(|(generation, revision)| {
-        generation == next.generation && next.view_revision <= revision
-    }) {
+    if jobs
+        .watermark
+        .is_some_and(|revision| next.view_revision <= revision)
+    {
         next.cancel();
         return Err(DataWindowError::Cancelled);
     }
-    jobs.watermark = Some((next.generation, next.view_revision));
+    jobs.watermark = Some(next.view_revision);
     if let Some(previous) = jobs.active.replace(next) {
         previous.cancel();
     }
@@ -226,15 +273,12 @@ fn register_data_view_job(
 
 fn finish_data_view_job(
     jobs: &mut DataViewJobsState,
-    generation: u64,
     view_revision: u64,
     interrupt: &Arc<DataViewInterruptHandle>,
 ) -> bool {
     let is_current = jobs.active.as_ref().is_some_and(|active| {
-        active.generation == generation
-            && active.view_revision == view_revision
-            && Arc::ptr_eq(&active.interrupt, interrupt)
-    }) && jobs.watermark == Some((generation, view_revision));
+        active.view_revision == view_revision && Arc::ptr_eq(&active.interrupt, interrupt)
+    }) && jobs.watermark == Some(view_revision);
     if is_current {
         jobs.active.take();
     }
@@ -243,20 +287,19 @@ fn finish_data_view_job(
 
 fn cancel_data_view_job(
     jobs: &mut DataViewJobsState,
-    generation: u64,
     view_revision: u64,
 ) -> Option<ActiveDataViewJob> {
     if !jobs
         .watermark
-        .is_some_and(|(watermark_generation, revision)| {
-            watermark_generation == generation && revision >= view_revision
-        })
+        .is_some_and(|revision| revision >= view_revision)
     {
-        jobs.watermark = Some((generation, view_revision));
+        jobs.watermark = Some(view_revision);
     }
-    if jobs.active.as_ref().is_some_and(|active| {
-        active.generation == generation && active.view_revision == view_revision
-    }) {
+    if jobs
+        .active
+        .as_ref()
+        .is_some_and(|active| active.view_revision == view_revision)
+    {
         jobs.active.take()
     } else {
         None
@@ -264,18 +307,12 @@ fn cancel_data_view_job(
 }
 
 #[derive(Default)]
-struct TextValueSuggestionJobs {
-    state: Mutex<TextValueSuggestionJobsState>,
-}
-
-#[derive(Default)]
 struct TextValueSuggestionJobsState {
-    watermark: Option<(u64, u64)>,
+    watermark: Option<u64>,
     active: Option<ActiveTextValueSuggestionJob>,
 }
 
 struct ActiveTextValueSuggestionJob {
-    generation: u64,
     suggestion_revision: u64,
     interrupt: Arc<TextValueSuggestionsInterruptHandle>,
 }
@@ -290,13 +327,14 @@ fn register_text_value_suggestion_job(
     jobs: &mut TextValueSuggestionJobsState,
     next: ActiveTextValueSuggestionJob,
 ) -> Result<(), DataWindowError> {
-    if jobs.watermark.is_some_and(|(generation, revision)| {
-        generation == next.generation && next.suggestion_revision <= revision
-    }) {
+    if jobs
+        .watermark
+        .is_some_and(|revision| next.suggestion_revision <= revision)
+    {
         next.cancel();
         return Err(DataWindowError::Cancelled);
     }
-    jobs.watermark = Some((next.generation, next.suggestion_revision));
+    jobs.watermark = Some(next.suggestion_revision);
     if let Some(previous) = jobs.active.replace(next) {
         previous.cancel();
     }
@@ -305,15 +343,13 @@ fn register_text_value_suggestion_job(
 
 fn finish_text_value_suggestion_job(
     jobs: &mut TextValueSuggestionJobsState,
-    generation: u64,
     suggestion_revision: u64,
     interrupt: &Arc<TextValueSuggestionsInterruptHandle>,
 ) -> bool {
     let is_current = jobs.active.as_ref().is_some_and(|active| {
-        active.generation == generation
-            && active.suggestion_revision == suggestion_revision
+        active.suggestion_revision == suggestion_revision
             && Arc::ptr_eq(&active.interrupt, interrupt)
-    }) && jobs.watermark == Some((generation, suggestion_revision));
+    }) && jobs.watermark == Some(suggestion_revision);
     if is_current {
         jobs.active.take();
     }
@@ -322,20 +358,19 @@ fn finish_text_value_suggestion_job(
 
 fn cancel_text_value_suggestion_job(
     jobs: &mut TextValueSuggestionJobsState,
-    generation: u64,
     suggestion_revision: u64,
 ) -> Option<ActiveTextValueSuggestionJob> {
     if !jobs
         .watermark
-        .is_some_and(|(watermark_generation, revision)| {
-            watermark_generation == generation && revision >= suggestion_revision
-        })
+        .is_some_and(|revision| revision >= suggestion_revision)
     {
-        jobs.watermark = Some((generation, suggestion_revision));
+        jobs.watermark = Some(suggestion_revision);
     }
-    if jobs.active.as_ref().is_some_and(|active| {
-        active.generation == generation && active.suggestion_revision == suggestion_revision
-    }) {
+    if jobs
+        .active
+        .as_ref()
+        .is_some_and(|active| active.suggestion_revision == suggestion_revision)
+    {
         jobs.active.take()
     } else {
         None
@@ -346,16 +381,6 @@ fn cancel_text_value_suggestion_job(
 enum ColumnStatisticsRequest {
     Cached(ColumnStatistics),
     Scan { path: PathBuf, column_name: String },
-}
-
-#[derive(Default)]
-struct ColumnStatisticsJobs {
-    active: Mutex<Option<ActiveColumnStatisticsJob>>,
-}
-
-struct ActiveColumnStatisticsJob {
-    generation: u64,
-    job: Arc<ColumnStatisticsJob>,
 }
 
 struct ColumnStatisticsJob {
@@ -376,6 +401,20 @@ pub(crate) struct OpenedSourceInfo {
     generation: u64,
     #[serde(flatten)]
     summary: SourceSummary,
+}
+
+/// One open source as the file switcher and the titlebar list it.
+///
+/// The full path is part of this shape on purpose: the switcher shows it as a
+/// tooltip, and files with the same name are only distinguishable by it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct OpenedSourceEntry {
+    generation: u64,
+    name: String,
+    directory: String,
+    path: String,
+    active: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -431,6 +470,13 @@ enum DataWindowSessionError {
     NoSourceOpen,
     SourceChanged,
     ViewChanged,
+}
+
+fn missing_data_window_session(state: &OpenedSourceState) -> DataWindowCommandError {
+    DataWindowCommandError::Session(state.missing_session(
+        DataWindowSessionError::NoSourceOpen,
+        DataWindowSessionError::SourceChanged,
+    ))
 }
 
 #[derive(Debug, PartialEq, Eq, Serialize)]
@@ -517,6 +563,10 @@ impl OpenedSource {
         Ok(())
     }
 
+    /// Opens a source as the active one, keeping every already open source.
+    ///
+    /// A path that is already open activates its existing session instead of
+    /// opening a second one, so its reading state and its running jobs survive.
     fn install(
         &self,
         recent_sources_path: Option<&std::path::Path>,
@@ -528,79 +578,95 @@ impl OpenedSource {
         if intent == SourceOpenIntent::Restore && state.blocks_restore {
             return Ok(None);
         }
-        self.cancel_data_views()?;
-        self.data_exports.cancel_all();
-        self.cancel_text_suggestions()?;
-        let generation = state
-            .generation
-            .checked_add(1)
-            .ok_or(SourceError::Unsupported)?;
-        state.generation = generation;
-        let schema = summary.schema.clone();
-        state.session = Some(OpenedSourceSession {
-            generation,
-            reader: DataWindowReader::new(path.clone()),
-            path,
-            schema,
-            source_row_count: summary.row_count,
-            view_revision: 0,
-            view: None,
-            text_suggestion_reader: None,
-            statistics_cache: HashMap::new(),
-        });
         if intent == SourceOpenIntent::Explicit {
             state.blocks_restore = true;
         }
+        let opened = state
+            .sessions
+            .iter()
+            .find(|session| session.path == path)
+            .map(|session| OpenedSourceInfo {
+                generation: session.generation,
+                summary: session.summary.clone(),
+            });
+        let info = match opened {
+            Some(info) => {
+                state.activate(info.generation);
+                info
+            }
+            None => {
+                let generation = state
+                    .generation
+                    .checked_add(1)
+                    .ok_or(SourceError::Unsupported)?;
+                state.generation = generation;
+                state.sessions.insert(
+                    0,
+                    OpenedSourceSession {
+                        generation,
+                        reader: DataWindowReader::new(path.clone()),
+                        path: path.clone(),
+                        summary: summary.clone(),
+                        view_revision: 0,
+                        view: None,
+                        text_suggestion_reader: None,
+                        statistics_cache: HashMap::new(),
+                        data_view_jobs: DataViewJobsState::default(),
+                        text_suggestion_jobs: TextValueSuggestionJobsState::default(),
+                        statistics_job: None,
+                    },
+                );
+                OpenedSourceInfo {
+                    generation,
+                    summary,
+                }
+            }
+        };
         if let Some(recent_sources_path) = recent_sources_path {
-            // Keep source state and recents in the same order when restore races an explicit open.
-            // The source is already open; history remains best-effort.
-            let path = &state.session.as_ref().ok_or(SourceError::Unsupported)?.path;
-            let _ = self.recents.record_path(recent_sources_path, path);
+            // Recorded under the source lock so a restore racing an explicit open
+            // cannot invert the history order. The source is open either way, so
+            // history stays best-effort.
+            let _ = self.recents.record_path(recent_sources_path, &path);
         }
-        Ok(Some(OpenedSourceInfo {
-            generation,
-            summary,
-        }))
+        Ok(Some(info))
     }
 
-    pub(crate) fn current_path(&self) -> Result<Option<PathBuf>, OpenSourceError> {
+    /// Drops one session, interrupting the jobs and releasing the state it owns.
+    fn close(&self, generation: u64) -> Result<bool, OpenSourceError> {
+        let mut state = self.lock_state()?;
+        let Some(index) = state
+            .sessions
+            .iter()
+            .position(|session| session.generation == generation)
+        else {
+            return Ok(false);
+        };
+        let mut session = state.sessions.remove(index);
+        // Outside the source lock: dropping the session also removes the
+        // temporary sort directory its prepared view holds on disk.
+        drop(state);
+        session.cancel_jobs();
+        Ok(true)
+    }
+
+    /// Open source paths in most-recently-used order, the active source first.
+    pub(crate) fn open_paths(&self) -> Result<Vec<PathBuf>, OpenSourceError> {
         Ok(self
             .lock_state()?
-            .session
-            .as_ref()
-            .map(|session| session.path.clone()))
+            .sessions
+            .iter()
+            .map(|session| session.path.clone())
+            .collect())
     }
 
     fn blocks_restore(&self) -> Result<bool, OpenSourceError> {
         Ok(self.lock_state()?.blocks_restore)
     }
 
-    fn cancel_data_views(&self) -> Result<(), OpenSourceError> {
-        let mut jobs = self
-            .data_views
-            .state
-            .lock()
-            .map_err(|_| RecentSourceError::Storage)?;
-        let active = jobs.active.take();
-        jobs.watermark = None;
-        drop(jobs);
-        if let Some(active) = active {
-            active.cancel();
-        }
-        Ok(())
-    }
-
-    fn cancel_text_suggestions(&self) -> Result<(), OpenSourceError> {
-        let mut jobs = self
-            .text_suggestions
-            .state
-            .lock()
-            .map_err(|_| RecentSourceError::Storage)?;
-        let active = jobs.active.take();
-        jobs.watermark = None;
-        drop(jobs);
-        if let Some(active) = active {
-            active.cancel();
+    fn cancel_all_jobs(&self) -> Result<(), OpenSourceError> {
+        let mut state = self.lock_state()?;
+        for session in &mut state.sessions {
+            session.cancel_jobs();
         }
         Ok(())
     }
@@ -648,17 +714,8 @@ fn fetch_opened_source_window(
     row_count: u32,
     source_indices: &[u32],
 ) -> Result<Vec<u8>, DataWindowCommandError> {
-    let session = state
-        .session
-        .as_mut()
-        .ok_or(DataWindowCommandError::Session(
-            DataWindowSessionError::NoSourceOpen,
-        ))?;
-    if session.generation != generation {
-        return Err(DataWindowCommandError::Session(
-            DataWindowSessionError::SourceChanged,
-        ));
-    }
+    let missing = missing_data_window_session(state);
+    let session = state.session_mut(generation).ok_or(missing)?;
     if session.view_revision != view_revision {
         return Err(DataWindowCommandError::Session(
             DataWindowSessionError::ViewChanged,
@@ -673,7 +730,7 @@ fn fetch_opened_source_window(
             // Keep this predicate aligned with DataWindowReader::fetch_columns: this fast path
             // avoids parsing the footer, while the reader still protects direct library callers.
             let identity_projection = !source_indices.is_empty()
-                && source_indices.len() == session.schema.len()
+                && source_indices.len() == session.summary.schema.len()
                 && source_indices
                     .iter()
                     .enumerate()
@@ -711,49 +768,24 @@ async fn prepare_data_view(
             .state
             .lock()
             .map_err(|_| DataWindowError::Unsupported)?;
-        let session = state
-            .session
-            .as_ref()
-            .ok_or(DataWindowCommandError::Session(
-                DataWindowSessionError::NoSourceOpen,
-            ))?;
-        if session.generation != generation {
-            return Err(DataWindowCommandError::Session(
-                DataWindowSessionError::SourceChanged,
-            ));
-        }
-        session.path.clone()
+        let missing = missing_data_window_session(&state);
+        state.session(generation).ok_or(missing)?.path.clone()
     };
     let builder = DataViewBuilder::with_memory_limit(path, &filters, &sort, settings.memory_limit)?;
     let interrupt = Arc::new(builder.interrupt_handle());
     {
-        // Registration shares the source -> view lock order with source replacement.
-        // A replacement therefore either sees and cancels this job, or wins first and
-        // makes this generation stale before preparation can start.
-        let state = opened_source
+        // Registering under the source lock keeps closing the source decisive:
+        // it either sees and cancels this job, or wins first and leaves no
+        // session for the preparation to start against.
+        let mut state = opened_source
             .state
             .lock()
             .map_err(|_| DataWindowError::Unsupported)?;
-        let session = state
-            .session
-            .as_ref()
-            .ok_or(DataWindowCommandError::Session(
-                DataWindowSessionError::NoSourceOpen,
-            ))?;
-        if session.generation != generation {
-            return Err(DataWindowCommandError::Session(
-                DataWindowSessionError::SourceChanged,
-            ));
-        }
-        let mut jobs = opened_source
-            .data_views
-            .state
-            .lock()
-            .map_err(|_| DataWindowError::Unsupported)?;
+        let missing = missing_data_window_session(&state);
+        let session = state.session_mut(generation).ok_or(missing)?;
         register_data_view_job(
-            &mut jobs,
+            &mut session.data_view_jobs,
             ActiveDataViewJob {
-                generation,
                 interrupt: Arc::clone(&interrupt),
                 view_revision,
             },
@@ -766,28 +798,13 @@ async fn prepare_data_view(
         .state
         .lock()
         .map_err(|_| DataWindowError::Unsupported)?;
-    let mut jobs = opened_source
-        .data_views
-        .state
-        .lock()
-        .map_err(|_| DataWindowError::Unsupported)?;
-    let is_current = finish_data_view_job(&mut jobs, generation, view_revision, &interrupt);
-    drop(jobs);
+    let missing = missing_data_window_session(&state);
+    let session = state.session_mut(generation).ok_or(missing)?;
+    let is_current = finish_data_view_job(&mut session.data_view_jobs, view_revision, &interrupt);
     if cancelled || !is_current {
         return Err(DataWindowError::Cancelled.into());
     }
     let view = result.map_err(|_| DataWindowError::QueryEngineUnavailable)??;
-    let session = state
-        .session
-        .as_mut()
-        .ok_or(DataWindowCommandError::Session(
-            DataWindowSessionError::NoSourceOpen,
-        ))?;
-    if session.generation != generation {
-        return Err(DataWindowCommandError::Session(
-            DataWindowSessionError::SourceChanged,
-        ));
-    }
     if view_revision <= session.view_revision {
         return Err(DataWindowError::Cancelled.into());
     }
@@ -809,40 +826,25 @@ fn activate_direct_data_view(
         .state
         .lock()
         .map_err(|_| DataWindowError::Unsupported)?;
-    let session = state
-        .session
-        .as_mut()
-        .ok_or(DataWindowCommandError::Session(
-            DataWindowSessionError::NoSourceOpen,
-        ))?;
-    if session.generation != generation {
-        return Err(DataWindowCommandError::Session(
-            DataWindowSessionError::SourceChanged,
-        ));
-    }
+    let missing = missing_data_window_session(&state);
+    let session = state.session_mut(generation).ok_or(missing)?;
     if view_revision <= session.view_revision {
         return Err(DataWindowError::Cancelled.into());
     }
-    let mut jobs = opened_source
-        .data_views
-        .state
-        .lock()
-        .map_err(|_| DataWindowError::Unsupported)?;
-    if jobs
+    if session
+        .data_view_jobs
         .watermark
-        .is_some_and(|(watermark_generation, revision)| {
-            watermark_generation == generation && view_revision <= revision
-        })
+        .is_some_and(|revision| view_revision <= revision)
     {
         return Err(DataWindowError::Cancelled.into());
     }
-    jobs.watermark = Some((generation, view_revision));
-    if let Some(active) = jobs.active.take() {
+    session.data_view_jobs.watermark = Some(view_revision);
+    if let Some(active) = session.data_view_jobs.active.take() {
         active.cancel();
     }
     let status = DataViewStatus {
         revision: view_revision,
-        row_count: session.source_row_count,
+        row_count: session.summary.row_count,
     };
     session.view_revision = view_revision;
     session.view = None;
@@ -859,23 +861,14 @@ fn get_data_view_status(
         .state
         .lock()
         .map_err(|_| DataWindowError::Unsupported)?;
-    let session = state
-        .session
-        .as_ref()
-        .ok_or(DataWindowCommandError::Session(
-            DataWindowSessionError::NoSourceOpen,
-        ))?;
-    if session.generation != generation {
-        return Err(DataWindowCommandError::Session(
-            DataWindowSessionError::SourceChanged,
-        ));
-    }
+    let missing = missing_data_window_session(&state);
+    let session = state.session(generation).ok_or(missing)?;
     Ok(DataViewStatus {
         revision: session.view_revision,
         row_count: session
             .view
             .as_ref()
-            .map_or(session.source_row_count, PreparedDataView::row_count),
+            .map_or(session.summary.row_count, PreparedDataView::row_count),
     })
 }
 
@@ -887,23 +880,14 @@ fn cancel_data_view(
     opened_source: tauri::State<'_, OpenedSource>,
 ) -> Result<(), DataWindowCommandError> {
     let active = {
-        let state = opened_source
+        let mut state = opened_source
             .state
             .lock()
             .map_err(|_| DataWindowError::Unsupported)?;
-        if !state
-            .session
-            .as_ref()
-            .is_some_and(|session| session.generation == generation)
-        {
+        let Some(session) = state.session_mut(generation) else {
             return Ok(());
-        }
-        let mut jobs = opened_source
-            .data_views
-            .state
-            .lock()
-            .map_err(|_| DataWindowError::Unsupported)?;
-        cancel_data_view_job(&mut jobs, generation, view_revision)
+        };
+        cancel_data_view_job(&mut session.data_view_jobs, view_revision)
     };
     if let Some(active) = active {
         active.cancel();
@@ -926,18 +910,10 @@ async fn get_text_value_suggestions(
             .state
             .lock()
             .map_err(|_| DataWindowError::Unsupported)?;
-        let session = state
-            .session
-            .as_mut()
-            .ok_or(DataWindowCommandError::Session(
-                DataWindowSessionError::NoSourceOpen,
-            ))?;
-        if session.generation != generation {
-            return Err(DataWindowCommandError::Session(
-                DataWindowSessionError::SourceChanged,
-            ));
-        }
+        let missing = missing_data_window_session(&state);
+        let session = state.session_mut(generation).ok_or(missing)?;
         let column = session
+            .summary
             .schema
             .get(column_index)
             .cloned()
@@ -946,30 +922,15 @@ async fn get_text_value_suggestions(
     };
     let interrupt = Arc::new(reader.interrupt_handle());
     {
-        let state = opened_source
+        let mut state = opened_source
             .state
             .lock()
             .map_err(|_| DataWindowError::Unsupported)?;
-        let session = state
-            .session
-            .as_ref()
-            .ok_or(DataWindowCommandError::Session(
-                DataWindowSessionError::NoSourceOpen,
-            ))?;
-        if session.generation != generation {
-            return Err(DataWindowCommandError::Session(
-                DataWindowSessionError::SourceChanged,
-            ));
-        }
-        let mut jobs = opened_source
-            .text_suggestions
-            .state
-            .lock()
-            .map_err(|_| DataWindowError::Unsupported)?;
+        let missing = missing_data_window_session(&state);
+        let session = state.session_mut(generation).ok_or(missing)?;
         register_text_value_suggestion_job(
-            &mut jobs,
+            &mut session.text_suggestion_jobs,
             ActiveTextValueSuggestionJob {
-                generation,
                 suggestion_revision,
                 interrupt: Arc::clone(&interrupt),
             },
@@ -982,25 +943,20 @@ async fn get_text_value_suggestions(
     })
     .await;
     let cancelled = interrupt.is_cancelled();
-    let state = opened_source
+    let mut state = opened_source
         .state
         .lock()
         .map_err(|_| DataWindowError::Unsupported)?;
-    let source_is_current = state
-        .session
-        .as_ref()
-        .is_some_and(|session| session.generation == generation);
-    let mut jobs = opened_source
-        .text_suggestions
-        .state
-        .lock()
-        .map_err(|_| DataWindowError::Unsupported)?;
-    let is_current =
-        finish_text_value_suggestion_job(&mut jobs, generation, suggestion_revision, &interrupt);
-    drop(jobs);
+    let is_current = state.session_mut(generation).is_some_and(|session| {
+        finish_text_value_suggestion_job(
+            &mut session.text_suggestion_jobs,
+            suggestion_revision,
+            &interrupt,
+        )
+    });
     drop(state);
 
-    if cancelled || !source_is_current || !is_current {
+    if cancelled || !is_current {
         Err(DataWindowError::Cancelled.into())
     } else {
         result
@@ -1017,23 +973,14 @@ fn cancel_text_value_suggestions(
     opened_source: tauri::State<'_, OpenedSource>,
 ) -> Result<(), DataWindowCommandError> {
     let active = {
-        let state = opened_source
+        let mut state = opened_source
             .state
             .lock()
             .map_err(|_| DataWindowError::Unsupported)?;
-        if !state
-            .session
-            .as_ref()
-            .is_some_and(|session| session.generation == generation)
-        {
+        let Some(session) = state.session_mut(generation) else {
             return Ok(());
-        }
-        let mut jobs = opened_source
-            .text_suggestions
-            .state
-            .lock()
-            .map_err(|_| DataWindowError::Unsupported)?;
-        cancel_text_value_suggestion_job(&mut jobs, generation, suggestion_revision)
+        };
+        cancel_text_value_suggestion_job(&mut session.text_suggestion_jobs, suggestion_revision)
     };
     if let Some(active) = active {
         active.cancel();
@@ -1048,7 +995,6 @@ async fn get_column_statistics(
     column_index: usize,
     include_min_max: bool,
     opened_source: tauri::State<'_, OpenedSource>,
-    statistics_jobs: tauri::State<'_, ColumnStatisticsJobs>,
 ) -> Result<ColumnStatistics, ColumnStatisticsCommandError> {
     let request = {
         let state = opened_source
@@ -1059,7 +1005,7 @@ async fn get_column_statistics(
     };
     let (path, column_name) = match request {
         ColumnStatisticsRequest::Cached(statistics) => {
-            cancel_active_statistics_job(&statistics_jobs, generation)?;
+            cancel_active_statistics_job(&opened_source, generation)?;
             return Ok(statistics);
         }
         ColumnStatisticsRequest::Scan { path, column_name } => (path, column_name),
@@ -1069,32 +1015,34 @@ async fn get_column_statistics(
         cancelled: AtomicBool::new(false),
         interrupt: reader.interrupt_handle(),
     });
-    let previous = statistics_jobs
-        .active
-        .lock()
-        .map_err(|_| ColumnStatisticsCommandError::Unsupported)?
-        .replace(ActiveColumnStatisticsJob {
-            generation,
-            job: Arc::clone(&job),
-        });
-    if let Some(previous) = previous {
-        previous.job.cancel();
+    {
+        let mut state = opened_source
+            .state
+            .lock()
+            .map_err(|_| ColumnStatisticsCommandError::Unsupported)?;
+        let session = state
+            .session_mut(generation)
+            .ok_or(ColumnStatisticsCommandError::SourceChanged)?;
+        if let Some(previous) = session.statistics_job.replace(Arc::clone(&job)) {
+            previous.cancel();
+        }
     }
 
     let result =
         tauri::async_runtime::spawn_blocking(move || reader.fetch(&column_name, include_min_max))
             .await;
-    let mut active = statistics_jobs
-        .active
+    let mut state = opened_source
+        .state
         .lock()
         .map_err(|_| ColumnStatisticsCommandError::Unsupported)?;
-    if active
-        .as_ref()
-        .is_some_and(|current| current.generation == generation && Arc::ptr_eq(&current.job, &job))
-    {
-        active.take();
+    if let Some(session) = state.session_mut(generation).filter(|session| {
+        session
+            .statistics_job
+            .as_ref()
+            .is_some_and(|active| Arc::ptr_eq(active, &job))
+    }) {
+        session.statistics_job.take();
     }
-    drop(active);
     let cancelled = job.cancelled.load(Ordering::Acquire);
 
     if cancelled {
@@ -1103,10 +1051,6 @@ async fn get_column_statistics(
     let statistics = result
         .map_err(|_| ColumnStatisticsCommandError::QueryEngineUnavailable)?
         .map_err(ColumnStatisticsCommandError::from)?;
-    let mut state = opened_source
-        .state
-        .lock()
-        .map_err(|_| ColumnStatisticsCommandError::Unsupported)?;
     cache_statistics(&mut state, generation, column_index, statistics.clone())?;
     Ok(statistics)
 }
@@ -1117,21 +1061,21 @@ fn statistics_request(
     column_index: usize,
     include_min_max: bool,
 ) -> Result<ColumnStatisticsRequest, ColumnStatisticsCommandError> {
-    let session = state
-        .session
-        .as_ref()
-        .ok_or(ColumnStatisticsCommandError::NoSourceOpen)?;
-    if session.generation != generation {
-        return Err(ColumnStatisticsCommandError::SourceChanged);
-    }
+    let session = state.session(generation).ok_or_else(|| {
+        state.missing_session(
+            ColumnStatisticsCommandError::NoSourceOpen,
+            ColumnStatisticsCommandError::SourceChanged,
+        )
+    })?;
     if let Some(statistics) = session
         .statistics_cache
-        .get(&(generation, column_index))
+        .get(&column_index)
         .filter(|statistics| !include_min_max || statistics.min_max_computed)
     {
         return Ok(ColumnStatisticsRequest::Cached(statistics.clone()));
     }
     let column_name = session
+        .summary
         .schema
         .get(column_index)
         .ok_or(ColumnStatisticsCommandError::UnsupportedColumn)?
@@ -1149,17 +1093,15 @@ fn cache_statistics(
     column_index: usize,
     statistics: ColumnStatistics,
 ) -> Result<(), ColumnStatisticsCommandError> {
-    let session = state
-        .session
-        .as_mut()
-        .ok_or(ColumnStatisticsCommandError::NoSourceOpen)?;
-    if session.generation != generation {
-        return Err(ColumnStatisticsCommandError::SourceChanged);
-    }
-    if session.schema.get(column_index).is_none() {
+    let missing = state.missing_session(
+        ColumnStatisticsCommandError::NoSourceOpen,
+        ColumnStatisticsCommandError::SourceChanged,
+    );
+    let session = state.session_mut(generation).ok_or(missing)?;
+    if session.summary.schema.get(column_index).is_none() {
         return Err(ColumnStatisticsCommandError::UnsupportedColumn);
     }
-    match session.statistics_cache.entry((generation, column_index)) {
+    match session.statistics_cache.entry(column_index) {
         Entry::Vacant(entry) => {
             entry.insert(statistics);
         }
@@ -1174,36 +1116,28 @@ fn cache_statistics(
 }
 
 fn cancel_active_statistics_job(
-    statistics_jobs: &ColumnStatisticsJobs,
+    opened_source: &OpenedSource,
     generation: u64,
 ) -> Result<(), ColumnStatisticsCommandError> {
-    let active = {
-        let mut active = statistics_jobs
-            .active
-            .lock()
-            .map_err(|_| ColumnStatisticsCommandError::Unsupported)?;
-        if active
-            .as_ref()
-            .is_some_and(|active| active.generation == generation)
-        {
-            active.take()
-        } else {
-            None
-        }
-    };
+    let active = opened_source
+        .state
+        .lock()
+        .map_err(|_| ColumnStatisticsCommandError::Unsupported)?
+        .session_mut(generation)
+        .and_then(|session| session.statistics_job.take());
     if let Some(active) = active {
-        active.job.cancel();
+        active.cancel();
     }
     Ok(())
 }
 
-/// Interrupts the active statistics scan for an opened-source generation.
+/// Interrupts the active statistics scan of one opened source.
 #[tauri::command]
 fn cancel_column_statistics(
     generation: u64,
-    statistics_jobs: tauri::State<'_, ColumnStatisticsJobs>,
+    opened_source: tauri::State<'_, OpenedSource>,
 ) -> Result<(), ColumnStatisticsCommandError> {
-    cancel_active_statistics_job(&statistics_jobs, generation)
+    cancel_active_statistics_job(&opened_source, generation)
 }
 
 /// Owns the native file dialog and passes the selected path directly to data-engine.
@@ -1348,6 +1282,80 @@ fn open_recent_source_at_path(
     result
 }
 
+/// Lists the open sources, most recently used first, for the switcher and titlebar.
+#[tauri::command]
+fn list_opened_sources(
+    app: tauri::AppHandle,
+    opened_source: tauri::State<'_, OpenedSource>,
+) -> Result<Vec<OpenedSourceEntry>, OpenSourceError> {
+    let home = app
+        .path()
+        .home_dir()
+        .ok()
+        .and_then(|home| std::fs::canonicalize(home).ok());
+    let state = opened_source.lock_state()?;
+    Ok(state
+        .sessions
+        .iter()
+        .enumerate()
+        .map(|(index, session)| OpenedSourceEntry {
+            generation: session.generation,
+            name: session.summary.display_name.clone(),
+            directory: recents::display_directory(&session.path, home.as_deref()),
+            path: session.path.to_string_lossy().into_owned(),
+            active: index == 0,
+        })
+        .collect())
+}
+
+/// Makes one open source the active and most recently used one.
+#[tauri::command]
+fn activate_opened_source(
+    generation: u64,
+    opened_source: tauri::State<'_, OpenedSource>,
+) -> Result<(), DataWindowCommandError> {
+    let mut state = opened_source
+        .state
+        .lock()
+        .map_err(|_| DataWindowError::Unsupported)?;
+    if state.activate(generation) {
+        return Ok(());
+    }
+    Err(missing_data_window_session(&state))
+}
+
+/// Closes one open source and reports whether it closed.
+///
+/// A running export is confirmed first: declining leaves the source open and
+/// the export running.
+#[tauri::command]
+async fn close_opened_source(
+    app: tauri::AppHandle,
+    generation: u64,
+) -> Result<bool, DataWindowCommandError> {
+    let file_names = app
+        .state::<OpenedSource>()
+        .data_exports
+        .running_file_names_for(generation)
+        .unwrap_or_default();
+    if !confirm_data_export_cancellation(&app, file_names, DataExportShutdownAction::CloseSource)
+        .await
+    {
+        return Ok(false);
+    }
+    let opened_source = app.state::<OpenedSource>();
+    if opened_source
+        .close(generation)
+        .map_err(|_| DataWindowError::Unsupported)?
+    {
+        return Ok(true);
+    }
+    let state = opened_source
+        .lock_state()
+        .map_err(|_| DataWindowError::Unsupported)?;
+    Err(missing_data_window_session(&state))
+}
+
 fn check_for_updates_from_menu(app: &tauri::AppHandle) {
     let app = app.clone();
     tauri::async_runtime::spawn(async move {
@@ -1399,33 +1407,24 @@ fn data_export_close_dialog_copy(
     action: DataExportShutdownAction,
 ) -> DataExportCloseDialogCopy {
     debug_assert!(!file_names.is_empty());
-    match (file_names, action) {
-        ([file_name], DataExportShutdownAction::Close) => DataExportCloseDialogCopy {
-            message: format!(
-                "\u{201c}{file_name}\u{201d} is still being exported. If you close Viewda now, the unfinished file will be deleted."
-            ),
-            destructive_button: "Close Viewda",
-        },
-        (_, DataExportShutdownAction::Close) => DataExportCloseDialogCopy {
-            message: format!(
-                "{} exports are still running. If you close Viewda now, their unfinished files will be deleted.",
-                file_names.len()
-            ),
-            destructive_button: "Close Viewda",
-        },
-        ([file_name], DataExportShutdownAction::RestartForUpdate) => DataExportCloseDialogCopy {
-            message: format!(
-                "\u{201c}{file_name}\u{201d} is still being exported. If you restart Viewda now, the unfinished file will be deleted."
-            ),
-            destructive_button: "Restart Viewda",
-        },
-        (_, DataExportShutdownAction::RestartForUpdate) => DataExportCloseDialogCopy {
-            message: format!(
-                "{} exports are still running. If you restart Viewda now, their unfinished files will be deleted.",
-                file_names.len()
-            ),
-            destructive_button: "Restart Viewda",
-        },
+    let (consequence, destructive_button) = match action {
+        DataExportShutdownAction::Close => ("close Viewda", "Close Viewda"),
+        DataExportShutdownAction::CloseSource => ("close this file", "Close File"),
+        DataExportShutdownAction::RestartForUpdate => ("restart Viewda", "Restart Viewda"),
+    };
+    let message = match file_names {
+        [file_name] => format!(
+            "\u{201c}{file_name}\u{201d} is still being exported. If you {consequence} now, the unfinished file will be deleted."
+        ),
+        _ => format!(
+            "{} exports are still running. If you {consequence} now, their unfinished files will be deleted.",
+            file_names.len()
+        ),
+    };
+
+    DataExportCloseDialogCopy {
+        message,
+        destructive_button,
     }
 }
 
@@ -1465,6 +1464,8 @@ async fn resolve_data_export_close_dialog(app: tauri::AppHandle, cancel_export: 
         if matches!(action, DataExportShutdownAction::RestartForUpdate) {
             let _ = app.state::<OpenedSource>().data_exports.block_starts();
         }
+        // One export runs at a time process-wide, so cancelling every export
+        // cancels exactly the export this decision was asked about.
         let cancellation_app = app.clone();
         let _ = tauri::async_runtime::spawn_blocking(move || {
             cancellation_app
@@ -1481,11 +1482,11 @@ async fn resolve_data_export_close_dialog(app: tauri::AppHandle, cancel_export: 
     true
 }
 
-async fn confirm_running_export_cancellation(
+async fn confirm_data_export_cancellation(
     app: &tauri::AppHandle,
+    file_names: Vec<String>,
     action: DataExportShutdownAction,
 ) -> bool {
-    let file_names = running_data_export_file_names(app);
     if file_names.is_empty() {
         return true;
     }
@@ -1528,11 +1529,10 @@ fn request_application_exit(app: &tauri::AppHandle, exit_code: i32) {
 }
 
 fn finish_shutdown(app: &tauri::AppHandle) {
-    let _ = app.state::<OpenedSource>().cancel_data_views();
+    let _ = app.state::<OpenedSource>().cancel_all_jobs();
     app.state::<OpenedSource>()
         .data_exports
         .cancel_all_and_wait();
-    let _ = app.state::<OpenedSource>().cancel_text_suggestions();
 }
 
 #[tauri::command]
@@ -1540,7 +1540,12 @@ async fn install_pending_update(
     app: tauri::AppHandle,
     on_progress: tauri::ipc::Channel<UpdateProgress>,
 ) -> Result<bool, UpdateError> {
-    if !confirm_running_export_cancellation(&app, DataExportShutdownAction::RestartForUpdate).await
+    if !confirm_data_export_cancellation(
+        &app,
+        running_data_export_file_names(&app),
+        DataExportShutdownAction::RestartForUpdate,
+    )
+    .await
     {
         return Ok(false);
     }
@@ -1585,7 +1590,6 @@ pub fn run() {
         .plugin(tauri_plugin_updater::Builder::new().build())
         .manage(OpenedSource::default())
         .manage(DataExportCloseDialog::default())
-        .manage(ColumnStatisticsJobs::default())
         .manage(PendingOpenedSource::default())
         .manage(PendingUpdate::default())
         .manage(UpdateStateStore::default())
@@ -1722,6 +1726,9 @@ pub fn run() {
             open_local_source,
             get_recent_sources,
             open_recent_source,
+            list_opened_sources,
+            activate_opened_source,
+            close_opened_source,
             take_opened_source,
             get_default_application_status,
             set_default_application,
@@ -1796,6 +1803,8 @@ pub fn run() {
 
 #[cfg(test)]
 mod tests {
+    use viewda_data_engine::SchemaField;
+
     use super::*;
 
     #[test]
@@ -1842,6 +1851,20 @@ mod tests {
         assert_eq!(
             copy.message,
             "2 exports are still running. If you close Viewda now, their unfinished files will be deleted."
+        );
+    }
+
+    #[test]
+    fn close_source_dialog_is_about_the_file_and_not_the_application() {
+        let copy = data_export_close_dialog_copy(
+            &["orders-view.csv".to_owned()],
+            DataExportShutdownAction::CloseSource,
+        );
+
+        assert_eq!(copy.destructive_button, "Close File");
+        assert_eq!(
+            copy.message,
+            "\u{201c}orders-view.csv\u{201d} is still being exported. If you close this file now, the unfinished file will be deleted."
         );
     }
 
@@ -2004,8 +2027,8 @@ mod tests {
         assert_eq!(opened.1.generation, 1);
         assert_eq!(opened.1.summary, summary);
         assert_eq!(
-            opened_source.current_path().expect("opened-source state"),
-            Some(opened.0)
+            opened_source.open_paths().expect("opened-source state"),
+            vec![opened.0]
         );
     }
 
@@ -2108,7 +2131,7 @@ mod tests {
                 .expect("source state")
                 .is_none()
         );
-        assert_eq!(opened_source.current_path(), Ok(Some(launched)));
+        assert_eq!(opened_source.open_paths(), Ok(vec![launched]));
     }
 
     #[test]
@@ -2194,42 +2217,152 @@ mod tests {
     }
 
     #[test]
-    fn a_stale_generation_cannot_read_the_replacement_source() {
+    fn a_second_source_reads_alongside_the_first_until_it_is_closed() {
         let opened_source = OpenedSource::default();
-        let summary = SourceSummary {
-            display_name: "source.parquet".into(),
-            size_bytes: 8,
-            row_count: 1,
-            row_group_count: 1,
-            schema: Vec::new(),
-        };
-        let first = opened_source
-            .install(
-                None,
-                PathBuf::from("first.parquet"),
-                summary.clone(),
-                SourceOpenIntent::Explicit,
-            )
-            .expect("first source state")
-            .expect("first source is accepted");
-        let second = opened_source
-            .install(
-                None,
-                PathBuf::from("second.parquet"),
-                summary,
-                SourceOpenIntent::Explicit,
-            )
-            .expect("replacement source state")
-            .expect("replacement source is accepted");
-        let mut state = opened_source.state.lock().expect("opened source state");
-
+        let first = open_test_source(&opened_source, "first.parquet");
+        let second = open_test_source(&opened_source, "second.parquet");
         assert!(second.generation > first.generation);
+
+        {
+            let mut state = opened_source.state.lock().expect("opened source state");
+            // Both sessions answer for themselves; only the missing file is unreadable.
+            for generation in [first.generation, second.generation] {
+                assert_eq!(
+                    fetch_opened_source_window(&mut state, generation, 0, 0, 1, &[]),
+                    Err(DataWindowCommandError::Engine(DataWindowError::Unsupported))
+                );
+            }
+        }
+
+        assert!(
+            opened_source
+                .close(first.generation)
+                .expect("opened source state")
+        );
+        let mut state = opened_source.state.lock().expect("opened source state");
         assert_eq!(
             fetch_opened_source_window(&mut state, first.generation, 0, 0, 1, &[]),
             Err(DataWindowCommandError::Session(
                 DataWindowSessionError::SourceChanged,
             ))
         );
+    }
+
+    #[test]
+    fn opening_a_source_puts_it_in_front_of_the_most_recently_used_order() {
+        let opened_source = OpenedSource::default();
+        let first = open_test_source(&opened_source, "first.parquet");
+        let second = open_test_source(&opened_source, "second.parquet");
+        let third = open_test_source(&opened_source, "third.parquet");
+
+        assert_eq!(
+            open_generations(&opened_source),
+            [third.generation, second.generation, first.generation]
+        );
+
+        assert!(
+            opened_source
+                .state
+                .lock()
+                .expect("opened source state")
+                .activate(first.generation)
+        );
+        assert_eq!(
+            open_generations(&opened_source),
+            [first.generation, third.generation, second.generation]
+        );
+
+        assert!(
+            !opened_source
+                .state
+                .lock()
+                .expect("opened source state")
+                .activate(first.generation + 100)
+        );
+    }
+
+    #[test]
+    fn reopening_an_open_path_activates_its_session_instead_of_a_second_one() {
+        let opened_source = OpenedSource::default();
+        let first = open_test_source(&opened_source, "first.parquet");
+        open_test_source(&opened_source, "second.parquet");
+
+        let reopened = open_test_source(&opened_source, "first.parquet");
+
+        assert_eq!(reopened.generation, first.generation);
+        assert_eq!(reopened.summary, first.summary);
+        assert_eq!(
+            opened_source.open_paths().expect("opened source state"),
+            [
+                PathBuf::from("first.parquet"),
+                PathBuf::from("second.parquet")
+            ]
+        );
+    }
+
+    #[test]
+    fn closing_the_active_source_activates_the_next_most_recently_used_one() {
+        let opened_source = OpenedSource::default();
+        let first = open_test_source(&opened_source, "first.parquet");
+        let second = open_test_source(&opened_source, "second.parquet");
+        let third = open_test_source(&opened_source, "third.parquet");
+
+        assert!(
+            opened_source
+                .close(third.generation)
+                .expect("opened source state")
+        );
+
+        assert_eq!(
+            open_generations(&opened_source),
+            [second.generation, first.generation]
+        );
+        assert!(
+            !opened_source
+                .close(third.generation)
+                .expect("opened source state")
+        );
+    }
+
+    #[test]
+    fn closing_a_source_interrupts_only_the_jobs_it_owns() {
+        let opened_source = OpenedSource::default();
+        let closed = open_test_source(&opened_source, "closed.parquet");
+        let kept = open_test_source(&opened_source, "kept.parquet");
+        let closed_view = register_test_view_job(&opened_source, closed.generation);
+        let kept_view = register_test_view_job(&opened_source, kept.generation);
+        let closed_suggestions = register_test_suggestion_job(&opened_source, closed.generation);
+        let kept_suggestions = register_test_suggestion_job(&opened_source, kept.generation);
+        let closed_statistics = register_test_statistics_job(&opened_source, closed.generation);
+        let kept_statistics = register_test_statistics_job(&opened_source, kept.generation);
+
+        assert!(
+            opened_source
+                .close(closed.generation)
+                .expect("opened source state")
+        );
+
+        assert!(closed_view.is_cancelled());
+        assert!(closed_suggestions.is_cancelled());
+        assert!(closed_statistics.cancelled.load(Ordering::Acquire));
+        assert!(!kept_view.is_cancelled());
+        assert!(!kept_suggestions.is_cancelled());
+        assert!(!kept_statistics.cancelled.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn opening_another_source_leaves_running_jobs_alone() {
+        let opened_source = OpenedSource::default();
+        let first = open_test_source(&opened_source, "first.parquet");
+        let view = register_test_view_job(&opened_source, first.generation);
+        let suggestions = register_test_suggestion_job(&opened_source, first.generation);
+        let statistics = register_test_statistics_job(&opened_source, first.generation);
+
+        open_test_source(&opened_source, "second.parquet");
+
+        assert!(!view.is_cancelled());
+        assert!(!suggestions.is_cancelled());
+        assert!(!statistics.cancelled.load(Ordering::Acquire));
     }
 
     #[test]
@@ -2276,142 +2409,27 @@ mod tests {
     }
 
     #[test]
-    fn replacing_the_source_interrupts_the_active_view_preparation() {
+    fn reuses_one_text_suggestion_reader_per_open_source() {
         let opened_source = OpenedSource::default();
-        let builder =
-            DataViewBuilder::new(PathBuf::from("view.parquet"), &[], &[]).expect("view builder");
-        let interrupt = Arc::new(builder.interrupt_handle());
-        opened_source
-            .data_views
-            .state
-            .lock()
-            .expect("view jobs")
-            .active
-            .replace(ActiveDataViewJob {
-                generation: 1,
-                view_revision: 3,
-                interrupt: Arc::clone(&interrupt),
-            });
-
-        opened_source
-            .install(
-                None,
-                PathBuf::from("replacement.parquet"),
-                SourceSummary {
-                    display_name: "replacement.parquet".into(),
-                    size_bytes: 8,
-                    row_count: 1,
-                    row_group_count: 1,
-                    schema: Vec::new(),
-                },
-                SourceOpenIntent::Explicit,
-            )
-            .expect("source state")
-            .expect("replacement source is accepted");
-
-        assert!(interrupt.is_cancelled());
-        assert!(
-            opened_source
-                .data_views
-                .state
-                .lock()
-                .expect("view jobs")
-                .active
-                .is_none()
-        );
-    }
-
-    #[test]
-    fn replacing_the_source_interrupts_active_text_suggestions() {
-        let reader = TextValueSuggestionsReader::new(PathBuf::from("suggestions.parquet"))
-            .expect("suggestion reader");
-        let interrupt = Arc::new(reader.interrupt_handle());
-        let opened_source = OpenedSource::default();
-        opened_source
-            .text_suggestions
-            .state
-            .lock()
-            .expect("suggestion jobs")
-            .active
-            .replace(ActiveTextValueSuggestionJob {
-                generation: 1,
-                suggestion_revision: 3,
-                interrupt: Arc::clone(&interrupt),
-            });
-
-        opened_source
-            .install(
-                None,
-                PathBuf::from("replacement.parquet"),
-                SourceSummary {
-                    display_name: "replacement.parquet".into(),
-                    size_bytes: 8,
-                    row_count: 1,
-                    row_group_count: 1,
-                    schema: Vec::new(),
-                },
-                SourceOpenIntent::Explicit,
-            )
-            .expect("source state")
-            .expect("replacement source is accepted");
-
-        assert!(interrupt.is_cancelled());
-        assert!(
-            opened_source
-                .text_suggestions
-                .state
-                .lock()
-                .expect("suggestion jobs")
-                .active
-                .is_none()
-        );
-    }
-
-    #[test]
-    fn reuses_one_text_suggestion_reader_until_the_source_changes() {
-        let opened_source = OpenedSource::default();
-        let summary = |display_name: &str| SourceSummary {
-            display_name: display_name.to_owned(),
-            size_bytes: 8,
-            row_count: 1,
-            row_group_count: 1,
-            schema: Vec::new(),
-        };
-        opened_source
-            .install(
-                None,
-                PathBuf::from("source.parquet"),
-                summary("source.parquet"),
-                SourceOpenIntent::Explicit,
-            )
-            .expect("source state");
-
-        let reader = || {
+        let source = open_test_source(&opened_source, "source.parquet");
+        let reader = |generation| {
             opened_source
                 .state
                 .lock()
                 .expect("source state")
-                .session
-                .as_mut()
+                .session_mut(generation)
                 .expect("opened session")
                 .text_suggestion_reader()
                 .expect("suggestion reader")
         };
-        let first = reader();
-        let second = reader();
+
+        let first = reader(source.generation);
+        let second = reader(source.generation);
         assert!(Arc::ptr_eq(&first, &second));
 
-        opened_source
-            .install(
-                None,
-                PathBuf::from("replacement.parquet"),
-                summary("replacement.parquet"),
-                SourceOpenIntent::Explicit,
-            )
-            .expect("replacement source state");
-
-        let replacement = reader();
-        assert!(!Arc::ptr_eq(&first, &replacement));
+        let other = open_test_source(&opened_source, "other.parquet");
+        assert!(!Arc::ptr_eq(&first, &reader(other.generation)));
+        assert!(Arc::ptr_eq(&first, &reader(source.generation)));
     }
 
     #[test]
@@ -2429,7 +2447,6 @@ mod tests {
         register_data_view_job(
             &mut jobs,
             ActiveDataViewJob {
-                generation: 7,
                 view_revision: 2,
                 interrupt: Arc::clone(&current),
             },
@@ -2439,7 +2456,6 @@ mod tests {
             register_data_view_job(
                 &mut jobs,
                 ActiveDataViewJob {
-                    generation: 7,
                     view_revision: 1,
                     interrupt: Arc::clone(&stale),
                 },
@@ -2452,7 +2468,6 @@ mod tests {
         register_data_view_job(
             &mut jobs,
             ActiveDataViewJob {
-                generation: 7,
                 view_revision: 3,
                 interrupt: Arc::clone(&next),
             },
@@ -2460,7 +2475,7 @@ mod tests {
         .expect("new revision");
         assert!(current.is_cancelled());
         assert!(!next.is_cancelled());
-        assert_eq!(jobs.watermark, Some((7, 3)));
+        assert_eq!(jobs.watermark, Some(3));
         assert!(
             jobs.active
                 .as_ref()
@@ -2477,16 +2492,15 @@ mod tests {
         register_data_view_job(
             &mut jobs,
             ActiveDataViewJob {
-                generation: 7,
                 view_revision: 3,
                 interrupt: Arc::clone(&interrupt),
             },
         )
         .expect("initial revision");
 
-        assert!(finish_data_view_job(&mut jobs, 7, 3, &interrupt));
+        assert!(finish_data_view_job(&mut jobs, 3, &interrupt));
 
-        assert_eq!(jobs.watermark, Some((7, 3)));
+        assert_eq!(jobs.watermark, Some(3));
         assert!(jobs.active.is_none());
         for revision in [2, 3] {
             let late = DataViewBuilder::new(PathBuf::from("view.parquet"), &[], &[])
@@ -2496,7 +2510,6 @@ mod tests {
                 register_data_view_job(
                     &mut jobs,
                     ActiveDataViewJob {
-                        generation: 7,
                         view_revision: revision,
                         interrupt: Arc::clone(&late),
                     },
@@ -2512,7 +2525,6 @@ mod tests {
         register_data_view_job(
             &mut jobs,
             ActiveDataViewJob {
-                generation: 7,
                 view_revision: 4,
                 interrupt: Arc::clone(&next),
             },
@@ -2536,7 +2548,6 @@ mod tests {
         register_text_value_suggestion_job(
             &mut jobs,
             ActiveTextValueSuggestionJob {
-                generation: 7,
                 suggestion_revision: 2,
                 interrupt: Arc::clone(&current),
             },
@@ -2546,7 +2557,6 @@ mod tests {
             register_text_value_suggestion_job(
                 &mut jobs,
                 ActiveTextValueSuggestionJob {
-                    generation: 7,
                     suggestion_revision: 1,
                     interrupt: Arc::clone(&stale),
                 },
@@ -2559,7 +2569,6 @@ mod tests {
         register_text_value_suggestion_job(
             &mut jobs,
             ActiveTextValueSuggestionJob {
-                generation: 7,
                 suggestion_revision: 3,
                 interrupt: Arc::clone(&next),
             },
@@ -2567,7 +2576,7 @@ mod tests {
         .expect("new revision");
         assert!(current.is_cancelled());
         assert!(!next.is_cancelled());
-        assert_eq!(jobs.watermark, Some((7, 3)));
+        assert_eq!(jobs.watermark, Some(3));
     }
 
     #[test]
@@ -2582,17 +2591,14 @@ mod tests {
         register_text_value_suggestion_job(
             &mut jobs,
             ActiveTextValueSuggestionJob {
-                generation: 7,
                 suggestion_revision: 3,
                 interrupt: Arc::clone(&interrupt),
             },
         )
         .expect("initial revision");
 
-        assert!(finish_text_value_suggestion_job(
-            &mut jobs, 7, 3, &interrupt
-        ));
-        assert_eq!(jobs.watermark, Some((7, 3)));
+        assert!(finish_text_value_suggestion_job(&mut jobs, 3, &interrupt));
+        assert_eq!(jobs.watermark, Some(3));
         assert!(jobs.active.is_none());
 
         let late = make_interrupt();
@@ -2600,7 +2606,6 @@ mod tests {
             register_text_value_suggestion_job(
                 &mut jobs,
                 ActiveTextValueSuggestionJob {
-                    generation: 7,
                     suggestion_revision: 2,
                     interrupt: Arc::clone(&late),
                 },
@@ -2617,12 +2622,11 @@ mod tests {
         let late = Arc::new(reader.interrupt_handle());
         let mut jobs = TextValueSuggestionJobsState::default();
 
-        assert!(cancel_text_value_suggestion_job(&mut jobs, 7, 3).is_none());
+        assert!(cancel_text_value_suggestion_job(&mut jobs, 3).is_none());
         assert_eq!(
             register_text_value_suggestion_job(
                 &mut jobs,
                 ActiveTextValueSuggestionJob {
-                    generation: 7,
                     suggestion_revision: 3,
                     interrupt: Arc::clone(&late),
                 },
@@ -2635,28 +2639,16 @@ mod tests {
     #[test]
     fn published_view_revision_never_moves_backwards_without_a_watermark() {
         let opened_source = OpenedSource::default();
-        let opened = opened_source
-            .install(
-                None,
-                PathBuf::from("source.parquet"),
-                SourceSummary {
-                    display_name: "source.parquet".into(),
-                    size_bytes: 8,
-                    row_count: 1,
-                    row_group_count: 1,
-                    schema: Vec::new(),
-                },
-                SourceOpenIntent::Explicit,
-            )
-            .expect("source state")
-            .expect("source is accepted");
+        let opened = open_test_source(&opened_source, "source.parquet");
 
         activate_direct_data_view(&opened_source, opened.generation, 5).expect("newer direct view");
         opened_source
-            .data_views
             .state
             .lock()
-            .expect("view jobs")
+            .expect("opened source state")
+            .session_mut(opened.generation)
+            .expect("opened session")
+            .data_view_jobs
             .watermark = None;
 
         assert_eq!(
@@ -2664,7 +2656,7 @@ mod tests {
             Err(DataWindowCommandError::Engine(DataWindowError::Cancelled))
         );
         let state = opened_source.state.lock().expect("opened source state");
-        let session = state.session.as_ref().expect("opened source session");
+        let session = state.session(opened.generation).expect("opened session");
         assert_eq!(session.view_revision, 5);
         assert!(session.view.is_none());
     }
@@ -2673,7 +2665,7 @@ mod tests {
     fn cancellation_watermark_covers_cancel_before_registration() {
         let mut jobs = DataViewJobsState::default();
 
-        assert!(cancel_data_view_job(&mut jobs, 7, 3).is_none());
+        assert!(cancel_data_view_job(&mut jobs, 3).is_none());
         let late =
             DataViewBuilder::new(PathBuf::from("view.parquet"), &[], &[]).expect("late builder");
         let late = Arc::new(late.interrupt_handle());
@@ -2681,7 +2673,6 @@ mod tests {
             register_data_view_job(
                 &mut jobs,
                 ActiveDataViewJob {
-                    generation: 7,
                     view_revision: 3,
                     interrupt: Arc::clone(&late),
                 },
@@ -2696,18 +2687,17 @@ mod tests {
         register_data_view_job(
             &mut jobs,
             ActiveDataViewJob {
-                generation: 7,
                 view_revision: 4,
                 interrupt: Arc::clone(&current),
             },
         )
         .expect("newer revision");
-        cancel_data_view_job(&mut jobs, 7, 4)
+        cancel_data_view_job(&mut jobs, 4)
             .expect("active revision")
             .cancel();
         assert!(current.is_cancelled());
         assert!(jobs.active.is_none());
-        assert_eq!(jobs.watermark, Some((7, 4)));
+        assert_eq!(jobs.watermark, Some(4));
     }
 
     #[test]
@@ -2812,22 +2802,27 @@ mod tests {
         );
 
         drop(state);
-        let replacement = opened_source
+        let second = opened_source
             .install(
                 None,
-                PathBuf::from("replacement.parquet"),
+                PathBuf::from("second.parquet"),
                 summary,
                 SourceOpenIntent::Explicit,
             )
-            .expect("replacement source state")
-            .expect("replacement source is accepted");
+            .expect("second source state")
+            .expect("second source is accepted");
+        assert!(
+            opened_source
+                .close(opened.generation)
+                .expect("opened source state")
+        );
         let state = opened_source.state.lock().expect("opened source state");
         assert_eq!(
             statistics_request(&state, opened.generation, 0, false),
             Err(ColumnStatisticsCommandError::SourceChanged)
         );
         assert!(matches!(
-            statistics_request(&state, replacement.generation, 0, false),
+            statistics_request(&state, second.generation, 0, false),
             Ok(ColumnStatisticsRequest::Scan { .. })
         ));
     }
@@ -2871,5 +2866,128 @@ mod tests {
                 MessageDialogKind::Info
             ))
         );
+    }
+
+    #[test]
+    fn open_sources_keep_their_frontend_wire_shape() {
+        let entry = OpenedSourceEntry {
+            generation: 3,
+            name: "trips.parquet".to_owned(),
+            directory: "~/Data/2026".to_owned(),
+            path: "/home/analyst/Data/2026/trips.parquet".to_owned(),
+            active: true,
+        };
+
+        assert_eq!(
+            serde_json::to_value(entry).expect("open source JSON"),
+            serde_json::json!({
+                "generation": 3,
+                "name": "trips.parquet",
+                "directory": "~/Data/2026",
+                "path": "/home/analyst/Data/2026/trips.parquet",
+                "active": true,
+            })
+        );
+    }
+
+    fn test_summary(display_name: &str) -> SourceSummary {
+        SourceSummary {
+            display_name: display_name.to_owned(),
+            size_bytes: 8,
+            row_count: 1,
+            row_group_count: 1,
+            schema: Vec::new(),
+        }
+    }
+
+    pub(crate) fn open_test_source(opened_source: &OpenedSource, path: &str) -> OpenedSourceInfo {
+        opened_source
+            .install(
+                None,
+                PathBuf::from(path),
+                test_summary(path),
+                SourceOpenIntent::Explicit,
+            )
+            .expect("opened source state")
+            .expect("explicit source is accepted")
+    }
+
+    fn open_generations(opened_source: &OpenedSource) -> Vec<u64> {
+        opened_source
+            .state
+            .lock()
+            .expect("opened source state")
+            .sessions
+            .iter()
+            .map(|session| session.generation)
+            .collect()
+    }
+
+    fn register_test_view_job(
+        opened_source: &OpenedSource,
+        generation: u64,
+    ) -> Arc<DataViewInterruptHandle> {
+        let builder =
+            DataViewBuilder::new(PathBuf::from("view.parquet"), &[], &[]).expect("view builder");
+        let interrupt = Arc::new(builder.interrupt_handle());
+        register_data_view_job(
+            &mut opened_source
+                .state
+                .lock()
+                .expect("opened source state")
+                .session_mut(generation)
+                .expect("opened session")
+                .data_view_jobs,
+            ActiveDataViewJob {
+                view_revision: 1,
+                interrupt: Arc::clone(&interrupt),
+            },
+        )
+        .expect("view job");
+        interrupt
+    }
+
+    fn register_test_suggestion_job(
+        opened_source: &OpenedSource,
+        generation: u64,
+    ) -> Arc<TextValueSuggestionsInterruptHandle> {
+        let reader = TextValueSuggestionsReader::new(PathBuf::from("suggestions.parquet"))
+            .expect("suggestion reader");
+        let interrupt = Arc::new(reader.interrupt_handle());
+        register_text_value_suggestion_job(
+            &mut opened_source
+                .state
+                .lock()
+                .expect("opened source state")
+                .session_mut(generation)
+                .expect("opened session")
+                .text_suggestion_jobs,
+            ActiveTextValueSuggestionJob {
+                suggestion_revision: 1,
+                interrupt: Arc::clone(&interrupt),
+            },
+        )
+        .expect("suggestion job");
+        interrupt
+    }
+
+    fn register_test_statistics_job(
+        opened_source: &OpenedSource,
+        generation: u64,
+    ) -> Arc<ColumnStatisticsJob> {
+        let reader =
+            ColumnStatisticsReader::new(PathBuf::from("statistics.parquet")).expect("reader");
+        let job = Arc::new(ColumnStatisticsJob {
+            cancelled: AtomicBool::new(false),
+            interrupt: reader.interrupt_handle(),
+        });
+        opened_source
+            .state
+            .lock()
+            .expect("opened source state")
+            .session_mut(generation)
+            .expect("opened session")
+            .statistics_job = Some(Arc::clone(&job));
+        job
     }
 }

@@ -159,9 +159,21 @@ fn display_entry(entry: &StoredRecentSource, home: Option<&Path>) -> RecentSourc
         .file_name()
         .map(|name| name.to_string_lossy().into_owned())
         .unwrap_or_default();
-    let parent = entry.path.parent().unwrap_or(Path::new(""));
-    let directory = home
-        .and_then(|home| parent.strip_prefix(home).ok())
+
+    RecentSource {
+        id: entry.id.clone(),
+        name,
+        directory: display_directory(&entry.path, home),
+    }
+}
+
+/// Renders the directory of a source for display, shortened against `home`.
+///
+/// `home` must already be canonical: paths are stored canonicalized, and a
+/// symlinked home would otherwise never match.
+pub(crate) fn display_directory(path: &Path, home: Option<&Path>) -> String {
+    let parent = path.parent().unwrap_or(Path::new(""));
+    home.and_then(|home| parent.strip_prefix(home).ok())
         .map(|relative| {
             if relative.as_os_str().is_empty() {
                 "~".to_owned()
@@ -179,13 +191,7 @@ fn display_entry(entry: &StoredRecentSource, home: Option<&Path>) -> RecentSourc
                 || "…".to_owned(),
                 |name| format!("…/{}", name.to_string_lossy()),
             )
-        });
-
-    RecentSource {
-        id: entry.id.clone(),
-        name,
-        directory,
-    }
+        })
 }
 
 fn read_state_file(path: &Path) -> Result<StoredRecentSources, RecentSourceError> {

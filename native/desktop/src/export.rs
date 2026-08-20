@@ -16,7 +16,7 @@ use viewda_data_engine::{
     DataExportRequest, PreparedDataViewExport,
 };
 
-use crate::OpenedSource;
+use crate::{OpenedSource, OpenedSourceSession, OpenedSourceState};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -119,6 +119,8 @@ struct DataExportJobsState {
 
 struct ActiveDataExportJob {
     id: u64,
+    /// Opened source this export reads, so closing that source can cancel it.
+    generation: u64,
     file_name: String,
     target_path: PathBuf,
     progress: Option<DataExportProgress>,
@@ -139,12 +141,14 @@ enum DataExportExecutionState {
 impl ActiveDataExportJob {
     fn running(
         id: u64,
+        generation: u64,
         file_name: String,
         target_path: PathBuf,
         reader: &DataExportReader,
     ) -> Self {
         Self {
             id,
+            generation,
             file_name,
             target_path,
             progress: Some(reader.progress()),
@@ -157,12 +161,14 @@ impl ActiveDataExportJob {
 
     fn failed(
         id: u64,
+        generation: u64,
         file_name: String,
         target_path: PathBuf,
         error: DataExportFailureCode,
     ) -> Self {
         Self {
             id,
+            generation,
             file_name,
             target_path,
             progress: None,
@@ -293,6 +299,25 @@ impl DataExportJobs {
     }
 
     pub(crate) fn running_file_names(&self) -> Result<Vec<String>, DataExportCommandError> {
+        Ok(self
+            .running_job()?
+            .map(|job| vec![job.file_name.clone()])
+            .unwrap_or_default())
+    }
+
+    /// Running export targets of one opened source, for its close confirmation.
+    pub(crate) fn running_file_names_for(
+        &self,
+        generation: u64,
+    ) -> Result<Vec<String>, DataExportCommandError> {
+        Ok(self
+            .running_job()?
+            .filter(|job| job.generation == generation)
+            .map(|job| vec![job.file_name.clone()])
+            .unwrap_or_default())
+    }
+
+    fn running_job(&self) -> Result<Option<Arc<ActiveDataExportJob>>, DataExportCommandError> {
         let job = self
             .state
             .lock()
@@ -300,19 +325,8 @@ impl DataExportJobs {
             .active
             .clone();
         match job {
-            Some(job) if job.is_running()? => Ok(vec![job.file_name.clone()]),
-            _ => Ok(Vec::new()),
-        }
-    }
-
-    pub(crate) fn cancel_all(&self) {
-        let job = self
-            .state
-            .lock()
-            .ok()
-            .and_then(|state| state.active.clone());
-        if let Some(job) = job {
-            job.cancel();
+            Some(job) if job.is_running()? => Ok(Some(job)),
+            _ => Ok(None),
         }
     }
 
@@ -348,14 +362,7 @@ impl OpenedSource {
             .state
             .lock()
             .map_err(|_| DataExportCommandError::Unsupported)?;
-        let session = state
-            .session
-            .as_ref()
-            .ok_or(DataExportCommandError::NoSourceOpen)?;
-        if session.generation != generation {
-            return Err(DataExportCommandError::SourceChanged);
-        }
-        Ok(session.path.clone())
+        Ok(export_session(&state, generation)?.path.clone())
     }
 
     fn export_source(
@@ -367,13 +374,7 @@ impl OpenedSource {
             .state
             .lock()
             .map_err(|_| DataExportCommandError::Unsupported)?;
-        let session = state
-            .session
-            .as_ref()
-            .ok_or(DataExportCommandError::NoSourceOpen)?;
-        if session.generation != generation {
-            return Err(DataExportCommandError::SourceChanged);
-        }
+        let session = export_session(&state, generation)?;
         if session.view_revision != view_revision {
             return Err(DataExportCommandError::ViewChanged);
         }
@@ -393,18 +394,23 @@ impl OpenedSource {
             .state
             .lock()
             .map_err(|_| DataExportCommandError::QueryFailed)?;
-        let session = state
-            .session
-            .as_ref()
-            .ok_or(DataExportCommandError::NoSourceOpen)?;
-        if session.generation != generation {
-            return Err(DataExportCommandError::SourceChanged);
-        }
-        if session.view_revision != view_revision {
+        if export_session(&state, generation)?.view_revision != view_revision {
             return Err(DataExportCommandError::ViewChanged);
         }
         self.data_exports.install(job)
     }
+}
+
+fn export_session(
+    state: &OpenedSourceState,
+    generation: u64,
+) -> Result<&OpenedSourceSession, DataExportCommandError> {
+    state.session(generation).ok_or_else(|| {
+        state.missing_session(
+            DataExportCommandError::NoSourceOpen,
+            DataExportCommandError::SourceChanged,
+        )
+    })
 }
 
 #[tauri::command]
@@ -485,6 +491,7 @@ pub(crate) async fn start_data_export(
             };
             let job = Arc::new(ActiveDataExportJob::failed(
                 id,
+                generation,
                 file_name,
                 target_path,
                 failure,
@@ -500,6 +507,7 @@ pub(crate) async fn start_data_export(
     };
     let job = Arc::new(ActiveDataExportJob::running(
         id,
+        generation,
         file_name,
         target_path,
         &reader,
@@ -632,8 +640,7 @@ mod tests {
     use std::sync::{Arc, Barrier};
 
     use super::*;
-    use crate::SourceOpenIntent;
-    use viewda_data_engine::SourceSummary;
+    use crate::tests::open_test_source;
 
     #[test]
     fn suggests_scope_specific_csv_names_without_exposing_the_directory() {
@@ -703,7 +710,7 @@ mod tests {
         ));
         jobs.release_start();
 
-        let job = test_running_job();
+        let job = test_running_job(1);
         jobs.install(Arc::clone(&job)).expect("install running job");
         let worker_ready = Arc::new(Barrier::new(2));
         let worker = {
@@ -740,67 +747,53 @@ mod tests {
     }
 
     #[test]
-    fn changing_the_open_source_cancels_the_running_export() {
+    fn opening_another_source_keeps_the_running_export() {
         let opened_source = OpenedSource::default();
-        let job = test_running_job();
+        open_test_source(&opened_source, "exporting.parquet");
+        let job = test_running_job(1);
         opened_source
             .data_exports
             .install(Arc::clone(&job))
             .expect("install running job");
 
-        opened_source
-            .install(
-                None,
-                PathBuf::from("replacement.parquet"),
-                SourceSummary {
-                    display_name: "replacement.parquet".to_owned(),
-                    size_bytes: 0,
-                    row_count: 0,
-                    row_group_count: 0,
-                    schema: Vec::new(),
-                },
-                SourceOpenIntent::Explicit,
-            )
-            .expect("replace source");
+        open_test_source(&opened_source, "second.parquet");
 
-        assert!(job.cancel_requested.load(Ordering::Acquire));
-        job.finish(Err(DataExportError::Cancelled));
+        assert!(!job.cancel_requested.load(Ordering::Acquire));
+        job.finish(Ok(42));
     }
 
     #[test]
-    fn a_stale_export_cannot_start_after_the_source_changes() {
+    fn the_close_confirmation_covers_only_the_exports_of_one_source() {
+        let jobs = DataExportJobs::default();
+        let job = test_running_job(2);
+        jobs.install(Arc::clone(&job)).expect("install running job");
+
+        assert_eq!(
+            jobs.running_file_names_for(2).expect("running exports"),
+            vec!["example-view.csv"]
+        );
+        assert!(
+            jobs.running_file_names_for(1)
+                .expect("other source exports")
+                .is_empty()
+        );
+
+        job.finish(Ok(42));
+    }
+
+    #[test]
+    fn a_stale_export_cannot_start_after_its_source_closed() {
         let opened_source = OpenedSource::default();
-        opened_source
-            .install(
-                None,
-                PathBuf::from("first.parquet"),
-                SourceSummary {
-                    display_name: "first.parquet".to_owned(),
-                    size_bytes: 0,
-                    row_count: 0,
-                    row_group_count: 0,
-                    schema: Vec::new(),
-                },
-                SourceOpenIntent::Explicit,
-            )
-            .expect("open first source");
-        opened_source
-            .install(
-                None,
-                PathBuf::from("second.parquet"),
-                SourceSummary {
-                    display_name: "second.parquet".to_owned(),
-                    size_bytes: 0,
-                    row_count: 0,
-                    row_group_count: 0,
-                    schema: Vec::new(),
-                },
-                SourceOpenIntent::Explicit,
-            )
-            .expect("replace source");
+        let closed = open_test_source(&opened_source, "closed.parquet");
+        open_test_source(&opened_source, "second.parquet");
+        assert!(
+            opened_source
+                .close(closed.generation)
+                .expect("opened source state")
+        );
 
         assert!(matches!(
-            opened_source.install_export_job(1, 0, test_running_job()),
+            opened_source.install_export_job(closed.generation, 0, test_running_job(1)),
             Err(DataExportCommandError::SourceChanged)
         ));
         assert!(
@@ -817,31 +810,17 @@ mod tests {
     #[test]
     fn a_stale_export_cannot_start_after_the_view_changes() {
         let opened_source = OpenedSource::default();
-        opened_source
-            .install(
-                None,
-                PathBuf::from("view.parquet"),
-                SourceSummary {
-                    display_name: "view.parquet".to_owned(),
-                    size_bytes: 0,
-                    row_count: 0,
-                    row_group_count: 0,
-                    schema: Vec::new(),
-                },
-                SourceOpenIntent::Explicit,
-            )
-            .expect("open source");
+        let opened = open_test_source(&opened_source, "view.parquet");
         opened_source
             .state
             .lock()
             .expect("opened source")
-            .session
-            .as_mut()
+            .session_mut(opened.generation)
             .expect("session")
             .view_revision = 2;
 
         assert!(matches!(
-            opened_source.install_export_job(1, 1, test_running_job()),
+            opened_source.install_export_job(opened.generation, 1, test_running_job(1)),
             Err(DataExportCommandError::ViewChanged)
         ));
         assert!(
@@ -870,7 +849,7 @@ mod tests {
     #[test]
     fn shutdown_waits_for_the_cancelled_export_worker() {
         let jobs = Arc::new(DataExportJobs::default());
-        let job = test_running_job();
+        let job = test_running_job(1);
         jobs.install(Arc::clone(&job)).expect("install running job");
         let shutdown_jobs = Arc::clone(&jobs);
         let shutdown = std::thread::spawn(move || shutdown_jobs.cancel_all_and_wait());
@@ -887,7 +866,7 @@ mod tests {
     #[test]
     fn close_guard_reports_only_running_export_targets() {
         let jobs = DataExportJobs::default();
-        let job = test_running_job();
+        let job = test_running_job(1);
         jobs.install(Arc::clone(&job)).expect("install running job");
 
         assert_eq!(
@@ -904,9 +883,10 @@ mod tests {
         );
     }
 
-    fn test_running_job() -> Arc<ActiveDataExportJob> {
+    fn test_running_job(generation: u64) -> Arc<ActiveDataExportJob> {
         Arc::new(ActiveDataExportJob {
             id: 1,
+            generation,
             file_name: "example-view.csv".to_owned(),
             target_path: PathBuf::from("example-view.csv"),
             progress: None,

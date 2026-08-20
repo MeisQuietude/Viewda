@@ -344,8 +344,10 @@ pub(crate) async fn install_pending_update(
         .take()
         .ok_or(UpdateError::NoPendingUpdate)?;
     let source_path = opened_source
-        .current_path()
-        .map_err(|_| UpdateError::Storage)?;
+        .open_paths()
+        .map_err(|_| UpdateError::Storage)?
+        .into_iter()
+        .next();
     let restart = PendingRestart {
         version: update.version.clone(),
         source_path,
