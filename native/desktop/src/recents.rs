@@ -144,6 +144,18 @@ impl RecentSourcesStore {
         }
         Ok(())
     }
+
+    pub(crate) fn clear_path(&self, state_path: &Path) -> Result<(), RecentSourceError> {
+        let _guard = self.0.lock().map_err(|_| RecentSourceError::Storage)?;
+        let mut stored = read_state_file(state_path)?;
+        if stored.entries.is_empty() {
+            return Ok(());
+        }
+        // Identifiers keep counting up so a cleared entry cannot be confused
+        // with a source recorded afterwards.
+        stored.entries.clear();
+        write_state_file(state_path, &stored)
+    }
 }
 
 pub(crate) fn state_path(app: &AppHandle) -> Result<PathBuf, RecentSourceError> {
@@ -311,6 +323,38 @@ mod tests {
         let stored = read_state_file(&state_path).expect("repaired recent sources");
         assert_eq!(stored.entries.len(), 1);
         assert_eq!(stored.entries[0].id, "recent-1");
+    }
+
+    #[test]
+    fn clearing_forgets_every_source_without_reusing_identifiers() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let state_path = directory.path().join("recents.json");
+        let store = RecentSourcesStore::default();
+        store
+            .record_path(&state_path, &create_file(directory.path(), "first.parquet"))
+            .expect("recent source");
+
+        store.clear_path(&state_path).expect("cleared history");
+
+        assert!(
+            store
+                .list_path(&state_path, None)
+                .expect("cleared recent sources")
+                .is_empty()
+        );
+        store
+            .record_path(
+                &state_path,
+                &create_file(directory.path(), "second.parquet"),
+            )
+            .expect("recent source after clearing");
+        assert_eq!(
+            read_state_file(&state_path)
+                .expect("recent sources")
+                .entries[0]
+                .id,
+            "recent-2"
+        );
     }
 
     #[test]

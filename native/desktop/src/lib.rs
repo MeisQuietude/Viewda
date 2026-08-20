@@ -1282,6 +1282,32 @@ fn open_recent_source_at_path(
     result
 }
 
+/// Forgets one recent source without touching the sources that are open.
+#[tauri::command]
+async fn remove_recent_source(app: tauri::AppHandle, id: String) -> Result<(), RecentSourceError> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let opened_source = app.state::<OpenedSource>();
+        opened_source
+            .recents
+            .remove_path(&recents::state_path(&app)?, &id)
+    })
+    .await
+    .map_err(|_| RecentSourceError::Storage)?
+}
+
+/// Empties the recent-source history shared by every surface that lists it.
+#[tauri::command]
+async fn clear_recent_sources(app: tauri::AppHandle) -> Result<(), RecentSourceError> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let opened_source = app.state::<OpenedSource>();
+        opened_source
+            .recents
+            .clear_path(&recents::state_path(&app)?)
+    })
+    .await
+    .map_err(|_| RecentSourceError::Storage)?
+}
+
 /// Lists the open sources, most recently used first, for the switcher and titlebar.
 #[tauri::command]
 fn list_opened_sources(
@@ -1726,6 +1752,8 @@ pub fn run() {
             open_local_source,
             get_recent_sources,
             open_recent_source,
+            remove_recent_source,
+            clear_recent_sources,
             list_opened_sources,
             activate_opened_source,
             close_opened_source,
