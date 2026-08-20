@@ -56,9 +56,11 @@ use viewda_data_engine::{
 };
 
 const OPEN_SOURCE_MENU_ID: &str = "open-local-source";
+const CLOSE_SOURCE_MENU_ID: &str = "close-source";
 const SETTINGS_MENU_ID: &str = "settings";
 const CHECK_FOR_UPDATES_MENU_ID: &str = "check-for-updates";
 const OPEN_SOURCE_REQUESTED_EVENT: &str = "open-source-requested";
+const CLOSE_SOURCE_REQUESTED_EVENT: &str = "close-source-requested";
 const SETTINGS_REQUESTED_EVENT: &str = "settings-requested";
 const UPDATE_AVAILABLE_EVENT: &str = "update-available";
 const DATA_EXPORT_CLOSE_REQUESTED_EVENT: &str = "data-export-close-requested";
@@ -1382,6 +1384,23 @@ async fn close_opened_source(
     Err(missing_data_window_session(&state))
 }
 
+/// Routes the close shortcut: the active file while one is open, the window otherwise.
+///
+/// Rust owns the open set, so the decision cannot be left to the webview. Closing
+/// the file goes back to the UI, which owns the confirmation for a running export.
+fn request_source_close(app: &tauri::AppHandle) {
+    let has_open_sources = app
+        .state::<OpenedSource>()
+        .open_paths()
+        .is_ok_and(|paths| !paths.is_empty());
+    if has_open_sources {
+        // The frontend receiver can already be gone while the app is shutting down.
+        let _ = app.emit(CLOSE_SOURCE_REQUESTED_EVENT, ());
+    } else if let Some(window) = app.get_webview_window("main") {
+        let _ = window.close();
+    }
+}
+
 fn check_for_updates_from_menu(app: &tauri::AppHandle) {
     let app = app.clone();
     tauri::async_runtime::spawn(async move {
@@ -1637,6 +1656,9 @@ pub fn run() {
             let open_source = MenuItemBuilder::with_id(OPEN_SOURCE_MENU_ID, "Open File…")
                 .accelerator("CmdOrCtrl+O")
                 .build(app)?;
+            let close_source = MenuItemBuilder::with_id(CLOSE_SOURCE_MENU_ID, "Close File")
+                .accelerator("CmdOrCtrl+W")
+                .build(app)?;
             let settings = MenuItemBuilder::with_id(SETTINGS_MENU_ID, "Settings…")
                 .accelerator("CmdOrCtrl+,")
                 .build(app)?;
@@ -1662,12 +1684,13 @@ pub fn run() {
             if let Some(file_menu) = existing_file_menu {
                 let open_separator = PredefinedMenuItem::separator(app)?;
                 #[cfg(target_os = "macos")]
-                file_menu.prepend_items(&[&open_source, &open_separator])?;
+                file_menu.prepend_items(&[&open_source, &close_source, &open_separator])?;
                 #[cfg(not(target_os = "macos"))]
                 {
                     let update_separator = PredefinedMenuItem::separator(app)?;
                     file_menu.prepend_items(&[
                         &open_source,
+                        &close_source,
                         &open_separator,
                         &settings,
                         &check_for_updates,
@@ -1683,11 +1706,29 @@ pub fn run() {
                     .item(&settings)
                     .item(&check_for_updates)
                     .separator();
-                let file_menu = file_menu.close_window();
+                let file_menu = file_menu.item(&close_source);
+                // Elsewhere the predefined item keeps its own Alt+F4; on macOS it
+                // would claim Cmd+W, which belongs to Close File.
                 #[cfg(not(target_os = "macos"))]
-                let file_menu = file_menu.quit();
+                let file_menu = file_menu.close_window().quit();
                 let file_menu = file_menu.build()?;
                 menu.prepend(&file_menu)?;
+            }
+
+            // The default Window submenu ends with a predefined Close Window on
+            // Cmd+W. Viewda gives that shortcut to Close File, which closes the
+            // window once the last file is gone.
+            #[cfg(target_os = "macos")]
+            if let Some(window_menu) = menu.items()?.into_iter().find_map(|item| match item {
+                MenuItemKind::Submenu(submenu)
+                    if submenu.text().is_ok_and(|text| text == "Window") =>
+                {
+                    Some(submenu)
+                }
+                _ => None,
+            }) {
+                let close_position = window_menu.items()?.len().saturating_sub(1);
+                let _ = window_menu.remove_at(close_position)?;
             }
 
             #[cfg(target_os = "macos")]
@@ -1720,6 +1761,8 @@ pub fn run() {
             if event.id() == OPEN_SOURCE_MENU_ID {
                 // The frontend receiver can already be gone while the app is shutting down.
                 let _ = app.emit(OPEN_SOURCE_REQUESTED_EVENT, ());
+            } else if event.id() == CLOSE_SOURCE_MENU_ID {
+                request_source_close(app);
             } else if event.id() == SETTINGS_MENU_ID {
                 let _ = app.emit(SETTINGS_REQUESTED_EVENT, ());
             } else if event.id() == CHECK_FOR_UPDATES_MENU_ID {

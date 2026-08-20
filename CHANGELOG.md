@@ -11,6 +11,7 @@ Backward-incompatible entries start with **Breaking:**.
 ### Added
 
 - Open Parquet files by dropping them on the window.
+- Close the active file with Cmd+W on macOS or Ctrl+W elsewhere.
 
 ## 0.1.0 — 2026-08-20
 
