@@ -116,13 +116,13 @@ describe("desktop seam", () => {
   it("unwraps a restored source error from the Rust wire shape", async () => {
     invokeMock.mockResolvedValue({
       version: "0.1.0",
-      source: null,
+      sources: [],
       sourceError: { code: "notFound" },
     });
 
     await expect(takePostUpdateState()).resolves.toEqual({
       version: "0.1.0",
-      source: null,
+      sources: [],
       sourceError: "notFound",
     });
     expect(invokeMock).toHaveBeenCalledWith("take_post_update_state");

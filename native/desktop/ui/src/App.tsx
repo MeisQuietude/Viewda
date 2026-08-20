@@ -431,8 +431,9 @@ export function App({
           simulated: false,
           dismissing: false,
         });
-        if (!receivedOpenedSource.current && restored.source !== null) {
-          setSource(restored.source);
+        const restoredSource = restored.sources[0] ?? null;
+        if (!receivedOpenedSource.current && restoredSource !== null) {
+          setSource(restoredSource);
           setSourceMode("data");
           setSourceMode("data");
         }

@@ -64,7 +64,10 @@ pub struct UpdateInfo {
 #[serde(rename_all = "camelCase")]
 pub struct PostUpdateState {
     pub version: String,
-    pub source: Option<OpenedSourceInfo>,
+    /// Restored sources in most-recently-used order, the active one first.
+    pub sources: Vec<OpenedSourceInfo>,
+    /// Reported only when nothing could be restored: a window with sources open
+    /// has no surface for a restore failure.
     pub source_error: Option<SourceError>,
 }
 
@@ -109,7 +112,34 @@ struct StoredUpdateState {
 #[serde(rename_all = "camelCase")]
 struct PendingRestart {
     version: String,
+    /// Open sources in most-recently-used order, the active one first.
+    #[serde(default)]
+    source_paths: Vec<PathBuf>,
+    /// The active source, repeated for releases that restore a single source.
+    ///
+    /// Installing a downgrade restarts into such a release, and it fails to read
+    /// the whole state file when this field is missing.
+    #[serde(default)]
     source_path: Option<PathBuf>,
+}
+
+impl PendingRestart {
+    fn new(version: String, source_paths: Vec<PathBuf>) -> Self {
+        Self {
+            source_path: source_paths.first().cloned(),
+            source_paths,
+            version,
+        }
+    }
+
+    /// Sources to reopen, most recently used first, from either marker shape.
+    fn restored_paths(self) -> Vec<PathBuf> {
+        if self.source_paths.is_empty() {
+            self.source_path.into_iter().collect()
+        } else {
+            self.source_paths
+        }
+    }
 }
 
 /// Keeps a checked, signature-verified release on the Rust side.
@@ -327,8 +357,8 @@ pub fn discard_pending_update(pending: State<'_, PendingUpdate>) -> Result<(), U
 ///
 /// The pending restart marker is written before installation because the
 /// Windows updater exits the process as part of the install. The marker keeps
-/// the currently open source entirely in Rust and lets the new process restore
-/// it without ever handing its path to the webview.
+/// the currently open sources entirely in Rust and lets the new process restore
+/// them without ever handing their paths to the webview.
 pub(crate) async fn install_pending_update(
     app: AppHandle,
     pending: State<'_, PendingUpdate>,
@@ -343,15 +373,10 @@ pub(crate) async fn install_pending_update(
         .map_err(|_| UpdateError::Unavailable)?
         .take()
         .ok_or(UpdateError::NoPendingUpdate)?;
-    let source_path = opened_source
+    let source_paths = opened_source
         .open_paths()
-        .map_err(|_| UpdateError::Storage)?
-        .into_iter()
-        .next();
-    let restart = PendingRestart {
-        version: update.version.clone(),
-        source_path,
-    };
+        .map_err(|_| UpdateError::Storage)?;
+    let restart = PendingRestart::new(update.version.clone(), source_paths);
     store.mutate(&app, |stored| stored.pending_restart = Some(restart))?;
 
     let progress = Mutex::new(UpdateProgressTracker::default());
@@ -388,7 +413,7 @@ pub(crate) async fn install_pending_update(
     Ok(())
 }
 
-/// Restores the pre-update source and reports the installed version once.
+/// Restores the pre-update sources and reports the installed version once.
 #[tauri::command]
 pub async fn take_post_update_state(
     app: AppHandle,
@@ -404,27 +429,38 @@ pub async fn take_post_update_state(
     let Some(restart) = restart else {
         return Ok(None);
     };
-    let (source, source_error) = match restart.source_path {
-        Some(path) => {
-            let inspected = tauri::async_runtime::spawn_blocking(move || {
-                inspect_selected_source(&app, path, SourceOpenIntent::Restore)
-            })
-            .await
-            .map_err(|_| UpdateError::Storage)?;
-            match inspected {
-                Ok(Some((_, source))) => (Some(source), None),
-                Ok(None) => (None, None),
-                Err(OpenSourceError::Source(error)) => (None, Some(error)),
-                Err(OpenSourceError::Recent(_)) => return Err(UpdateError::Storage),
-            }
+    let version = restart.version.clone();
+    let paths = restart.restored_paths();
+    let inspected = tauri::async_runtime::spawn_blocking(move || {
+        // Reopened least recently used first, so the pre-update active source
+        // ends up active again.
+        paths
+            .into_iter()
+            .rev()
+            .map(|path| inspect_selected_source(&app, path, SourceOpenIntent::Restore))
+            .collect::<Vec<_>>()
+    })
+    .await
+    .map_err(|_| UpdateError::Storage)?;
+
+    let mut sources = Vec::new();
+    let mut source_error = None;
+    for result in inspected {
+        match result {
+            Ok(Some((_, source))) => sources.push(source),
+            Ok(None) => {}
+            // The source meant to become active is inspected last, so its
+            // failure is the one an empty window reports.
+            Err(OpenSourceError::Source(error)) => source_error = Some(error),
+            Err(OpenSourceError::Recent(_)) => return Err(UpdateError::Storage),
         }
-        None => (None, None),
-    };
+    }
+    sources.reverse();
 
     Ok(Some(PostUpdateState {
-        version: restart.version,
-        source,
-        source_error,
+        version,
+        source_error: source_error.filter(|_| sources.is_empty()),
+        sources,
     }))
 }
 
@@ -627,10 +663,7 @@ mod tests {
             .expect("data-view resources");
         store
             .mutate_path(&path, |stored| {
-                stored.pending_restart = Some(PendingRestart {
-                    version: "0.1.0".to_owned(),
-                    source_path: None,
-                });
+                stored.pending_restart = Some(PendingRestart::new("0.1.0".to_owned(), Vec::new()));
             })
             .expect("restart marker");
         let restart = store
@@ -652,6 +685,81 @@ mod tests {
             viewda_data_engine::DataViewMemoryLimit::Mb1536
         );
         assert!(stored.pending_restart.is_none());
+    }
+
+    #[test]
+    fn restored_sources_keep_their_frontend_wire_shape() {
+        let state = PostUpdateState {
+            version: "0.1.0".to_owned(),
+            sources: vec![OpenedSourceInfo {
+                generation: 2,
+                summary: viewda_data_engine::SourceSummary {
+                    display_name: "trips.parquet".to_owned(),
+                    size_bytes: 31,
+                    row_count: 7,
+                    row_group_count: 1,
+                    schema: Vec::new(),
+                },
+            }],
+            source_error: None,
+        };
+
+        assert_eq!(
+            serde_json::to_value(state).expect("post-update state JSON"),
+            serde_json::json!({
+                "version": "0.1.0",
+                "sources": [{
+                    "generation": 2,
+                    "displayName": "trips.parquet",
+                    "sizeBytes": 31,
+                    "rowCount": 7,
+                    "rowGroupCount": 1,
+                    "schema": [],
+                }],
+                "sourceError": null,
+            })
+        );
+    }
+
+    #[test]
+    fn the_restart_marker_keeps_every_open_source_in_use_order() {
+        let restart = PendingRestart::new(
+            "0.1.0".to_owned(),
+            vec![
+                PathBuf::from("/data/active.parquet"),
+                PathBuf::from("/data/second.parquet"),
+            ],
+        );
+
+        assert_eq!(
+            serde_json::to_value(&restart).expect("restart marker JSON"),
+            serde_json::json!({
+                "version": "0.1.0",
+                "sourcePaths": ["/data/active.parquet", "/data/second.parquet"],
+                "sourcePath": "/data/active.parquet",
+            })
+        );
+        assert_eq!(
+            restart.restored_paths(),
+            [
+                PathBuf::from("/data/active.parquet"),
+                PathBuf::from("/data/second.parquet")
+            ]
+        );
+    }
+
+    #[test]
+    fn a_restart_marker_from_a_single_source_release_still_restores_it() {
+        let restart: PendingRestart = serde_json::from_value(serde_json::json!({
+            "version": "0.1.0",
+            "sourcePath": "/data/only.parquet",
+        }))
+        .expect("single-source restart marker");
+
+        assert_eq!(
+            restart.restored_paths(),
+            [PathBuf::from("/data/only.parquet")]
+        );
     }
 
     #[test]

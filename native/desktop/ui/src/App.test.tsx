@@ -490,14 +490,16 @@ describe("App", () => {
     await act(async () => {
       resolveRestore({
         version: "0.1.0",
-        source: {
-          generation: 1,
-          displayName: "restored.parquet",
-          sizeBytes: 256,
-          rowCount: 6,
-          rowGroupCount: 1,
-          schema: [],
-        },
+        sources: [
+          {
+            generation: 1,
+            displayName: "restored.parquet",
+            sizeBytes: 256,
+            rowCount: 6,
+            rowGroupCount: 1,
+            schema: [],
+          },
+        ],
         sourceError: null,
       });
     });
@@ -910,14 +912,16 @@ describe("App", () => {
     vi.spyOn(desktop, "takePostUpdateState").mockResolvedValue({
       version: "0.1.0",
       sourceError: null,
-      source: {
-        generation: 2,
-        displayName: "restored.parquet",
-        sizeBytes: 4096,
-        rowCount: 12,
-        rowGroupCount: 2,
-        schema: [],
-      },
+      sources: [
+        {
+          generation: 2,
+          displayName: "restored.parquet",
+          sizeBytes: 4096,
+          rowCount: 12,
+          rowGroupCount: 2,
+          schema: [],
+        },
+      ],
     });
     render(<App />);
     await act(async () => Promise.resolve());
@@ -937,7 +941,7 @@ describe("App", () => {
     vi.spyOn(desktop, "takePostUpdateState").mockResolvedValue({
       version: "0.1.0-alpha.2",
       sourceError: null,
-      source: null,
+      sources: [],
     });
     const openPage = vi.spyOn(desktop, "openReleasesPage");
     render(<App />);

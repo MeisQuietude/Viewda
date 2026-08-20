@@ -189,7 +189,7 @@ export interface UpdateCheckOptions {
 
 export interface PostUpdateState {
   version: string;
-  source: SourceSummary | null;
+  sources: SourceSummary[];
   sourceError: SourceErrorCode | null;
 }
 
@@ -211,7 +211,7 @@ interface NativeSourceError {
 
 interface NativePostUpdateState {
   version: string;
-  source: SourceSummary | null;
+  sources: SourceSummary[];
   sourceError: NativeSourceError | null;
 }
 
