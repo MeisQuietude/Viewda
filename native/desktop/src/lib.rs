@@ -12,7 +12,7 @@ use std::{
     collections::{HashMap, hash_map::Entry},
     path::PathBuf,
     sync::{
-        Arc, Mutex,
+        Arc, Condvar, Mutex,
         atomic::{AtomicBool, Ordering},
     },
 };
@@ -34,7 +34,7 @@ use recents::{RecentSource, RecentSourceError, RecentSourcesStore};
 use serde::Serialize;
 use tauri::{
     Emitter, Manager,
-    menu::{Menu, MenuItemBuilder, MenuItemKind, PredefinedMenuItem, SubmenuBuilder},
+    menu::{Menu, MenuItemBuilder, MenuItemKind, PredefinedMenuItem, Submenu, SubmenuBuilder},
 };
 use tauri_plugin_dialog::{DialogExt, MessageDialogKind};
 use theme::{apply_saved_theme, get_theme_preference, set_theme_preference, sync_system_theme};
@@ -57,10 +57,14 @@ use viewda_data_engine::{
 
 const OPEN_SOURCE_MENU_ID: &str = "open-local-source";
 const CLOSE_SOURCE_MENU_ID: &str = "close-source";
+const OPEN_RECENT_MENU_ID: &str = "open-recent";
+const OPEN_RECENT_MENU_PREFIX: &str = "open-recent:";
+const CLEAR_RECENT_MENU_ID: &str = "clear-recent";
 const SETTINGS_MENU_ID: &str = "settings";
 const CHECK_FOR_UPDATES_MENU_ID: &str = "check-for-updates";
 const OPEN_SOURCE_REQUESTED_EVENT: &str = "open-source-requested";
 const CLOSE_SOURCE_REQUESTED_EVENT: &str = "close-source-requested";
+const RECENT_SOURCES_CHANGED_EVENT: &str = "recent-sources-changed";
 const SETTINGS_REQUESTED_EVENT: &str = "settings-requested";
 const UPDATE_AVAILABLE_EVENT: &str = "update-available";
 const DATA_EXPORT_CLOSE_REQUESTED_EVENT: &str = "data-export-close-requested";
@@ -69,8 +73,24 @@ const QUIT_MENU_ID: &str = "quit";
 
 #[derive(Default)]
 struct DataExportCloseDialog {
-    pending: Mutex<Option<PendingDataExportCloseDialog>>,
+    state: Arc<Mutex<DataExportCloseDialogState>>,
 }
+
+#[derive(Default)]
+enum DataExportCloseDialogState {
+    #[default]
+    Idle,
+    Pending(PendingDataExportCloseDialog),
+    Resolving,
+}
+
+struct DataExportCloseResolution {
+    state: Arc<Mutex<DataExportCloseDialogState>>,
+    pending: Option<PendingDataExportCloseDialog>,
+}
+
+#[derive(Default)]
+struct RecentSourcesMenu(Mutex<Option<Submenu<tauri::Wry>>>);
 
 impl DataExportCloseDialog {
     fn try_open<F>(
@@ -82,15 +102,16 @@ impl DataExportCloseDialog {
     where
         F: FnOnce(bool) + Send + 'static,
     {
-        let Ok(mut pending) = self.pending.lock() else {
+        let Ok(mut state) = self.state.lock() else {
             on_decision(false);
             return false;
         };
-        if pending.is_some() {
+        if !matches!(*state, DataExportCloseDialogState::Idle) {
+            drop(state);
             on_decision(false);
             return false;
         }
-        *pending = Some(PendingDataExportCloseDialog {
+        *state = DataExportCloseDialogState::Pending(PendingDataExportCloseDialog {
             copy,
             action,
             on_decision: Box::new(on_decision),
@@ -99,27 +120,45 @@ impl DataExportCloseDialog {
     }
 
     fn copy(&self) -> Option<DataExportCloseDialogCopy> {
-        self.pending
-            .lock()
-            .ok()?
-            .as_ref()
-            .map(|pending| pending.copy.clone())
+        let state = self.state.lock().ok()?;
+        match &*state {
+            DataExportCloseDialogState::Pending(pending) => Some(pending.copy.clone()),
+            DataExportCloseDialogState::Idle | DataExportCloseDialogState::Resolving => None,
+        }
     }
 
-    fn action(&self) -> Option<DataExportShutdownAction> {
-        self.pending
-            .lock()
-            .ok()?
-            .as_ref()
-            .map(|pending| pending.action)
+    fn begin_resolution(&self) -> Option<DataExportCloseResolution> {
+        let mut state = self.state.lock().ok()?;
+        let pending = match std::mem::replace(&mut *state, DataExportCloseDialogState::Resolving) {
+            DataExportCloseDialogState::Pending(pending) => pending,
+            previous => {
+                *state = previous;
+                return None;
+            }
+        };
+        Some(DataExportCloseResolution {
+            state: Arc::clone(&self.state),
+            pending: Some(pending),
+        })
+    }
+}
+
+impl DataExportCloseResolution {
+    fn action(&self) -> DataExportShutdownAction {
+        self.pending.as_ref().expect("pending resolution").action
     }
 
-    fn take_decision(&self) -> Option<Box<dyn FnOnce(bool) + Send>> {
-        self.pending
-            .lock()
-            .ok()?
-            .take()
-            .map(|pending| pending.on_decision)
+    fn decide(mut self, decision: bool) {
+        let pending = self.pending.take().expect("pending resolution");
+        (pending.on_decision)(decision);
+    }
+}
+
+impl Drop for DataExportCloseResolution {
+    fn drop(&mut self) {
+        if let Ok(mut state) = self.state.lock() {
+            *state = DataExportCloseDialogState::Idle;
+        }
     }
 }
 
@@ -136,9 +175,10 @@ struct DataExportCloseDialogCopy {
     destructive_button: &'static str,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum DataExportShutdownAction {
     Close,
+    CloseWindow,
     CloseSource,
     RestartForUpdate,
 }
@@ -154,21 +194,16 @@ pub(crate) struct OpenedSource {
 struct OpenedSourceState {
     generation: u64,
     /// Open sessions in most-recently-used order; the first one is the active source.
-    sessions: Vec<OpenedSourceSession>,
+    sessions: Vec<Arc<OpenedSourceSession>>,
     blocks_restore: bool,
 }
 
 impl OpenedSourceState {
-    fn session(&self, generation: u64) -> Option<&OpenedSourceSession> {
+    fn session(&self, generation: u64) -> Option<Arc<OpenedSourceSession>> {
         self.sessions
             .iter()
             .find(|session| session.generation == generation)
-    }
-
-    fn session_mut(&mut self, generation: u64) -> Option<&mut OpenedSourceSession> {
-        self.sessions
-            .iter_mut()
-            .find(|session| session.generation == generation)
+            .map(Arc::clone)
     }
 
     /// Tells a window without sources apart from a source that has since been closed.
@@ -199,6 +234,11 @@ struct OpenedSourceSession {
     generation: u64,
     path: PathBuf,
     summary: SourceSummary,
+    state: Mutex<OpenedSourceSessionState>,
+    lifecycle: Arc<SessionLifecycle>,
+}
+
+struct OpenedSourceSessionState {
     view_revision: u64,
     view: Option<PreparedDataView>,
     reader: DataWindowReader,
@@ -210,12 +250,49 @@ struct OpenedSourceSession {
 }
 
 impl OpenedSourceSession {
+    fn lock_state(
+        &self,
+    ) -> Result<std::sync::MutexGuard<'_, OpenedSourceSessionState>, DataWindowError> {
+        self.state.lock().map_err(|_| DataWindowError::Unsupported)
+    }
+
+    fn begin_work(&self) -> Result<SessionWork, DataWindowError> {
+        self.lifecycle.begin()
+    }
+
+    fn with_open_state<T>(
+        &self,
+        action: impl FnOnce(&mut OpenedSourceSessionState) -> T,
+    ) -> Result<T, DataWindowError> {
+        let lifecycle = self
+            .lifecycle
+            .state
+            .lock()
+            .map_err(|_| DataWindowError::Unsupported)?;
+        if lifecycle.closing {
+            return Err(DataWindowError::Cancelled);
+        }
+        let mut state = self.lock_state()?;
+        Ok(action(&mut state))
+    }
+
+    fn close_and_wait(&self) {
+        self.lifecycle.start_closing();
+        if let Ok(mut state) = self.state.lock() {
+            state.cancel_jobs();
+        }
+        self.lifecycle.wait_until_idle();
+    }
+}
+
+impl OpenedSourceSessionState {
     fn text_suggestion_reader(
         &mut self,
+        path: &std::path::Path,
     ) -> Result<Arc<TextValueSuggestionsReader>, DataWindowError> {
         if self.text_suggestion_reader.is_none() {
             self.text_suggestion_reader = Some(Arc::new(TextValueSuggestionsReader::new(
-                self.path.clone(),
+                path.to_path_buf(),
             )?));
         }
         self.text_suggestion_reader
@@ -234,6 +311,66 @@ impl OpenedSourceSession {
         }
         if let Some(job) = self.statistics_job.take() {
             job.cancel();
+        }
+    }
+}
+
+#[derive(Default)]
+struct SessionLifecycle {
+    state: Mutex<SessionLifecycleState>,
+    idle: Condvar,
+}
+
+#[derive(Default)]
+struct SessionLifecycleState {
+    closing: bool,
+    workers: usize,
+}
+
+impl SessionLifecycle {
+    fn begin(self: &Arc<Self>) -> Result<SessionWork, DataWindowError> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| DataWindowError::Unsupported)?;
+        if state.closing {
+            return Err(DataWindowError::Cancelled);
+        }
+        state.workers = state
+            .workers
+            .checked_add(1)
+            .ok_or(DataWindowError::Unsupported)?;
+        Ok(SessionWork(Arc::clone(self)))
+    }
+
+    fn start_closing(&self) {
+        if let Ok(mut state) = self.state.lock() {
+            state.closing = true;
+        }
+    }
+
+    fn wait_until_idle(&self) {
+        let Ok(mut state) = self.state.lock() else {
+            return;
+        };
+        while state.workers != 0 {
+            let Ok(next) = self.idle.wait(state) else {
+                return;
+            };
+            state = next;
+        }
+    }
+}
+
+struct SessionWork(Arc<SessionLifecycle>);
+
+impl Drop for SessionWork {
+    fn drop(&mut self) {
+        if let Ok(mut state) = self.0.state.lock() {
+            state.workers = state.workers.saturating_sub(1);
+            if state.workers == 0 {
+                self.0.idle.notify_all();
+            }
         }
     }
 }
@@ -513,6 +650,26 @@ impl From<ColumnStatisticsError> for ColumnStatisticsCommandError {
     }
 }
 
+impl From<DataWindowError> for ColumnStatisticsCommandError {
+    fn from(error: DataWindowError) -> Self {
+        match error {
+            DataWindowError::Cancelled => Self::Cancelled,
+            DataWindowError::NotFound => Self::NotFound,
+            DataWindowError::PermissionDenied => Self::PermissionDenied,
+            DataWindowError::NotParquet => Self::NotParquet,
+            DataWindowError::CorruptSource => Self::CorruptSource,
+            DataWindowError::ResourceExhausted => Self::ResourceExhausted,
+            DataWindowError::QueryFailed => Self::QueryFailed,
+            DataWindowError::QueryEngineUnavailable => Self::QueryEngineUnavailable,
+            DataWindowError::Unsupported
+            | DataWindowError::WindowTooLarge
+            | DataWindowError::InvalidFilter
+            | DataWindowError::InvalidSort
+            | DataWindowError::EncodingFailed => Self::Unsupported,
+        }
+    }
+}
+
 impl From<DataWindowError> for DataWindowCommandError {
     fn from(error: DataWindowError) -> Self {
         Self::Engine(error)
@@ -604,19 +761,22 @@ impl OpenedSource {
                 state.generation = generation;
                 state.sessions.insert(
                     0,
-                    OpenedSourceSession {
+                    Arc::new(OpenedSourceSession {
                         generation,
-                        reader: DataWindowReader::new(path.clone()),
                         path: path.clone(),
                         summary: summary.clone(),
-                        view_revision: 0,
-                        view: None,
-                        text_suggestion_reader: None,
-                        statistics_cache: HashMap::new(),
-                        data_view_jobs: DataViewJobsState::default(),
-                        text_suggestion_jobs: TextValueSuggestionJobsState::default(),
-                        statistics_job: None,
-                    },
+                        state: Mutex::new(OpenedSourceSessionState {
+                            reader: DataWindowReader::new(path.clone()),
+                            view_revision: 0,
+                            view: None,
+                            text_suggestion_reader: None,
+                            statistics_cache: HashMap::new(),
+                            data_view_jobs: DataViewJobsState::default(),
+                            text_suggestion_jobs: TextValueSuggestionJobsState::default(),
+                            statistics_job: None,
+                        }),
+                        lifecycle: Arc::new(SessionLifecycle::default()),
+                    }),
                 );
                 OpenedSourceInfo {
                     generation,
@@ -643,11 +803,9 @@ impl OpenedSource {
         else {
             return Ok(false);
         };
-        let mut session = state.sessions.remove(index);
-        // Outside the source lock: dropping the session also removes the
-        // temporary sort directory its prepared view holds on disk.
+        let session = state.sessions.remove(index);
         drop(state);
-        session.cancel_jobs();
+        session.close_and_wait();
         Ok(true)
     }
 
@@ -666,11 +824,41 @@ impl OpenedSource {
     }
 
     fn cancel_all_jobs(&self) -> Result<(), OpenSourceError> {
-        let mut state = self.lock_state()?;
-        for session in &mut state.sessions {
-            session.cancel_jobs();
+        let sessions = self.lock_state()?.sessions.clone();
+        for session in sessions {
+            session.close_and_wait();
         }
         Ok(())
+    }
+
+    #[cfg(target_os = "macos")]
+    fn close_all(&self) -> Result<(), OpenSourceError> {
+        let sessions = {
+            let mut state = self.lock_state()?;
+            std::mem::take(&mut state.sessions)
+        };
+        for session in sessions {
+            session.close_and_wait();
+        }
+        Ok(())
+    }
+}
+
+fn should_prevent_exit(is_macos: bool, code: Option<i32>, has_running_exports: bool) -> bool {
+    (is_macos && code.is_none()) || (code != Some(tauri::RESTART_EXIT_CODE) && has_running_exports)
+}
+
+#[cfg(target_os = "macos")]
+fn ensure_main_window(app: &tauri::AppHandle) {
+    if let Some(window) = app.get_webview_window("main") {
+        let _ = window.show();
+        let _ = window.set_focus();
+    } else if let Some(config) = app.config().app.windows.first()
+        && let Ok(window) = tauri::WebviewWindowBuilder::from_config(app, config)
+            .and_then(|builder| builder.build())
+    {
+        let _ = window.show();
+        let _ = window.set_focus();
     }
 }
 
@@ -690,12 +878,18 @@ async fn get_data_window(
     source_indices: Vec<u32>,
     opened_source: tauri::State<'_, OpenedSource>,
 ) -> Result<tauri::ipc::Response, DataWindowCommandError> {
-    let state = Arc::clone(&opened_source.state);
+    let session = {
+        let state = opened_source
+            .state
+            .lock()
+            .map_err(|_| DataWindowError::Unsupported)?;
+        let missing = missing_data_window_session(&state);
+        state.session(generation).ok_or(missing)?
+    };
+    let _work = session.begin_work()?;
     let bytes = tauri::async_runtime::spawn_blocking(move || {
-        let mut state = state.lock().map_err(|_| DataWindowError::Unsupported)?;
         fetch_opened_source_window(
-            &mut state,
-            generation,
+            &session,
             view_revision,
             row_offset,
             row_count,
@@ -709,21 +903,19 @@ async fn get_data_window(
 }
 
 fn fetch_opened_source_window(
-    state: &mut OpenedSourceState,
-    generation: u64,
+    session: &OpenedSourceSession,
     view_revision: u64,
     row_offset: u64,
     row_count: u32,
     source_indices: &[u32],
 ) -> Result<Vec<u8>, DataWindowCommandError> {
-    let missing = missing_data_window_session(state);
-    let session = state.session_mut(generation).ok_or(missing)?;
-    if session.view_revision != view_revision {
+    let mut state = session.lock_state()?;
+    if state.view_revision != view_revision {
         return Err(DataWindowCommandError::Session(
             DataWindowSessionError::ViewChanged,
         ));
     }
-    match &session.view {
+    match &state.view {
         Some(view) => view
             .fetch_window_columns(row_offset, row_count, source_indices)
             .map_err(Into::into),
@@ -738,12 +930,12 @@ fn fetch_opened_source_window(
                     .enumerate()
                     .all(|(index, source_index)| usize::try_from(*source_index) == Ok(index));
             if identity_projection {
-                session
+                state
                     .reader
                     .fetch(row_offset, row_count)
                     .map_err(Into::into)
             } else {
-                session
+                state
                     .reader
                     .fetch_columns(row_offset, row_count, source_indices)
                     .map_err(Into::into)
@@ -765,57 +957,49 @@ async fn prepare_data_view(
     if filters.is_empty() && sort.is_empty() {
         return activate_direct_data_view(&opened_source, generation, view_revision);
     }
-    let path = {
+    let session = {
         let state = opened_source
             .state
             .lock()
             .map_err(|_| DataWindowError::Unsupported)?;
         let missing = missing_data_window_session(&state);
-        state.session(generation).ok_or(missing)?.path.clone()
+        state.session(generation).ok_or(missing)?
     };
-    let builder = DataViewBuilder::with_memory_limit(path, &filters, &sort, settings.memory_limit)?;
+    let _work = session.begin_work()?;
+    let builder = DataViewBuilder::with_memory_limit(
+        session.path.clone(),
+        &filters,
+        &sort,
+        settings.memory_limit,
+    )?;
     let interrupt = Arc::new(builder.interrupt_handle());
-    {
-        // Registering under the source lock keeps closing the source decisive:
-        // it either sees and cancels this job, or wins first and leaves no
-        // session for the preparation to start against.
-        let mut state = opened_source
-            .state
-            .lock()
-            .map_err(|_| DataWindowError::Unsupported)?;
-        let missing = missing_data_window_session(&state);
-        let session = state.session_mut(generation).ok_or(missing)?;
+    session.with_open_state(|state| {
         register_data_view_job(
-            &mut session.data_view_jobs,
+            &mut state.data_view_jobs,
             ActiveDataViewJob {
                 interrupt: Arc::clone(&interrupt),
                 view_revision,
             },
-        )?;
-    }
+        )
+    })??;
 
     let result = tauri::async_runtime::spawn_blocking(move || builder.build()).await;
     let cancelled = interrupt.is_cancelled();
-    let mut state = opened_source
-        .state
-        .lock()
-        .map_err(|_| DataWindowError::Unsupported)?;
-    let missing = missing_data_window_session(&state);
-    let session = state.session_mut(generation).ok_or(missing)?;
-    let is_current = finish_data_view_job(&mut session.data_view_jobs, view_revision, &interrupt);
+    let mut state = session.lock_state()?;
+    let is_current = finish_data_view_job(&mut state.data_view_jobs, view_revision, &interrupt);
     if cancelled || !is_current {
         return Err(DataWindowError::Cancelled.into());
     }
     let view = result.map_err(|_| DataWindowError::QueryEngineUnavailable)??;
-    if view_revision <= session.view_revision {
+    if view_revision <= state.view_revision {
         return Err(DataWindowError::Cancelled.into());
     }
     let status = DataViewStatus {
         revision: view_revision,
         row_count: view.row_count(),
     };
-    session.view_revision = view_revision;
-    session.view = Some(view);
+    state.view_revision = view_revision;
+    state.view = Some(view);
     Ok(status)
 }
 
@@ -824,32 +1008,35 @@ fn activate_direct_data_view(
     generation: u64,
     view_revision: u64,
 ) -> Result<DataViewStatus, DataWindowCommandError> {
-    let mut state = opened_source
-        .state
-        .lock()
-        .map_err(|_| DataWindowError::Unsupported)?;
-    let missing = missing_data_window_session(&state);
-    let session = state.session_mut(generation).ok_or(missing)?;
-    if view_revision <= session.view_revision {
+    let session = {
+        let state = opened_source
+            .state
+            .lock()
+            .map_err(|_| DataWindowError::Unsupported)?;
+        let missing = missing_data_window_session(&state);
+        state.session(generation).ok_or(missing)?
+    };
+    let mut state = session.lock_state()?;
+    if view_revision <= state.view_revision {
         return Err(DataWindowError::Cancelled.into());
     }
-    if session
+    if state
         .data_view_jobs
         .watermark
         .is_some_and(|revision| view_revision <= revision)
     {
         return Err(DataWindowError::Cancelled.into());
     }
-    session.data_view_jobs.watermark = Some(view_revision);
-    if let Some(active) = session.data_view_jobs.active.take() {
+    state.data_view_jobs.watermark = Some(view_revision);
+    if let Some(active) = state.data_view_jobs.active.take() {
         active.cancel();
     }
     let status = DataViewStatus {
         revision: view_revision,
         row_count: session.summary.row_count,
     };
-    session.view_revision = view_revision;
-    session.view = None;
+    state.view_revision = view_revision;
+    state.view = None;
     Ok(status)
 }
 
@@ -859,15 +1046,18 @@ fn get_data_view_status(
     generation: u64,
     opened_source: tauri::State<'_, OpenedSource>,
 ) -> Result<DataViewStatus, DataWindowCommandError> {
-    let state = opened_source
-        .state
-        .lock()
-        .map_err(|_| DataWindowError::Unsupported)?;
-    let missing = missing_data_window_session(&state);
-    let session = state.session(generation).ok_or(missing)?;
+    let session = {
+        let state = opened_source
+            .state
+            .lock()
+            .map_err(|_| DataWindowError::Unsupported)?;
+        let missing = missing_data_window_session(&state);
+        state.session(generation).ok_or(missing)?
+    };
+    let state = session.lock_state()?;
     Ok(DataViewStatus {
-        revision: session.view_revision,
-        row_count: session
+        revision: state.view_revision,
+        row_count: state
             .view
             .as_ref()
             .map_or(session.summary.row_count, PreparedDataView::row_count),
@@ -882,14 +1072,15 @@ fn cancel_data_view(
     opened_source: tauri::State<'_, OpenedSource>,
 ) -> Result<(), DataWindowCommandError> {
     let active = {
-        let mut state = opened_source
+        let session = opened_source
             .state
             .lock()
-            .map_err(|_| DataWindowError::Unsupported)?;
-        let Some(session) = state.session_mut(generation) else {
+            .map_err(|_| DataWindowError::Unsupported)?
+            .session(generation);
+        let Some(session) = session else {
             return Ok(());
         };
-        cancel_data_view_job(&mut session.data_view_jobs, view_revision)
+        cancel_data_view_job(&mut session.lock_state()?.data_view_jobs, view_revision)
     };
     if let Some(active) = active {
         active.cancel();
@@ -907,37 +1098,34 @@ async fn get_text_value_suggestions(
     operator: DataFilterOperator,
     opened_source: tauri::State<'_, OpenedSource>,
 ) -> Result<TextValueSuggestions, DataWindowCommandError> {
-    let (reader, column) = {
-        let mut state = opened_source
+    let session = {
+        let state = opened_source
             .state
             .lock()
             .map_err(|_| DataWindowError::Unsupported)?;
         let missing = missing_data_window_session(&state);
-        let session = state.session_mut(generation).ok_or(missing)?;
-        let column = session
-            .summary
-            .schema
-            .get(column_index)
-            .cloned()
-            .ok_or(DataWindowError::InvalidFilter)?;
-        (session.text_suggestion_reader()?, column)
+        state.session(generation).ok_or(missing)?
     };
+    let _work = session.begin_work()?;
+    let column = session
+        .summary
+        .schema
+        .get(column_index)
+        .cloned()
+        .ok_or(DataWindowError::InvalidFilter)?;
+    let reader = session
+        .lock_state()?
+        .text_suggestion_reader(&session.path)?;
     let interrupt = Arc::new(reader.interrupt_handle());
-    {
-        let mut state = opened_source
-            .state
-            .lock()
-            .map_err(|_| DataWindowError::Unsupported)?;
-        let missing = missing_data_window_session(&state);
-        let session = state.session_mut(generation).ok_or(missing)?;
+    session.with_open_state(|state| {
         register_text_value_suggestion_job(
-            &mut session.text_suggestion_jobs,
+            &mut state.text_suggestion_jobs,
             ActiveTextValueSuggestionJob {
                 suggestion_revision,
                 interrupt: Arc::clone(&interrupt),
             },
-        )?;
-    }
+        )
+    })??;
 
     let request_interrupt = Arc::clone(&interrupt);
     let result = tauri::async_runtime::spawn_blocking(move || {
@@ -945,18 +1133,14 @@ async fn get_text_value_suggestions(
     })
     .await;
     let cancelled = interrupt.is_cancelled();
-    let mut state = opened_source
-        .state
-        .lock()
-        .map_err(|_| DataWindowError::Unsupported)?;
-    let is_current = state.session_mut(generation).is_some_and(|session| {
+    let is_current = {
+        let mut state = session.lock_state()?;
         finish_text_value_suggestion_job(
-            &mut session.text_suggestion_jobs,
+            &mut state.text_suggestion_jobs,
             suggestion_revision,
             &interrupt,
         )
-    });
-    drop(state);
+    };
 
     if cancelled || !is_current {
         Err(DataWindowError::Cancelled.into())
@@ -975,14 +1159,18 @@ fn cancel_text_value_suggestions(
     opened_source: tauri::State<'_, OpenedSource>,
 ) -> Result<(), DataWindowCommandError> {
     let active = {
-        let mut state = opened_source
+        let session = opened_source
             .state
             .lock()
-            .map_err(|_| DataWindowError::Unsupported)?;
-        let Some(session) = state.session_mut(generation) else {
+            .map_err(|_| DataWindowError::Unsupported)?
+            .session(generation);
+        let Some(session) = session else {
             return Ok(());
         };
-        cancel_text_value_suggestion_job(&mut session.text_suggestion_jobs, suggestion_revision)
+        cancel_text_value_suggestion_job(
+            &mut session.lock_state()?.text_suggestion_jobs,
+            suggestion_revision,
+        )
     };
     if let Some(active) = active {
         active.cancel();
@@ -998,13 +1186,22 @@ async fn get_column_statistics(
     include_min_max: bool,
     opened_source: tauri::State<'_, OpenedSource>,
 ) -> Result<ColumnStatistics, ColumnStatisticsCommandError> {
-    let request = {
+    let session = {
         let state = opened_source
             .state
             .lock()
             .map_err(|_| ColumnStatisticsCommandError::Unsupported)?;
-        statistics_request(&state, generation, column_index, include_min_max)?
+        state.session(generation).ok_or_else(|| {
+            state.missing_session(
+                ColumnStatisticsCommandError::NoSourceOpen,
+                ColumnStatisticsCommandError::SourceChanged,
+            )
+        })?
     };
+    let _work = session
+        .begin_work()
+        .map_err(ColumnStatisticsCommandError::from)?;
+    let request = statistics_request(&session, column_index, include_min_max)?;
     let (path, column_name) = match request {
         ColumnStatisticsRequest::Cached(statistics) => {
             cancel_active_statistics_job(&opened_source, generation)?;
@@ -1018,14 +1215,10 @@ async fn get_column_statistics(
         interrupt: reader.interrupt_handle(),
     });
     {
-        let mut state = opened_source
-            .state
-            .lock()
-            .map_err(|_| ColumnStatisticsCommandError::Unsupported)?;
-        let session = state
-            .session_mut(generation)
-            .ok_or(ColumnStatisticsCommandError::SourceChanged)?;
-        if let Some(previous) = session.statistics_job.replace(Arc::clone(&job)) {
+        let previous = session
+            .with_open_state(|state| state.statistics_job.replace(Arc::clone(&job)))
+            .map_err(ColumnStatisticsCommandError::from)?;
+        if let Some(previous) = previous {
             previous.cancel();
         }
     }
@@ -1033,17 +1226,17 @@ async fn get_column_statistics(
     let result =
         tauri::async_runtime::spawn_blocking(move || reader.fetch(&column_name, include_min_max))
             .await;
-    let mut state = opened_source
-        .state
-        .lock()
-        .map_err(|_| ColumnStatisticsCommandError::Unsupported)?;
-    if let Some(session) = state.session_mut(generation).filter(|session| {
-        session
+    {
+        let mut state = session
+            .lock_state()
+            .map_err(ColumnStatisticsCommandError::from)?;
+        if state
             .statistics_job
             .as_ref()
             .is_some_and(|active| Arc::ptr_eq(active, &job))
-    }) {
-        session.statistics_job.take();
+        {
+            state.statistics_job.take();
+        }
     }
     let cancelled = job.cancelled.load(Ordering::Acquire);
 
@@ -1053,23 +1246,19 @@ async fn get_column_statistics(
     let statistics = result
         .map_err(|_| ColumnStatisticsCommandError::QueryEngineUnavailable)?
         .map_err(ColumnStatisticsCommandError::from)?;
-    cache_statistics(&mut state, generation, column_index, statistics.clone())?;
+    cache_statistics(&session, column_index, statistics.clone())?;
     Ok(statistics)
 }
 
 fn statistics_request(
-    state: &OpenedSourceState,
-    generation: u64,
+    session: &OpenedSourceSession,
     column_index: usize,
     include_min_max: bool,
 ) -> Result<ColumnStatisticsRequest, ColumnStatisticsCommandError> {
-    let session = state.session(generation).ok_or_else(|| {
-        state.missing_session(
-            ColumnStatisticsCommandError::NoSourceOpen,
-            ColumnStatisticsCommandError::SourceChanged,
-        )
-    })?;
-    if let Some(statistics) = session
+    let state = session
+        .lock_state()
+        .map_err(ColumnStatisticsCommandError::from)?;
+    if let Some(statistics) = state
         .statistics_cache
         .get(&column_index)
         .filter(|statistics| !include_min_max || statistics.min_max_computed)
@@ -1090,20 +1279,17 @@ fn statistics_request(
 }
 
 fn cache_statistics(
-    state: &mut OpenedSourceState,
-    generation: u64,
+    session: &OpenedSourceSession,
     column_index: usize,
     statistics: ColumnStatistics,
 ) -> Result<(), ColumnStatisticsCommandError> {
-    let missing = state.missing_session(
-        ColumnStatisticsCommandError::NoSourceOpen,
-        ColumnStatisticsCommandError::SourceChanged,
-    );
-    let session = state.session_mut(generation).ok_or(missing)?;
     if session.summary.schema.get(column_index).is_none() {
         return Err(ColumnStatisticsCommandError::UnsupportedColumn);
     }
-    match session.statistics_cache.entry(column_index) {
+    let mut state = session
+        .lock_state()
+        .map_err(ColumnStatisticsCommandError::from)?;
+    match state.statistics_cache.entry(column_index) {
         Entry::Vacant(entry) => {
             entry.insert(statistics);
         }
@@ -1121,12 +1307,20 @@ fn cancel_active_statistics_job(
     opened_source: &OpenedSource,
     generation: u64,
 ) -> Result<(), ColumnStatisticsCommandError> {
-    let active = opened_source
+    let session = opened_source
         .state
         .lock()
         .map_err(|_| ColumnStatisticsCommandError::Unsupported)?
-        .session_mut(generation)
-        .and_then(|session| session.statistics_job.take());
+        .session(generation);
+    let active = session
+        .map(|session| {
+            session
+                .lock_state()
+                .map(|mut state| state.statistics_job.take())
+        })
+        .transpose()
+        .map_err(ColumnStatisticsCommandError::from)?
+        .flatten();
     if let Some(active) = active {
         active.cancel();
     }
@@ -1144,17 +1338,17 @@ fn cancel_column_statistics(
 
 /// Owns the native file dialog and passes the selected path directly to data-engine.
 ///
-/// The dialog lives on the Rust side on purpose: the plugin's JS `open()`
-/// API would hand the raw path to the webview, and the UI must never see
-/// paths or touch files. Cancellation returns `Ok(None)` — it is a normal
-/// outcome, not an error.
+/// Rust owns file selection and reading; the webview receives the canonical
+/// path later only for switcher search, tooltip, and explicit path actions.
+/// Cancellation returns `Ok(None)` — it is a normal outcome, not an error.
 #[tauri::command]
 async fn open_local_source(
     app: tauri::AppHandle,
 ) -> Result<Option<OpenedSourceInfo>, OpenSourceError> {
+    let command_app = app.clone();
     // blocking_pick_file would stall the async runtime thread.
     let inspected = tauri::async_runtime::spawn_blocking(move || {
-        let selected = app
+        let selected = command_app
             .dialog()
             .file()
             .add_filter("Parquet", &["parquet"])
@@ -1164,11 +1358,14 @@ async fn open_local_source(
         };
         let path = selected.into_path().map_err(|_| SourceError::Unsupported)?;
 
-        inspect_selected_source(&app, path, SourceOpenIntent::Explicit)
+        inspect_selected_source(&command_app, path, SourceOpenIntent::Explicit)
     })
     .await
     .map_err(|_| SourceError::Unsupported)??;
 
+    if inspected.is_some() {
+        let _ = recent_sources_changed(&app);
+    }
     Ok(inspected.map(|(_, source)| source))
 }
 
@@ -1229,7 +1426,7 @@ fn require_explicit_source(
     source.ok_or_else(|| SourceError::Unsupported.into())
 }
 
-/// Returns existing recent sources without exposing their paths.
+/// Returns recent display metadata, including canonical paths for the switcher.
 #[tauri::command]
 async fn get_recent_sources(app: tauri::AppHandle) -> Result<Vec<RecentSource>, RecentSourceError> {
     tauri::async_runtime::spawn_blocking(move || {
@@ -1246,15 +1443,17 @@ async fn open_recent_source(
     app: tauri::AppHandle,
     id: String,
 ) -> Result<OpenedSourceInfo, OpenSourceError> {
-    let result =
-        tauri::async_runtime::spawn_blocking(move || open_recent_source_with_app(&app, &id))
-            .await
-            .map_err(|_| SourceError::Unsupported)?;
-
+    let command_app = app.clone();
+    let result = tauri::async_runtime::spawn_blocking(move || {
+        open_recent_source_with_app(&command_app, &id)
+    })
+    .await
+    .map_err(|_| SourceError::Unsupported)?;
+    let _ = recent_sources_changed(&app);
     result.map(|(_, source)| source)
 }
 
-fn open_recent_source_with_app(
+pub(crate) fn open_recent_source_with_app(
     app: &tauri::AppHandle,
     id: &str,
 ) -> Result<(PathBuf, OpenedSourceInfo), OpenSourceError> {
@@ -1287,27 +1486,84 @@ fn open_recent_source_at_path(
 /// Forgets one recent source without touching the sources that are open.
 #[tauri::command]
 async fn remove_recent_source(app: tauri::AppHandle, id: String) -> Result<(), RecentSourceError> {
+    let command_app = app.clone();
     tauri::async_runtime::spawn_blocking(move || {
-        let opened_source = app.state::<OpenedSource>();
+        let opened_source = command_app.state::<OpenedSource>();
         opened_source
             .recents
-            .remove_path(&recents::state_path(&app)?, &id)
+            .remove_path(&recents::state_path(&command_app)?, &id)
     })
     .await
-    .map_err(|_| RecentSourceError::Storage)?
+    .map_err(|_| RecentSourceError::Storage)??;
+    recent_sources_changed(&app)
 }
 
 /// Empties the recent-source history shared by every surface that lists it.
 #[tauri::command]
 async fn clear_recent_sources(app: tauri::AppHandle) -> Result<(), RecentSourceError> {
+    let command_app = app.clone();
     tauri::async_runtime::spawn_blocking(move || {
-        let opened_source = app.state::<OpenedSource>();
+        let opened_source = command_app.state::<OpenedSource>();
         opened_source
             .recents
-            .clear_path(&recents::state_path(&app)?)
+            .clear_path(&recents::state_path(&command_app)?)
     })
     .await
-    .map_err(|_| RecentSourceError::Storage)?
+    .map_err(|_| RecentSourceError::Storage)??;
+    recent_sources_changed(&app)
+}
+
+pub(crate) fn recent_sources_changed(app: &tauri::AppHandle) -> Result<(), RecentSourceError> {
+    sync_recent_sources_menu(app)?;
+    let _ = app.emit(RECENT_SOURCES_CHANGED_EVENT, ());
+    Ok(())
+}
+
+fn sync_recent_sources_menu(app: &tauri::AppHandle) -> Result<(), RecentSourceError> {
+    let submenu = app
+        .state::<RecentSourcesMenu>()
+        .0
+        .lock()
+        .map_err(|_| RecentSourceError::Storage)?
+        .clone();
+    let Some(submenu) = submenu else {
+        return Ok(());
+    };
+    while !submenu
+        .items()
+        .map_err(|_| RecentSourceError::Storage)?
+        .is_empty()
+    {
+        submenu
+            .remove_at(0)
+            .map_err(|_| RecentSourceError::Storage)?;
+    }
+    let recents = app.state::<OpenedSource>().recents.list(app)?;
+    for recent in &recents {
+        let item = MenuItemBuilder::with_id(
+            format!("{OPEN_RECENT_MENU_PREFIX}{}", recent.id),
+            format!("{} — {}", recent.name, recent.directory),
+        )
+        .build(app)
+        .map_err(|_| RecentSourceError::Storage)?;
+        submenu
+            .append(&item)
+            .map_err(|_| RecentSourceError::Storage)?;
+    }
+    if !recents.is_empty() {
+        let separator =
+            PredefinedMenuItem::separator(app).map_err(|_| RecentSourceError::Storage)?;
+        submenu
+            .append(&separator)
+            .map_err(|_| RecentSourceError::Storage)?;
+    }
+    let clear = MenuItemBuilder::with_id(CLEAR_RECENT_MENU_ID, "Clear Recent")
+        .enabled(!recents.is_empty())
+        .build(app)
+        .map_err(|_| RecentSourceError::Storage)?;
+    submenu
+        .append(&clear)
+        .map_err(|_| RecentSourceError::Storage)
 }
 
 /// Lists the open sources, most recently used first, for the switcher and titlebar.
@@ -1352,6 +1608,42 @@ fn activate_opened_source(
     Err(missing_data_window_session(&state))
 }
 
+/// Cycles the native MRU list atomically, so rapid shortcuts cannot use stale UI state.
+#[tauri::command]
+fn cycle_opened_source(
+    reverse: bool,
+    opened_source: tauri::State<'_, OpenedSource>,
+) -> Result<Option<u64>, DataWindowCommandError> {
+    let mut state = opened_source
+        .state
+        .lock()
+        .map_err(|_| DataWindowError::Unsupported)?;
+    Ok(cycle_opened_source_state(&mut state, reverse))
+}
+
+fn cycle_opened_source_state(state: &mut OpenedSourceState, reverse: bool) -> Option<u64> {
+    if state.sessions.len() <= 1 {
+        return state.sessions.first().map(|session| session.generation);
+    }
+    let index = if reverse { state.sessions.len() - 1 } else { 1 };
+    let generation = state.sessions[index].generation;
+    state.activate(generation);
+    Some(generation)
+}
+
+#[tauri::command]
+fn reveal_opened_source(
+    generation: u64,
+    opened_source: tauri::State<'_, OpenedSource>,
+) -> Result<(), OpenSourceError> {
+    let path = opened_source
+        .lock_state()?
+        .session(generation)
+        .map(|session| session.path.clone())
+        .ok_or(RecentSourceError::UnknownRecent)?;
+    tauri_plugin_opener::reveal_item_in_dir(path).map_err(|_| RecentSourceError::Storage.into())
+}
+
 /// Closes one open source and reports whether it closed.
 ///
 /// A running export is confirmed first: declining leaves the source open and
@@ -1361,21 +1653,21 @@ async fn close_opened_source(
     app: tauri::AppHandle,
     generation: u64,
 ) -> Result<bool, DataWindowCommandError> {
-    let file_names = app
-        .state::<OpenedSource>()
+    let opened_source = app.state::<OpenedSource>();
+    let (close_reservation, file_names) = opened_source
         .data_exports
-        .running_file_names_for(generation)
-        .unwrap_or_default();
+        .begin_source_close(generation)
+        .map_err(|_| DataWindowError::Unsupported)?;
     if !confirm_data_export_cancellation(&app, file_names, DataExportShutdownAction::CloseSource)
         .await
     {
         return Ok(false);
     }
-    let opened_source = app.state::<OpenedSource>();
-    if opened_source
+    close_reservation.cancel_and_wait();
+    let closed = opened_source
         .close(generation)
-        .map_err(|_| DataWindowError::Unsupported)?
-    {
+        .map_err(|_| DataWindowError::Unsupported);
+    if closed? {
         return Ok(true);
     }
     let state = opened_source
@@ -1389,13 +1681,14 @@ async fn close_opened_source(
 /// Rust owns the open set, so the decision cannot be left to the webview. Closing
 /// the file goes back to the UI, which owns the confirmation for a running export.
 fn request_source_close(app: &tauri::AppHandle) {
-    let has_open_sources = app
+    let active_generation = app
         .state::<OpenedSource>()
-        .open_paths()
-        .is_ok_and(|paths| !paths.is_empty());
-    if has_open_sources {
+        .lock_state()
+        .ok()
+        .and_then(|state| state.sessions.first().map(|session| session.generation));
+    if let Some(generation) = active_generation {
         // The frontend receiver can already be gone while the app is shutting down.
-        let _ = app.emit(CLOSE_SOURCE_REQUESTED_EVENT, ());
+        let _ = app.emit(CLOSE_SOURCE_REQUESTED_EVENT, generation);
     } else if let Some(window) = app.get_webview_window("main") {
         let _ = window.close();
     }
@@ -1454,6 +1747,7 @@ fn data_export_close_dialog_copy(
     debug_assert!(!file_names.is_empty());
     let (consequence, destructive_button) = match action {
         DataExportShutdownAction::Close => ("close Viewda", "Close Viewda"),
+        DataExportShutdownAction::CloseWindow => ("close this window", "Close Window"),
         DataExportShutdownAction::CloseSource => ("close this file", "Close File"),
         DataExportShutdownAction::RestartForUpdate => ("restart Viewda", "Restart Viewda"),
     };
@@ -1501,30 +1795,47 @@ fn get_pending_data_export_close_dialog(
 #[tauri::command]
 async fn resolve_data_export_close_dialog(app: tauri::AppHandle, cancel_export: bool) -> bool {
     let dialog = app.state::<DataExportCloseDialog>();
-    let Some(action) = dialog.action() else {
+    let Some(resolution) = dialog.begin_resolution() else {
         return false;
     };
 
-    if cancel_export {
-        if matches!(action, DataExportShutdownAction::RestartForUpdate) {
-            let _ = app.state::<OpenedSource>().data_exports.block_starts();
-        }
-        // One export runs at a time process-wide, so cancelling every export
-        // cancels exactly the export this decision was asked about.
-        let cancellation_app = app.clone();
-        let _ = tauri::async_runtime::spawn_blocking(move || {
-            cancellation_app
-                .state::<OpenedSource>()
-                .data_exports
-                .cancel_all_and_wait();
-        })
-        .await;
+    if !cancel_export {
+        resolution.decide(false);
+        return true;
     }
-    let Some(on_decision) = dialog.take_decision() else {
-        return false;
-    };
-    on_decision(cancel_export);
+    match resolution.action() {
+        DataExportShutdownAction::CloseSource => resolution.decide(true),
+        DataExportShutdownAction::CloseWindow => {
+            let cancellation_app = app.clone();
+            let _ = tauri::async_runtime::spawn_blocking(move || {
+                let opened_source = cancellation_app.state::<OpenedSource>();
+                opened_source
+                    .data_exports
+                    .drain_temporarily(|| resolution.decide(true))
+            })
+            .await;
+        }
+        DataExportShutdownAction::Close | DataExportShutdownAction::RestartForUpdate => {
+            let cancellation_app = app.clone();
+            let _ = tauri::async_runtime::spawn_blocking(move || {
+                cancellation_app
+                    .state::<OpenedSource>()
+                    .data_exports
+                    .cancel_all_and_wait();
+                resolution.decide(true);
+            })
+            .await;
+        }
+    }
     true
+}
+
+fn window_close_action(keeps_running_after_close: bool) -> DataExportShutdownAction {
+    if keeps_running_after_close {
+        DataExportShutdownAction::CloseWindow
+    } else {
+        DataExportShutdownAction::Close
+    }
 }
 
 async fn confirm_data_export_cancellation(
@@ -1596,7 +1907,7 @@ async fn install_pending_update(
     }
     app.state::<OpenedSource>()
         .data_exports
-        .block_starts()
+        .block_starts_and_wait()
         .map_err(|_| UpdateError::Unavailable)?;
     let result = install_pending_update_without_restart(
         app.clone(),
@@ -1634,12 +1945,15 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
         .manage(OpenedSource::default())
+        .manage(RecentSourcesMenu::default())
         .manage(DataExportCloseDialog::default())
         .manage(PendingOpenedSource::default())
         .manage(PendingUpdate::default())
         .manage(UpdateStateStore::default())
         .setup(|_app| {
             apply_saved_theme(_app.handle(), &_app.state::<UpdateStateStore>());
+            // Tauri's path resolver becomes available during setup, after the menu is built.
+            let _ = sync_recent_sources_menu(_app.handle());
             #[cfg(not(target_os = "macos"))]
             {
                 let cwd = std::env::current_dir().unwrap_or_default();
@@ -1656,6 +1970,11 @@ pub fn run() {
             let open_source = MenuItemBuilder::with_id(OPEN_SOURCE_MENU_ID, "Open File…")
                 .accelerator("CmdOrCtrl+O")
                 .build(app)?;
+            let open_recent =
+                SubmenuBuilder::with_id(app, OPEN_RECENT_MENU_ID, "Open Recent").build()?;
+            if let Ok(mut stored) = app.state::<RecentSourcesMenu>().0.lock() {
+                *stored = Some(open_recent.clone());
+            }
             let close_source = MenuItemBuilder::with_id(CLOSE_SOURCE_MENU_ID, "Close File")
                 .accelerator("CmdOrCtrl+W")
                 .build(app)?;
@@ -1684,12 +2003,18 @@ pub fn run() {
             if let Some(file_menu) = existing_file_menu {
                 let open_separator = PredefinedMenuItem::separator(app)?;
                 #[cfg(target_os = "macos")]
-                file_menu.prepend_items(&[&open_source, &close_source, &open_separator])?;
+                file_menu.prepend_items(&[
+                    &open_source,
+                    &open_recent,
+                    &close_source,
+                    &open_separator,
+                ])?;
                 #[cfg(not(target_os = "macos"))]
                 {
                     let update_separator = PredefinedMenuItem::separator(app)?;
                     file_menu.prepend_items(&[
                         &open_source,
+                        &open_recent,
                         &close_source,
                         &open_separator,
                         &settings,
@@ -1700,6 +2025,7 @@ pub fn run() {
             } else {
                 let file_menu = SubmenuBuilder::new(app, "File")
                     .item(&open_source)
+                    .item(&open_recent)
                     .separator();
                 #[cfg(not(target_os = "macos"))]
                 let file_menu = file_menu
@@ -1749,7 +2075,6 @@ pub fn run() {
                 let _ = app_menu.remove_at(quit_position)?;
                 app_menu.insert(&quit, quit_position)?;
             }
-
             Ok(menu)
         })
         .on_menu_event(|app, event| {
@@ -1763,6 +2088,13 @@ pub fn run() {
                 let _ = app.emit(OPEN_SOURCE_REQUESTED_EVENT, ());
             } else if event.id() == CLOSE_SOURCE_MENU_ID {
                 request_source_close(app);
+            } else if event.id() == CLEAR_RECENT_MENU_ID {
+                let app = app.clone();
+                tauri::async_runtime::spawn(async move {
+                    let _ = clear_recent_sources(app).await;
+                });
+            } else if let Some(id) = event.id().0.strip_prefix(OPEN_RECENT_MENU_PREFIX) {
+                launch::open_recent(app, id);
             } else if event.id() == SETTINGS_MENU_ID {
                 let _ = app.emit(SETTINGS_REQUESTED_EVENT, ());
             } else if event.id() == CHECK_FOR_UPDATES_MENU_ID {
@@ -1784,7 +2116,7 @@ pub fn run() {
                 request_data_export_close_confirmation(
                     &app,
                     file_names,
-                    DataExportShutdownAction::Close,
+                    window_close_action(cfg!(target_os = "macos")),
                     move |cancel_export| {
                         if cancel_export {
                             let _ = window.close();
@@ -1802,7 +2134,9 @@ pub fn run() {
             clear_recent_sources,
             list_opened_sources,
             activate_opened_source,
+            cycle_opened_source,
             close_opened_source,
+            reveal_opened_source,
             take_opened_source,
             get_default_application_status,
             set_default_application,
@@ -1840,21 +2174,24 @@ pub fn run() {
             match &event {
                 tauri::RunEvent::ExitRequested { api, code, .. } => {
                     let file_names = running_data_export_file_names(app);
-                    if *code != Some(tauri::RESTART_EXIT_CODE) && !file_names.is_empty() {
+                    if should_prevent_exit(cfg!(target_os = "macos"), *code, !file_names.is_empty())
+                    {
                         api.prevent_exit();
-                        let dialog_app = app.clone();
-                        let exit_app = app.clone();
-                        let exit_code = code.unwrap_or(0);
-                        request_data_export_close_confirmation(
-                            &dialog_app,
-                            file_names,
-                            DataExportShutdownAction::Close,
-                            move |cancel_export| {
-                                if cancel_export {
-                                    exit_app.exit(exit_code);
-                                }
-                            },
-                        );
+                        if !file_names.is_empty() {
+                            let dialog_app = app.clone();
+                            let exit_app = app.clone();
+                            let exit_code = code.unwrap_or(0);
+                            request_data_export_close_confirmation(
+                                &dialog_app,
+                                file_names,
+                                DataExportShutdownAction::Close,
+                                move |cancel_export| {
+                                    if cancel_export {
+                                        exit_app.exit(exit_code);
+                                    }
+                                },
+                            );
+                        }
                     }
                 }
                 tauri::RunEvent::Exit => {
@@ -1863,23 +2200,163 @@ pub fn run() {
                 _ => {}
             }
             #[cfg(target_os = "macos")]
-            if let tauri::RunEvent::Opened { urls } = event
-                && let Some(path) = urls.into_iter().find_map(|url| url.to_file_path().ok())
-            {
-                open_path(app, path);
-                if let Some(window) = app.get_webview_window("main") {
-                    let _ = window.show();
-                    let _ = window.set_focus();
+            match event {
+                tauri::RunEvent::WindowEvent { label, event, .. }
+                    if label == "main" && matches!(event, tauri::WindowEvent::Destroyed) =>
+                {
+                    let opened_source = app.state::<OpenedSource>();
+                    let _ = opened_source
+                        .data_exports
+                        .drain_temporarily(|| opened_source.close_all());
                 }
+                tauri::RunEvent::Opened { urls } => {
+                    ensure_main_window(app);
+                    for path in urls.into_iter().filter_map(|url| url.to_file_path().ok()) {
+                        open_path(app, path);
+                    }
+                }
+                tauri::RunEvent::Reopen {
+                    has_visible_windows: false,
+                    ..
+                } => {
+                    ensure_main_window(app);
+                }
+                _ => {}
             }
         });
 }
 
 #[cfg(test)]
 mod tests {
+    use std::sync::mpsc;
+
     use viewda_data_engine::SchemaField;
 
     use super::*;
+
+    #[test]
+    fn macos_keeps_running_after_the_last_window_closes() {
+        assert!(should_prevent_exit(true, None, false));
+        assert!(!should_prevent_exit(false, None, false));
+        assert!(should_prevent_exit(false, None, true));
+        assert!(!should_prevent_exit(
+            true,
+            Some(tauri::RESTART_EXIT_CODE),
+            true
+        ));
+        assert_eq!(
+            window_close_action(true),
+            DataExportShutdownAction::CloseWindow
+        );
+        assert_eq!(window_close_action(false), DataExportShutdownAction::Close);
+    }
+
+    #[test]
+    fn native_mru_cycles_single_and_rapid_requests_atomically() {
+        let opened_source = OpenedSource::default();
+        let first = open_test_source(&opened_source, "first.parquet");
+        assert_eq!(
+            cycle_opened_source_state(
+                &mut opened_source.state.lock().expect("source state"),
+                false,
+            ),
+            Some(first.generation)
+        );
+        let second = open_test_source(&opened_source, "second.parquet");
+        let third = open_test_source(&opened_source, "third.parquet");
+        let mut state = opened_source.state.lock().expect("source state");
+        assert_eq!(
+            cycle_opened_source_state(&mut state, false),
+            Some(second.generation)
+        );
+        assert_eq!(
+            cycle_opened_source_state(&mut state, false),
+            Some(third.generation)
+        );
+        assert_eq!(
+            cycle_opened_source_state(&mut state, true),
+            Some(first.generation)
+        );
+    }
+
+    #[test]
+    fn close_waits_for_registered_worker_resources_without_holding_global_state() {
+        let opened_source = Arc::new(OpenedSource::default());
+        let opened = open_test_source(&opened_source, "slow.parquet");
+        let session = opened_source
+            .state
+            .lock()
+            .expect("source state")
+            .session(opened.generation)
+            .expect("session");
+        let (ready_tx, ready_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let _work = session.begin_work().expect("registered worker");
+            let temporary = tempfile::tempdir().expect("temporary preparation directory");
+            ready_tx.send(temporary.path().to_path_buf()).unwrap();
+            release_rx.recv().unwrap();
+            drop(temporary);
+        });
+        let temporary_path = ready_rx.recv().unwrap();
+        let closing_source = Arc::clone(&opened_source);
+        let close = std::thread::spawn(move || {
+            closing_source
+                .close(opened.generation)
+                .expect("close source")
+        });
+
+        while !session_is_closing(&opened_source, opened.generation) {
+            std::thread::yield_now();
+        }
+        assert!(!close.is_finished());
+        assert!(opened_source.open_paths().expect("open paths").is_empty());
+        release_tx.send(()).unwrap();
+        worker.join().unwrap();
+        assert!(close.join().unwrap());
+        assert!(!temporary_path.exists());
+    }
+
+    #[test]
+    fn one_session_fetch_lock_does_not_block_other_session_lifecycle() {
+        let opened_source = OpenedSource::default();
+        let first = open_test_source(&opened_source, "first.parquet");
+        let second = open_test_source(&opened_source, "second.parquet");
+        let second_session = opened_source
+            .state
+            .lock()
+            .expect("source state")
+            .session(second.generation)
+            .expect("second session");
+        let _blocked_fetch = second_session.lock_state().expect("session fetch lock");
+
+        assert!(
+            opened_source
+                .state
+                .lock()
+                .expect("source state")
+                .activate(first.generation)
+        );
+        assert_eq!(opened_source.open_paths().expect("open paths").len(), 2);
+        assert!(opened_source.close(first.generation).expect("close first"));
+    }
+
+    fn session_is_closing(opened_source: &OpenedSource, generation: u64) -> bool {
+        opened_source
+            .state
+            .lock()
+            .ok()
+            .and_then(|state| state.session(generation))
+            .and_then(|session| {
+                session
+                    .lifecycle
+                    .state
+                    .lock()
+                    .ok()
+                    .map(|state| state.closing)
+            })
+            .unwrap_or(true)
+    }
 
     #[test]
     fn close_dialog_names_one_running_export_with_concise_actions() {
@@ -1979,9 +2456,72 @@ mod tests {
         assert!(!second_receiver.recv().unwrap());
         assert_eq!(dialog.copy().unwrap().message, copy.message);
 
-        dialog.take_decision().unwrap()(false);
+        dialog.begin_resolution().unwrap().decide(false);
         assert!(!first_receiver.recv().unwrap());
 
+        assert!(dialog.try_open(copy, DataExportShutdownAction::Close, |_| {}));
+    }
+
+    #[test]
+    fn close_dialog_rejects_new_work_until_the_callback_finishes() {
+        let dialog = DataExportCloseDialog::default();
+        let copy = data_export_close_dialog_copy(
+            &["orders-view.csv".to_owned()],
+            DataExportShutdownAction::Close,
+        );
+        let (entered_tx, entered_rx) = mpsc::sync_channel(1);
+        let (release_tx, release_rx) = mpsc::sync_channel(1);
+        let (first_tx, first_rx) = mpsc::sync_channel(1);
+        assert!(dialog.try_open(
+            copy.clone(),
+            DataExportShutdownAction::Close,
+            move |decision| {
+                entered_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+                first_tx.send(decision).unwrap();
+            },
+        ));
+        let resolution = dialog.begin_resolution().expect("begin resolution");
+
+        std::thread::scope(|scope| {
+            let resolving = scope.spawn(move || resolution.decide(true));
+            entered_rx.recv().expect("callback entered");
+
+            let (rejected_tx, rejected_rx) = mpsc::sync_channel(1);
+            assert!(!dialog.try_open(
+                copy.clone(),
+                DataExportShutdownAction::Close,
+                move |decision| rejected_tx.send(decision).unwrap(),
+            ));
+            assert!(!rejected_rx.recv().expect("rejected dialog decision"));
+            assert!(dialog.begin_resolution().is_none());
+
+            release_tx.send(()).unwrap();
+            resolving.join().expect("resolve dialog");
+        });
+
+        assert!(first_rx.recv().expect("first dialog decision"));
+        assert!(dialog.try_open(copy, DataExportShutdownAction::Close, |_| {}));
+    }
+
+    #[test]
+    fn close_dialog_resolution_releases_its_slot_when_the_callback_panics() {
+        let dialog = DataExportCloseDialog::default();
+        let copy = data_export_close_dialog_copy(
+            &["orders-view.csv".to_owned()],
+            DataExportShutdownAction::Close,
+        );
+        assert!(
+            dialog.try_open(copy.clone(), DataExportShutdownAction::Close, |_| panic!(
+                "simulated callback panic"
+            ),)
+        );
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            dialog.begin_resolution().unwrap().decide(true);
+        }));
+
+        assert!(result.is_err());
         assert!(dialog.try_open(copy, DataExportShutdownAction::Close, |_| {}));
     }
 
@@ -2298,11 +2838,11 @@ mod tests {
         assert!(second.generation > first.generation);
 
         {
-            let mut state = opened_source.state.lock().expect("opened source state");
-            // Both sessions answer for themselves; only the missing file is unreadable.
+            let state = opened_source.state.lock().expect("opened source state");
             for generation in [first.generation, second.generation] {
+                let session = state.session(generation).expect("opened session");
                 assert_eq!(
-                    fetch_opened_source_window(&mut state, generation, 0, 0, 1, &[]),
+                    fetch_opened_source_window(&session, 0, 0, 1, &[]),
                     Err(DataWindowCommandError::Engine(DataWindowError::Unsupported))
                 );
             }
@@ -2313,12 +2853,10 @@ mod tests {
                 .close(first.generation)
                 .expect("opened source state")
         );
-        let mut state = opened_source.state.lock().expect("opened source state");
+        let state = opened_source.state.lock().expect("opened source state");
         assert_eq!(
-            fetch_opened_source_window(&mut state, first.generation, 0, 0, 1, &[]),
-            Err(DataWindowCommandError::Session(
-                DataWindowSessionError::SourceChanged,
-            ))
+            missing_data_window_session(&state),
+            DataWindowCommandError::Session(DataWindowSessionError::SourceChanged)
         );
     }
 
@@ -2470,14 +3008,15 @@ mod tests {
             )
             .expect("source state")
             .expect("source is accepted");
-        let mut state = opened_source.state.lock().expect("opened source state");
+        let state = opened_source.state.lock().expect("opened source state");
+        let session = state.session(opened.generation).expect("opened session");
 
         assert_eq!(
-            fetch_opened_source_window(&mut state, opened.generation, 0, 0, 1, &[]),
+            fetch_opened_source_window(&session, 0, 0, 1, &[]),
             Err(DataWindowCommandError::Engine(DataWindowError::Unsupported))
         );
         assert_eq!(
-            fetch_opened_source_window(&mut state, opened.generation, 0, 0, 1, &[1]),
+            fetch_opened_source_window(&session, 0, 0, 1, &[1]),
             Err(DataWindowCommandError::Engine(DataWindowError::NotFound))
         );
     }
@@ -2487,13 +3026,16 @@ mod tests {
         let opened_source = OpenedSource::default();
         let source = open_test_source(&opened_source, "source.parquet");
         let reader = |generation| {
-            opened_source
+            let session = opened_source
                 .state
                 .lock()
                 .expect("source state")
-                .session_mut(generation)
-                .expect("opened session")
-                .text_suggestion_reader()
+                .session(generation)
+                .expect("opened session");
+            session
+                .lock_state()
+                .expect("session state")
+                .text_suggestion_reader(&session.path)
                 .expect("suggestion reader")
         };
 
@@ -2720,8 +3262,10 @@ mod tests {
             .state
             .lock()
             .expect("opened source state")
-            .session_mut(opened.generation)
+            .session(opened.generation)
             .expect("opened session")
+            .lock_state()
+            .expect("session state")
             .data_view_jobs
             .watermark = None;
 
@@ -2731,8 +3275,9 @@ mod tests {
         );
         let state = opened_source.state.lock().expect("opened source state");
         let session = state.session(opened.generation).expect("opened session");
-        assert_eq!(session.view_revision, 5);
-        assert!(session.view.is_none());
+        let session_state = session.lock_state().expect("session state");
+        assert_eq!(session_state.view_revision, 5);
+        assert!(session_state.view.is_none());
     }
 
     #[test]
@@ -2799,22 +3344,20 @@ mod tests {
             .expect("source state")
             .expect("source is accepted");
         let state = opened_source.state.lock().expect("opened source state");
+        let session = state.session(opened.generation).expect("opened session");
 
         assert_eq!(
-            statistics_request(&state, opened.generation, 0, true),
+            statistics_request(&session, 0, true),
             Ok(ColumnStatisticsRequest::Scan {
                 path: PathBuf::from("source.parquet"),
                 column_name: "trusted_name".to_owned(),
             })
         );
         assert_eq!(
-            statistics_request(&state, opened.generation, 1, true),
+            statistics_request(&session, 1, true),
             Err(ColumnStatisticsCommandError::UnsupportedColumn)
         );
-        assert_eq!(
-            statistics_request(&state, opened.generation + 1, 0, true),
-            Err(ColumnStatisticsCommandError::SourceChanged)
-        );
+        assert!(state.session(opened.generation + 1).is_none());
     }
 
     #[test]
@@ -2841,7 +3384,8 @@ mod tests {
             )
             .expect("source state")
             .expect("source is accepted");
-        let mut state = opened_source.state.lock().expect("opened source state");
+        let state = opened_source.state.lock().expect("opened source state");
+        let session = state.session(opened.generation).expect("opened session");
         let summary_statistics = ColumnStatistics {
             minimum: None,
             maximum: None,
@@ -2850,14 +3394,14 @@ mod tests {
             approximate_distinct_count: 31_300_000,
         };
 
-        cache_statistics(&mut state, opened.generation, 0, summary_statistics.clone())
+        cache_statistics(&session, 0, summary_statistics.clone())
             .expect("summary statistics should be cached");
         assert_eq!(
-            statistics_request(&state, opened.generation, 0, false),
+            statistics_request(&session, 0, false),
             Ok(ColumnStatisticsRequest::Cached(summary_statistics))
         );
         assert!(matches!(
-            statistics_request(&state, opened.generation, 0, true),
+            statistics_request(&session, 0, true),
             Ok(ColumnStatisticsRequest::Scan { .. })
         ));
 
@@ -2868,10 +3412,10 @@ mod tests {
             null_share: 0.25,
             approximate_distinct_count: 31_300_000,
         };
-        cache_statistics(&mut state, opened.generation, 0, full_statistics.clone())
+        cache_statistics(&session, 0, full_statistics.clone())
             .expect("full statistics should replace the summary");
         assert_eq!(
-            statistics_request(&state, opened.generation, 0, true),
+            statistics_request(&session, 0, true),
             Ok(ColumnStatisticsRequest::Cached(full_statistics))
         );
 
@@ -2891,12 +3435,10 @@ mod tests {
                 .expect("opened source state")
         );
         let state = opened_source.state.lock().expect("opened source state");
-        assert_eq!(
-            statistics_request(&state, opened.generation, 0, false),
-            Err(ColumnStatisticsCommandError::SourceChanged)
-        );
+        assert!(state.session(opened.generation).is_none());
+        let second_session = state.session(second.generation).expect("second session");
         assert!(matches!(
-            statistics_request(&state, second.generation, 0, false),
+            statistics_request(&second_session, 0, false),
             Ok(ColumnStatisticsRequest::Scan { .. })
         ));
     }
@@ -3004,14 +3546,14 @@ mod tests {
         let builder =
             DataViewBuilder::new(PathBuf::from("view.parquet"), &[], &[]).expect("view builder");
         let interrupt = Arc::new(builder.interrupt_handle());
+        let session = opened_source
+            .state
+            .lock()
+            .expect("opened source state")
+            .session(generation)
+            .expect("opened session");
         register_data_view_job(
-            &mut opened_source
-                .state
-                .lock()
-                .expect("opened source state")
-                .session_mut(generation)
-                .expect("opened session")
-                .data_view_jobs,
+            &mut session.lock_state().expect("session state").data_view_jobs,
             ActiveDataViewJob {
                 view_revision: 1,
                 interrupt: Arc::clone(&interrupt),
@@ -3028,13 +3570,16 @@ mod tests {
         let reader = TextValueSuggestionsReader::new(PathBuf::from("suggestions.parquet"))
             .expect("suggestion reader");
         let interrupt = Arc::new(reader.interrupt_handle());
+        let session = opened_source
+            .state
+            .lock()
+            .expect("opened source state")
+            .session(generation)
+            .expect("opened session");
         register_text_value_suggestion_job(
-            &mut opened_source
-                .state
-                .lock()
-                .expect("opened source state")
-                .session_mut(generation)
-                .expect("opened session")
+            &mut session
+                .lock_state()
+                .expect("session state")
                 .text_suggestion_jobs,
             ActiveTextValueSuggestionJob {
                 suggestion_revision: 1,
@@ -3059,8 +3604,10 @@ mod tests {
             .state
             .lock()
             .expect("opened source state")
-            .session_mut(generation)
+            .session(generation)
             .expect("opened session")
+            .lock_state()
+            .expect("session state")
             .statistics_job = Some(Arc::clone(&job));
         job
     }

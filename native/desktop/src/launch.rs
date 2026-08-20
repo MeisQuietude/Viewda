@@ -61,6 +61,26 @@ pub fn open_path(app: &tauri::AppHandle, path: PathBuf) {
     };
 
     publish(app, activation);
+    let _ = crate::recent_sources_changed(app);
+}
+
+pub fn open_recent(app: &tauri::AppHandle, id: &str) {
+    let activation = match crate::open_recent_source_with_app(app, id) {
+        Ok((_, source)) => OpenedSourceActivation {
+            source: Some(source),
+            source_error: None,
+        },
+        Err(OpenSourceError::Source(error)) => OpenedSourceActivation {
+            source: None,
+            source_error: Some(error),
+        },
+        Err(OpenSourceError::Recent(_)) => OpenedSourceActivation {
+            source: None,
+            source_error: Some(SourceError::Unsupported),
+        },
+    };
+    publish(app, activation);
+    let _ = crate::recent_sources_changed(app);
 }
 
 /// Opens every Parquet file of one drag and drop without exposing the paths.

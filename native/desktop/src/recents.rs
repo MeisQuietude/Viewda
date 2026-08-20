@@ -13,13 +13,15 @@ use thiserror::Error;
 const RECENT_SOURCES_FILE: &str = "recents.json";
 const RECENT_SOURCES_LIMIT: usize = 8;
 
-/// A path-free recent-source entry exposed to the desktop UI.
+/// A recent-source entry exposed to the desktop switcher.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RecentSource {
     pub id: String,
     pub name: String,
     pub directory: String,
+    /// Canonical identity used for exact open-file exclusion and explicit display.
+    pub path: String,
 }
 
 /// Stable failures for recent-source commands.
@@ -176,10 +178,11 @@ fn display_entry(entry: &StoredRecentSource, home: Option<&Path>) -> RecentSourc
         id: entry.id.clone(),
         name,
         directory: display_directory(&entry.path, home),
+        path: entry.path.to_string_lossy().into_owned(),
     }
 }
 
-/// Renders the directory of a source for display, shortened against `home`.
+/// Renders the full parent directory, replacing a canonical `home` prefix with `~`.
 ///
 /// `home` must already be canonical: paths are stored canonicalized, and a
 /// symlinked home would otherwise never match.
@@ -198,12 +201,7 @@ pub(crate) fn display_directory(path: &Path, home: Option<&Path>) -> String {
                 format!("~/{relative}")
             }
         })
-        .unwrap_or_else(|| {
-            parent.file_name().map_or_else(
-                || "…".to_owned(),
-                |name| format!("…/{}", name.to_string_lossy()),
-            )
-        })
+        .unwrap_or_else(|| parent.to_string_lossy().into_owned())
 }
 
 fn read_state_file(path: &Path) -> Result<StoredRecentSources, RecentSourceError> {
@@ -358,7 +356,7 @@ mod tests {
     }
 
     #[test]
-    fn shortens_directories_outside_the_home_path() {
+    fn keeps_full_directories_outside_home_and_shortens_the_home_prefix() {
         let directory = tempfile::tempdir().expect("temporary directory");
         let home = directory.path().join("home");
         let external = directory.path().join("external");
@@ -375,11 +373,15 @@ mod tests {
             .list_path(&state_path, Some(&home))
             .expect("shortened recent source");
 
-        assert_eq!(entries[0].directory, "…/external");
-        assert!(
-            !entries[0]
-                .directory
-                .contains(directory.path().to_string_lossy().as_ref())
+        assert_eq!(
+            entries[0].directory,
+            fs::canonicalize(&external)
+                .expect("canonical external directory")
+                .to_string_lossy()
+        );
+        assert_eq!(
+            display_directory(&home.join("reports/source.parquet"), Some(&home)),
+            "~/reports"
         );
     }
 }

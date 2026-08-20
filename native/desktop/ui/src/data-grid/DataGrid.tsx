@@ -459,10 +459,14 @@ export function DataGrid({
   source,
   viewSettings = DEFAULT_DATA_VIEW_SETTINGS,
   diagnostics = gridDiagnosticsNoopSink,
+  active = true,
+  onOperationChange,
 }: {
   source: SourceSummary;
   viewSettings?: DataViewSettings;
   diagnostics?: GridDiagnosticsSink;
+  active?: boolean;
+  onOperationChange?: (running: boolean) => void;
 }) {
   const [columnStates, setColumnStates] = useState<ColumnState[]>(() =>
     source.schema.map((field, sourceIndex) => ({
@@ -555,6 +559,20 @@ export function DataGrid({
   const wherePopupAnchorRef = useRef<HTMLDivElement>(null);
   const wherePopupRef = useRef<HTMLDivElement>(null);
   const sortPopupRef = useRef<HTMLDivElement>(null);
+  const onOperationChangeRef = useRef(onOperationChange);
+  onOperationChangeRef.current = onOperationChange;
+
+  useEffect(() => {
+    const exportRunning = exportStarting || exportStatus?.state === "running";
+    onOperationChangeRef.current?.(pendingView !== null || exportRunning);
+  }, [exportStarting, exportStatus?.state, pendingView]);
+
+  useEffect(
+    () => () => {
+      onOperationChangeRef.current?.(false);
+    },
+    [],
+  );
 
   const visibleColumnStates = useMemo(
     () => [
@@ -1358,7 +1376,7 @@ export function DataGrid({
   );
 
   const refreshExportStatus = useCallback(() => {
-    void getDataExportStatus().then(
+    void getDataExportStatus(source.generation).then(
       (status) => {
         exportStatusFailuresRef.current = 0;
         setExportStatus(status);
@@ -1586,6 +1604,9 @@ export function DataGrid({
   }, [sortPopupOpen]);
 
   useEffect(() => {
+    if (!active) {
+      return;
+    }
     const toggleSidebar = (event: globalThis.KeyboardEvent) => {
       if (
         !(event.metaKey || event.ctrlKey) ||
@@ -1600,9 +1621,12 @@ export function DataGrid({
     };
     window.addEventListener("keydown", toggleSidebar);
     return () => window.removeEventListener("keydown", toggleSidebar);
-  }, []);
+  }, [active]);
 
   useEffect(() => {
+    if (!active) {
+      return;
+    }
     const exportView = (event: globalThis.KeyboardEvent) => {
       if (
         !(event.metaKey || event.ctrlKey) ||
@@ -1618,7 +1642,7 @@ export function DataGrid({
     };
     window.addEventListener("keydown", exportView);
     return () => window.removeEventListener("keydown", exportView);
-  }, [selectedExport, startExport]);
+  }, [active, selectedExport, startExport]);
 
   useEffect(() => {
     const sourceIndex = schemaFocusColumnRef.current;

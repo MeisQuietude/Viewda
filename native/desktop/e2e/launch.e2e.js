@@ -330,7 +330,7 @@ try {
       },
     );
     assert.equal(clickedRecent, true);
-    await waitForText(".file-context", /^people\.parquet$/);
+    await waitForText(".file-context-name", /^people\.parquet$/);
     await waitForGridCell("name", 0, /^Ada$/);
 
     const grid = await inspectGrid();

@@ -357,8 +357,9 @@ pub fn discard_pending_update(pending: State<'_, PendingUpdate>) -> Result<(), U
 ///
 /// The pending restart marker is written before installation because the
 /// Windows updater exits the process as part of the install. The marker keeps
-/// the currently open sources entirely in Rust and lets the new process restore
-/// them without ever handing their paths to the webview.
+/// the currently open sources in Rust and lets the new process restore them
+/// through the data engine. The switcher later receives canonical paths only
+/// for search, tooltip, and explicit path actions.
 pub(crate) async fn install_pending_update(
     app: AppHandle,
     pending: State<'_, PendingUpdate>,

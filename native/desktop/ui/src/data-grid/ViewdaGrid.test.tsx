@@ -526,6 +526,7 @@ describe("ViewdaGrid foundation", () => {
     });
     let resize: (() => void) | undefined;
     let visible = true;
+    let scrollLeft = 0;
     const port: GridMeasurementPort = {
       ...measurementPort(420, 84),
       // A hidden panel reports a zero viewport, and the browser forgets the
@@ -534,7 +535,7 @@ describe("ViewdaGrid foundation", () => {
         width: visible ? 420 : 0,
         height: visible ? 84 : 0,
         scrollTop: visible ? scrollport.scrollTop : 0,
-        scrollLeft: 0,
+        scrollLeft: visible ? scrollLeft : 0,
         devicePixelRatio: 1,
       }),
       observe: (_element, callback) => {
@@ -549,12 +550,17 @@ describe("ViewdaGrid foundation", () => {
       ".viewda-grid-body-scrollport",
     ) as HTMLElement;
     scrollport.scrollTop = 4_200;
+    scrollLeft = 640;
+    scrollport.scrollLeft = 640;
     fireEvent.scroll(scrollport);
     act(() => frames.shift()?.(0));
     expect(scrollport.scrollTop).toBe(4_200);
+    expect(scrollport.scrollLeft).toBe(640);
 
     visible = false;
     scrollport.scrollTop = 0;
+    scrollLeft = 0;
+    scrollport.scrollLeft = 0;
     act(() => resize?.());
     act(() => frames.shift()?.(0));
 
@@ -563,6 +569,7 @@ describe("ViewdaGrid foundation", () => {
     act(() => frames.shift()?.(0));
 
     expect(scrollport.scrollTop).toBe(4_200);
+    expect(scrollport.scrollLeft).toBe(640);
   });
 
   it("reports viewport shapes once and uses the latest callback", async () => {
