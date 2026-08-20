@@ -26,23 +26,18 @@ draft release. Smoke-test its assets on physical target machines before
 publishing it. Publishing refreshes the Stable and Latest update channels on
 GitHub Pages.
 
-## Testing a branch installer
+## Testing a pull request installer
 
-Open **Actions → Platform builds → Run workflow** and keep **Use workflow
-from** on `main`. Enter any repository branch, tag, or commit in `source_ref`,
-then select the installable target. Linux x64 produces Debian and AppImage
-downloads; macOS targets produce DMG downloads; Windows x64 produces an NSIS
-executable. The Actions archive name contains the resolved commit SHA and
-remains available for seven days.
+Every pull request to `main`, including a draft, builds installers from its
+merge commit. Download them from the **Platform builds** run under
+**Artifacts**. Archives expire after seven days.
 
-Manual branch builds never receive the updater signing key and cannot create a
-release. Select `all` to run the same platform and installer gates as the
-nightly rehearsal, without updater companions or release publication.
-Before merging changes to Linux packaging, bundled native libraries, startup,
-or updater behavior, run `linux-x64`: it includes the installed Debian and
-AppImage WebDriver smoke tests that ordinary pull requests omit. Run the
-affected macOS or Windows target before merging platform-specific packaging
-changes.
+- Linux x64: Debian and AppImage
+- macOS: Apple silicon, Intel, and Universal DMGs
+- Windows x64: NSIS
+
+The workflow installs and launches these builds without signing updater
+artifacts or publishing a release.
 
 ## Prereleases
 
@@ -67,14 +62,11 @@ Release notes follow the reader:
 
 ## What automation produces
 
-Branches without an open pull request run the complete shared checks on Linux
-and native Rust checks on macOS arm64 and Windows x64 for every push. Pull
-requests run the same checks against GitHub's merge ref with their target
-branch. They do not build installers. A release tag must pass those checks
-before any platform build starts. The nightly platform rehearsal runs only when
-`main` changed since its latest successful scheduled run. Nightlies and release
-tags verify Linux x64 AppImage and Debian packages, macOS Apple silicon and
-Intel installers, Universal macOS, and Windows x64. Each directly installable
-format has its own Actions archive with the full commit SHA. Updater companions
-are archived only for release tags; release files use the release version
-instead.
+Branches without an open pull request run the shared Linux checks and native
+Rust checks on macOS arm64 and Windows x64. Pull requests run those checks plus
+every installer and launch gate against their merge ref. Nightlies repeat the
+installer matrix when `main` changes. Version tags run the shared checks, build
+the same matrix with updater signatures, and create a draft release.
+
+Each installer has its own Actions archive named with the tested commit SHA.
+Release assets use the release version instead.
