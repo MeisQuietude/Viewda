@@ -8,6 +8,10 @@ Backward-incompatible entries start with **Breaking:**.
 
 ## Unreleased
 
+### Added
+
+- Open Parquet files by dropping them on the window.
+
 ## 0.1.0 — 2026-08-20
 
 Viewda's first stable release: a free, fully offline viewer for local

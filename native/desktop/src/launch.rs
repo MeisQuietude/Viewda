@@ -1,9 +1,13 @@
 //! Native file-open activation without exposing filesystem paths to the webview.
 
-use std::{path::PathBuf, sync::Mutex};
+use std::{
+    collections::VecDeque,
+    path::{Path, PathBuf},
+    sync::Mutex,
+};
 
 #[cfg(any(not(target_os = "macos"), test))]
-use std::{ffi::OsString, path::Path};
+use std::ffi::OsString;
 
 use serde::Serialize;
 use tauri::{Emitter, Manager};
@@ -15,9 +19,12 @@ use crate::{
 
 pub const OPENED_SOURCE_AVAILABLE_EVENT: &str = "opened-source-available";
 
-/// One native activation result waiting for the webview to consume it.
+/// Native activation results waiting for the webview to consume them, oldest first.
+///
+/// Dropping several files at once activates them faster than the webview drains
+/// the queue, and every activation carries a source the window must keep open.
 #[derive(Default)]
-pub struct PendingOpenedSource(Mutex<Option<OpenedSourceActivation>>);
+pub struct PendingOpenedSource(Mutex<VecDeque<OpenedSourceActivation>>);
 
 /// Path-free result of an operating-system file-open activation.
 #[derive(Clone, Serialize)]
@@ -31,7 +38,7 @@ pub struct OpenedSourceActivation {
 pub fn take_opened_source(
     pending: tauri::State<'_, PendingOpenedSource>,
 ) -> Option<OpenedSourceActivation> {
-    pending.0.lock().ok()?.take()
+    pending.0.lock().ok()?.pop_front()
 }
 
 pub fn open_path(app: &tauri::AppHandle, path: PathBuf) {
@@ -53,8 +60,51 @@ pub fn open_path(app: &tauri::AppHandle, path: PathBuf) {
         },
     };
 
+    publish(app, activation);
+}
+
+/// Opens every Parquet file of one drag and drop without exposing the paths.
+///
+/// Files open in drop order, so the last one dropped becomes the active source.
+pub fn open_dropped_paths(app: &tauri::AppHandle, paths: Vec<PathBuf>) {
+    match dropped_parquet_paths(paths) {
+        Ok(paths) => {
+            for path in paths {
+                open_path(app, path);
+            }
+        }
+        Err(error) => report_source_error(app, error),
+    }
+}
+
+fn dropped_parquet_paths(paths: Vec<PathBuf>) -> Result<Vec<PathBuf>, SourceError> {
+    let paths: Vec<PathBuf> = paths.into_iter().filter(|path| is_parquet(path)).collect();
+    if paths.is_empty() {
+        return Err(SourceError::NotParquet);
+    }
+    Ok(paths)
+}
+
+fn is_parquet(path: &Path) -> bool {
+    path.extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("parquet"))
+}
+
+fn report_source_error(app: &tauri::AppHandle, error: SourceError) {
+    let _ = app.state::<OpenedSource>().mark_explicit();
+    publish(
+        app,
+        OpenedSourceActivation {
+            source: None,
+            source_error: Some(error),
+        },
+    );
+}
+
+fn publish(app: &tauri::AppHandle, activation: OpenedSourceActivation) {
     if let Ok(mut pending) = app.state::<PendingOpenedSource>().0.lock() {
-        *pending = Some(activation);
+        pending.push_back(activation);
     }
     let _ = app.emit(OPENED_SOURCE_AVAILABLE_EVENT, ());
 }
@@ -67,16 +117,7 @@ where
     match parquet_path_from_args(args, cwd) {
         Ok(Some(path)) => open_path(app, path),
         Ok(None) => {}
-        Err(error) => {
-            let _ = app.state::<OpenedSource>().mark_explicit();
-            if let Ok(mut pending) = app.state::<PendingOpenedSource>().0.lock() {
-                *pending = Some(OpenedSourceActivation {
-                    source: None,
-                    source_error: Some(error),
-                });
-            }
-            let _ = app.emit(OPENED_SOURCE_AVAILABLE_EVENT, ());
-        }
+        Err(error) => report_source_error(app, error),
     }
 }
 
@@ -93,11 +134,7 @@ where
         return Ok(None);
     };
     let path = PathBuf::from(raw_path);
-    let is_parquet = path
-        .extension()
-        .and_then(|extension| extension.to_str())
-        .is_some_and(|extension| extension.eq_ignore_ascii_case("parquet"));
-    if !is_parquet {
+    if !is_parquet(&path) {
         return Err(SourceError::NotParquet);
     }
 
@@ -168,6 +205,32 @@ mod tests {
                 directory.path()
             ),
             Ok(None)
+        );
+    }
+
+    #[test]
+    fn a_drop_opens_its_parquet_files_in_drop_order() {
+        assert_eq!(
+            dropped_parquet_paths(vec![
+                PathBuf::from("/data/notes.txt"),
+                PathBuf::from("/data/first.parquet"),
+                PathBuf::from("/data/second.PARQUET"),
+            ]),
+            Ok(vec![
+                PathBuf::from("/data/first.parquet"),
+                PathBuf::from("/data/second.PARQUET"),
+            ])
+        );
+    }
+
+    #[test]
+    fn a_drop_without_parquet_files_reports_one_source_error() {
+        assert_eq!(
+            dropped_parquet_paths(vec![
+                PathBuf::from("/data/notes.txt"),
+                PathBuf::from("/data/table.csv"),
+            ]),
+            Err(SourceError::NotParquet)
         );
     }
 

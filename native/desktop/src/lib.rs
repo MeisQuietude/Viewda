@@ -1727,6 +1727,9 @@ pub fn run() {
             }
         })
         .on_window_event(|window, event| {
+            if let tauri::WindowEvent::DragDrop(tauri::DragDropEvent::Drop { paths, .. }) = event {
+                launch::open_dropped_paths(window.app_handle(), paths.clone());
+            }
             if let tauri::WindowEvent::CloseRequested { api, .. } = event {
                 let file_names = running_data_export_file_names(window.app_handle());
                 if file_names.is_empty() {
