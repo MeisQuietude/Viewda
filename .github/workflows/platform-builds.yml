@@ -1,39 +1,22 @@
 # Distributable artifacts must be produced and launched on their target OS.
-# Tags always build the complete release set. Maintainers can also select one
-# installable target from any branch without exposing the updater signing key
-# to code outside a trusted tag or scheduled rehearsal.
+# Pull requests build the complete installable set before merge. Tags and the
+# scheduled rehearsal additionally receive the updater signing key.
 name: Platform builds
 run-name: >-
-  ${{ github.event_name == 'workflow_dispatch' &&
-  format('{0} from {1}', inputs.platform, inputs.source_ref) ||
+  ${{ github.event_name == 'pull_request' &&
+  format('PR #{0}: {1}', github.event.pull_request.number,
+  github.event.pull_request.title) ||
   github.event_name == 'schedule' &&
   format('Nightly rehearsal from {0}', github.ref_name) ||
   format('Release {0}', github.ref_name) }}
 
 on:
+  pull_request:
+    branches: [main]
   push:
     tags: ["v*"]
   schedule:
     - cron: "17 1 * * *"
-  workflow_dispatch:
-    inputs:
-      source_ref:
-        description: Branch, tag, or commit to build
-        required: true
-        default: main
-        type: string
-      platform:
-        description: Installable target to build from the selected branch
-        required: true
-        default: all
-        type: choice
-        options:
-          - all
-          - linux-x64
-          - macos-arm64
-          - macos-x64
-          - macos-universal
-          - windows-x64
 
 permissions:
   actions: read
@@ -41,10 +24,7 @@ permissions:
   pull-requests: read
 
 concurrency:
-  group: >-
-    platform-builds-${{ github.event_name == 'workflow_dispatch' &&
-    inputs.source_ref || github.ref }}-${{
-    github.event_name == 'workflow_dispatch' && inputs.platform || 'all' }}
+  group: platform-builds-${{ github.ref }}
   cancel-in-progress: true
 
 env:
@@ -69,12 +49,8 @@ jobs:
       release: ${{ steps.source.outputs.release }}
       sha: ${{ steps.source.outputs.sha }}
     steps:
-      - name: Check out the requested source
+      - name: Check out the tested source
         uses: actions/checkout@v6
-        with:
-          ref: >-
-            ${{ github.event_name == 'workflow_dispatch' &&
-            inputs.source_ref || github.ref }}
 
       - name: Record the exact source commit
         id: source
@@ -123,10 +99,7 @@ jobs:
       needs.source.result == 'success' &&
       needs.source.outputs.build == 'true' &&
       (needs.source.outputs.release != 'true' ||
-      needs.release-checks.result == 'success') &&
-      (github.event_name != 'workflow_dispatch' ||
-      inputs.platform == 'all' ||
-      inputs.platform == 'linux-x64')
+      needs.release-checks.result == 'success')
     name: Linux x64 artifact
     # AppImage inherits its glibc floor from the build host. Ubuntu 22.04 is
     # the oldest supported GitHub runner with WebKitGTK 4.1, so using a newer
@@ -138,7 +111,8 @@ jobs:
       SCCACHE_GHA_ENABLED: "true"
       SCCACHE_GHA_VERSION: viewda-platform-v1
       TAURI_SIGNING_PRIVATE_KEY: >-
-        ${{ github.event_name != 'workflow_dispatch' &&
+        ${{ (github.event_name == 'schedule' ||
+        (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v'))) &&
         secrets.TAURI_SIGNING_PRIVATE_KEY || '' }}
       TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ""
     steps:
@@ -334,10 +308,7 @@ jobs:
       needs.source.result == 'success' &&
       needs.source.outputs.build == 'true' &&
       (needs.source.outputs.release != 'true' ||
-      needs.release-checks.result == 'success') &&
-      (github.event_name != 'workflow_dispatch' ||
-      inputs.platform == 'all' ||
-      startsWith(inputs.platform, 'macos-'))
+      needs.release-checks.result == 'success')
     # Pinned to the OS generation real users run: dyld and signing policy
     # tighten across macOS generations, so a launch gate on an older
     # runner accepts bundles a newer macOS refuses.
@@ -356,45 +327,35 @@ jobs:
             dmg-architecture: x64
     runs-on: ${{ matrix.runner }}
     env:
-      BUILD_SELECTED: >-
-        ${{ github.event_name != 'workflow_dispatch' ||
-        inputs.platform == 'all' ||
-        inputs.platform == 'macos-universal' ||
-        inputs.platform == format('macos-{0}', matrix.artifact-architecture) }}
       CARGO_SYSTEM_LAYER: ${{ matrix.runner }}
       RUSTC_WRAPPER: sccache
       SCCACHE_GHA_ENABLED: "true"
       SCCACHE_GHA_VERSION: viewda-platform-v1
       TAURI_SIGNING_PRIVATE_KEY: >-
-        ${{ github.event_name != 'workflow_dispatch' &&
+        ${{ (github.event_name == 'schedule' ||
+        (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v'))) &&
         secrets.TAURI_SIGNING_PRIVATE_KEY || '' }}
       TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ""
     steps:
       - name: Check out the tested commit
-        if: env.BUILD_SELECTED == 'true'
         uses: actions/checkout@v6
         with:
           ref: ${{ needs.source.outputs.sha }}
 
       - name: Require the updater signing key
-        if: >-
-          env.BUILD_SELECTED == 'true' &&
-          env.REQUIRE_UPDATER_ARTIFACTS == 'true'
+        if: env.REQUIRE_UPDATER_ARTIFACTS == 'true'
         run: test -n "$TAURI_SIGNING_PRIVATE_KEY"
 
       - name: Install the pinned Rust toolchain
-        if: env.BUILD_SELECTED == 'true'
         run: rustup toolchain install
         working-directory: native
 
       - name: Install sccache
-        if: env.BUILD_SELECTED == 'true'
         uses: mozilla-actions/sccache-action@v0.0.11
         with:
           version: v0.17.0
 
       - name: Restore Cargo sources
-        if: env.BUILD_SELECTED == 'true'
         uses: actions/cache@v5
         with:
           path: |
@@ -406,7 +367,6 @@ jobs:
             cargo-sources-${{ env.CARGO_CACHE_EPOCH }}-${{ env.CARGO_SYSTEM_LAYER }}-${{ runner.arch }}-${{ hashFiles('native/rust-toolchain.toml') }}-
 
       - name: Restore provisioned dependencies
-        if: env.BUILD_SELECTED == 'true'
         uses: actions/cache@v5
         with:
           path: |
@@ -418,19 +378,15 @@ jobs:
             provision-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('.node-version', 'scripts/install-node.sh', 'scripts/install-duckdb.sh') }}-
 
       - name: Verify runner architecture
-        if: env.BUILD_SELECTED == 'true'
         run: test "$(uname -m)" = "${{ matrix.host-architecture }}"
 
       - name: Prepare the artifact build
-        if: env.BUILD_SELECTED == 'true'
         run: scripts/run.sh setup
 
       - name: Build the macOS ${{ matrix.artifact-architecture }} artifact
-        if: env.BUILD_SELECTED == 'true'
         run: scripts/run.sh bundle
 
       - name: Verify packaged DuckDB
-        if: env.BUILD_SELECTED == 'true'
         run: |
           app=native/target/release/bundle/macos/Viewda.app
           executable="$app/Contents/MacOS/viewda"
@@ -496,7 +452,6 @@ jobs:
       # signatures and rpath. DYLD_FALLBACK_LIBRARY_PATH is stripped so the dev
       # copy in native/.duckdb cannot satisfy dyld and mask a broken installer.
       - name: Verify and launch the DMG installer
-        if: env.BUILD_SELECTED == 'true'
         run: |
           version=$(scripts/release.sh version)
           source_dmg="native/target/release/bundle/dmg/Viewda_${version}_${{ matrix.dmg-architecture }}.dmg"
@@ -570,7 +525,6 @@ jobs:
           trap - EXIT
 
       - name: Upload the macOS ${{ matrix.artifact-architecture }} artifact
-        if: env.BUILD_SELECTED == 'true'
         uses: actions/upload-artifact@v7
         with:
           name: viewda-macos-${{ matrix.artifact-architecture }}-${{ needs.source.outputs.sha }}
@@ -579,9 +533,7 @@ jobs:
           retention-days: 7
 
       - name: Upload the macOS ${{ matrix.artifact-architecture }} updater
-        if: >-
-          env.BUILD_SELECTED == 'true' &&
-          needs.source.outputs.release == 'true'
+        if: needs.source.outputs.release == 'true'
         uses: actions/upload-artifact@v7
         with:
           name: viewda-updater-macos-${{ matrix.artifact-architecture }}-${{ needs.source.outputs.sha }}
@@ -595,10 +547,7 @@ jobs:
     if: >-
       always() &&
       needs.source.result == 'success' &&
-      needs.macos.result == 'success' &&
-      (github.event_name != 'workflow_dispatch' ||
-      inputs.platform == 'all' ||
-      inputs.platform == 'macos-universal')
+      needs.macos.result == 'success'
     name: macOS Universal derived artifact
     needs: [source, macos]
     runs-on: macos-26
@@ -782,10 +731,7 @@ jobs:
       needs.source.result == 'success' &&
       needs.source.outputs.build == 'true' &&
       (needs.source.outputs.release != 'true' ||
-      needs.release-checks.result == 'success') &&
-      (github.event_name != 'workflow_dispatch' ||
-      inputs.platform == 'all' ||
-      inputs.platform == 'windows-x64')
+      needs.release-checks.result == 'success')
     name: Windows x64 installer
     runs-on: windows-2025
     env:
@@ -797,7 +743,8 @@ jobs:
       # provision cache shared with the other native jobs.
       npm_config_cache: ~/.npm
       TAURI_SIGNING_PRIVATE_KEY: >-
-        ${{ github.event_name != 'workflow_dispatch' &&
+        ${{ (github.event_name == 'schedule' ||
+        (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v'))) &&
         secrets.TAURI_SIGNING_PRIVATE_KEY || '' }}
       TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ""
     defaults:
@@ -989,10 +936,7 @@ jobs:
     if: >-
       always() &&
       needs.source.result == 'success' &&
-      needs.linux.result == 'success' &&
-      (github.event_name != 'workflow_dispatch' ||
-      inputs.platform == 'all' ||
-      inputs.platform == 'linux-x64')
+      needs.linux.result == 'success'
     name: Linux downloaded-artifact acceptance
     needs: [source, linux]
     runs-on: ubuntu-24.04
