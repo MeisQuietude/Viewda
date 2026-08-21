@@ -139,7 +139,7 @@ fn map_io_error(error: io::Error) -> SourceError {
     }
 }
 
-fn map_parquet_error(error: ParquetError) -> SourceError {
+pub(crate) fn map_parquet_error(error: ParquetError) -> SourceError {
     match error {
         ParquetError::NYI(_) => SourceError::Unsupported,
         ParquetError::External(external) => external
@@ -176,7 +176,7 @@ fn schema_field(field: &Type) -> SchemaField {
     }
 }
 
-fn physical_type_name(physical_type: &ParquetPhysicalType) -> &'static str {
+pub(crate) fn physical_type_name(physical_type: &ParquetPhysicalType) -> &'static str {
     match physical_type {
         ParquetPhysicalType::BOOLEAN => "BOOLEAN",
         ParquetPhysicalType::INT32 => "INT32",
@@ -189,7 +189,7 @@ fn physical_type_name(physical_type: &ParquetPhysicalType) -> &'static str {
     }
 }
 
-fn logical_type_name(logical_type: &LogicalType) -> String {
+pub(crate) fn logical_type_name(logical_type: &LogicalType) -> String {
     match logical_type {
         LogicalType::String => "String".to_owned(),
         LogicalType::Map => "Map".to_owned(),
@@ -246,7 +246,7 @@ fn logical_type_name(logical_type: &LogicalType) -> String {
     }
 }
 
-fn converted_type_name(field: &Type, converted_type: ConvertedType) -> Option<String> {
+pub(crate) fn converted_type_name(field: &Type, converted_type: ConvertedType) -> Option<String> {
     let name = match converted_type {
         ConvertedType::NONE => return None,
         ConvertedType::UTF8 => "String".to_owned(),

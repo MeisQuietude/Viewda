@@ -7,6 +7,7 @@ mod filter;
 mod source;
 #[cfg(feature = "query-engine")]
 mod statistics;
+mod structure;
 #[cfg(feature = "query-engine")]
 mod suggestions;
 #[cfg(feature = "query-engine")]
@@ -32,6 +33,16 @@ pub use source::{SchemaField, SourceError, SourceSummary, inspect_local_source};
 #[cfg(feature = "query-engine")]
 pub use statistics::{
     ColumnStatistics, ColumnStatisticsError, ColumnStatisticsReader, StatisticsInterruptHandle,
+};
+pub use structure::{
+    StructureBloomProbe, StructureBloomProbeOutcome, StructureBloomProbeResult, StructureByteUnit,
+    StructureCancellation, StructureChunkDetails, StructureChunkStatistics, StructureCodecTotal,
+    StructureColumnPage, StructureColumnSort, StructureColumnSummary, StructureError,
+    StructureKeyValue, StructureKeyValueEntry, StructureLayout, StructureLayoutRow,
+    StructureLayoutSegment, StructureLayoutTail, StructureLensTotal, StructureLensTotals,
+    StructureLoadProgress, StructureLoadSnapshot, StructurePresenceTotals, StructureRatioStep,
+    StructureReader, StructureRowGroupPage, StructureRowGroupSort, StructureRowGroupSummary,
+    StructureSortDirection, StructureSummary,
 };
 #[cfg(feature = "query-engine")]
 pub use suggestions::{
