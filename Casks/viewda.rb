@@ -1,9 +1,9 @@
 cask "viewda" do
   arch arm: "arm64", intel: "x64"
 
-  version "0.1.0"
-  sha256 arm:   "b93ef5701abd02743ecca951220d39fe76b66c3b7cdf6db6d31e2d4b2b5b6fad",
-         intel: "92c2a57666e7c2c12a27ab285879c3dad1bccbf4e2e3d63f0eeacd29738b9e63"
+  version "0.2.0"
+  sha256 arm:   "55cca4a65b3e62cffc7ab3a445f6d56987ac5c0409f27be7a3a73e6cb8d958d4",
+         intel: "16c9f9c63ba869a327af907f948bdec0d4c664336dbf3bcff33afe03e5a676f4"
 
   url "https://github.com/MeisQuietude/Viewda/releases/download/v#{version}/Viewda_#{version}_#{arch}.dmg"
   name "Viewda"
