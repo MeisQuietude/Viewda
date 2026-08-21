@@ -12,9 +12,33 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { App, formatFileSize } from "./App";
 import * as desktop from "./desktop";
 
+const dataGridProps = vi.hoisted(() => vi.fn());
 vi.mock("./data-grid/DataGrid", () => ({
-  DataGrid: () => <section aria-label="Data">Grid data</section>,
+  DataGrid: (props: unknown) => {
+    dataGridProps(props);
+    return <section aria-label="Data">Grid data</section>;
+  },
 }));
+
+const structureSummary: desktop.StructureSummary = {
+  compressedBytes: 1_200_000,
+  uncompressedBytes: 3_600_000,
+  compressionRatio: 3,
+  formatVersion: 2,
+  createdBy: "parquet-mr version 1.13.1",
+  rowCount: 1_234_567,
+  rowGroupCount: 12,
+  columnCount: 2,
+  rowsPerRowGroup: 102_880.58,
+  footerBytes: 4_096,
+  codecs: ["snappy", "zstd"],
+  chunkCount: 24,
+  chunksWithStatistics: 24,
+  chunksWithBloomFilter: 0,
+  unreadableRowGroupCount: 0,
+  keyValueCount: 0,
+  keyValueMetadata: [],
+};
 
 let requestSettings: (() => void) | undefined;
 let requestOpenSource: (() => void) | undefined;
@@ -41,6 +65,31 @@ function listedSource(
   };
 }
 
+function sourceSummary(
+  generation = 1,
+  displayName = "people.parquet",
+): desktop.SourceSummary {
+  return {
+    generation,
+    displayName,
+    sizeBytes: 8,
+    rowCount: 1,
+    rowGroupCount: 1,
+    columnCount: 1,
+    schema: [
+      {
+        name: "value",
+        physicalType: "INT64",
+        logicalType: null,
+        children: [],
+      },
+    ],
+    schemaNodeCount: 1,
+    schemaIsTruncated: false,
+    stringsTruncated: false,
+  };
+}
+
 afterEach(() => {
   cleanup();
   vi.useRealTimers();
@@ -59,6 +108,7 @@ beforeEach(() => {
   systemDark = false;
   themeChangeListeners = new Set();
   listedSources = [];
+  dataGridProps.mockClear();
   vi.stubGlobal(
     "matchMedia",
     vi.fn(() => ({
@@ -77,6 +127,47 @@ beforeEach(() => {
     queryEngineVersion: "v1.5.5",
   });
   vi.spyOn(desktop, "getRecentSources").mockResolvedValue([]);
+  vi.spyOn(desktop, "getStructureSummary").mockResolvedValue(structureSummary);
+  vi.spyOn(desktop, "getStructureLoadProgress").mockResolvedValue(null);
+  vi.spyOn(desktop, "cancelStructureLoad").mockResolvedValue();
+  vi.spyOn(desktop, "cancelSourceOpen").mockResolvedValue("cancelled");
+  vi.spyOn(desktop, "getSourceOpenProgress").mockResolvedValue(null);
+  vi.spyOn(desktop, "getStructureLensTotals").mockResolvedValue({
+    codecs: [],
+    ratioSteps: [],
+    unrated: { chunkCount: 0, compressedBytes: 0, uncompressedBytes: 0 },
+    statistics: {
+      present: { chunkCount: 0, compressedBytes: 0, uncompressedBytes: 0 },
+      absent: { chunkCount: 0, compressedBytes: 0, uncompressedBytes: 0 },
+    },
+    bloomFilters: {
+      present: { chunkCount: 0, compressedBytes: 0, uncompressedBytes: 0 },
+      absent: { chunkCount: 0, compressedBytes: 0, uncompressedBytes: 0 },
+    },
+  });
+  vi.spyOn(desktop, "getStructureLayout").mockResolvedValue({
+    columns: [],
+    remainingColumnCount: 0,
+    overview: [],
+    rows: [],
+  });
+  vi.spyOn(desktop, "getStructureRowOffset").mockResolvedValue(0);
+  vi.spyOn(desktop, "getStructureReport").mockResolvedValue("# report");
+  vi.spyOn(desktop, "getStructureRowGroups").mockResolvedValue({
+    offset: 0,
+    totalCount: 0,
+    rowGroups: [],
+  });
+  vi.spyOn(desktop, "getStructureColumns").mockResolvedValue({
+    offset: 0,
+    totalCount: 0,
+    columns: [],
+  });
+  vi.spyOn(desktop, "getSourceSchemaNodePage").mockResolvedValue({
+    nodes: [],
+    nextCursor: null,
+    totalCount: 0,
+  });
   vi.spyOn(desktop, "openRecentSource").mockRejectedValue(
     new desktop.OpenSourceError("unsupported"),
   );
@@ -168,7 +259,11 @@ function renderWithOpenSources(...sources: desktop.OpenedSourceEntry[]) {
       sizeBytes: 8,
       rowCount: 1,
       rowGroupCount: 1,
+      columnCount: 0,
       schema: [],
+      schemaNodeCount: 0,
+      schemaIsTruncated: false,
+      stringsTruncated: false,
     })),
   });
   render(<App />);
@@ -264,7 +359,11 @@ describe("App", () => {
       sizeBytes: 2048,
       rowCount: 4,
       rowGroupCount: 1,
+      columnCount: 0,
       schema: [],
+      schemaNodeCount: 0,
+      schemaIsTruncated: false,
+      stringsTruncated: false,
     });
 
     render(<App />);
@@ -285,7 +384,10 @@ describe("App", () => {
     fireEvent.keyDown(secondEntry, { key: "Enter" });
 
     await waitFor(() =>
-      expect(desktop.openRecentSource).toHaveBeenCalledWith("recent-7"),
+      expect(desktop.openRecentSource).toHaveBeenCalledWith(
+        "recent-7",
+        expect.any(String),
+      ),
     );
     expect(
       (await screen.findAllByText("events.parquet")).some((element) =>
@@ -354,6 +456,7 @@ describe("App", () => {
       sizeBytes: 1_300_000,
       rowCount: 1_234_567,
       rowGroupCount: 12,
+      columnCount: 2,
       schema: [
         {
           name: "created_on",
@@ -382,6 +485,9 @@ describe("App", () => {
           ],
         },
       ],
+      schemaNodeCount: 4,
+      schemaIsTruncated: false,
+      stringsTruncated: false,
     });
 
     const { container } = render(<App />);
@@ -409,38 +515,43 @@ describe("App", () => {
         facts.querySelectorAll("dt"),
         ({ textContent }) => textContent,
       ),
-    ).toEqual(["Rows", "Row groups", "Fields", "Size"]);
-    const factValues = Array.from(facts.querySelectorAll("dd"));
-    expect(factValues.map(({ textContent }) => textContent)).toEqual([
-      "1,234,567",
-      "12",
-      "2",
-      "1.3 MB",
-    ]);
-    for (const value of factValues) {
-      expect(value).toHaveClass("fact-value");
-    }
+    ).toEqual(["Shape", "Storage"]);
+    expect(
+      Array.from(
+        facts.querySelectorAll("strong.is-technical"),
+        ({ textContent }) => textContent,
+      ),
+    ).toEqual(["1,234,567", "2", "12", "—", "1.3 MB"]);
     expect(within(facts).getByText("1.3 MB")).toHaveAttribute(
       "title",
       "1,300,000 bytes",
     );
+    await waitFor(() =>
+      expect(
+        Array.from(
+          facts.querySelectorAll("dt"),
+          ({ textContent }) => textContent,
+        ),
+      ).toEqual(["Shape", "Storage", "Metadata", "Chunk metadata"]),
+    );
+    expect(within(facts).getByText("≈ 102,881")).toHaveClass("is-technical");
+    expect(facts).toHaveTextContent("snappy + zstd · ×3.0");
+    expect(
+      within(facts).getByText("100% · 24 of 24 chunks"),
+    ).toBeInTheDocument();
 
-    const schema = screen.getByRole("heading", {
-      name: "Schema",
-    }).parentElement;
-    expect(schema).not.toBeNull();
-    expect(within(schema!).getByText("INT32 · Date")).toHaveClass(
+    expect(screen.getAllByRole("heading", { name: "Columns" })).toHaveLength(1);
+    expect(screen.queryByRole("heading", { name: "Schema" })).toBeNull();
+    fireEvent.click(screen.getByRole("tab", { name: "Schema" }));
+    const schema = screen.getByRole("tabpanel");
+    expect(within(schema).getByText("INT32 · Date")).toHaveClass("schema-type");
+    expect(within(schema).getByText("GROUP · List")).toHaveClass("schema-type");
+    expect(within(schema).getByText("GROUP")).toHaveClass("schema-type");
+    expect(within(schema).getByText("BYTE_ARRAY · String")).toHaveClass(
       "schema-type",
     );
-    expect(within(schema!).getByText("GROUP · List")).toHaveClass(
-      "schema-type",
-    );
-    expect(within(schema!).getByText("GROUP")).toHaveClass("schema-type");
-    expect(within(schema!).getByText("BYTE_ARRAY · String")).toHaveClass(
-      "schema-type",
-    );
-    expect(schema?.querySelector(".schema-logical")).toBeNull();
-    expect(schema?.querySelector("kbd")).toBeNull();
+    expect(schema.querySelector(".schema-logical")).toBeNull();
+    expect(schema.querySelector("kbd")).toBeNull();
     expect(
       screen.queryByText("Data preview is not in this build yet."),
     ).not.toBeInTheDocument();
@@ -470,6 +581,72 @@ describe("App", () => {
     expect(await screen.findByRole("alert")).toHaveTextContent(
       "Viewda cannot read that file. Check its permissions and try again.",
     );
+  });
+
+  it("keeps one source-open attempt authoritative while menu and recent opens repeat", async () => {
+    vi.spyOn(desktop, "getRecentSources").mockResolvedValue([
+      {
+        id: "recent-1",
+        name: "other.parquet",
+        directory: "~/Data",
+        path: "/home/test/Data/other.parquet",
+      },
+    ]);
+    let resolveOpen:
+      ((source: desktop.SourceSummary | null) => void) | undefined;
+    vi.spyOn(desktop, "openLocalSource").mockReturnValue(
+      new Promise((resolve) => {
+        resolveOpen = resolve;
+      }),
+    );
+
+    render(<App />);
+    const recent = await screen.findByRole("button", {
+      name: /other\.parquet/,
+    });
+    fireEvent.click(await readyOpenButton());
+    expect(
+      await screen.findByRole("button", { name: "Cancel opening" }),
+    ).toBeEnabled();
+
+    fireEvent.click(recent);
+    await act(async () => requestOpenSource?.());
+    expect(desktop.openLocalSource).toHaveBeenCalledTimes(1);
+    expect(desktop.openRecentSource).not.toHaveBeenCalled();
+
+    listedSources = [listedSource(1, "people.parquet")];
+    await act(async () => resolveOpen?.(sourceSummary()));
+    expect(await screen.findByText("people.parquet")).toBeInTheDocument();
+  });
+
+  it("discards a late local-open result after native confirms cancellation", async () => {
+    let resolveOpen:
+      ((source: desktop.SourceSummary | null) => void) | undefined;
+    vi.spyOn(desktop, "openLocalSource").mockReturnValue(
+      new Promise((resolve) => {
+        resolveOpen = resolve;
+      }),
+    );
+    vi.mocked(desktop.getSourceOpenProgress).mockResolvedValue("readingFooter");
+
+    render(<App />);
+    fireEvent.click(await readyOpenButton());
+    expect(
+      await screen.findByText("Reading the Parquet footer…"),
+    ).toHaveAttribute("role", "status");
+    fireEvent.click(
+      await screen.findByRole("button", { name: "Cancel opening" }),
+    );
+
+    const attempt = vi.mocked(desktop.openLocalSource).mock.calls[0]?.[0];
+    expect(desktop.cancelSourceOpen).toHaveBeenCalledWith(attempt);
+    await waitFor(() =>
+      expect(
+        screen.getByRole("button", { name: "Open Parquet file…" }),
+      ).toBeEnabled(),
+    );
+    await act(async () => resolveOpen?.(sourceSummary()));
+    expect(screen.queryByText("people.parquet")).not.toBeInTheDocument();
   });
 
   it("treats dialog cancellation as an unchanged empty state", async () => {
@@ -511,7 +688,11 @@ describe("App", () => {
           sizeBytes: 128,
           rowCount: 3,
           rowGroupCount: 1,
+          columnCount: 0,
           schema: [],
+          schemaNodeCount: 0,
+          schemaIsTruncated: false,
+          stringsTruncated: false,
         },
         sourceError: null,
       });
@@ -543,7 +724,11 @@ describe("App", () => {
           sizeBytes: 128,
           rowCount: 3,
           rowGroupCount: 1,
+          columnCount: 0,
           schema: [],
+          schemaNodeCount: 0,
+          schemaIsTruncated: false,
+          stringsTruncated: false,
         },
         sourceError: null,
       })
@@ -565,7 +750,11 @@ describe("App", () => {
             sizeBytes: 256,
             rowCount: 6,
             rowGroupCount: 1,
+            columnCount: 0,
             schema: [],
+            schemaNodeCount: 0,
+            schemaIsTruncated: false,
+            stringsTruncated: false,
           },
         ],
         sourceError: null,
@@ -602,7 +791,11 @@ describe("App", () => {
           sizeBytes: 16,
           rowCount: 2,
           rowGroupCount: 1,
+          columnCount: 0,
           schema: [],
+          schemaNodeCount: 0,
+          schemaIsTruncated: false,
+          stringsTruncated: false,
         },
         {
           generation: 1,
@@ -610,7 +803,11 @@ describe("App", () => {
           sizeBytes: 8,
           rowCount: 1,
           rowGroupCount: 1,
+          columnCount: 0,
           schema: [],
+          schemaNodeCount: 0,
+          schemaIsTruncated: false,
+          stringsTruncated: false,
         },
       ],
     });
@@ -648,6 +845,247 @@ describe("App", () => {
     act(() => requestCloseSource?.(2));
     await waitFor(() =>
       expect(desktop.closeOpenedSource).toHaveBeenCalledWith(2),
+    );
+  });
+
+  it("retains Structure mode, unit, and Columns view per file generation", async () => {
+    const second = listedSource(2, "second.parquet", true);
+    const first = listedSource(1, "first.parquet", false);
+    let secondLoads = 0;
+    let resolveSecondRefresh:
+      ((summary: desktop.StructureSummary) => void) | undefined;
+    vi.mocked(desktop.getStructureSummary).mockImplementation((generation) => {
+      if (generation !== 2 || secondLoads++ === 0) {
+        return Promise.resolve(structureSummary);
+      }
+      return new Promise((resolve) => {
+        resolveSecondRefresh = resolve;
+      });
+    });
+    vi.mocked(desktop.activateOpenedSource).mockImplementation(
+      async (generation) => {
+        listedSources = listedSources.map((entry) => ({
+          ...entry,
+          active: entry.generation === generation,
+        }));
+      },
+    );
+    renderWithOpenSources(second, first);
+
+    await screen.findByText("second.parquet");
+    fireEvent.click(screen.getByRole("button", { name: "Structure" }));
+    const size = await screen.findByRole("group", { name: "Size" });
+    fireEvent.click(
+      within(size).getByRole("button", { name: "Before compression" }),
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Codec" }));
+    fireEvent.click(screen.getByRole("tab", { name: "Schema" }));
+    const secondPanel = document.querySelector(
+      ".structure-mode-panel:not([hidden])",
+    ) as HTMLElement;
+    secondPanel.scrollTop = 137;
+
+    fireEvent.click(screen.getByRole("button", { name: "Switch files" }));
+    fireEvent.click(
+      await screen.findByRole("option", { name: /first\.parquet/ }),
+    );
+    await waitFor(() =>
+      expect(screen.getByRole("button", { name: "Data" })).toHaveAttribute(
+        "aria-pressed",
+        "true",
+      ),
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Structure" }));
+    expect(
+      within(await screen.findByRole("group", { name: "Size" })).getByRole(
+        "button",
+        { name: "On disk" },
+      ),
+    ).toHaveAttribute("aria-pressed", "true");
+    expect(screen.getByRole("tab", { name: "By size" })).toHaveAttribute(
+      "aria-selected",
+      "true",
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "Switch files" }));
+    fireEvent.click(
+      await screen.findByRole("option", { name: /second\.parquet/ }),
+    );
+    await waitFor(() =>
+      expect(screen.getByRole("button", { name: "Structure" })).toHaveAttribute(
+        "aria-pressed",
+        "true",
+      ),
+    );
+    expect(desktop.getStructureSummary).toHaveBeenCalledWith(2);
+    expect(desktop.getStructureSummary).toHaveBeenCalledWith(1);
+    await waitFor(() =>
+      expect(
+        vi
+          .mocked(desktop.getStructureSummary)
+          .mock.calls.filter(([generation]) => generation === 2),
+      ).toHaveLength(2),
+    );
+    const reactivatedPanel = document.querySelector(
+      ".structure-mode-panel:not([hidden])",
+    ) as HTMLElement;
+    const reactivatedSource = reactivatedPanel.querySelector(
+      '.source-view[aria-label="Parquet source"]',
+    ) as HTMLElement;
+    const buttonNamed = (name: string) =>
+      Array.from(reactivatedSource.querySelectorAll("button")).find(
+        (button) => button.textContent === name,
+      ) as HTMLButtonElement;
+    expect(reactivatedPanel).toBe(secondPanel);
+    expect(reactivatedSource).toHaveAttribute("aria-busy", "true");
+    expect(reactivatedSource).toHaveAttribute("inert");
+    expect(
+      within(reactivatedSource).getByText("Refreshing file structure…"),
+    ).toHaveClass("visually-hidden");
+    expect(
+      reactivatedSource.querySelector('section[aria-label="Physical layout"]'),
+    ).toBeInTheDocument();
+    expect(buttonNamed("Before compression")).toHaveAttribute(
+      "aria-pressed",
+      "true",
+    );
+    expect(buttonNamed("Codec")).toHaveAttribute("aria-pressed", "true");
+    expect(buttonNamed("Schema")).toHaveAttribute("aria-selected", "true");
+    expect(reactivatedPanel.scrollTop).toBe(137);
+
+    const layoutCallsBeforeRefresh = vi
+      .mocked(desktop.getStructureLayout)
+      .mock.calls.filter(([generation]) => generation === 2).length;
+    const onDisk = buttonNamed("On disk");
+    fireEvent.click(onDisk);
+    expect(
+      vi
+        .mocked(desktop.getStructureLayout)
+        .mock.calls.filter(([generation]) => generation === 2),
+    ).toHaveLength(layoutCallsBeforeRefresh);
+    expect(onDisk).toHaveAttribute("aria-pressed", "false");
+
+    await act(async () => resolveSecondRefresh?.(structureSummary));
+    await waitFor(() => {
+      expect(reactivatedSource).not.toHaveAttribute("aria-busy");
+      expect(reactivatedSource).not.toHaveAttribute("inert");
+    });
+    fireEvent.click(onDisk);
+    await waitFor(() =>
+      expect(
+        vi
+          .mocked(desktop.getStructureLayout)
+          .mock.calls.filter(([generation]) => generation === 2),
+      ).toHaveLength(layoutCallsBeforeRefresh + 1),
+    );
+    expect(onDisk).toHaveAttribute("aria-pressed", "true");
+  });
+
+  it("ignores late row-offset navigation after A switches to B and back", async () => {
+    const first = listedSource(1, "first.parquet", true);
+    const second = listedSource(2, "second.parquet", false);
+    vi.mocked(desktop.activateOpenedSource).mockImplementation(
+      async (generation) => {
+        listedSources = listedSources.map((entry) => ({
+          ...entry,
+          active: entry.generation === generation,
+        }));
+      },
+    );
+    vi.mocked(desktop.getStructureLayout).mockResolvedValue({
+      columns: [],
+      remainingColumnCount: 0,
+      overview: [],
+      rows: [
+        {
+          index: 0,
+          compressedBytes: 100,
+          uncompressedBytes: 200,
+          isReadable: true,
+          hasLayoutFacts: true,
+          segments: [],
+          tail: null,
+        },
+      ],
+    });
+    let resolveRowOffset: ((row: number) => void) | undefined;
+    vi.mocked(desktop.getStructureRowOffset).mockReturnValue(
+      new Promise((resolve) => {
+        resolveRowOffset = resolve;
+      }),
+    );
+    renderWithOpenSources(first, second);
+
+    await screen.findByText("first.parquet");
+    fireEvent.click(screen.getByRole("button", { name: "Structure" }));
+    fireEvent.doubleClick(await screen.findByRole("button", { name: "RG 0" }));
+    expect(desktop.getStructureRowOffset).toHaveBeenCalledWith(1, 0);
+
+    fireEvent.click(screen.getByRole("button", { name: "Switch files" }));
+    fireEvent.click(
+      await screen.findByRole("option", { name: /second\.parquet/ }),
+    );
+    await waitFor(() =>
+      expect(screen.getByRole("button", { name: "Data" })).toHaveAttribute(
+        "aria-pressed",
+        "true",
+      ),
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Switch files" }));
+    fireEvent.click(
+      await screen.findByRole("option", { name: /first\.parquet/ }),
+    );
+    await waitFor(() =>
+      expect(screen.getByRole("button", { name: "Structure" })).toHaveAttribute(
+        "aria-pressed",
+        "true",
+      ),
+    );
+    await act(async () => resolveRowOffset?.(42));
+
+    expect(screen.getByRole("button", { name: "Structure" })).toHaveAttribute(
+      "aria-pressed",
+      "true",
+    );
+    const firstGridCalls = dataGridProps.mock.calls
+      .map(
+        ([props]) =>
+          props as { source: desktop.SourceSummary; requestedRow: unknown },
+      )
+      .filter(({ source }) => source.generation === 1);
+    expect(firstGridCalls.at(-1)?.requestedRow).toBeNull();
+  });
+
+  it("does not resurrect a closed file when its Structure load resolves late", async () => {
+    const first = listedSource(1, "first.parquet", true);
+    const second = listedSource(2, "second.parquet", false);
+    let resolveFirst: ((summary: desktop.StructureSummary) => void) | undefined;
+    vi.mocked(desktop.getStructureSummary).mockImplementation((generation) =>
+      generation === 1
+        ? new Promise((resolve) => {
+            resolveFirst = resolve;
+          })
+        : Promise.resolve(structureSummary),
+    );
+    renderWithOpenSources(first, second);
+
+    await screen.findByText("first.parquet");
+    fireEvent.click(screen.getByRole("button", { name: "Structure" }));
+    await waitFor(() =>
+      expect(desktop.getStructureSummary).toHaveBeenCalledWith(1),
+    );
+
+    listedSources = [{ ...second, active: true }];
+    await act(async () => requestCloseSource?.(1));
+    await waitFor(() =>
+      expect(screen.getByText("second.parquet")).toBeInTheDocument(),
+    );
+    await act(async () => resolveFirst?.(structureSummary));
+
+    expect(screen.queryByText("first.parquet")).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Data" })).toHaveAttribute(
+      "aria-pressed",
+      "true",
     );
   });
 
@@ -808,7 +1246,11 @@ describe("App", () => {
           sizeBytes: 8,
           rowCount: 1,
           rowGroupCount: 1,
+          columnCount: 0,
           schema: [],
+          schemaNodeCount: 0,
+          schemaIsTruncated: false,
+          stringsTruncated: false,
         },
         sourceError: null,
       })
@@ -843,7 +1285,11 @@ describe("App", () => {
           sizeBytes: 8,
           rowCount: 1,
           rowGroupCount: 1,
+          columnCount: 0,
           schema: [],
+          schemaNodeCount: 0,
+          schemaIsTruncated: false,
+          stringsTruncated: false,
         },
         sourceError: null,
       })
@@ -1289,7 +1735,11 @@ describe("App", () => {
           sizeBytes: 4096,
           rowCount: 12,
           rowGroupCount: 2,
+          columnCount: 0,
           schema: [],
+          schemaNodeCount: 0,
+          schemaIsTruncated: false,
+          stringsTruncated: false,
         },
       ],
     });

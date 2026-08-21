@@ -3,6 +3,8 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import {
   activateOpenedSource,
   cancelDataView,
+  cancelSourceOpen,
+  cancelStructureBloomProbe,
   cancelTextValueSuggestions,
   ColumnStatisticsCommandError,
   DataExportCommandError,
@@ -13,10 +15,16 @@ import {
   getDataViewSettings,
   getDataWindow,
   getDataViewStatus,
+  getSourceOpenProgress,
+  getSourceSchemaNodePage,
+  getStructureColumns,
+  getStructureLoadProgress,
+  getStructureSummary,
   getTextValueSuggestions,
   installPendingUpdate,
   listOpenedSources,
   prepareDataView,
+  probeStructureBloomFilter,
   revealDataExport,
   revealOpenedSource,
   closeOpenedSource,
@@ -25,7 +33,10 @@ import {
   cycleOpenedSource,
   setDataViewSettings,
   startDataExport,
+  StructureCommandError,
   takePostUpdateState,
+  openLocalSource,
+  openRecentSource,
 } from "./desktop";
 
 const { channelHandlers, invokeMock } = vi.hoisted(() => ({
@@ -81,6 +92,105 @@ describe("desktop seam", () => {
     expect(invokeMock).toHaveBeenNthCalledWith(2, "set_data_view_settings", {
       settings: { memoryLimit: "mb1536" },
     });
+  });
+
+  it("passes generation-scoped structure paging and probe arguments", async () => {
+    invokeMock
+      .mockResolvedValueOnce({ offset: 0, totalCount: 1, columns: [] })
+      .mockResolvedValueOnce({
+        offset: 0,
+        totalCount: 1,
+        rowGroups: [{ index: 0, outcome: "definitelyAbsent" }],
+      })
+      .mockResolvedValueOnce(undefined);
+
+    await getStructureColumns(7, "uncompressed", "bytes", "descending", 20, 50);
+    await probeStructureBloomFilter(7, "probe-a", 1, "north", 0, 64);
+    await cancelStructureBloomProbe(7, "probe-a");
+
+    expect(invokeMock).toHaveBeenNthCalledWith(1, "get_structure_columns", {
+      generation: 7,
+      unit: "uncompressed",
+      sort: "bytes",
+      direction: "descending",
+      offset: 20,
+      limit: 50,
+    });
+    expect(invokeMock).toHaveBeenNthCalledWith(
+      2,
+      "probe_structure_bloom_filter",
+      {
+        generation: 7,
+        request: "probe-a",
+        columnIndex: 1,
+        value: "north",
+        offset: 0,
+        limit: 64,
+      },
+    );
+    expect(invokeMock).toHaveBeenNthCalledWith(
+      3,
+      "cancel_structure_bloom_probe",
+      { generation: 7, request: "probe-a" },
+    );
+  });
+
+  it("passes the stable nested schema cursor with its generation", async () => {
+    invokeMock.mockResolvedValue({
+      nodes: [],
+      nextCursor: null,
+      totalCount: 0,
+    });
+
+    await getSourceSchemaNodePage(7, { path: [1, 254], leafIndex: 255 }, 256);
+
+    expect(invokeMock).toHaveBeenCalledWith("get_source_schema_node_page", {
+      generation: 7,
+      cursor: { path: [1, 254], leafIndex: 255 },
+      limit: 256,
+    });
+  });
+
+  it("uses one opaque attempt for local, recent, and cancellation commands", async () => {
+    invokeMock
+      .mockResolvedValueOnce(null)
+      .mockResolvedValueOnce({ generation: 4 })
+      .mockResolvedValueOnce("published");
+
+    await openLocalSource("app-session:9");
+    await openRecentSource("recent-4", "app-session:10");
+    await expect(cancelSourceOpen("app-session:10")).resolves.toBe("published");
+
+    expect(invokeMock.mock.calls).toEqual([
+      ["open_local_source", { attempt: "app-session:9" }],
+      ["open_recent_source", { id: "recent-4", attempt: "app-session:10" }],
+      ["cancel_source_open", { attempt: "app-session:10" }],
+    ]);
+  });
+
+  it("keeps structure errors typed and progress generation-scoped", async () => {
+    invokeMock
+      .mockRejectedValueOnce({ code: "notLoaded" })
+      .mockResolvedValueOnce(null)
+      .mockResolvedValueOnce("decodingFooter");
+
+    await expect(getStructureSummary(1)).rejects.toEqual(
+      new StructureCommandError("notLoaded"),
+    );
+    await expect(getStructureLoadProgress(3)).resolves.toBeNull();
+    await expect(getSourceOpenProgress()).resolves.toBe("decodingFooter");
+    expect(invokeMock).toHaveBeenNthCalledWith(
+      2,
+      "get_structure_load_progress",
+      {
+        generation: 3,
+      },
+    );
+    expect(invokeMock).toHaveBeenNthCalledWith(
+      3,
+      "get_source_open_progress",
+      undefined,
+    );
   });
 
   it("uses generation-scoped commands for open file sessions", async () => {

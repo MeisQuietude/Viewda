@@ -776,6 +776,7 @@ describe("ViewdaGrid foundation", () => {
 
     const report = JSON.parse(diagnostics.stop() ?? "null");
     expect(report.wheel).toMatchObject({
+      consumedEvents: 1,
       movedEvents: 0,
       horizontal: {
         movedEvents: 0,
@@ -918,6 +919,7 @@ describe("ViewdaGrid foundation", () => {
     const eventCount = 400;
 
     for (let eventIndex = 1; eventIndex <= eventCount; eventIndex += 1) {
+      const previousLeft = bodyScrollport.scrollLeft;
       const wheel = wheelEvent(
         { deltaX: 10, deltaY: 0.5, deltaMode: WheelEvent.DOM_DELTA_PIXEL },
         (eventIndex - 1) * 8,
@@ -930,7 +932,9 @@ describe("ViewdaGrid foundation", () => {
       act(() => {
         frames.shift()?.(eventIndex * 8);
       });
-      expect(wheel.defaultPrevented).toBe(true);
+      expect(wheel.defaultPrevented).toBe(
+        bodyScrollport.scrollLeft !== previousLeft,
+      );
       maximumCells = Math.max(
         maximumCells,
         container.querySelectorAll(".viewda-grid-cell").length,
@@ -1851,7 +1855,7 @@ describe("ViewdaGrid foundation", () => {
     expect(scrollport.scrollTop).toBeCloseTo(336, 10);
   });
 
-  it("prevents native double movement when a row step reaches a bound", () => {
+  it("yields a downward wheel at the bottom and resets the gesture", () => {
     const ref = createRef<ViewdaGridHandle>();
     const { container } = render(
       <ViewdaGrid
@@ -1871,8 +1875,115 @@ describe("ViewdaGrid foundation", () => {
     const wheel = wheelEvent({ deltaY: 84 }, 1);
     act(() => scrollport.dispatchEvent(wheel));
 
-    expect(wheel.defaultPrevented).toBe(true);
+    expect(wheel.defaultPrevented).toBe(false);
     expect(scrollport.scrollTop).toBe(maximum);
+
+    const inward = wheelEvent({ deltaY: -28 }, 2);
+    act(() => scrollport.dispatchEvent(inward));
+    expect(inward.defaultPrevented).toBe(true);
+    expect(scrollport.scrollTop).toBeLessThan(maximum);
+  });
+
+  it("repeatedly yields a vertical diagonal tie at a row boundary", () => {
+    const ref = createRef<ViewdaGridHandle>();
+    const { container } = render(
+      <ViewdaGrid
+        ref={ref}
+        {...props({
+          rowCount: 1_000,
+          measurementPort: measurementPort(420, 84, 1_000_000),
+        })}
+      />,
+    );
+    const scrollport = container.querySelector(
+      ".viewda-grid-body-scrollport",
+    ) as HTMLElement;
+    act(() => ref.current?.scrollToRow(1_000));
+    const maximum = scrollport.scrollTop;
+    const horizontalStart = scrollport.scrollLeft;
+
+    const first = wheelEvent({ deltaY: 10, deltaX: 10 }, 1);
+    act(() => scrollport.dispatchEvent(first));
+    const repeated = wheelEvent({ deltaY: 10, deltaX: 10 }, 2);
+    act(() => scrollport.dispatchEvent(repeated));
+
+    expect(first.defaultPrevented).toBe(false);
+    expect(repeated.defaultPrevented).toBe(false);
+    expect(scrollport.scrollTop).toBe(maximum);
+    expect(scrollport.scrollLeft).toBe(horizontalStart);
+
+    act(() => ref.current?.scrollToRow(0));
+    const upward = wheelEvent({ deltaY: -10, deltaX: 10 }, 3);
+    act(() => scrollport.dispatchEvent(upward));
+    expect(upward.defaultPrevented).toBe(false);
+    expect(scrollport.scrollTop).toBe(0);
+    expect(scrollport.scrollLeft).toBe(horizontalStart);
+  });
+
+  it("never traps a vertical wheel when there is no row extent", () => {
+    const outerWheel = vi.fn<(event: Event) => void>();
+    const { container } = render(
+      <div>
+        <ViewdaGrid
+          {...props({
+            rowCount: 1,
+            measurementPort: measurementPort(420, 84, 1_000_000),
+          })}
+        />
+      </div>,
+    );
+    container.firstElementChild?.addEventListener("wheel", outerWheel);
+    const scrollport = container.querySelector(
+      ".viewda-grid-body-scrollport",
+    ) as HTMLElement;
+
+    const wheel = wheelEvent({ deltaY: 28 }, 1);
+    act(() => scrollport.dispatchEvent(wheel));
+
+    expect(wheel.defaultPrevented).toBe(false);
+    expect(outerWheel).toHaveBeenCalledOnce();
+    expect(outerWheel.mock.calls[0]?.[0].defaultPrevented).toBe(false);
+  });
+
+  it("yields an upward wheel at the top", () => {
+    const { container } = render(
+      <ViewdaGrid
+        {...props({
+          rowCount: 100,
+          measurementPort: measurementPort(420, 84, 1_000_000),
+        })}
+      />,
+    );
+    const scrollport = container.querySelector(
+      ".viewda-grid-body-scrollport",
+    ) as HTMLElement;
+
+    const wheel = wheelEvent({ deltaY: -28 }, 1);
+    act(() => scrollport.dispatchEvent(wheel));
+
+    expect(wheel.defaultPrevented).toBe(false);
+    expect(scrollport.scrollTop).toBe(0);
+  });
+
+  it("consumes interior movement and sub-row accumulation", () => {
+    const { container } = render(
+      <ViewdaGrid
+        {...props({
+          rowCount: 100,
+          measurementPort: measurementPort(420, 84, 1_000_000),
+        })}
+      />,
+    );
+    const scrollport = container.querySelector(
+      ".viewda-grid-body-scrollport",
+    ) as HTMLElement;
+
+    for (let index = 0; index < 4; index += 1) {
+      const wheel = wheelEvent({ deltaY: 7 }, index + 1);
+      act(() => scrollport.dispatchEvent(wheel));
+      expect(wheel.defaultPrevented).toBe(true);
+    }
+    expect(scrollport.scrollTop).toBe(28);
   });
 
   it("re-reads bounded cells when content revision changes", () => {
