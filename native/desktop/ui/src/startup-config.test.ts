@@ -9,6 +9,7 @@ interface TauriConfig {
     windows: Array<{
       label: string;
       backgroundColor?: string;
+      create?: boolean;
       visible?: boolean;
     }>;
   };
@@ -25,6 +26,7 @@ it("keeps the main window hidden until its styled UI is ready", () => {
   const mainWindow = config.app.windows.find(({ label }) => label === "main");
 
   expect(mainWindow?.visible).toBe(false);
+  expect(mainWindow?.create).toBe(false);
   expect(mainWindow?.backgroundColor).toMatch(/^#[\da-f]{6}$/i);
 
   const document = readFileSync(
