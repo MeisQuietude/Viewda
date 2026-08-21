@@ -13,11 +13,11 @@ use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Manager, State, ipc::Channel};
 use tauri_plugin_updater::{Update, UpdaterExt};
 use thiserror::Error;
-use viewda_data_engine::SourceError;
+use viewda_data_engine::{DatasetError, SourceError};
 
 use crate::{
-    OpenSourceError, OpenedSource, OpenedSourceInfo, SourceOpenIntent, inspect_selected_source,
-    theme::ThemePreference, view_settings::DataViewSettings,
+    OpenSourceError, OpenedSource, OpenedSourceInfo, SourceDescriptor, SourceOpenIntent,
+    inspect_source_descriptor, theme::ThemePreference, view_settings::DataViewSettings,
 };
 
 const UPDATE_STATE_FILE: &str = "updates.json";
@@ -68,7 +68,15 @@ pub struct PostUpdateState {
     pub sources: Vec<OpenedSourceInfo>,
     /// Reported only when nothing could be restored: a window with sources open
     /// has no surface for a restore failure.
-    pub source_error: Option<SourceError>,
+    pub source_error: Option<PostUpdateSourceError>,
+}
+
+/// One path-free source failure retained when update recovery restores nothing.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(untagged)]
+pub enum PostUpdateSourceError {
+    Source(SourceError),
+    Dataset(DatasetError),
 }
 
 /// Download progress reported while installing a checked update.
@@ -112,6 +120,9 @@ struct StoredUpdateState {
 #[serde(rename_all = "camelCase")]
 struct PendingRestart {
     version: String,
+    /// Complete native descriptors used by releases that support datasets.
+    #[serde(default)]
+    source_descriptors: Vec<SourceDescriptor>,
     /// Open sources in most-recently-used order, the active one first.
     #[serde(default)]
     source_paths: Vec<PathBuf>,
@@ -124,20 +135,36 @@ struct PendingRestart {
 }
 
 impl PendingRestart {
-    fn new(version: String, source_paths: Vec<PathBuf>) -> Self {
+    fn new(version: String, source_descriptors: Vec<SourceDescriptor>) -> Self {
+        let source_paths = source_descriptors
+            .iter()
+            .filter_map(|descriptor| match descriptor {
+                SourceDescriptor::File(path) => Some(path.clone()),
+                SourceDescriptor::Folder(_) | SourceDescriptor::ExplicitFiles { .. } => None,
+            })
+            .collect::<Vec<_>>();
         Self {
             source_path: source_paths.first().cloned(),
             source_paths,
+            source_descriptors,
             version,
         }
     }
 
-    /// Sources to reopen, most recently used first, from either marker shape.
-    fn restored_paths(self) -> Vec<PathBuf> {
-        if self.source_paths.is_empty() {
-            self.source_path.into_iter().collect()
+    /// Sources to reopen, most recently used first, from every marker shape.
+    fn restored_descriptors(self) -> Vec<SourceDescriptor> {
+        if !self.source_descriptors.is_empty() {
+            self.source_descriptors
+        } else if self.source_paths.is_empty() {
+            self.source_path
+                .into_iter()
+                .map(SourceDescriptor::File)
+                .collect()
         } else {
             self.source_paths
+                .into_iter()
+                .map(SourceDescriptor::File)
+                .collect()
         }
     }
 }
@@ -374,10 +401,10 @@ pub(crate) async fn install_pending_update(
         .map_err(|_| UpdateError::Unavailable)?
         .take()
         .ok_or(UpdateError::NoPendingUpdate)?;
-    let source_paths = opened_source
-        .open_paths()
+    let source_descriptors = opened_source
+        .open_descriptors()
         .map_err(|_| UpdateError::Storage)?;
-    let restart = PendingRestart::new(update.version.clone(), source_paths);
+    let restart = PendingRestart::new(update.version.clone(), source_descriptors);
     store.mutate(&app, |stored| stored.pending_restart = Some(restart))?;
 
     let progress = Mutex::new(UpdateProgressTracker::default());
@@ -431,31 +458,22 @@ pub async fn take_post_update_state(
         return Ok(None);
     };
     let version = restart.version.clone();
-    let paths = restart.restored_paths();
+    let descriptors = restart.restored_descriptors();
     let inspected = tauri::async_runtime::spawn_blocking(move || {
         // Reopened least recently used first, so the pre-update active source
         // ends up active again.
-        paths
+        descriptors
             .into_iter()
             .rev()
-            .map(|path| inspect_selected_source(&app, path, SourceOpenIntent::Restore))
+            .map(|descriptor| {
+                inspect_source_descriptor(&app, descriptor, SourceOpenIntent::Restore)
+            })
             .collect::<Vec<_>>()
     })
     .await
     .map_err(|_| UpdateError::Storage)?;
 
-    let mut sources = Vec::new();
-    let mut source_error = None;
-    for result in inspected {
-        match result {
-            Ok(Some((_, source))) => sources.push(source),
-            Ok(None) => {}
-            // The source meant to become active is inspected last, so its
-            // failure is the one an empty window reports.
-            Err(OpenSourceError::Source(error)) => source_error = Some(error),
-            Err(OpenSourceError::Recent(_)) => return Err(UpdateError::Storage),
-        }
-    }
+    let (mut sources, source_error) = collect_restored_sources(inspected)?;
     sources.reverse();
 
     Ok(Some(PostUpdateState {
@@ -463,6 +481,29 @@ pub async fn take_post_update_state(
         source_error: source_error.filter(|_| sources.is_empty()),
         sources,
     }))
+}
+
+fn collect_restored_sources(
+    inspected: Vec<Result<Option<OpenedSourceInfo>, OpenSourceError>>,
+) -> Result<(Vec<OpenedSourceInfo>, Option<PostUpdateSourceError>), UpdateError> {
+    let mut sources = Vec::new();
+    let mut source_error = None;
+    for result in inspected {
+        match result {
+            Ok(Some(source)) => sources.push(source),
+            Ok(None) => {}
+            // The source meant to become active is inspected last, so its
+            // failure is the one an empty window reports.
+            Err(OpenSourceError::Source(error)) => {
+                source_error = Some(PostUpdateSourceError::Source(error));
+            }
+            Err(OpenSourceError::Dataset(error)) => {
+                source_error = Some(PostUpdateSourceError::Dataset(error));
+            }
+            Err(OpenSourceError::Recent(_)) => return Err(UpdateError::Storage),
+        }
+    }
+    Ok((sources, source_error))
 }
 
 /// Opens the immutable GitHub Releases page without accepting a URL from the webview.
@@ -694,6 +735,9 @@ mod tests {
             version: "0.1.0".to_owned(),
             sources: vec![OpenedSourceInfo {
                 generation: 2,
+                kind: crate::OpenedSourceKind::File,
+                dataset_member_count: None,
+                dataset_ignored_file_count: None,
                 summary: viewda_data_engine::SourceSummary {
                     display_name: "trips.parquet".to_owned(),
                     size_bytes: 31,
@@ -714,7 +758,10 @@ mod tests {
             serde_json::json!({
                 "version": "0.1.0",
                 "sources": [{
-                    "generation": 2,
+                "generation": 2,
+                "kind": "file",
+                "datasetMemberCount": null,
+                "datasetIgnoredFileCount": null,
                     "displayName": "trips.parquet",
                     "sizeBytes": 31,
                     "rowCount": 7,
@@ -735,8 +782,8 @@ mod tests {
         let restart = PendingRestart::new(
             "0.1.0".to_owned(),
             vec![
-                PathBuf::from("/data/active.parquet"),
-                PathBuf::from("/data/second.parquet"),
+                SourceDescriptor::File(PathBuf::from("/data/active.parquet")),
+                SourceDescriptor::File(PathBuf::from("/data/second.parquet")),
             ],
         );
 
@@ -744,15 +791,19 @@ mod tests {
             serde_json::to_value(&restart).expect("restart marker JSON"),
             serde_json::json!({
                 "version": "0.1.0",
+                "sourceDescriptors": [
+                    {"kind": "file", "source": "/data/active.parquet"},
+                    {"kind": "file", "source": "/data/second.parquet"},
+                ],
                 "sourcePaths": ["/data/active.parquet", "/data/second.parquet"],
                 "sourcePath": "/data/active.parquet",
             })
         );
         assert_eq!(
-            restart.restored_paths(),
+            restart.restored_descriptors(),
             [
-                PathBuf::from("/data/active.parquet"),
-                PathBuf::from("/data/second.parquet")
+                SourceDescriptor::File(PathBuf::from("/data/active.parquet")),
+                SourceDescriptor::File(PathBuf::from("/data/second.parquet"))
             ]
         );
     }
@@ -766,8 +817,60 @@ mod tests {
         .expect("single-source restart marker");
 
         assert_eq!(
-            restart.restored_paths(),
-            [PathBuf::from("/data/only.parquet")]
+            restart.restored_descriptors(),
+            [SourceDescriptor::File(PathBuf::from("/data/only.parquet"))]
+        );
+    }
+
+    #[test]
+    fn restart_marker_retains_folder_and_explicit_dataset_composition() {
+        let descriptors = vec![
+            SourceDescriptor::Folder(PathBuf::from("/data/folder")),
+            SourceDescriptor::ExplicitFiles {
+                root: PathBuf::from("/data"),
+                paths: vec![
+                    PathBuf::from("/data/a.parquet"),
+                    PathBuf::from("/data/nested/b.parquet"),
+                ],
+            },
+        ];
+        let marker = PendingRestart::new("0.1.0".to_owned(), descriptors.clone());
+        let serialized = serde_json::to_value(&marker).expect("restart marker JSON");
+        let restored: PendingRestart =
+            serde_json::from_value(serialized).expect("restart marker parses");
+
+        assert_eq!(restored.restored_descriptors(), descriptors);
+    }
+
+    #[test]
+    fn failed_dataset_restore_does_not_hide_an_already_restored_source() {
+        let restored = OpenedSourceInfo {
+            generation: 7,
+            kind: crate::OpenedSourceKind::File,
+            dataset_member_count: None,
+            dataset_ignored_file_count: None,
+            summary: viewda_data_engine::SourceSummary {
+                display_name: "kept.parquet".to_owned(),
+                size_bytes: 1,
+                row_count: 1,
+                row_group_count: 1,
+                column_count: 1,
+                schema: Vec::new(),
+                schema_node_count: 0,
+                schema_is_truncated: false,
+                strings_truncated: false,
+            },
+        };
+        let (sources, error) = collect_restored_sources(vec![
+            Ok(Some(restored.clone())),
+            Err(DatasetError::NotFound.into()),
+        ])
+        .expect("partial restore remains reportable");
+
+        assert_eq!(sources, [restored]);
+        assert_eq!(
+            error,
+            Some(PostUpdateSourceError::Dataset(DatasetError::NotFound))
         );
     }
 

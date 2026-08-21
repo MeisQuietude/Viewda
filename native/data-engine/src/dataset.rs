@@ -39,11 +39,15 @@ use parquet::arrow::ArrowWriter;
 use crate::{
     DataFilter, DataFilterOperator, SchemaField,
     filter::{build_filter_predicate, quote_identifier},
-    source::{SourceError, SourceSnapshot, inspect_local_source},
-    window::{DataWindowError, MAX_WINDOW_ROWS, classify_query_error, set_utc_session_timezone},
+    source::{SourceError, SourceSnapshot, inspect_local_source, inspect_local_source_for_query},
+    window::{
+        DataWindowError, MAX_WINDOW_ROWS, classify_query_error, set_utc_session_timezone,
+        validate_projection,
+    },
 };
 
 const MAX_MEMBER_PAGE_SIZE: u32 = 256;
+const MAX_PREVIEW_COLUMNS: usize = 256;
 const MAX_PARTITION_DEPTH: usize = 256;
 const PROVENANCE_COLUMN: &str = "file";
 
@@ -280,10 +284,7 @@ impl DatasetSource {
         if paths.is_empty() {
             return Err(DatasetError::NoParquetFiles);
         }
-        if paths.iter().any(|path| {
-            path.extension()
-                .is_none_or(|extension| extension != "parquet")
-        }) {
+        if paths.iter().any(|path| !has_parquet_extension(path)) {
             return Err(DatasetError::Unsupported);
         }
 
@@ -637,7 +638,10 @@ impl DatasetInspector {
             self.deviating_members.clone(),
             self.member_row_counts.clone(),
         )?;
-        let arrow_ipc = reader.fetch(0, row_count, &[])?;
+        let projection = (0..reader.summary.schema.len().min(MAX_PREVIEW_COLUMNS))
+            .map(|index| u32::try_from(index).map_err(|_| DatasetError::Unsupported))
+            .collect::<Result<Vec<_>, _>>()?;
+        let arrow_ipc = reader.fetch_columns(0, row_count, &[], &projection)?;
         self.preview_reader = Some(reader);
         Ok(DatasetPreview {
             progress,
@@ -664,7 +668,7 @@ impl DatasetInspector {
             }
             let member = &self.source.members[self.next_member];
             self.source.ensure_member_unchanged(member)?;
-            let member_summary = inspect_local_source(&member.path)
+            let member_summary = inspect_local_source_for_query(&member.path)
                 .map_err(|error| self.source.latch_member_error(error, member))?;
             validate_member_schema(&member_summary.schema, &member.relative_path, "")?;
             self.size_bytes = self
@@ -1058,6 +1062,29 @@ impl DatasetQuerySource {
 }
 
 impl DatasetWindowReader {
+    /// Returns the selected member's first row in frozen dataset order.
+    ///
+    /// The whole fixed composition is revalidated before and after calculating
+    /// the checked prefix so callers cannot navigate through stale member data.
+    pub fn member_row_offset(&self, ordinal: u64) -> Result<u64, DatasetError> {
+        let index = usize::try_from(ordinal).map_err(|_| DatasetError::Unsupported)?;
+        if self
+            .source
+            .members
+            .get(index)
+            .is_none_or(|member| member.ordinal != ordinal)
+        {
+            return Err(DatasetError::Unsupported);
+        }
+        self.source.ensure_members_unchanged(&self.source.members)?;
+        let offset = self.member_row_counts[..index]
+            .iter()
+            .try_fold(0_u64, |offset, row_count| offset.checked_add(*row_count))
+            .ok_or(DatasetError::Unsupported)?;
+        self.source.ensure_members_unchanged(&self.source.members)?;
+        Ok(offset)
+    }
+
     /// Opens one selected fixed member without exposing its absolute path.
     pub fn member_snapshot(&self, ordinal: u64) -> Result<DatasetMemberSnapshot, DatasetError> {
         self.member_snapshot_checked(ordinal, || {})
@@ -1211,6 +1238,11 @@ impl DatasetWindowReader {
         &self.summary
     }
 
+    /// Reports a previously detected member change without rescanning the dataset.
+    pub fn latched_source_change(&self) -> Result<(), DatasetError> {
+        self.source.require_active()
+    }
+
     /// Returns a bounded page of members whose schema differs from the first member.
     pub fn schema_drift_page(
         &self,
@@ -1227,6 +1259,28 @@ impl DatasetWindowReader {
         row_count: u32,
         filters: &[DataFilter],
     ) -> Result<Vec<u8>, DatasetError> {
+        self.fetch_projection(row_offset, row_count, filters, None)
+    }
+
+    /// Reads selected union-schema columns in the requested order.
+    pub fn fetch_columns(
+        &mut self,
+        row_offset: u64,
+        row_count: u32,
+        filters: &[DataFilter],
+        source_indices: &[u32],
+    ) -> Result<Vec<u8>, DatasetError> {
+        let projection = validate_projection(&self.summary.schema, source_indices)?;
+        self.fetch_projection(row_offset, row_count, filters, Some(&projection))
+    }
+
+    fn fetch_projection(
+        &mut self,
+        row_offset: u64,
+        row_count: u32,
+        filters: &[DataFilter],
+        source_indices: Option<&[usize]>,
+    ) -> Result<Vec<u8>, DatasetError> {
         if row_count > MAX_WINDOW_ROWS {
             return Err(DataWindowError::WindowTooLarge.into());
         }
@@ -1236,8 +1290,12 @@ impl DatasetWindowReader {
         let members = self.active_members();
         self.source.ensure_members_unchanged(members)?;
         let candidates = candidate_members(members, &self.summary, filters);
+        let projected_schema = source_indices
+            .map(|indices| self.arrow_schema.project(indices).map(Arc::new))
+            .transpose()
+            .map_err(|_| DataWindowError::Unsupported)?;
         if candidates.is_empty() {
-            return encode_empty_ipc(&self.arrow_schema);
+            return encode_empty_ipc(projected_schema.as_ref().unwrap_or(&self.arrow_schema));
         }
         self.bind_candidate_paths(&candidates)?;
         let where_clause = if filters.is_empty() {
@@ -1245,7 +1303,7 @@ impl DatasetWindowReader {
         } else {
             format!(" WHERE {}", predicate.sql)
         };
-        let query = self.query_sql(&where_clause);
+        let query = self.query_sql(&where_clause, source_indices);
         let mut parameters = predicate.parameters;
         parameters.push(Value::BigInt(i64::from(row_count)));
         parameters.push(Value::BigInt(
@@ -1273,8 +1331,14 @@ impl DatasetWindowReader {
                 ));
             }
         };
-        let mut writer = StreamWriter::try_new(Vec::new(), self.arrow_schema.as_ref())
-            .map_err(|_| DataWindowError::EncodingFailed)?;
+        let mut writer = StreamWriter::try_new(
+            Vec::new(),
+            projected_schema
+                .as_ref()
+                .unwrap_or(&self.arrow_schema)
+                .as_ref(),
+        )
+        .map_err(|_| DataWindowError::EncodingFailed)?;
         let encoded = match catch_unwind(AssertUnwindSafe(|| {
             for batch in batches {
                 writer
@@ -1321,7 +1385,7 @@ impl DatasetWindowReader {
     }
 
     fn query_schema(&self, candidates: &[&DatasetMember]) -> Result<SchemaRef, DatasetError> {
-        let query = self.query_sql("");
+        let query = self.query_sql("", None);
         let mut statement = self
             .connection
             .prepare(&query)
@@ -1362,7 +1426,7 @@ impl DatasetWindowReader {
         Ok(())
     }
 
-    fn query_sql(&self, where_clause: &str) -> String {
+    fn query_sql(&self, where_clause: &str, source_indices: Option<&[usize]>) -> String {
         let relation = dataset_relation_sql(
             &self.summary,
             self.physical_column_count,
@@ -1370,10 +1434,13 @@ impl DatasetWindowReader {
             None,
             self.schema_seed.is_some(),
         );
-        let projection = self
-            .summary
-            .schema
-            .iter()
+        let projection = source_indices
+            .map_or_else(
+                || (0..self.summary.schema.len()).collect::<Vec<_>>(),
+                <[usize]>::to_vec,
+            )
+            .into_iter()
+            .map(|index| &self.summary.schema[index])
             .map(|field| quote_identifier(&field.name))
             .collect::<Vec<_>>()
             .join(", ");
@@ -1704,9 +1771,13 @@ fn is_visible_parquet_path(root: &Path, path: &Path) -> bool {
     relative
         .components()
         .all(|component| !component.as_os_str().to_string_lossy().starts_with('.'))
-        && path
-            .extension()
-            .is_some_and(|extension| extension == "parquet")
+        && has_parquet_extension(path)
+}
+
+fn has_parquet_extension(path: &Path) -> bool {
+    path.extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("parquet"))
 }
 
 fn slash_path(path: &Path) -> Result<String, DatasetError> {
@@ -2736,7 +2807,7 @@ mod tests {
             member_row_counts: row_counts,
         };
 
-        let query = reader.query_sql("");
+        let query = reader.query_sql("", None);
 
         assert!(query.len() < 1_500);
         assert!(!query.contains("part-0000.parquet"));

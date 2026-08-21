@@ -38,7 +38,7 @@ use structure::{
     get_structure_columns, get_structure_key_value, get_structure_layout,
     get_structure_lens_totals, get_structure_load_progress, get_structure_report,
     get_structure_row_groups, get_structure_row_offset, get_structure_summary,
-    probe_structure_bloom_filter,
+    probe_structure_bloom_filter, select_dataset_structure_member,
 };
 use tauri::{
     Emitter, Manager,
@@ -57,14 +57,17 @@ use view_settings::{DataViewSettings, get_data_view_settings, set_data_view_sett
 use viewda_data_engine::{
     ColumnStatistics, ColumnStatisticsError, ColumnStatisticsReader, DataFilter,
     DataFilterOperator, DataSort, DataViewBuilder, DataViewError, DataViewInterruptHandle,
-    DataViewResourceDiagnostics, DataWindowError, DataWindowReader, EngineError, EngineStatus,
-    PreparedDataView, SchemaField, SourceError, SourceIdentity, SourceOpenPhase, SourceSnapshot,
-    SourceSummary, StatisticsInterruptHandle, StructureReader, TextValueSuggestions,
-    TextValueSuggestionsInterruptHandle, TextValueSuggestionsReader, engine_status,
-    inspect_local_source_snapshot_cancellable,
+    DataViewResourceDiagnostics, DataWindowError, DataWindowReader, DatasetError,
+    DatasetInspectionInterruptHandle, DatasetInspectionProgress, DatasetInspector,
+    DatasetMemberPage, DatasetPartitionPage, DatasetSource, DatasetSummary, DatasetWindowReader,
+    EngineError, EngineStatus, PreparedDataView, SchemaField, SourceError, SourceIdentity,
+    SourceOpenPhase, SourceSnapshot, SourceSummary, StatisticsInterruptHandle, StructureReader,
+    TextValueSuggestions, TextValueSuggestionsInterruptHandle, TextValueSuggestionsReader,
+    engine_status, inspect_local_source_snapshot_cancellable,
 };
 
 const OPEN_SOURCE_MENU_ID: &str = "open-local-source";
+const OPEN_FOLDER_MENU_ID: &str = "open-local-folder";
 const CLOSE_SOURCE_MENU_ID: &str = "close-source";
 const OPEN_RECENT_MENU_ID: &str = "open-recent";
 const OPEN_RECENT_MENU_PREFIX: &str = "open-recent:";
@@ -72,6 +75,7 @@ const CLEAR_RECENT_MENU_ID: &str = "clear-recent";
 const SETTINGS_MENU_ID: &str = "settings";
 const CHECK_FOR_UPDATES_MENU_ID: &str = "check-for-updates";
 const OPEN_SOURCE_REQUESTED_EVENT: &str = "open-source-requested";
+const OPEN_FOLDER_REQUESTED_EVENT: &str = "open-folder-requested";
 const CLOSE_SOURCE_REQUESTED_EVENT: &str = "close-source-requested";
 const RECENT_SOURCES_CHANGED_EVENT: &str = "recent-sources-changed";
 const SETTINGS_REQUESTED_EVENT: &str = "settings-requested";
@@ -79,6 +83,41 @@ const UPDATE_AVAILABLE_EVENT: &str = "update-available";
 const DATA_EXPORT_CLOSE_REQUESTED_EVENT: &str = "data-export-close-requested";
 #[cfg(target_os = "macos")]
 const QUIT_MENU_ID: &str = "quit";
+
+#[derive(Default)]
+pub(crate) struct DatasetDropModifier(AtomicBool);
+
+#[tauri::command]
+fn set_dataset_drop_modifier(active: bool, modifier: tauri::State<'_, DatasetDropModifier>) {
+    modifier.0.store(active, Ordering::Release);
+}
+
+fn open_dataset_descriptor_from_native(
+    app: &tauri::AppHandle,
+    descriptor: SourceDescriptor,
+) -> Result<OpenedSourceInfo, OpenSourceError> {
+    let opened_source = app.state::<OpenedSource>();
+    let request = opened_source.begin_source_open()?;
+    let opened = inspect_dataset_for_request(
+        opened_source.inner(),
+        descriptor,
+        SourceOpenIntent::Explicit,
+        SourceOpenPublication {
+            request,
+            client_attempt: None,
+            reload_generation: None,
+        },
+        true,
+    )?
+    .ok_or(SourceError::Unsupported)?;
+    Ok(match opened {
+        DatasetOpenResult::Existing(info) => info,
+        DatasetOpenResult::Inspecting(info, session, inspector) => {
+            spawn_dataset_inspection(session, *inspector);
+            info
+        }
+    })
+}
 
 #[derive(Default)]
 struct DataExportCloseDialog {
@@ -235,6 +274,7 @@ const RECENT_CLIENT_SOURCE_OPEN_ATTEMPTS: usize = 16;
 struct SourceOpenPublication<'a> {
     request: u64,
     client_attempt: Option<&'a str>,
+    reload_generation: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -291,6 +331,8 @@ impl OpenedSourceState {
 struct OpenedSourceSession {
     generation: u64,
     path: PathBuf,
+    descriptor: SourceDescriptor,
+    kind: OpenedSourceKind,
     summary: SourceSummary,
     schema: Vec<SchemaField>,
     schema_complete: bool,
@@ -304,8 +346,8 @@ struct OpenedSourceSession {
 struct OpenedSourceSessionState {
     source_snapshot: Option<Arc<SourceSnapshot>>,
     view_revision: u64,
-    view: Option<PreparedDataView>,
-    reader: DataWindowReader,
+    view: Option<Arc<Mutex<PreparedDataView>>>,
+    reader: SessionWindowReader,
     text_suggestion_reader: Option<Arc<TextValueSuggestionsReader>>,
     statistics_cache: HashMap<usize, ColumnStatistics>,
     data_view_jobs: DataViewJobsState,
@@ -313,6 +355,169 @@ struct OpenedSourceSessionState {
     statistics_job: Option<Arc<ColumnStatisticsJob>>,
     /// Footer parse of this source, installed by the first structure query.
     structure: Option<Arc<StructureReader>>,
+    structure_member_ordinal: u64,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(
+    tag = "kind",
+    content = "source",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
+pub(crate) enum SourceDescriptor {
+    File(PathBuf),
+    Folder(PathBuf),
+    ExplicitFiles { root: PathBuf, paths: Vec<PathBuf> },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+enum OpenedSourceKind {
+    File,
+    FolderDataset,
+    FileDataset,
+}
+
+enum SessionWindowReader {
+    File(DataWindowReader),
+    Dataset(DatasetSessionState),
+}
+
+impl SessionWindowReader {
+    fn fetch(
+        &mut self,
+        row_offset: u64,
+        row_count: u32,
+    ) -> Result<Vec<u8>, DataWindowCommandError> {
+        match self {
+            Self::File(reader) => reader.fetch(row_offset, row_count).map_err(Into::into),
+            Self::Dataset(dataset) => match &dataset.phase {
+                DatasetSessionPhase::Ready { .. } => Err(DataWindowError::Unsupported.into()),
+                DatasetSessionPhase::Inspecting { .. } => {
+                    Err(DataWindowSessionError::NotReady.into())
+                }
+                DatasetSessionPhase::Failed(error) => {
+                    Err(dataset_window_command_error(error.clone()))
+                }
+            },
+        }
+    }
+
+    fn fetch_columns(
+        &mut self,
+        row_offset: u64,
+        row_count: u32,
+        source_indices: &[u32],
+    ) -> Result<Vec<u8>, DataWindowCommandError> {
+        match self {
+            Self::File(reader) => reader
+                .fetch_columns(row_offset, row_count, source_indices)
+                .map_err(Into::into),
+            Self::Dataset(dataset) => match &dataset.phase {
+                DatasetSessionPhase::Ready { .. } => Err(DataWindowError::Unsupported.into()),
+                DatasetSessionPhase::Inspecting { .. } => {
+                    Err(DataWindowSessionError::NotReady.into())
+                }
+                DatasetSessionPhase::Failed(error) => {
+                    Err(dataset_window_command_error(error.clone()))
+                }
+            },
+        }
+    }
+}
+
+fn dataset_window_command_error(error: DatasetError) -> DataWindowCommandError {
+    match error {
+        DatasetError::Window { error } => error.into(),
+        DatasetError::Cancelled => DataWindowError::Cancelled.into(),
+        error => DataWindowCommandError::Dataset(error),
+    }
+}
+
+fn session_query_facts<'a>(
+    session: &'a OpenedSourceSession,
+    state: &'a OpenedSourceSessionState,
+) -> Result<(&'a [SchemaField], usize, u64), DataWindowCommandError> {
+    match &state.reader {
+        SessionWindowReader::File(_) if session.schema_complete => Ok((
+            &session.schema,
+            session.schema_node_count,
+            session.summary.row_count,
+        )),
+        SessionWindowReader::File(_) => Err(DataWindowError::Unsupported.into()),
+        SessionWindowReader::Dataset(dataset) => match &dataset.phase {
+            DatasetSessionPhase::Ready { summary, .. } => Ok((
+                &summary.schema,
+                summary.schema.iter().map(schema_node_count).sum(),
+                summary.row_count,
+            )),
+            DatasetSessionPhase::Inspecting { .. } => Err(DataWindowSessionError::NotReady.into()),
+            DatasetSessionPhase::Failed(error) => Err(dataset_window_command_error(error.clone())),
+        },
+    }
+}
+
+struct DatasetSessionState {
+    source: DatasetSource,
+    preview: Arc<Vec<u8>>,
+    phase: DatasetSessionPhase,
+}
+
+enum DatasetSessionPhase {
+    Inspecting {
+        progress: DatasetInspectionProgress,
+        interrupt: DatasetInspectionInterruptHandle,
+    },
+    Ready {
+        summary: DatasetSummary,
+        reader: Arc<Mutex<DatasetWindowReader>>,
+    },
+    Failed(DatasetError),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(
+    tag = "state",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
+enum DatasetSessionStatus {
+    Inspecting { progress: DatasetInspectionStatus },
+    Ready { summary: DatasetSummaryStatus },
+    Failed { error: DatasetError },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DatasetInspectionStatus {
+    completed_member_count: u64,
+    total_member_count: u64,
+    row_count: u64,
+    row_group_count: u64,
+    schema: Option<Vec<SchemaField>>,
+    schema_node_count: usize,
+    schema_is_truncated: bool,
+    strings_truncated: bool,
+    schema_complete: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DatasetSummaryStatus {
+    display_name: String,
+    member_count: u64,
+    ignored_file_count: u64,
+    size_bytes: u64,
+    row_count: u64,
+    row_group_count: u64,
+    schema: Vec<SchemaField>,
+    schema_node_count: usize,
+    schema_is_truncated: bool,
+    strings_truncated: bool,
+    schema_drift_member_count: u64,
+    partition_column_indices: Vec<u32>,
+    provenance_column_index: u32,
 }
 
 impl OpenedSourceSession {
@@ -359,26 +564,160 @@ impl OpenedSourceSession {
             None => Ok(()),
         }
     }
+
+    fn dataset_status(&self) -> Result<DatasetSessionStatus, DataWindowError> {
+        let state = self.lock_state()?;
+        let SessionWindowReader::Dataset(dataset) = &state.reader else {
+            return Err(DataWindowError::Unsupported);
+        };
+        let ready = match &dataset.phase {
+            DatasetSessionPhase::Inspecting { progress, .. } => DatasetSessionStatus::Inspecting {
+                progress: DatasetInspectionStatus::from(progress),
+            },
+            DatasetSessionPhase::Ready { summary, reader } => {
+                let ready = (summary.clone(), Arc::clone(reader));
+                drop(state);
+                if let Err(error) = ready
+                    .1
+                    .lock()
+                    .map_err(|_| DataWindowError::Unsupported)?
+                    .latched_source_change()
+                {
+                    self.with_open_state(|state| {
+                        let SessionWindowReader::Dataset(dataset) = &mut state.reader else {
+                            return;
+                        };
+                        if matches!(dataset.phase, DatasetSessionPhase::Ready { .. }) {
+                            dataset.phase = DatasetSessionPhase::Failed(error.clone());
+                        }
+                    })?;
+                    return Ok(DatasetSessionStatus::Failed { error });
+                }
+                return Ok(DatasetSessionStatus::Ready {
+                    summary: DatasetSummaryStatus::from(&ready.0),
+                });
+            }
+            DatasetSessionPhase::Failed(error) => DatasetSessionStatus::Failed {
+                error: error.clone(),
+            },
+        };
+        Ok(ready)
+    }
+}
+
+impl From<&DatasetInspectionProgress> for DatasetInspectionStatus {
+    fn from(progress: &DatasetInspectionProgress) -> Self {
+        let schema_node_count = progress
+            .schema
+            .as_deref()
+            .unwrap_or_default()
+            .iter()
+            .map(schema_node_count)
+            .sum();
+        let (schema, strings_truncated) = progress.schema.as_deref().map_or_else(
+            || (None, false),
+            |schema| {
+                let (schema, truncated) = bounded_wire_schema_with_marker(schema);
+                (Some(schema), truncated)
+            },
+        );
+        Self {
+            completed_member_count: progress.completed_member_count,
+            total_member_count: progress.total_member_count,
+            row_count: progress.row_count,
+            row_group_count: progress.row_group_count,
+            schema_is_truncated: schema
+                .as_ref()
+                .is_some_and(|schema| schema_node_count > schema.len()),
+            schema,
+            schema_node_count,
+            strings_truncated,
+            schema_complete: progress.schema_complete,
+        }
+    }
+}
+
+impl From<&DatasetSummary> for DatasetSummaryStatus {
+    fn from(summary: &DatasetSummary) -> Self {
+        let schema_node_count = summary.schema.iter().map(schema_node_count).sum();
+        let (schema, schema_strings_truncated) = bounded_wire_schema_with_marker(&summary.schema);
+        let (display_name, display_name_truncated) = bounded_wire_label(&summary.display_name);
+        let schema_is_truncated = schema_node_count > schema.len();
+        Self {
+            display_name,
+            member_count: summary.member_count,
+            ignored_file_count: summary.ignored_file_count,
+            size_bytes: summary.size_bytes,
+            row_count: summary.row_count,
+            row_group_count: summary.row_group_count,
+            schema,
+            schema_node_count,
+            schema_is_truncated,
+            strings_truncated: schema_strings_truncated || display_name_truncated,
+            schema_drift_member_count: summary.schema_drift_member_count,
+            partition_column_indices: summary.partition_column_indices.clone(),
+            provenance_column_index: summary.provenance_column_index,
+        }
+    }
+}
+
+impl SourceDescriptor {
+    fn path(&self) -> &std::path::Path {
+        match self {
+            Self::File(path) | Self::Folder(path) => path,
+            Self::ExplicitFiles { root, .. } => root,
+        }
+    }
+
+    fn kind(&self) -> OpenedSourceKind {
+        match self {
+            Self::File(_) => OpenedSourceKind::File,
+            Self::Folder(_) => OpenedSourceKind::FolderDataset,
+            Self::ExplicitFiles { .. } => OpenedSourceKind::FileDataset,
+        }
+    }
+
+    fn reopen_dataset(&self) -> Result<DatasetSource, DatasetError> {
+        match self {
+            Self::Folder(root) => DatasetSource::open_folder(root),
+            Self::ExplicitFiles { paths, .. } => DatasetSource::open_files(paths),
+            Self::File(_) => Err(DatasetError::Unsupported),
+        }
+    }
+
+    fn explicit_files(paths: Vec<PathBuf>) -> Self {
+        let mut paths = paths;
+        paths.sort();
+        let root = common_parent(&paths).unwrap_or_default();
+        Self::ExplicitFiles { root, paths }
+    }
+}
+
+fn common_parent(paths: &[PathBuf]) -> Option<PathBuf> {
+    let first = paths.first()?.parent()?;
+    let mut root = first.to_path_buf();
+    while paths.iter().any(|path| {
+        !path
+            .parent()
+            .is_some_and(|parent| parent.starts_with(&root))
+    }) {
+        if !root.pop() {
+            return Some(root);
+        }
+    }
+    Some(root)
 }
 
 impl OpenedSourceSessionState {
-    fn text_suggestion_reader(
-        &mut self,
-        path: &std::path::Path,
-    ) -> Result<Arc<TextValueSuggestionsReader>, DataWindowError> {
-        if self.text_suggestion_reader.is_none() {
-            self.text_suggestion_reader = Some(Arc::new(TextValueSuggestionsReader::new(
-                path.to_path_buf(),
-            )?));
-        }
-        self.text_suggestion_reader
-            .as_ref()
-            .map(Arc::clone)
-            .ok_or(DataWindowError::QueryEngineUnavailable)
-    }
-
     /// Interrupts every job this session owns; each command then reports cancellation.
     fn cancel_jobs(&mut self) {
+        if let SessionWindowReader::Dataset(DatasetSessionState {
+            phase: DatasetSessionPhase::Inspecting { interrupt, .. },
+            ..
+        }) = &self.reader
+        {
+            interrupt.interrupt();
+        }
         if let Some(job) = self.data_view_jobs.active.take() {
             job.cancel();
         }
@@ -596,6 +935,7 @@ fn cancel_text_value_suggestion_job(
 enum ColumnStatisticsRequest {
     Cached(ColumnStatistics),
     Scan { path: PathBuf, column_name: String },
+    DatasetScan { column_name: String },
 }
 
 struct ColumnStatisticsJob {
@@ -614,8 +954,19 @@ impl ColumnStatisticsJob {
 #[serde(rename_all = "camelCase")]
 pub(crate) struct OpenedSourceInfo {
     generation: u64,
+    kind: OpenedSourceKind,
+    dataset_member_count: Option<u64>,
+    dataset_ignored_file_count: Option<u64>,
     #[serde(flatten)]
     summary: SourceSummary,
+}
+
+/// One file-dialog attempt, including every source published before a later failure.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct OpenedSourceBatch {
+    sources: Vec<OpenedSourceInfo>,
+    source_error: Option<OpenSourceError>,
 }
 
 /// One open source as the file switcher and the titlebar list it.
@@ -626,6 +977,9 @@ pub(crate) struct OpenedSourceInfo {
 #[serde(rename_all = "camelCase")]
 struct OpenedSourceEntry {
     generation: u64,
+    kind: OpenedSourceKind,
+    dataset_member_count: Option<u64>,
+    dataset_ignored_file_count: Option<u64>,
     name: String,
     directory: String,
     path: String,
@@ -673,21 +1027,7 @@ struct SourceSchemaNodePage {
 }
 
 fn bounded_source_schema_field(field: &SchemaField) -> SchemaField {
-    const MAX_LABEL_BYTES: usize = 128;
-    let mut end = field.name.len().min(MAX_LABEL_BYTES);
-    while !field.name.is_char_boundary(end) {
-        end -= 1;
-    }
-    let name = if end == field.name.len() {
-        field.name.clone()
-    } else {
-        let ellipsis_bytes = '…'.len_utf8();
-        let mut prefix_end = MAX_LABEL_BYTES.saturating_sub(ellipsis_bytes);
-        while !field.name.is_char_boundary(prefix_end) {
-            prefix_end -= 1;
-        }
-        format!("{}…", &field.name[..prefix_end])
-    };
+    let (name, _) = bounded_wire_label(&field.name);
     SchemaField {
         name,
         physical_type: field.physical_type.clone(),
@@ -696,19 +1036,51 @@ fn bounded_source_schema_field(field: &SchemaField) -> SchemaField {
     }
 }
 
+fn bounded_wire_label(label: &str) -> (String, bool) {
+    const MAX_LABEL_BYTES: usize = 128;
+    let mut end = label.len().min(MAX_LABEL_BYTES);
+    while !label.is_char_boundary(end) {
+        end -= 1;
+    }
+    if end == label.len() {
+        (label.to_owned(), false)
+    } else {
+        let ellipsis_bytes = '…'.len_utf8();
+        let mut prefix_end = MAX_LABEL_BYTES.saturating_sub(ellipsis_bytes);
+        while !label.is_char_boundary(prefix_end) {
+            prefix_end -= 1;
+        }
+        (format!("{}…", &label[..prefix_end]), true)
+    }
+}
+
+fn bounded_wire_schema_with_marker(schema: &[SchemaField]) -> (Vec<SchemaField>, bool) {
+    let strings_truncated = schema.iter().any(schema_field_strings_truncated);
+    let schema = schema
+        .iter()
+        .take(MAX_SOURCE_SCHEMA_PAGE_COLUMNS)
+        .map(bounded_source_schema_field)
+        .collect::<Vec<_>>();
+    (schema, strings_truncated)
+}
+
+fn schema_field_strings_truncated(field: &SchemaField) -> bool {
+    bounded_wire_label(&field.name).1 || field.children.iter().any(schema_field_strings_truncated)
+}
+
 fn source_schema_page(
-    session: &OpenedSourceSession,
+    schema: &[SchemaField],
     offset: usize,
     limit: usize,
 ) -> Result<SourceSchemaPage, DataWindowCommandError> {
-    if limit == 0 || limit > MAX_SOURCE_SCHEMA_PAGE_COLUMNS || offset > session.schema.len() {
+    if limit == 0 || limit > MAX_SOURCE_SCHEMA_PAGE_COLUMNS || offset > schema.len() {
         return Err(DataWindowError::Unsupported.into());
     }
-    let end = offset.saturating_add(limit).min(session.schema.len());
+    let end = offset.saturating_add(limit).min(schema.len());
     Ok(SourceSchemaPage {
         offset,
-        total_count: session.schema.len(),
-        columns: session.schema[offset..end]
+        total_count: schema.len(),
+        columns: schema[offset..end]
             .iter()
             .map(bounded_source_schema_field)
             .collect(),
@@ -716,7 +1088,8 @@ fn source_schema_page(
 }
 
 fn source_schema_node_page(
-    session: &OpenedSourceSession,
+    schema: &[SchemaField],
+    schema_node_count: usize,
     cursor: Option<SourceSchemaNodeCursor>,
     limit: usize,
 ) -> Result<SourceSchemaNodePage, DataWindowCommandError> {
@@ -724,7 +1097,7 @@ fn source_schema_node_page(
         return Err(DataWindowError::Unsupported.into());
     }
     let mut cursor = cursor.or_else(|| {
-        (!session.schema.is_empty()).then_some(SourceSchemaNodeCursor {
+        (!schema.is_empty()).then_some(SourceSchemaNodeCursor {
             path: vec![0],
             leaf_index: 0,
         })
@@ -732,8 +1105,8 @@ fn source_schema_node_page(
     let mut nodes = Vec::with_capacity(limit);
     let mut path_components = 0usize;
     while let Some(current) = cursor.clone() {
-        let field = schema_field_at_path(&session.schema, &current.path)
-            .ok_or(DataWindowError::Unsupported)?;
+        let field =
+            schema_field_at_path(schema, &current.path).ok_or(DataWindowError::Unsupported)?;
         let next_components = path_components.saturating_add(current.path.len());
         if !nodes.is_empty() && next_components > MAX_SOURCE_SCHEMA_PAGE_PATH_COMPONENTS {
             break;
@@ -751,7 +1124,7 @@ fn source_schema_node_page(
             leaf_index: (!has_children).then_some(current.leaf_index),
         });
         path_components = next_components;
-        cursor = next_schema_cursor(&session.schema, current, has_children);
+        cursor = next_schema_cursor(schema, current, has_children);
         if nodes.len() == limit {
             break;
         }
@@ -759,7 +1132,7 @@ fn source_schema_node_page(
     Ok(SourceSchemaNodePage {
         nodes,
         next_cursor: cursor,
-        total_count: session.schema_node_count,
+        total_count: schema_node_count,
     })
 }
 
@@ -840,6 +1213,7 @@ enum DataViewResourceCommandError {
 enum DataWindowCommandError {
     Session(DataWindowSessionError),
     Engine(DataWindowError),
+    Dataset(DatasetError),
     ViewResource(Box<DataViewResourceCommandError>),
 }
 
@@ -849,6 +1223,29 @@ enum DataWindowSessionError {
     NoSourceOpen,
     SourceChanged,
     ViewChanged,
+    NotReady,
+}
+
+#[derive(Debug, PartialEq, Eq, Serialize)]
+#[serde(untagged)]
+enum DatasetCommandError {
+    Session(DatasetSessionCommandError),
+    Dataset(DatasetError),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(tag = "code", rename_all = "camelCase")]
+enum DatasetSessionCommandError {
+    NoSourceOpen,
+    SourceChanged,
+    NotDataset,
+    NotReady,
+}
+
+impl From<DatasetError> for DatasetCommandError {
+    fn from(error: DatasetError) -> Self {
+        Self::Dataset(error)
+    }
 }
 
 fn missing_data_window_session(state: &OpenedSourceState) -> DataWindowCommandError {
@@ -856,6 +1253,28 @@ fn missing_data_window_session(state: &OpenedSourceState) -> DataWindowCommandEr
         DataWindowSessionError::NoSourceOpen,
         DataWindowSessionError::SourceChanged,
     ))
+}
+
+fn dataset_session(
+    opened_source: &OpenedSource,
+    generation: u64,
+) -> Result<Arc<OpenedSourceSession>, DatasetCommandError> {
+    let state = opened_source
+        .state
+        .lock()
+        .map_err(|_| DatasetCommandError::Session(DatasetSessionCommandError::SourceChanged))?;
+    let session = state.session(generation).ok_or_else(|| {
+        DatasetCommandError::Session(state.missing_session(
+            DatasetSessionCommandError::NoSourceOpen,
+            DatasetSessionCommandError::SourceChanged,
+        ))
+    })?;
+    if session.kind == OpenedSourceKind::File {
+        return Err(DatasetCommandError::Session(
+            DatasetSessionCommandError::NotDataset,
+        ));
+    }
+    Ok(session)
 }
 
 impl From<DataWindowSessionError> for DataWindowCommandError {
@@ -869,6 +1288,7 @@ impl From<DataWindowSessionError> for DataWindowCommandError {
 enum ColumnStatisticsCommandError {
     NoSourceOpen,
     SourceChanged,
+    NotReady,
     UnsupportedColumn,
     Cancelled,
     NotFound,
@@ -943,11 +1363,13 @@ impl From<DataViewError> for DataWindowCommandError {
 }
 
 /// Stable failures exposed by every source-opening command.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Error, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Error, Serialize)]
 #[serde(untagged)]
 enum OpenSourceError {
     #[error(transparent)]
     Source(#[from] SourceError),
+    #[error(transparent)]
+    Dataset(#[from] DatasetError),
     #[error(transparent)]
     Recent(#[from] RecentSourceError),
 }
@@ -958,7 +1380,138 @@ enum SourceOpenIntent {
     Restore,
 }
 
+fn dataset_progress_source_summary(
+    source: &DatasetSource,
+    progress: &DatasetInspectionProgress,
+) -> Result<SourceSummary, SourceError> {
+    let (size_bytes, schema) = match &progress.summary {
+        Some(summary) => (summary.size_bytes, summary.schema.clone()),
+        None => (0, progress.schema.clone().unwrap_or_default()),
+    };
+    let row_group_count =
+        usize::try_from(progress.row_group_count).map_err(|_| SourceError::Unsupported)?;
+    let schema_node_count = schema.iter().map(schema_node_count).sum();
+    let column_count = schema.iter().map(schema_leaf_count).sum();
+    let (bounded_schema, schema_strings_truncated) = bounded_wire_schema_with_marker(&schema);
+    let (display_name, display_name_truncated) = bounded_wire_label(source.display_name());
+    let schema_is_truncated = schema_node_count > bounded_schema.len();
+    Ok(SourceSummary {
+        display_name,
+        size_bytes,
+        row_count: progress.row_count,
+        row_group_count,
+        column_count,
+        schema: bounded_schema,
+        schema_node_count,
+        schema_is_truncated,
+        strings_truncated: schema_strings_truncated || display_name_truncated,
+    })
+}
+
+fn completed_dataset_source_summary(
+    summary: &DatasetSummary,
+) -> Result<SourceSummary, SourceError> {
+    let row_group_count =
+        usize::try_from(summary.row_group_count).map_err(|_| SourceError::Unsupported)?;
+    let schema_node_count = summary.schema.iter().map(schema_node_count).sum();
+    let column_count = summary.schema.iter().map(schema_leaf_count).sum();
+    let (schema, schema_strings_truncated) = bounded_wire_schema_with_marker(&summary.schema);
+    let (display_name, display_name_truncated) = bounded_wire_label(&summary.display_name);
+    Ok(SourceSummary {
+        display_name,
+        size_bytes: summary.size_bytes,
+        row_count: summary.row_count,
+        row_group_count,
+        column_count,
+        schema_is_truncated: schema_node_count > schema.len(),
+        schema,
+        schema_node_count,
+        strings_truncated: schema_strings_truncated || display_name_truncated,
+    })
+}
+
+fn schema_node_count(field: &SchemaField) -> usize {
+    1usize.saturating_add(field.children.iter().map(schema_node_count).sum())
+}
+
+fn schema_leaf_count(field: &SchemaField) -> usize {
+    if field.children.is_empty() {
+        1
+    } else {
+        field.children.iter().map(schema_leaf_count).sum()
+    }
+}
+
 impl OpenedSource {
+    fn activate_dataset_descriptor(
+        &self,
+        descriptor: &SourceDescriptor,
+        intent: SourceOpenIntent,
+        publication: SourceOpenPublication<'_>,
+    ) -> Result<Option<OpenedSourceInfo>, OpenSourceError> {
+        let session = {
+            let mut state = self.lock_state()?;
+            if publication.request != state.open_request {
+                return Ok(None);
+            }
+            if let Some(client_attempt) = publication.client_attempt
+                && !state.client_open_attempt.as_ref().is_some_and(|attempt| {
+                    attempt.id == client_attempt
+                        && attempt.open_request == publication.request
+                        && matches!(
+                            attempt.status,
+                            ClientSourceOpenStatus::Pending | ClientSourceOpenStatus::Published
+                        )
+                })
+            {
+                return Ok(None);
+            }
+            if intent == SourceOpenIntent::Restore && state.blocks_restore {
+                return Ok(None);
+            }
+            let Some(index) = state
+                .sessions
+                .iter()
+                .position(|session| session.descriptor == *descriptor)
+            else {
+                return Ok(None);
+            };
+            if intent == SourceOpenIntent::Explicit {
+                state.blocks_restore = true;
+            }
+            let session = Arc::clone(&state.sessions[index]);
+            state.activate(session.generation);
+            if let Some(attempt) = publication.client_attempt
+                && let Some(client_open) = state
+                    .client_open_attempt
+                    .as_mut()
+                    .filter(|client_open| client_open.id == attempt)
+            {
+                client_open.status = ClientSourceOpenStatus::Published;
+            }
+            session
+        };
+        let state = session.lock_state().map_err(|_| SourceError::Unsupported)?;
+        let SessionWindowReader::Dataset(dataset) = &state.reader else {
+            return Ok(None);
+        };
+        let summary = match &dataset.phase {
+            DatasetSessionPhase::Ready { summary, .. } => {
+                completed_dataset_source_summary(summary)?
+            }
+            DatasetSessionPhase::Inspecting { .. } | DatasetSessionPhase::Failed(_) => {
+                session.summary.clone()
+            }
+        };
+        Ok(Some(OpenedSourceInfo {
+            generation: session.generation,
+            kind: session.kind,
+            dataset_member_count: Some(dataset.source.member_count()),
+            dataset_ignored_file_count: Some(dataset.source.ignored_file_count()),
+            summary,
+        }))
+    }
+
     fn remember_client_source_open_terminal(
         state: &mut OpenedSourceState,
         attempt: ClientSourceOpenAttempt,
@@ -1036,6 +1589,17 @@ impl OpenedSource {
         if publication.is_some_and(|publication| publication.request != state.open_request) {
             return Ok(None);
         }
+        if publication
+            .and_then(|publication| publication.reload_generation)
+            .is_some_and(|generation| {
+                !state
+                    .sessions
+                    .iter()
+                    .any(|session| session.generation == generation)
+            })
+        {
+            return Ok(None);
+        }
         if let Some((publication, client_attempt)) = publication.and_then(|publication| {
             publication
                 .client_attempt
@@ -1043,7 +1607,10 @@ impl OpenedSource {
         }) && !state.client_open_attempt.as_ref().is_some_and(|attempt| {
             attempt.id == client_attempt
                 && attempt.open_request == publication.request
-                && attempt.status == ClientSourceOpenStatus::Pending
+                && matches!(
+                    attempt.status,
+                    ClientSourceOpenStatus::Pending | ClientSourceOpenStatus::Published
+                )
         }) {
             return Ok(None);
         }
@@ -1065,6 +1632,9 @@ impl OpenedSource {
                 let session = &state.sessions[index];
                 let info = OpenedSourceInfo {
                     generation: session.generation,
+                    kind: session.kind,
+                    dataset_member_count: None,
+                    dataset_ignored_file_count: None,
                     summary: session.summary.clone(),
                 };
                 state.activate(info.generation);
@@ -1083,13 +1653,15 @@ impl OpenedSource {
                 let session = Arc::new(OpenedSourceSession {
                     generation,
                     path: path.clone(),
+                    descriptor: SourceDescriptor::File(path.clone()),
+                    kind: OpenedSourceKind::File,
                     summary: summary.clone(),
                     schema,
                     schema_complete,
                     schema_node_count: summary.schema_node_count,
                     source_identity: incoming_identity,
                     state: Mutex::new(OpenedSourceSessionState {
-                        reader: DataWindowReader::new(path.clone()),
+                        reader: SessionWindowReader::File(DataWindowReader::new(path.clone())),
                         view_revision: 0,
                         view: None,
                         text_suggestion_reader: None,
@@ -1099,6 +1671,7 @@ impl OpenedSource {
                         statistics_job: None,
                         source_snapshot: source_snapshot.map(Arc::new),
                         structure: None,
+                        structure_member_ordinal: 0,
                     }),
                     lifecycle: Arc::new(SessionLifecycle::default()),
                     structure_jobs: StructureJobs::default(),
@@ -1111,6 +1684,9 @@ impl OpenedSource {
                 state.sessions.insert(0, session);
                 OpenedSourceInfo {
                     generation,
+                    kind: OpenedSourceKind::File,
+                    dataset_member_count: None,
+                    dataset_ignored_file_count: None,
                     summary,
                 }
             }
@@ -1138,6 +1714,123 @@ impl OpenedSource {
         Ok(Some(info))
     }
 
+    fn install_dataset(
+        &self,
+        descriptor: SourceDescriptor,
+        source: DatasetSource,
+        preview: viewda_data_engine::DatasetPreview,
+        interrupt: DatasetInspectionInterruptHandle,
+        intent: SourceOpenIntent,
+        publication: SourceOpenPublication<'_>,
+    ) -> Result<Option<(OpenedSourceInfo, Arc<OpenedSourceSession>)>, OpenSourceError> {
+        let summary = dataset_progress_source_summary(&source, &preview.progress)?;
+        let path = descriptor.path().to_path_buf();
+        let kind = descriptor.kind();
+        let member_count = source.member_count();
+        let ignored_file_count = source.ignored_file_count();
+        let mut state = self.lock_state()?;
+        if publication.request != state.open_request {
+            return Ok(None);
+        }
+        if publication.reload_generation.is_some_and(|generation| {
+            !state
+                .sessions
+                .iter()
+                .any(|session| session.generation == generation)
+        }) {
+            return Ok(None);
+        }
+        if let Some(client_attempt) = publication.client_attempt
+            && !state.client_open_attempt.as_ref().is_some_and(|attempt| {
+                attempt.id == client_attempt
+                    && attempt.open_request == publication.request
+                    && matches!(
+                        attempt.status,
+                        ClientSourceOpenStatus::Pending | ClientSourceOpenStatus::Published
+                    )
+            })
+        {
+            return Ok(None);
+        }
+        if intent == SourceOpenIntent::Restore && state.blocks_restore {
+            return Ok(None);
+        }
+        if intent == SourceOpenIntent::Explicit {
+            state.blocks_restore = true;
+        }
+        let generation = state
+            .generation
+            .checked_add(1)
+            .ok_or(SourceError::Unsupported)?;
+        state.generation = generation;
+        let session = Arc::new(OpenedSourceSession {
+            generation,
+            path,
+            descriptor: descriptor.clone(),
+            kind,
+            summary: summary.clone(),
+            schema: summary.schema.clone(),
+            schema_complete: false,
+            schema_node_count: summary.schema_node_count,
+            source_identity: None,
+            state: Mutex::new(OpenedSourceSessionState {
+                reader: SessionWindowReader::Dataset(DatasetSessionState {
+                    source,
+                    preview: Arc::new(preview.arrow_ipc),
+                    phase: DatasetSessionPhase::Inspecting {
+                        progress: preview.progress,
+                        interrupt,
+                    },
+                }),
+                view_revision: 0,
+                view: None,
+                text_suggestion_reader: None,
+                statistics_cache: HashMap::new(),
+                data_view_jobs: DataViewJobsState::default(),
+                text_suggestion_jobs: TextValueSuggestionJobsState::default(),
+                statistics_job: None,
+                source_snapshot: None,
+                structure: None,
+                structure_member_ordinal: 0,
+            }),
+            lifecycle: Arc::new(SessionLifecycle::default()),
+            structure_jobs: StructureJobs::default(),
+        });
+        let existing = state
+            .sessions
+            .iter()
+            .position(|existing| existing.descriptor == descriptor);
+        let replaced = existing.map(|index| state.sessions.remove(index));
+        if let Some(previous) = &replaced {
+            previous.lifecycle.start_closing();
+        }
+        state.sessions.insert(0, Arc::clone(&session));
+        if let Some(attempt) = publication.client_attempt
+            && let Some(client_open) = state
+                .client_open_attempt
+                .as_mut()
+                .filter(|client_open| client_open.id == attempt)
+        {
+            client_open.status = ClientSourceOpenStatus::Published;
+        }
+        drop(state);
+        if let Some(previous) = replaced {
+            self.data_exports
+                .cancel_source_and_wait(previous.generation);
+            previous.close_and_wait();
+        }
+        Ok(Some((
+            OpenedSourceInfo {
+                generation,
+                kind,
+                dataset_member_count: Some(member_count),
+                dataset_ignored_file_count: Some(ignored_file_count),
+                summary,
+            },
+            session,
+        )))
+    }
+
     /// Drops one session, interrupting the jobs and releasing the state it owns.
     fn close(&self, generation: u64) -> Result<bool, OpenSourceError> {
         let mut state = self.lock_state()?;
@@ -1155,12 +1848,23 @@ impl OpenedSource {
     }
 
     /// Open source paths in most-recently-used order, the active source first.
+    #[cfg(test)]
     pub(crate) fn open_paths(&self) -> Result<Vec<PathBuf>, OpenSourceError> {
         Ok(self
             .lock_state()?
             .sessions
             .iter()
             .map(|session| session.path.clone())
+            .collect())
+    }
+
+    /// Open source descriptors in most-recently-used order, the active one first.
+    pub(crate) fn open_descriptors(&self) -> Result<Vec<SourceDescriptor>, OpenSourceError> {
+        Ok(self
+            .lock_state()?
+            .sessions
+            .iter()
+            .map(|session| session.descriptor.clone())
             .collect())
     }
 
@@ -1242,7 +1946,25 @@ impl OpenedSource {
             Some(ClientSourceOpenAttempt {
                 status: ClientSourceOpenStatus::Published,
                 ..
-            }) => return Ok(SourceOpenCancelOutcome::Published),
+            }) => {
+                let current = state
+                    .client_open_attempt
+                    .take()
+                    .expect("the published client source open was matched above");
+                if current.open_request == state.open_request {
+                    state.open_request = state
+                        .open_request
+                        .checked_add(1)
+                        .ok_or(SourceError::Unsupported)?;
+                }
+                Self::remember_client_source_open_terminal(&mut state, current);
+                drop(state);
+                self.source_open_progress
+                    .lock()
+                    .map_err(|_| SourceError::Unsupported)?
+                    .take();
+                return Ok(SourceOpenCancelOutcome::Published);
+            }
             Some(ClientSourceOpenAttempt {
                 status: ClientSourceOpenStatus::Cancelled,
                 ..
@@ -1451,6 +2173,25 @@ fn fetch_opened_source_window(
     row_count: u32,
     source_indices: &[u32],
 ) -> Result<Vec<u8>, DataWindowCommandError> {
+    fetch_opened_source_window_core(
+        session,
+        view_revision,
+        row_offset,
+        row_count,
+        source_indices,
+        #[cfg(test)]
+        || {},
+    )
+}
+
+fn fetch_opened_source_window_core(
+    session: &OpenedSourceSession,
+    view_revision: u64,
+    row_offset: u64,
+    row_count: u32,
+    source_indices: &[u32],
+    #[cfg(test)] prepared_view_state_released: impl FnOnce(),
+) -> Result<Vec<u8>, DataWindowCommandError> {
     let mut state = session.lock_state()?;
     if state.view_revision != view_revision {
         return Err(DataWindowCommandError::Session(
@@ -1458,37 +2199,119 @@ fn fetch_opened_source_window(
         ));
     }
     session.validate_source_identity()?;
-    if !session.schema_complete {
-        return Err(DataWindowError::Unsupported.into());
-    }
-    let result = match &state.view {
-        Some(view) => view
-            .fetch_window_columns(row_offset, row_count, source_indices)
-            .map_err(Into::into),
-        None => {
-            // The session installs its schema and reader from the same source generation.
-            // Keep this predicate aligned with DataWindowReader::fetch_columns: this fast path
-            // avoids parsing the footer, while the reader still protects direct library callers.
-            let identity_projection = !source_indices.is_empty()
-                && source_indices.len() == session.schema.len()
-                && source_indices
-                    .iter()
-                    .enumerate()
-                    .all(|(index, source_index)| usize::try_from(*source_index) == Ok(index));
-            if identity_projection {
-                state
-                    .reader
-                    .fetch(row_offset, row_count)
-                    .map_err(Into::into)
-            } else {
-                state
-                    .reader
-                    .fetch_columns(row_offset, row_count, source_indices)
-                    .map_err(Into::into)
-            }
-        }
+    let schema_len = session_query_facts(session, &state)?.0.len();
+    let dataset_reader = match &state.reader {
+        SessionWindowReader::Dataset(DatasetSessionState {
+            phase: DatasetSessionPhase::Ready { reader, .. },
+            ..
+        }) => Some(Arc::clone(reader)),
+        _ => None,
     };
+    if state.view.is_none()
+        && let SessionWindowReader::Dataset(dataset) = &state.reader
+    {
+        let reader = match &dataset.phase {
+            DatasetSessionPhase::Ready { reader, .. } => Arc::clone(reader),
+            DatasetSessionPhase::Inspecting { .. } => {
+                return Err(DataWindowSessionError::NotReady.into());
+            }
+            DatasetSessionPhase::Failed(error) => {
+                return Err(dataset_window_command_error(error.clone()));
+            }
+        };
+        let identity_projection = !source_indices.is_empty()
+            && source_indices.len() == schema_len
+            && source_indices
+                .iter()
+                .enumerate()
+                .all(|(index, source_index)| usize::try_from(*source_index) == Ok(index));
+        drop(state);
+        let result = {
+            let mut reader = reader
+                .lock()
+                .map_err(|_| DataWindowError::QueryEngineUnavailable)?;
+            if identity_projection {
+                reader
+                    .fetch(row_offset, row_count, &[])
+                    .map_err(dataset_window_command_error)
+            } else {
+                reader
+                    .fetch_columns(row_offset, row_count, &[], source_indices)
+                    .map_err(dataset_window_command_error)
+            }
+        };
+        session.with_open_state(|current| {
+            if current.view_revision != view_revision {
+                return Err(DataWindowCommandError::Session(
+                    DataWindowSessionError::ViewChanged,
+                ));
+            }
+            Ok(())
+        })??;
+        return map_dataset_window_result(result, dataset_reader.as_ref());
+    }
+    if let Some(view) = state.view.as_ref().map(Arc::clone) {
+        drop(state);
+        #[cfg(test)]
+        prepared_view_state_released();
+        let result = view
+            .lock()
+            .map_err(|_| DataWindowError::QueryEngineUnavailable)?
+            .fetch_window_columns(row_offset, row_count, source_indices)
+            .map_err(Into::into);
+        session.with_open_state(|current| {
+            if current.view_revision != view_revision
+                || !current
+                    .view
+                    .as_ref()
+                    .is_some_and(|current_view| Arc::ptr_eq(current_view, &view))
+            {
+                return Err(DataWindowCommandError::Session(
+                    DataWindowSessionError::ViewChanged,
+                ));
+            }
+            Ok(())
+        })??;
+        return map_dataset_window_result(result, dataset_reader.as_ref());
+    }
+    // The session installs its schema and reader from the same source generation.
+    // Keep this predicate aligned with DataWindowReader::fetch_columns: this fast path
+    // avoids parsing the footer, while the reader still protects direct library callers.
+    let identity_projection = !source_indices.is_empty()
+        && source_indices.len() == schema_len
+        && source_indices
+            .iter()
+            .enumerate()
+            .all(|(index, source_index)| usize::try_from(*source_index) == Ok(index));
+    let result = if identity_projection {
+        state.reader.fetch(row_offset, row_count)
+    } else {
+        state
+            .reader
+            .fetch_columns(row_offset, row_count, source_indices)
+    };
+    drop(state);
     session.validate_source_identity()?;
+    result
+}
+
+fn map_dataset_window_result(
+    result: Result<Vec<u8>, DataWindowCommandError>,
+    dataset_reader: Option<&Arc<Mutex<DatasetWindowReader>>>,
+) -> Result<Vec<u8>, DataWindowCommandError> {
+    if matches!(
+        result,
+        Err(DataWindowCommandError::Engine(
+            DataWindowError::SourceChanged | DataWindowError::CorruptSource
+        ))
+    ) && let Some(reader) = dataset_reader
+        && let Err(dataset_error) = reader
+            .lock()
+            .map_err(|_| DataWindowError::QueryEngineUnavailable)?
+            .latched_source_change()
+    {
+        return Err(dataset_window_command_error(dataset_error));
+    }
     result
 }
 
@@ -1507,7 +2330,9 @@ fn get_source_schema_page(
     let missing = missing_data_window_session(&state);
     let session = state.session(generation).ok_or(missing)?;
     session.validate_source_identity()?;
-    source_schema_page(&session, offset, limit)
+    let session_state = session.lock_state()?;
+    let (schema, _, _) = session_query_facts(&session, &session_state)?;
+    source_schema_page(schema, offset, limit)
 }
 
 /// Returns one bounded DFS page for merging into the existing Structure tree.
@@ -1525,7 +2350,9 @@ fn get_source_schema_node_page(
     let missing = missing_data_window_session(&state);
     let session = state.session(generation).ok_or(missing)?;
     session.validate_source_identity()?;
-    source_schema_node_page(&session, cursor, limit)
+    let session_state = session.lock_state()?;
+    let (schema, schema_node_count, _) = session_query_facts(&session, &session_state)?;
+    source_schema_node_page(schema, schema_node_count, cursor, limit)
 }
 
 /// Prepares one filtered and sorted position index, then atomically publishes it.
@@ -1551,12 +2378,35 @@ async fn prepare_data_view(
     };
     let _work = session.begin_work()?;
     session.validate_source_identity()?;
-    let builder = DataViewBuilder::with_memory_limit(
-        session.path.clone(),
-        &filters,
-        &sort,
-        settings.memory_limit,
-    )?;
+    let dataset_reader = {
+        let state = session.lock_state()?;
+        match &state.reader {
+            SessionWindowReader::File(_) => None,
+            SessionWindowReader::Dataset(dataset) => match &dataset.phase {
+                DatasetSessionPhase::Ready { reader, .. } => Some(Arc::clone(reader)),
+                DatasetSessionPhase::Inspecting { .. } => {
+                    return Err(DataWindowSessionError::NotReady.into());
+                }
+                DatasetSessionPhase::Failed(error) => {
+                    return Err(dataset_window_command_error(error.clone()));
+                }
+            },
+        }
+    };
+    let builder = match &dataset_reader {
+        Some(reader) => {
+            let reader = reader
+                .lock()
+                .map_err(|_| DataWindowError::QueryEngineUnavailable)?;
+            DataViewBuilder::for_dataset(&reader, &filters, &sort, settings.memory_limit)?
+        }
+        None => DataViewBuilder::with_memory_limit(
+            session.path.clone(),
+            &filters,
+            &sort,
+            settings.memory_limit,
+        )?,
+    };
     let interrupt = Arc::new(builder.interrupt_handle());
     session.with_open_state(|state| {
         register_data_view_job(
@@ -1570,13 +2420,35 @@ async fn prepare_data_view(
 
     let result = tauri::async_runtime::spawn_blocking(move || builder.build()).await;
     let cancelled = interrupt.is_cancelled();
-    let mut state = session.lock_state()?;
-    let is_current = finish_data_view_job(&mut state.data_view_jobs, view_revision, &interrupt);
+    let is_current = {
+        let mut state = session.lock_state()?;
+        finish_data_view_job(&mut state.data_view_jobs, view_revision, &interrupt)
+    };
     if cancelled || !is_current {
         return Err(DataWindowError::Cancelled.into());
     }
-    let view = result.map_err(|_| DataWindowError::QueryEngineUnavailable)??;
+    let built = result.map_err(|_| DataWindowError::QueryEngineUnavailable)?;
+    let view = match built {
+        Ok(view) => view,
+        Err(error) => {
+            if matches!(
+                error,
+                DataViewError::Engine(
+                    DataWindowError::SourceChanged | DataWindowError::CorruptSource
+                )
+            ) && let Some(reader) = dataset_reader
+                && let Err(dataset_error) = reader
+                    .lock()
+                    .map_err(|_| DataWindowError::QueryEngineUnavailable)?
+                    .latched_source_change()
+            {
+                return Err(dataset_window_command_error(dataset_error));
+            }
+            return Err(error.into());
+        }
+    };
     session.validate_source_identity()?;
+    let mut state = session.lock_state()?;
     if view_revision <= state.view_revision {
         return Err(DataWindowError::Cancelled.into());
     }
@@ -1585,7 +2457,7 @@ async fn prepare_data_view(
         row_count: view.row_count(),
     };
     state.view_revision = view_revision;
-    state.view = Some(view);
+    state.view = Some(Arc::new(Mutex::new(view)));
     Ok(status)
 }
 
@@ -1618,9 +2490,10 @@ fn activate_direct_data_view(
     if let Some(active) = state.data_view_jobs.active.take() {
         active.cancel();
     }
+    let (_, _, row_count) = session_query_facts(&session, &state)?;
     let status = DataViewStatus {
         revision: view_revision,
-        row_count: session.summary.row_count,
+        row_count,
     };
     state.view_revision = view_revision;
     state.view = None;
@@ -1642,12 +2515,13 @@ fn get_data_view_status(
         state.session(generation).ok_or(missing)?
     };
     let state = session.lock_state()?;
+    let (_, _, direct_row_count) = session_query_facts(&session, &state)?;
     Ok(DataViewStatus {
         revision: state.view_revision,
-        row_count: state
-            .view
-            .as_ref()
-            .map_or(session.summary.row_count, PreparedDataView::row_count),
+        row_count: state.view.as_ref().map_or(direct_row_count, |view| {
+            view.lock()
+                .map_or(direct_row_count, |view| view.row_count())
+        }),
     })
 }
 
@@ -1695,14 +2569,51 @@ async fn get_text_value_suggestions(
     };
     let _work = session.begin_work()?;
     session.validate_source_identity()?;
-    let column = session
-        .schema
-        .get(column_index)
-        .cloned()
-        .ok_or(DataWindowError::InvalidFilter)?;
-    let reader = session
-        .lock_state()?
-        .text_suggestion_reader(&session.path)?;
+    let (column, cached_reader, dataset_reader) = {
+        let state = session.lock_state()?;
+        let column = session_query_facts(&session, &state)?
+            .0
+            .get(column_index)
+            .cloned()
+            .ok_or(DataWindowError::InvalidFilter)?;
+        let dataset_reader = match &state.reader {
+            SessionWindowReader::File(_) => None,
+            SessionWindowReader::Dataset(dataset) => match &dataset.phase {
+                DatasetSessionPhase::Ready { reader, .. } => Some(Arc::clone(reader)),
+                DatasetSessionPhase::Inspecting { .. } => {
+                    return Err(DataWindowSessionError::NotReady.into());
+                }
+                DatasetSessionPhase::Failed(error) => {
+                    return Err(dataset_window_command_error(error.clone()));
+                }
+            },
+        };
+        (
+            column,
+            state.text_suggestion_reader.as_ref().map(Arc::clone),
+            dataset_reader,
+        )
+    };
+    let reader = match cached_reader {
+        Some(reader) => reader,
+        None => {
+            let created = match &dataset_reader {
+                Some(dataset_reader) => {
+                    let dataset_reader = dataset_reader
+                        .lock()
+                        .map_err(|_| DataWindowError::QueryEngineUnavailable)?;
+                    TextValueSuggestionsReader::for_dataset(&dataset_reader)
+                }
+                None => TextValueSuggestionsReader::new(session.path.clone()),
+            }?;
+            session.with_open_state(|state| {
+                state
+                    .text_suggestion_reader
+                    .get_or_insert_with(|| Arc::new(created))
+                    .clone()
+            })?
+        }
+    };
     let interrupt = Arc::new(reader.interrupt_handle());
     session.with_open_state(|state| {
         register_text_value_suggestion_job(
@@ -1734,9 +2645,19 @@ async fn get_text_value_suggestions(
     } else if cancelled || !is_current {
         Err(DataWindowError::Cancelled.into())
     } else {
-        result
-            .map_err(|_| DataWindowError::QueryEngineUnavailable)?
-            .map_err(Into::into)
+        let result = result.map_err(|_| DataWindowError::QueryEngineUnavailable)?;
+        if matches!(
+            result,
+            Err(DataWindowError::SourceChanged | DataWindowError::CorruptSource)
+        ) && let Some(reader) = dataset_reader
+            && let Err(dataset_error) = reader
+                .lock()
+                .map_err(|_| DataWindowError::QueryEngineUnavailable)?
+                .latched_source_change()
+        {
+            return Err(dataset_window_command_error(dataset_error));
+        }
+        result.map_err(Into::into)
     }
 }
 
@@ -1791,14 +2712,42 @@ async fn get_column_statistics(
         .begin_work()
         .map_err(ColumnStatisticsCommandError::from)?;
     let request = statistics_request(&session, column_index, include_min_max)?;
-    let (path, column_name) = match request {
+    let (reader, column_name) = match request {
         ColumnStatisticsRequest::Cached(statistics) => {
             cancel_active_statistics_job(&opened_source, generation)?;
             return Ok(statistics);
         }
-        ColumnStatisticsRequest::Scan { path, column_name } => (path, column_name),
+        ColumnStatisticsRequest::Scan { path, column_name } => {
+            (ColumnStatisticsReader::new(path)?, column_name)
+        }
+        ColumnStatisticsRequest::DatasetScan { column_name } => {
+            let dataset_reader = {
+                let state = session
+                    .lock_state()
+                    .map_err(ColumnStatisticsCommandError::from)?;
+                let SessionWindowReader::Dataset(dataset) = &state.reader else {
+                    return Err(ColumnStatisticsCommandError::Unsupported);
+                };
+                match &dataset.phase {
+                    DatasetSessionPhase::Ready { reader, .. } => Arc::clone(reader),
+                    DatasetSessionPhase::Inspecting { .. } => {
+                        return Err(ColumnStatisticsCommandError::NotReady);
+                    }
+                    DatasetSessionPhase::Failed(DatasetError::SourceChanged { .. }) => {
+                        return Err(ColumnStatisticsCommandError::SourceChanged);
+                    }
+                    DatasetSessionPhase::Failed(_) => {
+                        return Err(ColumnStatisticsCommandError::Unsupported);
+                    }
+                }
+            };
+            let dataset_reader = dataset_reader
+                .lock()
+                .map_err(|_| ColumnStatisticsCommandError::QueryEngineUnavailable)?;
+            let reader = ColumnStatisticsReader::for_dataset(&dataset_reader)?;
+            (reader, column_name)
+        }
     };
-    let reader = ColumnStatisticsReader::new(path)?;
     let job = Arc::new(ColumnStatisticsJob {
         cancelled: AtomicBool::new(false),
         interrupt: reader.interrupt_handle(),
@@ -1860,15 +2809,26 @@ fn statistics_request(
     {
         return Ok(ColumnStatisticsRequest::Cached(statistics.clone()));
     }
-    let column_name = session
-        .schema
+    let (schema, _, _) = session_query_facts(session, &state).map_err(|error| match error {
+        DataWindowCommandError::Session(DataWindowSessionError::NotReady) => {
+            ColumnStatisticsCommandError::NotReady
+        }
+        DataWindowCommandError::Session(DataWindowSessionError::SourceChanged) => {
+            ColumnStatisticsCommandError::SourceChanged
+        }
+        _ => ColumnStatisticsCommandError::Unsupported,
+    })?;
+    let column_name = schema
         .get(column_index)
         .ok_or(ColumnStatisticsCommandError::UnsupportedColumn)?
         .name
         .clone();
-    Ok(ColumnStatisticsRequest::Scan {
-        path: session.path.clone(),
-        column_name,
+    Ok(match &state.reader {
+        SessionWindowReader::File(_) => ColumnStatisticsRequest::Scan {
+            path: session.path.clone(),
+            column_name,
+        },
+        SessionWindowReader::Dataset(_) => ColumnStatisticsRequest::DatasetScan { column_name },
     })
 }
 
@@ -1877,12 +2837,16 @@ fn cache_statistics(
     column_index: usize,
     statistics: ColumnStatistics,
 ) -> Result<(), ColumnStatisticsCommandError> {
-    if session.schema.get(column_index).is_none() {
-        return Err(ColumnStatisticsCommandError::UnsupportedColumn);
-    }
     let mut state = session
         .lock_state()
         .map_err(ColumnStatisticsCommandError::from)?;
+    if session_query_facts(session, &state)
+        .ok()
+        .and_then(|(schema, _, _)| schema.get(column_index))
+        .is_none()
+    {
+        return Err(ColumnStatisticsCommandError::UnsupportedColumn);
+    }
     match state.statistics_cache.entry(column_index) {
         Entry::Vacant(entry) => {
             entry.insert(statistics);
@@ -1921,6 +2885,137 @@ fn cancel_active_statistics_job(
     Ok(())
 }
 
+const DATASET_PREVIEW_ROWS: u32 = 256;
+const DATASET_INSPECTION_BATCH_MEMBERS: u32 = 32;
+
+enum DatasetOpenResult {
+    Existing(OpenedSourceInfo),
+    Inspecting(
+        OpenedSourceInfo,
+        Arc<OpenedSourceSession>,
+        Box<DatasetInspector>,
+    ),
+}
+
+fn publish_dataset_open(opened: DatasetOpenResult) -> OpenedSourceInfo {
+    match opened {
+        DatasetOpenResult::Existing(info) => info,
+        DatasetOpenResult::Inspecting(info, session, inspector) => {
+            spawn_dataset_inspection(session, *inspector);
+            info
+        }
+    }
+}
+
+fn inspect_dataset_for_request(
+    opened_source: &OpenedSource,
+    descriptor: SourceDescriptor,
+    intent: SourceOpenIntent,
+    publication: SourceOpenPublication<'_>,
+    reuse_existing: bool,
+) -> Result<Option<DatasetOpenResult>, OpenSourceError> {
+    if !opened_source.source_open_is_current(publication.request)? {
+        return Ok(None);
+    }
+    if reuse_existing
+        && let Some(info) =
+            opened_source.activate_dataset_descriptor(&descriptor, intent, publication)?
+    {
+        return Ok(Some(DatasetOpenResult::Existing(info)));
+    }
+    let source = descriptor.reopen_dataset()?;
+    let mut inspector = source.inspector();
+    let interrupt = inspector.interrupt_handle();
+    let preview = inspector.preview(DATASET_PREVIEW_ROWS)?;
+    Ok(opened_source
+        .install_dataset(descriptor, source, preview, interrupt, intent, publication)?
+        .map(|(info, session)| DatasetOpenResult::Inspecting(info, session, Box::new(inspector))))
+}
+
+fn spawn_dataset_inspection(session: Arc<OpenedSourceSession>, mut inspector: DatasetInspector) {
+    tauri::async_runtime::spawn_blocking(move || {
+        let Ok(_work) = session.begin_work() else {
+            return;
+        };
+        let completed = loop {
+            let progress = match inspector.advance(DATASET_INSPECTION_BATCH_MEMBERS) {
+                Ok(progress) => progress,
+                Err(DatasetError::Cancelled) => return,
+                Err(error) => {
+                    let _ = publish_dataset_failure(&session, error);
+                    return;
+                }
+            };
+            let is_complete = progress.summary.is_some();
+            if session
+                .with_open_state(|state| {
+                    let SessionWindowReader::Dataset(dataset) = &mut state.reader else {
+                        return false;
+                    };
+                    let DatasetSessionPhase::Inspecting {
+                        progress: current, ..
+                    } = &mut dataset.phase
+                    else {
+                        return false;
+                    };
+                    *current = progress;
+                    true
+                })
+                .ok()
+                != Some(true)
+            {
+                return;
+            }
+            if is_complete {
+                break inspector.into_window_reader();
+            }
+        };
+        match completed {
+            Ok(reader) => {
+                let _ = publish_completed_dataset_reader(&session, reader);
+            }
+            Err(DatasetError::Cancelled) => {}
+            Err(error) => {
+                let _ = publish_dataset_failure(&session, error);
+            }
+        }
+    });
+}
+
+fn publish_dataset_failure(
+    session: &OpenedSourceSession,
+    error: DatasetError,
+) -> Result<bool, DataWindowError> {
+    session.with_open_state(|state| {
+        let SessionWindowReader::Dataset(dataset) = &mut state.reader else {
+            return false;
+        };
+        if !matches!(dataset.phase, DatasetSessionPhase::Inspecting { .. }) {
+            return false;
+        }
+        dataset.phase = DatasetSessionPhase::Failed(error);
+        true
+    })
+}
+
+fn publish_completed_dataset_reader(
+    session: &OpenedSourceSession,
+    reader: DatasetWindowReader,
+) -> Result<bool, DataWindowError> {
+    let summary = reader.summary().clone();
+    let reader = Arc::new(Mutex::new(reader));
+    session.with_open_state(|state| {
+        let SessionWindowReader::Dataset(dataset) = &mut state.reader else {
+            return false;
+        };
+        if !matches!(dataset.phase, DatasetSessionPhase::Inspecting { .. }) {
+            return false;
+        }
+        dataset.phase = DatasetSessionPhase::Ready { summary, reader };
+        true
+    })
+}
+
 /// Interrupts the active statistics scan of one opened source.
 #[tauri::command]
 fn cancel_column_statistics(
@@ -1939,7 +3034,8 @@ fn cancel_column_statistics(
 async fn open_local_source(
     app: tauri::AppHandle,
     attempt: String,
-) -> Result<Option<OpenedSourceInfo>, OpenSourceError> {
+    group_as_dataset: Option<bool>,
+) -> Result<Option<OpenedSourceBatch>, OpenSourceError> {
     let Some(open_request) = app
         .state::<OpenedSource>()
         .begin_client_source_open(&attempt)?
@@ -1949,30 +3045,84 @@ async fn open_local_source(
     let command_app = app.clone();
     let job_attempt = attempt.clone();
     // blocking_pick_file would stall the async runtime thread.
-    let inspected = match tauri::async_runtime::spawn_blocking(move || {
-        let selected = command_app
-            .dialog()
-            .file()
-            .add_filter("Parquet", &["parquet"])
-            .blocking_pick_file();
-        let Some(selected) = selected else {
-            return Ok(None);
-        };
-        let path = selected.into_path().map_err(|_| SourceError::Unsupported)?;
+    let inspected = match tauri::async_runtime::spawn_blocking(
+        move || -> Result<Option<OpenedSourceBatch>, OpenSourceError> {
+            let selected = command_app
+                .dialog()
+                .file()
+                .add_filter("Parquet", &["parquet"])
+                .blocking_pick_files();
+            let Some(selected) = selected else {
+                return Ok(None);
+            };
+            let paths = selected
+                .into_iter()
+                .map(|selected| selected.into_path().map_err(|_| SourceError::Unsupported))
+                .collect::<Result<Vec<_>, _>>()?;
+            if paths.is_empty() {
+                return Ok(None);
+            }
 
-        let opened_source = command_app.state::<OpenedSource>();
-        let recent_sources_path = recents::state_path(&command_app).ok();
-        inspect_selected_source_at_path_for_request(
-            recent_sources_path.as_deref(),
-            opened_source.inner(),
-            path,
-            SourceOpenIntent::Explicit,
-            SourceOpenPublication {
-                request: open_request,
-                client_attempt: Some(&job_attempt),
-            },
-        )
-    })
+            let opened_source = command_app.state::<OpenedSource>();
+            if group_as_dataset.unwrap_or(false) && paths.len() > 1 {
+                let descriptor = SourceDescriptor::explicit_files(paths);
+                return Ok(Some(
+                    match inspect_dataset_for_request(
+                        opened_source.inner(),
+                        descriptor,
+                        SourceOpenIntent::Explicit,
+                        SourceOpenPublication {
+                            request: open_request,
+                            client_attempt: Some(&job_attempt),
+                            reload_generation: None,
+                        },
+                        true,
+                    ) {
+                        Ok(Some(opened)) => {
+                            let info = publish_dataset_open(opened);
+                            OpenedSourceBatch {
+                                sources: vec![info],
+                                source_error: None,
+                            }
+                        }
+                        Ok(None) => return Ok(None),
+                        Err(error) => OpenedSourceBatch {
+                            sources: Vec::new(),
+                            source_error: Some(error),
+                        },
+                    },
+                ));
+            }
+            let recent_sources_path = recents::state_path(&command_app).ok();
+            let mut sources = Vec::new();
+            for path in paths {
+                match inspect_selected_source_at_path_for_request(
+                    recent_sources_path.as_deref(),
+                    opened_source.inner(),
+                    path,
+                    SourceOpenIntent::Explicit,
+                    SourceOpenPublication {
+                        request: open_request,
+                        client_attempt: Some(&job_attempt),
+                        reload_generation: None,
+                    },
+                ) {
+                    Ok(Some((_, info))) => sources.push(info),
+                    Ok(None) => {}
+                    Err(error) => {
+                        return Ok(Some(OpenedSourceBatch {
+                            sources,
+                            source_error: Some(error),
+                        }));
+                    }
+                }
+            }
+            Ok((!sources.is_empty()).then_some(OpenedSourceBatch {
+                sources,
+                source_error: None,
+            }))
+        },
+    )
     .await
     {
         Ok(result) => result,
@@ -1982,10 +3132,241 @@ async fn open_local_source(
         .finish_client_source_open(&attempt)?;
     let inspected = inspected?;
 
-    if inspected.is_some() {
+    if inspected
+        .as_ref()
+        .is_some_and(|batch| !batch.sources.is_empty())
+    {
         let _ = recent_sources_changed(&app);
     }
-    Ok(inspected.map(|(_, source)| source))
+    Ok(inspected)
+}
+
+/// Opens one folder as a fixed dataset and publishes its first-member preview.
+#[tauri::command]
+async fn open_local_folder(
+    app: tauri::AppHandle,
+    attempt: String,
+) -> Result<Option<OpenedSourceInfo>, OpenSourceError> {
+    let Some(open_request) = app
+        .state::<OpenedSource>()
+        .begin_client_source_open(&attempt)?
+    else {
+        return Ok(None);
+    };
+    let command_app = app.clone();
+    let job_attempt = attempt.clone();
+    let opened = tauri::async_runtime::spawn_blocking(move || {
+        let selected = command_app.dialog().file().blocking_pick_folder();
+        let Some(selected) = selected else {
+            return Ok(None);
+        };
+        let root = selected
+            .into_path()
+            .map_err(|_| DatasetError::Unsupported)?;
+        inspect_dataset_for_request(
+            command_app.state::<OpenedSource>().inner(),
+            SourceDescriptor::Folder(root),
+            SourceOpenIntent::Explicit,
+            SourceOpenPublication {
+                request: open_request,
+                client_attempt: Some(&job_attempt),
+                reload_generation: None,
+            },
+            true,
+        )
+    })
+    .await
+    .map_err(|_| DatasetError::Unsupported)?;
+    app.state::<OpenedSource>()
+        .finish_client_source_open(&attempt)?;
+    if let Some(opened) = opened? {
+        return Ok(Some(publish_dataset_open(opened)));
+    }
+    Ok(None)
+}
+
+#[tauri::command]
+fn get_dataset_status(
+    generation: u64,
+    opened_source: tauri::State<'_, OpenedSource>,
+) -> Result<DatasetSessionStatus, DatasetCommandError> {
+    let session = dataset_session(&opened_source, generation)?;
+    session
+        .dataset_status()
+        .map_err(|_| DatasetCommandError::Session(DatasetSessionCommandError::SourceChanged))
+}
+
+#[tauri::command]
+fn get_dataset_preview(
+    generation: u64,
+    opened_source: tauri::State<'_, OpenedSource>,
+) -> Result<tauri::ipc::Response, DatasetCommandError> {
+    let session = dataset_session(&opened_source, generation)?;
+    let state = session
+        .state
+        .lock()
+        .map_err(|_| DatasetCommandError::Session(DatasetSessionCommandError::SourceChanged))?;
+    let SessionWindowReader::Dataset(dataset) = &state.reader else {
+        return Err(DatasetCommandError::Session(
+            DatasetSessionCommandError::NotDataset,
+        ));
+    };
+    Ok(tauri::ipc::Response::new(dataset.preview.as_ref().clone()))
+}
+
+#[tauri::command]
+fn get_dataset_members(
+    generation: u64,
+    offset: u64,
+    limit: u32,
+    opened_source: tauri::State<'_, OpenedSource>,
+) -> Result<DatasetMemberPage, DatasetCommandError> {
+    let session = dataset_session(&opened_source, generation)?;
+    let state = session
+        .state
+        .lock()
+        .map_err(|_| DatasetCommandError::Session(DatasetSessionCommandError::SourceChanged))?;
+    let SessionWindowReader::Dataset(dataset) = &state.reader else {
+        unreachable!("dataset sessions retain dataset state");
+    };
+    dataset
+        .source
+        .member_page(offset, limit)
+        .map_err(Into::into)
+}
+
+#[tauri::command]
+fn get_dataset_partitions(
+    generation: u64,
+    parent: Vec<viewda_data_engine::PartitionValue>,
+    after: Option<viewda_data_engine::PartitionValue>,
+    limit: u32,
+    opened_source: tauri::State<'_, OpenedSource>,
+) -> Result<DatasetPartitionPage, DatasetCommandError> {
+    let session = dataset_session(&opened_source, generation)?;
+    let state = session
+        .state
+        .lock()
+        .map_err(|_| DatasetCommandError::Session(DatasetSessionCommandError::SourceChanged))?;
+    let SessionWindowReader::Dataset(dataset) = &state.reader else {
+        unreachable!("dataset sessions retain dataset state");
+    };
+    dataset
+        .source
+        .partition_page(&parent, after.as_ref(), limit)
+        .map_err(Into::into)
+}
+
+#[tauri::command]
+fn get_dataset_schema_drift_members(
+    generation: u64,
+    offset: u64,
+    limit: u32,
+    opened_source: tauri::State<'_, OpenedSource>,
+) -> Result<DatasetMemberPage, DatasetCommandError> {
+    let session = dataset_session(&opened_source, generation)?;
+    let state = session
+        .state
+        .lock()
+        .map_err(|_| DatasetCommandError::Session(DatasetSessionCommandError::SourceChanged))?;
+    let SessionWindowReader::Dataset(dataset) = &state.reader else {
+        unreachable!("dataset sessions retain dataset state");
+    };
+    let reader = match &dataset.phase {
+        DatasetSessionPhase::Ready { reader, .. } => Arc::clone(reader),
+        DatasetSessionPhase::Inspecting { .. } => Err(DatasetCommandError::Session(
+            DatasetSessionCommandError::NotReady,
+        ))?,
+        DatasetSessionPhase::Failed(error) => return Err(error.clone().into()),
+    };
+    drop(state);
+    reader
+        .lock()
+        .map_err(|_| DatasetCommandError::Session(DatasetSessionCommandError::SourceChanged))?
+        .schema_drift_page(offset, limit)
+        .map_err(Into::into)
+}
+
+#[tauri::command]
+fn cancel_dataset_inspection(
+    generation: u64,
+    opened_source: tauri::State<'_, OpenedSource>,
+) -> Result<bool, DatasetCommandError> {
+    let session = dataset_session(&opened_source, generation)?;
+    {
+        let state = session
+            .state
+            .lock()
+            .map_err(|_| DatasetCommandError::Session(DatasetSessionCommandError::SourceChanged))?;
+        let SessionWindowReader::Dataset(dataset) = &state.reader else {
+            unreachable!("dataset sessions retain dataset state");
+        };
+        if !matches!(dataset.phase, DatasetSessionPhase::Inspecting { .. }) {
+            return Ok(false);
+        }
+    }
+    opened_source
+        .close(generation)
+        .map_err(|_| DatasetCommandError::Session(DatasetSessionCommandError::SourceChanged))
+}
+
+/// Reopens the active fixed source descriptor and clears any latched source change.
+#[tauri::command]
+async fn reload_opened_source(
+    generation: u64,
+    app: tauri::AppHandle,
+) -> Result<OpenedSourceInfo, OpenSourceError> {
+    let opened_source = app.state::<OpenedSource>();
+    let descriptor = {
+        let state = opened_source.lock_state()?;
+        state
+            .session(generation)
+            .ok_or(SourceError::SourceChanged)?
+            .descriptor
+            .clone()
+    };
+    let request = opened_source.begin_source_open()?;
+    let command_app = app.clone();
+    let reopened = tauri::async_runtime::spawn_blocking(move || match descriptor {
+        SourceDescriptor::File(path) => inspect_selected_source_at_path_for_request(
+            recents::state_path(&command_app).ok().as_deref(),
+            command_app.state::<OpenedSource>().inner(),
+            path,
+            SourceOpenIntent::Explicit,
+            SourceOpenPublication {
+                request,
+                client_attempt: None,
+                reload_generation: Some(generation),
+            },
+        )
+        .map(|opened| opened.map(|(_, info)| (info, None))),
+        dataset_descriptor => inspect_dataset_for_request(
+            command_app.state::<OpenedSource>().inner(),
+            dataset_descriptor,
+            SourceOpenIntent::Explicit,
+            SourceOpenPublication {
+                request,
+                client_attempt: None,
+                reload_generation: Some(generation),
+            },
+            false,
+        )
+        .map(|opened| {
+            opened.map(|opened| match opened {
+                DatasetOpenResult::Existing(info) => (info, None),
+                DatasetOpenResult::Inspecting(info, session, inspector) => {
+                    (info, Some((session, inspector)))
+                }
+            })
+        }),
+    })
+    .await
+    .map_err(|_| SourceError::Unsupported)??
+    .ok_or(SourceError::Unsupported)?;
+    if let Some((session, inspector)) = reopened.1 {
+        spawn_dataset_inspection(session, *inspector);
+    }
+    Ok(reopened.0)
 }
 
 fn inspect_selected_source(
@@ -2001,6 +3382,40 @@ fn inspect_selected_source(
         path,
         intent,
     )
+}
+
+fn inspect_source_descriptor(
+    app: &tauri::AppHandle,
+    descriptor: SourceDescriptor,
+    intent: SourceOpenIntent,
+) -> Result<Option<OpenedSourceInfo>, OpenSourceError> {
+    match descriptor {
+        SourceDescriptor::File(path) => {
+            inspect_selected_source(app, path, intent).map(|opened| opened.map(|(_, info)| info))
+        }
+        descriptor => {
+            let opened_source = app.state::<OpenedSource>();
+            if intent == SourceOpenIntent::Restore && opened_source.blocks_restore()? {
+                return Ok(None);
+            }
+            let request = opened_source.begin_source_open()?;
+            let Some(opened) = inspect_dataset_for_request(
+                opened_source.inner(),
+                descriptor,
+                intent,
+                SourceOpenPublication {
+                    request,
+                    client_attempt: None,
+                    reload_generation: None,
+                },
+                true,
+            )?
+            else {
+                return Ok(None);
+            };
+            Ok(Some(publish_dataset_open(opened)))
+        }
+    }
 }
 
 fn inspect_selected_source_at_path(
@@ -2021,6 +3436,7 @@ fn inspect_selected_source_at_path(
         SourceOpenPublication {
             request: open_request,
             client_attempt: None,
+            reload_generation: None,
         },
     )
 }
@@ -2136,6 +3552,7 @@ async fn open_recent_source(
             SourceOpenPublication {
                 request: open_request,
                 client_attempt: Some(&job_attempt),
+                reload_generation: None,
             },
         )
     })
@@ -2170,6 +3587,7 @@ fn open_recent_source_at_path(
         SourceOpenPublication {
             request: open_request,
             client_attempt: None,
+            reload_generation: None,
         },
     )
 }
@@ -2297,12 +3715,26 @@ fn list_opened_sources(
         .sessions
         .iter()
         .enumerate()
-        .map(|(index, session)| OpenedSourceEntry {
-            generation: session.generation,
-            name: session.summary.display_name.clone(),
-            directory: recents::display_directory(&session.path, home.as_deref()),
-            path: session.path.to_string_lossy().into_owned(),
-            active: index == 0,
+        .map(|(index, session)| {
+            let dataset_facts = session.lock_state().ok().and_then(|state| {
+                let SessionWindowReader::Dataset(dataset) = &state.reader else {
+                    return None;
+                };
+                Some((
+                    dataset.source.member_count(),
+                    dataset.source.ignored_file_count(),
+                ))
+            });
+            OpenedSourceEntry {
+                generation: session.generation,
+                kind: session.kind,
+                dataset_member_count: dataset_facts.map(|facts| facts.0),
+                dataset_ignored_file_count: dataset_facts.map(|facts| facts.1),
+                name: session.summary.display_name.clone(),
+                directory: recents::display_directory(&session.path, home.as_deref()),
+                path: session.path.to_string_lossy().into_owned(),
+                active: index == 0,
+            }
         })
         .collect())
 }
@@ -2675,6 +4107,7 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
         .manage(OpenedSource::default())
+        .manage(DatasetDropModifier::default())
         .manage(RecentSourcesMenu::default())
         .manage(DataExportCloseDialog::default())
         .manage(PendingOpenedSource::default())
@@ -2699,6 +4132,9 @@ pub fn run() {
             let menu = Menu::default(app)?;
             let open_source = MenuItemBuilder::with_id(OPEN_SOURCE_MENU_ID, "Open File…")
                 .accelerator("CmdOrCtrl+O")
+                .build(app)?;
+            let open_folder = MenuItemBuilder::with_id(OPEN_FOLDER_MENU_ID, "Open Folder…")
+                .accelerator("CmdOrCtrl+Shift+O")
                 .build(app)?;
             let open_recent =
                 SubmenuBuilder::with_id(app, OPEN_RECENT_MENU_ID, "Open Recent").build()?;
@@ -2735,6 +4171,7 @@ pub fn run() {
                 #[cfg(target_os = "macos")]
                 file_menu.prepend_items(&[
                     &open_source,
+                    &open_folder,
                     &open_recent,
                     &close_source,
                     &open_separator,
@@ -2744,6 +4181,7 @@ pub fn run() {
                     let update_separator = PredefinedMenuItem::separator(app)?;
                     file_menu.prepend_items(&[
                         &open_source,
+                        &open_folder,
                         &open_recent,
                         &close_source,
                         &open_separator,
@@ -2755,6 +4193,7 @@ pub fn run() {
             } else {
                 let file_menu = SubmenuBuilder::new(app, "File")
                     .item(&open_source)
+                    .item(&open_folder)
                     .item(&open_recent)
                     .separator();
                 #[cfg(not(target_os = "macos"))]
@@ -2816,6 +4255,8 @@ pub fn run() {
             if event.id() == OPEN_SOURCE_MENU_ID {
                 // The frontend receiver can already be gone while the app is shutting down.
                 let _ = app.emit(OPEN_SOURCE_REQUESTED_EVENT, ());
+            } else if event.id() == OPEN_FOLDER_MENU_ID {
+                let _ = app.emit(OPEN_FOLDER_REQUESTED_EVENT, ());
             } else if event.id() == CLOSE_SOURCE_MENU_ID {
                 request_source_close(app);
             } else if event.id() == CLEAR_RECENT_MENU_ID {
@@ -2834,6 +4275,12 @@ pub fn run() {
         .on_window_event(|window, event| {
             if let tauri::WindowEvent::DragDrop(tauri::DragDropEvent::Drop { paths, .. }) = event {
                 launch::open_dropped_paths(window.app_handle(), paths.clone());
+            }
+            if matches!(event, tauri::WindowEvent::Focused(false)) {
+                window
+                    .state::<DatasetDropModifier>()
+                    .0
+                    .store(false, Ordering::Release);
             }
             if let tauri::WindowEvent::CloseRequested { api, .. } = event {
                 let file_names = running_data_export_file_names(window.app_handle());
@@ -2858,6 +4305,15 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             get_engine_status,
             open_local_source,
+            open_local_folder,
+            get_dataset_status,
+            get_dataset_preview,
+            get_dataset_members,
+            get_dataset_partitions,
+            get_dataset_schema_drift_members,
+            cancel_dataset_inspection,
+            reload_opened_source,
+            set_dataset_drop_modifier,
             get_recent_sources,
             open_recent_source,
             remove_recent_source,
@@ -2900,6 +4356,7 @@ pub fn run() {
             get_structure_report,
             probe_structure_bloom_filter,
             cancel_structure_bloom_probe,
+            select_dataset_structure_member,
             get_update_settings,
             set_update_settings,
             get_data_view_settings,
@@ -2983,6 +4440,255 @@ mod tests {
     use viewda_data_engine::SchemaField;
 
     use super::*;
+
+    fn install_test_dataset(
+        opened_source: &OpenedSource,
+        root: &std::path::Path,
+    ) -> (Arc<OpenedSourceSession>, DatasetInspector, OpenedSourceInfo) {
+        let descriptor = SourceDescriptor::Folder(root.to_path_buf());
+        let source = descriptor.reopen_dataset().expect("dataset discovery");
+        let mut inspector = source.inspector();
+        let interrupt = inspector.interrupt_handle();
+        let preview = inspector.preview(16).expect("dataset preview");
+        let request = opened_source.begin_source_open().expect("open request");
+        let (info, session) = opened_source
+            .install_dataset(
+                descriptor,
+                source,
+                preview,
+                interrupt,
+                SourceOpenIntent::Explicit,
+                SourceOpenPublication {
+                    request,
+                    client_attempt: None,
+                    reload_generation: None,
+                },
+            )
+            .expect("dataset install")
+            .expect("current request");
+        (session, inspector, info)
+    }
+
+    #[test]
+    fn dataset_preview_publishes_before_one_atomic_ready_upgrade() {
+        let directory = tempfile::tempdir().expect("dataset directory");
+        write_test_parquet(&directory.path().join("a.parquet"), &[1, 2]);
+        write_test_parquet(&directory.path().join("b.parquet"), &[3]);
+        let opened_source = OpenedSource::default();
+        let (session, mut inspector, info) = install_test_dataset(&opened_source, directory.path());
+
+        assert_eq!(info.kind, OpenedSourceKind::FolderDataset);
+        assert_eq!(info.dataset_member_count, Some(2));
+        assert!(matches!(
+            session.dataset_status().expect("dataset status"),
+            DatasetSessionStatus::Inspecting { progress }
+                if progress.completed_member_count == 1 && progress.total_member_count == 2
+        ));
+        let preview = {
+            let state = session.lock_state().expect("session state");
+            let SessionWindowReader::Dataset(dataset) = &state.reader else {
+                panic!("dataset session");
+            };
+            dataset.preview.as_ref().clone()
+        };
+        assert!(!preview.is_empty());
+        assert_eq!(
+            session_query_facts(&session, &session.lock_state().expect("session state")),
+            Err(DataWindowCommandError::Session(
+                DataWindowSessionError::NotReady
+            ))
+        );
+
+        inspector.advance(32).expect("remaining footer batch");
+        let reader = inspector.into_window_reader().expect("completed reader");
+        assert!(publish_completed_dataset_reader(&session, reader).expect("ready publication"));
+        let summary = match session.dataset_status().expect("ready status") {
+            DatasetSessionStatus::Ready { summary } => summary,
+            _ => panic!("dataset must upgrade atomically to ready"),
+        };
+        let projection = (0..summary.schema.len())
+            .rev()
+            .map(|index| u32::try_from(index).expect("schema index"))
+            .collect::<Vec<_>>();
+        assert!(fetch_opened_source_window(&session, 0, 0, 2, &projection).is_ok());
+    }
+
+    #[test]
+    fn closing_a_provisional_dataset_blocks_a_late_ready_publication() {
+        let directory = tempfile::tempdir().expect("dataset directory");
+        write_test_parquet(&directory.path().join("a.parquet"), &[1]);
+        let opened_source = OpenedSource::default();
+        let (session, inspector, info) = install_test_dataset(&opened_source, directory.path());
+        let reader = inspector
+            .into_window_reader()
+            .expect("preview completed reader");
+
+        assert!(opened_source.close(info.generation).expect("close dataset"));
+        assert_eq!(
+            publish_completed_dataset_reader(&session, reader),
+            Err(DataWindowError::Cancelled)
+        );
+        assert!(
+            opened_source
+                .lock_state()
+                .expect("source state")
+                .session(info.generation)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn background_failure_keeps_only_the_relative_member_name() {
+        let directory = tempfile::tempdir().expect("dataset directory");
+        write_test_parquet(&directory.path().join("a.parquet"), &[1]);
+        fs::write(directory.path().join("b.parquet"), b"not parquet").expect("damaged member");
+        let opened_source = OpenedSource::default();
+        let (session, mut inspector, _) = install_test_dataset(&opened_source, directory.path());
+        let error = inspector.advance(32).expect_err("damaged second member");
+        assert_eq!(
+            error,
+            DatasetError::InvalidMember {
+                member: "b.parquet".to_owned(),
+            }
+        );
+        assert!(publish_dataset_failure(&session, error.clone()).expect("failure publication"));
+        assert_eq!(
+            session.dataset_status().expect("failed status"),
+            DatasetSessionStatus::Failed { error }
+        );
+        let serialized = serde_json::to_string(&session.dataset_status().expect("failed status"))
+            .expect("status JSON");
+        assert!(!serialized.contains(directory.path().to_string_lossy().as_ref()));
+    }
+
+    #[test]
+    fn dataset_status_reports_a_latched_ready_source_change() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        write_test_parquet(&directory.path().join("a.parquet"), &[1]);
+        write_test_parquet(&directory.path().join("b.parquet"), &[2]);
+        let opened_source = OpenedSource::default();
+        let (session, mut inspector, _) = install_test_dataset(&opened_source, directory.path());
+        while inspector
+            .advance(32)
+            .expect("dataset inspection")
+            .summary
+            .is_none()
+        {}
+        let reader = inspector.into_window_reader().expect("dataset reader");
+        assert!(publish_completed_dataset_reader(&session, reader).expect("ready publication"));
+        fs::remove_file(directory.path().join("b.parquet")).expect("remove member");
+        let reader = {
+            let state = session.lock_state().expect("session state");
+            let SessionWindowReader::Dataset(dataset) = &state.reader else {
+                panic!("dataset session");
+            };
+            let DatasetSessionPhase::Ready { reader, .. } = &dataset.phase else {
+                panic!("ready dataset");
+            };
+            Arc::clone(reader)
+        };
+        assert!(matches!(
+            reader.lock().expect("dataset reader").fetch(0, 1, &[]),
+            Err(DatasetError::SourceChanged { member }) if member == "b.parquet"
+        ));
+
+        assert!(matches!(
+            session.dataset_status().expect("dataset status"),
+            DatasetSessionStatus::Failed {
+                error: DatasetError::SourceChanged { member }
+            } if member == "b.parquet"
+        ));
+    }
+
+    #[test]
+    fn folder_membership_changes_only_when_the_descriptor_reopens() {
+        let directory = tempfile::tempdir().expect("dataset directory");
+        write_test_parquet(&directory.path().join("a.parquet"), &[1]);
+        let descriptor = SourceDescriptor::Folder(directory.path().to_path_buf());
+        let frozen = descriptor.reopen_dataset().expect("first discovery");
+        write_test_parquet(&directory.path().join("b.parquet"), &[2]);
+
+        assert_eq!(frozen.member_count(), 1);
+        assert_eq!(
+            descriptor
+                .reopen_dataset()
+                .expect("reload discovery")
+                .member_count(),
+            2
+        );
+    }
+
+    #[test]
+    fn repeated_dataset_open_activates_fixed_membership_until_reload() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        write_test_parquet(&directory.path().join("a.parquet"), &[1]);
+        let opened_source = OpenedSource::default();
+        let (_, _, first) = install_test_dataset(&opened_source, directory.path());
+        write_test_parquet(&directory.path().join("b.parquet"), &[2]);
+        let descriptor = SourceDescriptor::Folder(directory.path().to_path_buf());
+
+        let repeat_request = opened_source.begin_source_open().expect("repeat request");
+        let repeated = inspect_dataset_for_request(
+            &opened_source,
+            descriptor.clone(),
+            SourceOpenIntent::Explicit,
+            SourceOpenPublication {
+                request: repeat_request,
+                client_attempt: None,
+                reload_generation: None,
+            },
+            true,
+        )
+        .expect("repeat open")
+        .expect("existing dataset");
+        let DatasetOpenResult::Existing(repeated) = repeated else {
+            panic!("repeat open must not inspect a new composition");
+        };
+        assert_eq!(repeated.generation, first.generation);
+        assert_eq!(repeated.dataset_member_count, Some(1));
+
+        let reload_request = opened_source.begin_source_open().expect("reload request");
+        let reloaded = inspect_dataset_for_request(
+            &opened_source,
+            descriptor,
+            SourceOpenIntent::Explicit,
+            SourceOpenPublication {
+                request: reload_request,
+                client_attempt: None,
+                reload_generation: Some(first.generation),
+            },
+            false,
+        )
+        .expect("reload")
+        .expect("new dataset generation");
+        let DatasetOpenResult::Inspecting(reloaded, _, _) = reloaded else {
+            panic!("reload must inspect the descriptor again");
+        };
+        assert_ne!(reloaded.generation, first.generation);
+        assert_eq!(reloaded.dataset_member_count, Some(2));
+    }
+
+    #[test]
+    fn explicit_dataset_descriptor_ignores_selection_order() {
+        let first = PathBuf::from("/data/a.parquet");
+        let second = PathBuf::from("/data/b.parquet");
+
+        assert_eq!(
+            SourceDescriptor::explicit_files(vec![first.clone(), second.clone()]),
+            SourceDescriptor::explicit_files(vec![second, first])
+        );
+    }
+
+    #[test]
+    fn explicit_dataset_descriptor_keeps_the_common_root_for_source_details() {
+        let descriptor = SourceDescriptor::explicit_files(vec![
+            PathBuf::from("/data/one/a.parquet"),
+            PathBuf::from("/data/two/b.parquet"),
+        ]);
+
+        assert_eq!(descriptor.path(), std::path::Path::new("/data"));
+        assert_eq!(descriptor.kind(), OpenedSourceKind::FileDataset);
+    }
 
     #[test]
     fn macos_keeps_running_after_the_last_window_closes() {
@@ -3089,6 +4795,65 @@ mod tests {
         );
         assert_eq!(opened_source.open_paths().expect("open paths").len(), 2);
         assert!(opened_source.close(first.generation).expect("close first"));
+    }
+
+    #[test]
+    fn prepared_view_fetch_does_not_hold_the_session_state_mutex() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let path = directory.path().join("source.parquet");
+        write_test_parquet(&path, &[1, 2]);
+        let (summary, snapshot) = inspect_local_source_snapshot_cancellable(&path, &mut |_| true)
+            .expect("source snapshot")
+            .expect("source inspection completes");
+        let opened_source = OpenedSource::default();
+        let opened = opened_source
+            .install_with_snapshot(
+                None,
+                path.clone(),
+                summary,
+                Some(snapshot),
+                SourceOpenIntent::Explicit,
+                None,
+            )
+            .expect("source install")
+            .expect("source publishes");
+        let session = opened_source
+            .state
+            .lock()
+            .expect("opened source state")
+            .session(opened.generation)
+            .expect("opened session");
+        let view = Arc::new(Mutex::new(
+            DataViewBuilder::new(path, &[], &[])
+                .expect("view builder")
+                .build()
+                .expect("prepared view"),
+        ));
+        {
+            let mut state = session.lock_state().expect("session state");
+            state.view_revision = 1;
+            state.view = Some(Arc::clone(&view));
+        }
+        let view_guard = view.lock().expect("hold prepared view");
+        let (state_released_tx, state_released_rx) = mpsc::sync_channel(0);
+        let fetching_session = Arc::clone(&session);
+        let fetching = std::thread::spawn(move || {
+            fetch_opened_source_window_core(&fetching_session, 1, 0, 1, &[], move || {
+                state_released_tx
+                    .send(())
+                    .expect("report released session state")
+            })
+        });
+        state_released_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("fetch releases session state before waiting on the prepared view");
+
+        assert!(
+            session.state.try_lock().is_ok(),
+            "a fetch waiting on its prepared relation must release session state"
+        );
+        drop(view_guard);
+        let _ = fetching.join().expect("fetch thread completes");
     }
 
     fn session_is_closing(opened_source: &OpenedSource, generation: u64) -> bool {
@@ -3216,14 +4981,20 @@ mod tests {
         let state = opened_source.state.lock().expect("source state");
         let session = state.sessions.first().expect("source session");
 
-        let first = source_schema_node_page(session, None, 256).expect("first page");
+        let first = source_schema_node_page(&session.schema, session.schema_node_count, None, 256)
+            .expect("first page");
         assert_eq!(first.nodes.len(), 256);
         assert_eq!(first.total_count, 302);
         assert_eq!(first.nodes[0].path, [0]);
         assert_eq!(first.nodes[1].path, [1]);
         assert!(first.nodes[1].has_children);
-        let second = source_schema_node_page(session, first.next_cursor.clone(), 256)
-            .expect("continuation page");
+        let second = source_schema_node_page(
+            &session.schema,
+            session.schema_node_count,
+            first.next_cursor.clone(),
+            256,
+        )
+        .expect("continuation page");
         assert_eq!(second.nodes.len(), 46);
         assert_eq!(second.nodes.last().expect("last node").path, [1, 299]);
         assert_eq!(
@@ -3238,6 +5009,66 @@ mod tests {
                     <= MAX_SOURCE_SCHEMA_PAGE_PATH_COMPONENTS
             );
         }
+    }
+
+    #[test]
+    fn dataset_ready_status_bounds_wide_schema_on_the_wire() {
+        let full_schema = (0..300)
+            .map(|index| SchemaField {
+                name: format!("column_{index}"),
+                physical_type: "INT64".to_owned(),
+                logical_type: None,
+                children: Vec::new(),
+            })
+            .collect::<Vec<_>>();
+        let status = DatasetSummaryStatus {
+            display_name: "wide/".to_owned(),
+            member_count: 1,
+            ignored_file_count: 0,
+            size_bytes: 1,
+            row_count: 1,
+            row_group_count: 1,
+            schema: bounded_wire_schema_with_marker(&full_schema).0,
+            schema_node_count: full_schema.len(),
+            schema_is_truncated: true,
+            strings_truncated: false,
+            schema_drift_member_count: 0,
+            partition_column_indices: Vec::new(),
+            provenance_column_index: 300,
+        };
+        let value = serde_json::to_value(status).expect("dataset status JSON");
+
+        assert_eq!(value["schema"].as_array().map(Vec::len), Some(256));
+        assert_eq!(value["schemaNodeCount"], 300);
+        assert_eq!(value["schemaIsTruncated"], true);
+    }
+
+    #[test]
+    fn dataset_wire_schema_marks_long_utf8_names_as_truncated() {
+        let mut schema = (0..256)
+            .map(|index| SchemaField {
+                name: format!("column_{index}"),
+                physical_type: "INT64".to_owned(),
+                logical_type: None,
+                children: Vec::new(),
+            })
+            .collect::<Vec<_>>();
+        schema.push(SchemaField {
+            name: "late".to_owned(),
+            physical_type: "GROUP".to_owned(),
+            logical_type: None,
+            children: vec![SchemaField {
+                name: "д".repeat(100),
+                physical_type: "BYTE_ARRAY".to_owned(),
+                logical_type: Some("STRING".to_owned()),
+                children: Vec::new(),
+            }],
+        });
+
+        let (bounded, strings_truncated) = bounded_wire_schema_with_marker(&schema);
+
+        assert!(strings_truncated);
+        assert_eq!(bounded.len(), 256);
     }
 
     #[test]
@@ -3666,6 +5497,7 @@ mod tests {
                     Some(SourceOpenPublication {
                         request: stale_request,
                         client_attempt: None,
+                        reload_generation: None,
                     }),
                 )
                 .expect("stale result is discarded")
@@ -3683,6 +5515,7 @@ mod tests {
                     Some(SourceOpenPublication {
                         request: current_request,
                         client_attempt: None,
+                        reload_generation: None,
                     }),
                 )
                 .expect("current result installs")
@@ -3695,6 +5528,67 @@ mod tests {
         assert_eq!(
             require_explicit_source(None),
             Err(SourceError::Unsupported.into())
+        );
+    }
+
+    #[test]
+    fn closing_reload_target_blocks_late_file_and_dataset_publication() {
+        let opened_source = OpenedSource::default();
+        let file = open_test_source(&opened_source, "source.parquet");
+        let file_request = opened_source
+            .begin_source_open()
+            .expect("file reload request");
+        assert!(opened_source.close(file.generation).expect("close file"));
+        assert!(
+            opened_source
+                .install_with_snapshot(
+                    None,
+                    PathBuf::from("source.parquet"),
+                    test_summary("source.parquet"),
+                    None,
+                    SourceOpenIntent::Explicit,
+                    Some(SourceOpenPublication {
+                        request: file_request,
+                        client_attempt: None,
+                        reload_generation: Some(file.generation),
+                    }),
+                )
+                .expect("late file reload")
+                .is_none()
+        );
+
+        let directory = tempfile::tempdir().expect("temporary directory");
+        write_test_parquet(&directory.path().join("a.parquet"), &[1]);
+        let (_, _, dataset) = install_test_dataset(&opened_source, directory.path());
+        let dataset_request = opened_source
+            .begin_source_open()
+            .expect("dataset reload request");
+        let descriptor = SourceDescriptor::Folder(directory.path().to_path_buf());
+        let source = descriptor.reopen_dataset().expect("dataset discovery");
+        let mut inspector = source.inspector();
+        let interrupt = inspector.interrupt_handle();
+        let preview = inspector.preview(1).expect("dataset preview");
+        assert!(
+            opened_source
+                .close(dataset.generation)
+                .expect("close dataset")
+        );
+        assert!(
+            opened_source
+                .install_dataset(
+                    descriptor,
+                    source,
+                    preview,
+                    interrupt,
+                    SourceOpenIntent::Explicit,
+                    SourceOpenPublication {
+                        request: dataset_request,
+                        client_attempt: None,
+                        reload_generation: Some(dataset.generation),
+                    },
+                )
+                .expect("late dataset reload")
+                .is_none()
         );
     }
 
@@ -3722,6 +5616,7 @@ mod tests {
                     Some(SourceOpenPublication {
                         request,
                         client_attempt: Some(attempt),
+                        reload_generation: None,
                     }),
                 )
                 .expect("cancelled result is discarded")
@@ -3748,6 +5643,7 @@ mod tests {
                 Some(SourceOpenPublication {
                     request,
                     client_attempt: Some(attempt),
+                    reload_generation: None,
                 }),
             )
             .expect("source install")
@@ -3758,6 +5654,23 @@ mod tests {
             Ok(SourceOpenCancelOutcome::Published)
         );
         assert_eq!(source.generation, 1);
+        assert!(
+            opened_source
+                .install_with_snapshot(
+                    None,
+                    PathBuf::from("batch-tail.parquet"),
+                    test_summary("batch-tail.parquet"),
+                    None,
+                    SourceOpenIntent::Explicit,
+                    Some(SourceOpenPublication {
+                        request,
+                        client_attempt: Some(attempt),
+                        reload_generation: None,
+                    }),
+                )
+                .expect("cancelled batch tail is discarded")
+                .is_none()
+        );
         assert_eq!(
             opened_source.open_paths(),
             Ok(vec![PathBuf::from("published.parquet")])
@@ -3792,6 +5705,7 @@ mod tests {
                 SourceOpenPublication {
                     request: stale_request,
                     client_attempt: Some(attempt),
+                    reload_generation: None,
                 },
             ),
             Err(SourceError::Unsupported.into()),
@@ -4224,11 +6138,26 @@ mod tests {
                 .expect("source state")
                 .session(generation)
                 .expect("opened session");
-            session
+            if let Some(reader) = session
                 .lock_state()
                 .expect("session state")
-                .text_suggestion_reader(&session.path)
-                .expect("suggestion reader")
+                .text_suggestion_reader
+                .as_ref()
+                .map(Arc::clone)
+            {
+                return reader;
+            }
+            let created = Arc::new(
+                TextValueSuggestionsReader::new(session.path.clone()).expect("suggestion reader"),
+            );
+            session
+                .with_open_state(|state| {
+                    state
+                        .text_suggestion_reader
+                        .get_or_insert_with(|| Arc::clone(&created))
+                        .clone()
+                })
+                .expect("open session")
         };
 
         let first = reader(source.generation);
@@ -4688,6 +6617,9 @@ mod tests {
     fn open_sources_keep_their_frontend_wire_shape() {
         let entry = OpenedSourceEntry {
             generation: 3,
+            kind: OpenedSourceKind::File,
+            dataset_member_count: None,
+            dataset_ignored_file_count: None,
             name: "trips.parquet".to_owned(),
             directory: "~/Data/2026".to_owned(),
             path: "/home/analyst/Data/2026/trips.parquet".to_owned(),
@@ -4698,11 +6630,30 @@ mod tests {
             serde_json::to_value(entry).expect("open source JSON"),
             serde_json::json!({
                 "generation": 3,
+                "kind": "file",
+                "datasetMemberCount": null,
+                "datasetIgnoredFileCount": null,
                 "name": "trips.parquet",
                 "directory": "~/Data/2026",
                 "path": "/home/analyst/Data/2026/trips.parquet",
                 "active": true,
             })
+        );
+    }
+
+    #[test]
+    fn file_dialog_batch_keeps_every_published_source_visible() {
+        let first = open_test_source(&OpenedSource::default(), "first.parquet");
+        let batch = OpenedSourceBatch {
+            sources: vec![first],
+            source_error: Some(SourceError::NotParquet.into()),
+        };
+
+        let value = serde_json::to_value(batch).expect("batch JSON");
+        assert_eq!(value["sources"].as_array().map(Vec::len), Some(1));
+        assert_eq!(
+            value["sourceError"],
+            serde_json::json!({ "code": "notParquet" })
         );
     }
 

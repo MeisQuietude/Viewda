@@ -27,6 +27,7 @@ fn discovers_visible_parquet_members_in_lexicographic_order_and_counts_other_fil
     let directory = TempDir::new().expect("dataset directory");
     write_ints(&directory.path().join("z/part.parquet"), "value", &[3]);
     write_ints(&directory.path().join("a/part.parquet"), "value", &[1]);
+    write_ints(&directory.path().join("upper.PARQUET"), "value", &[2]);
     fs::write(directory.path().join("_SUCCESS"), b"").expect("success marker");
     fs::write(directory.path().join("part.parquet.crc"), b"").expect("crc marker");
     fs::write(directory.path().join(".hidden.parquet"), b"not read").expect("hidden member");
@@ -40,14 +41,14 @@ fn discovers_visible_parquet_members_in_lexicographic_order_and_counts_other_fil
     let source = DatasetSource::open_folder(directory.path()).expect("folder dataset");
     let page = source.member_page(0, 16).expect("member page");
 
-    assert_eq!(source.member_count(), 2);
+    assert_eq!(source.member_count(), 3);
     assert_eq!(source.ignored_file_count(), 4);
     assert_eq!(
         page.members
             .iter()
             .map(|member| member.relative_path.as_str())
             .collect::<Vec<_>>(),
-        ["a/part.parquet", "z/part.parquet"]
+        ["a/part.parquet", "upper.PARQUET", "z/part.parquet"]
     );
 }
 
@@ -110,6 +111,86 @@ fn explicit_files_use_common_root_hive_paths_and_lexicographic_order() {
 }
 
 #[test]
+fn direct_dataset_windows_project_union_columns_in_requested_order() {
+    let directory = TempDir::new().expect("dataset directory");
+    write_ints(&directory.path().join("a.parquet"), "value", &[1]);
+    write_ints(&directory.path().join("b.parquet"), "value", &[2]);
+    let source = DatasetSource::open_folder(directory.path()).expect("folder dataset");
+    let mut inspector = source.inspector();
+    inspector.advance(8).expect("footer pass");
+    let mut reader = inspector.into_window_reader().expect("dataset reader");
+    let file_index = reader.summary().provenance_column_index;
+
+    let batch = decode_one(
+        &reader
+            .fetch_columns(0, 8, &[], &[file_index, 0])
+            .expect("projected window"),
+    );
+
+    assert_eq!(batch.schema().field(0).name(), "file");
+    assert_eq!(batch.schema().field(1).name(), "value");
+    assert_eq!(
+        batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("file strings")
+            .iter()
+            .collect::<Vec<_>>(),
+        [Some("a.parquet"), Some("b.parquet")]
+    );
+    assert_eq!(int64_values(&batch, 1), [1, 2]);
+}
+
+#[test]
+fn wide_dataset_keeps_late_columns_for_windows_and_export() {
+    let directory = TempDir::new().expect("dataset directory");
+    let columns = (0..300)
+        .map(|index| {
+            (
+                format!("column_{index}"),
+                Arc::new(Int64Array::from(vec![index as i64])) as ArrayRef,
+            )
+        })
+        .collect::<Vec<_>>();
+    let named_columns = columns
+        .iter()
+        .map(|(name, values)| (name.as_str(), Arc::clone(values)))
+        .collect();
+    write_columns(&directory.path().join("wide.parquet"), named_columns);
+    let source = DatasetSource::open_folder(directory.path()).expect("folder dataset");
+    let mut inspector = source.inspector();
+    let preview = inspector.preview(1).expect("wide preview");
+    let preview = decode_one(&preview.arrow_ipc);
+    assert_eq!(preview.num_columns(), 256);
+    let mut reader = inspector.into_window_reader().expect("dataset reader");
+
+    assert_eq!(reader.summary().schema.len(), 301);
+    let late_index = column_index(&reader, "column_299");
+    let batch = decode_one(
+        &reader
+            .fetch_columns(0, 1, &[], &[late_index])
+            .expect("late column window"),
+    );
+    assert_eq!(int64_values(&batch, 0), [299]);
+
+    let target = directory.path().join("late.csv");
+    DataExportReader::for_dataset(
+        &reader,
+        target.clone(),
+        dataset_csv_request(vec![late_index], vec![]),
+        None,
+    )
+    .expect("wide dataset export")
+    .export()
+    .expect("late column export");
+    assert_eq!(
+        fs::read_to_string(target).expect("exported CSV"),
+        "column_299\r\n299\r\n"
+    );
+}
+
+#[test]
 fn explicit_files_preserve_constant_trailing_hive_partitions() {
     let directory = TempDir::new().expect("dataset directory");
     let trips = directory.path().join("trips");
@@ -161,18 +242,20 @@ fn explicit_files_preserve_constant_trailing_hive_partitions() {
 fn explicit_file_validation_is_eager_but_footer_reads_remain_lazy() {
     let directory = TempDir::new().expect("dataset directory");
     let damaged = directory.path().join("damaged.parquet");
-    let uppercase = directory.path().join("ignored.PARQUET");
+    let uppercase = directory.path().join("member.PARQUET");
     fs::write(&damaged, b"not parquet").expect("damaged member");
-    fs::write(&uppercase, b"not parquet").expect("uppercase extension");
+    write_ints(&uppercase, "value", &[1]);
 
     assert!(matches!(
         DatasetSource::open_files(&[]),
         Err(DatasetError::NoParquetFiles)
     ));
-    assert!(matches!(
-        DatasetSource::open_files(&[damaged.clone(), uppercase]),
-        Err(DatasetError::Unsupported)
-    ));
+    assert_eq!(
+        DatasetSource::open_files(&[damaged.clone(), uppercase])
+            .expect("uppercase extension")
+            .member_count(),
+        2
+    );
     let source =
         DatasetSource::open_files(std::slice::from_ref(&damaged)).expect("lazy explicit source");
     assert_eq!(source.member_count(), 1);
@@ -276,7 +359,7 @@ fn non_utf8_member_paths_are_rejected_before_footer_inspection() {
     ));
 }
 
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 #[test]
 fn folder_discovery_counts_non_utf8_files_that_are_not_visible_members() {
     use std::{ffi::OsString, os::unix::ffi::OsStringExt as _};
@@ -675,18 +758,22 @@ fn zero_candidate_filters_return_schema_only_ipc_without_a_query_member() {
 #[test]
 fn treats_glob_metacharacters_quotes_and_unicode_as_exact_member_paths() {
     let directory = TempDir::new().expect("dataset directory");
-    let mut names = vec![
+    let names = vec![
         "br[ack].parquet",
         "quote'one.parquet",
         "right].parquet",
         "данные.parquet",
     ];
     #[cfg(unix)]
-    names.extend([
-        "double\"quote.parquet",
-        "question?.parquet",
-        "star*.parquet",
-    ]);
+    let names = {
+        let mut names = names;
+        names.extend([
+            "double\"quote.parquet",
+            "question?.parquet",
+            "star*.parquet",
+        ]);
+        names
+    };
     for (index, name) in names.iter().enumerate() {
         write_ints(&directory.path().join(name), "id", &[index as i64]);
     }
@@ -1344,6 +1431,21 @@ fn windows_remain_stable_across_empty_members_and_offsets() {
         int64_values(&decode_one(&reader.fetch(1, 2, &[]).expect("window")), 0),
         [11, 20]
     );
+}
+
+#[test]
+fn member_row_offsets_follow_frozen_order_across_empty_members() {
+    let directory = TempDir::new().expect("dataset directory");
+    write_ints(&directory.path().join("a.parquet"), "id", &[10, 11]);
+    write_ints(&directory.path().join("b.parquet"), "id", &[]);
+    write_ints(&directory.path().join("c.parquet"), "id", &[20, 21, 22]);
+    let reader =
+        complete_reader(DatasetSource::open_folder(directory.path()).expect("folder dataset"));
+
+    assert_eq!(reader.member_row_offset(0), Ok(0));
+    assert_eq!(reader.member_row_offset(1), Ok(2));
+    assert_eq!(reader.member_row_offset(2), Ok(2));
+    assert_eq!(reader.member_row_offset(3), Err(DatasetError::Unsupported));
 }
 
 #[test]
