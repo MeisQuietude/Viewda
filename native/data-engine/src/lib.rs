@@ -7,6 +7,7 @@ mod filter;
 mod source;
 #[cfg(feature = "query-engine")]
 mod statistics;
+mod structure;
 #[cfg(feature = "query-engine")]
 mod suggestions;
 #[cfg(feature = "query-engine")]
@@ -28,10 +29,24 @@ pub use export::{
 };
 #[cfg(feature = "query-engine")]
 pub use filter::{DataFilter, DataFilterOperator};
-pub use source::{SchemaField, SourceError, SourceSummary, inspect_local_source};
+pub use source::{
+    SchemaField, SourceError, SourceIdentity, SourceOpenPhase, SourceSnapshot, SourceSummary,
+    inspect_local_source, inspect_local_source_snapshot, inspect_local_source_snapshot_cancellable,
+};
 #[cfg(feature = "query-engine")]
 pub use statistics::{
     ColumnStatistics, ColumnStatisticsError, ColumnStatisticsReader, StatisticsInterruptHandle,
+};
+pub use structure::{
+    MAX_BLOOM_PROBE_VALUE_BYTES, StructureBloomProbe, StructureBloomProbeOutcome,
+    StructureBloomProbeResult, StructureByteUnit, StructureCancellation, StructureChunkDetails,
+    StructureChunkStatistics, StructureCodecTotal, StructureColumnPage, StructureColumnSort,
+    StructureColumnSummary, StructureError, StructureKeyValue, StructureKeyValueEntry,
+    StructureLayout, StructureLayoutColumn, StructureLayoutOverviewBucket, StructureLayoutRow,
+    StructureLayoutSegment, StructureLayoutTail, StructureLensTotal, StructureLensTotals,
+    StructureLoadProgress, StructureLoadSnapshot, StructurePresenceTotals, StructureRatioStep,
+    StructureReader, StructureRowGroupPage, StructureRowGroupSort, StructureRowGroupSummary,
+    StructureSortDirection, StructureSummary,
 };
 #[cfg(feature = "query-engine")]
 pub use suggestions::{
