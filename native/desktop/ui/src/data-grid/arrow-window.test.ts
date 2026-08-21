@@ -1,8 +1,16 @@
-import { decimal128, tableFromArrays, tableToIPC } from "@uwdata/flechette";
+import {
+  decimal128,
+  list,
+  struct,
+  tableFromArrays,
+  tableToIPC,
+  utf8,
+} from "@uwdata/flechette";
 import { describe, expect, it } from "vitest";
 
 import { decodeArrowWindow, windowDataType, windowValue } from "./arrow-window";
 import { formatCellValue } from "./format-cell";
+import { typedValue, valueChildAt } from "./value-format";
 
 describe("decodeArrowWindow", () => {
   it("keeps decimal128 integers exact and in digit notation across 2^64", () => {
@@ -45,5 +53,44 @@ describe("decodeArrowWindow", () => {
     expect(() =>
       decodeArrowWindow(Uint8Array.from(bytes!).buffer, 0, [1, 2]),
     ).toThrow("does not match");
+  });
+
+  it("formats five-level values decoded through the real Arrow boundary", () => {
+    const nestedType = struct({
+      level2: list(
+        struct({
+          level3: struct({
+            level4: list(struct({ level5: utf8() })),
+          }),
+        }),
+      ),
+    });
+    const value = {
+      level2: [{ level3: { level4: [{ level5: "leaf" }] } }],
+    };
+    const table = tableFromArrays(
+      { nested: [value] },
+      { types: { nested: nestedType } },
+    );
+    const bytes = tableToIPC(table, { format: "stream" });
+    expect(bytes).not.toBeNull();
+
+    const window = decodeArrowWindow(Uint8Array.from(bytes!).buffer, 0, [3]);
+    const type = windowDataType(window, 3);
+    const decoded = windowValue(window, 3, 0);
+    expect(type).toBeDefined();
+    expect(decoded).toEqual(value);
+    expect(formatCellValue(decoded, type!)).toMatchObject({
+      displayData: "{level2: […]}",
+      copyData: JSON.stringify(value),
+    });
+
+    let child = valueChildAt(typedValue(decoded, type!), 0);
+    for (const ordinal of [0, 0, 0, 0, 0]) {
+      expect(child).toBeDefined();
+      child = valueChildAt(child!.value, ordinal);
+    }
+    expect(child).toMatchObject({ label: "level5" });
+    expect(child?.value).toMatchObject({ value: "leaf" });
   });
 });

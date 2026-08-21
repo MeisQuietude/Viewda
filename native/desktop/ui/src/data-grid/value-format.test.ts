@@ -2,6 +2,7 @@ import {
   binary,
   decimal128,
   field,
+  float64,
   int32,
   int64,
   list,
@@ -11,11 +12,12 @@ import {
   timestamp,
   utf8,
 } from "@uwdata/flechette";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 
 import {
   formatValuePath,
   formatValuePreview,
+  formatValuePreviewTokens,
   fullValueText,
   typedValue,
   valueChildAt,
@@ -77,8 +79,33 @@ describe("recursive value formatting", () => {
     ]);
   });
 
-  it("shows collection counts before reading any child", () => {
+  it("quotes decimals whose text or scale cannot survive JSON parsing", () => {
+    const wide = 12_345_678_901_234_567_890_123_456_789_012_345_678n;
+    expect(JSON.parse(valueToJson(typedValue(wide, decimal128(38, 2))))).toBe(
+      "123456789012345678901234567890123456.78",
+    );
+    expect(JSON.parse(valueToJson(typedValue(120n, decimal128(6, 2))))).toBe(
+      "1.20",
+    );
+    expect(JSON.parse(valueToJson(typedValue(1999n, decimal128(9, 2))))).toBe(
+      19.99,
+    );
+  });
+
+  it.each([
+    [Number.NaN, "NaN"],
+    [Number.POSITIVE_INFINITY, "Infinity"],
+    [Number.NEGATIVE_INFINITY, "-Infinity"],
+  ])("copies non-finite %s as a lossless JSON string", (value, expected) => {
+    expect(JSON.parse(valueToJson(typedValue(value, float64())))).toBe(
+      expected,
+    );
+  });
+
+  it("bounds formatter child reads after Arrow value materialization", () => {
     expect(formatValuePreview(typedValue([], list(utf8())))).toBe("[0]");
+    // This synthetic value measures only formatter work. Flechette may already
+    // have materialized an Arrow child before it reaches this module boundary.
     const huge = ["x".repeat(1_000), "unread"];
     Object.defineProperty(huge, 1, {
       get: () => {
@@ -88,8 +115,51 @@ describe("recursive value formatting", () => {
 
     const preview = formatValuePreview(typedValue(huge, list(utf8())), 12);
     expect(preview.startsWith("[2] ")).toBe(true);
-    expect(preview.endsWith("…")).toBe(true);
+    expect(preview.endsWith('…"')).toBe(true);
   });
+
+  it("serializes only a bounded prefix of a multi-megabyte nested string", () => {
+    const originalStringify = JSON.stringify;
+    const stringify = vi
+      .spyOn(JSON, "stringify")
+      .mockImplementation((value) => {
+        if (typeof value === "string" && value.length > 2) {
+          throw new Error("preview serialized beyond its bounded prefix");
+        }
+        return originalStringify(value);
+      });
+
+    try {
+      const preview = formatValuePreview(
+        typedValue(["\0".repeat(2 * 1024 * 1024)], list(utf8())),
+        36,
+      );
+
+      expect(preview).toMatch(/^\[1\] "/);
+      expect(preview.endsWith('…"')).toBe(true);
+      expect(stringify.mock.calls.length).toBeLessThan(36);
+    } finally {
+      stringify.mockRestore();
+    }
+  });
+
+  it.each([
+    ["abcdef", 6, '"abc…"'],
+    ['a"\\\ncontrol', 12, '"a\\"\\\\\\nco…"'],
+    ["ab😀tail", 7, '"ab😀…"'],
+    ["x", 1, "…"],
+    ["x", 2, "…"],
+    ["xy", 3, '"…"'],
+  ])(
+    "keeps string preview valid and escape-aligned within its budget",
+    (value, limit, expected) => {
+      const preview = formatValuePreview(typedValue(value, utf8()), limit);
+      expect(preview).toBe(expected);
+      expect(preview.length).toBeLessThanOrEqual(limit);
+      if (preview.startsWith('"'))
+        expect(() => JSON.parse(preview)).not.toThrow();
+    },
+  );
 
   it("distinguishes a null struct from a struct containing null fields", () => {
     const type = struct({ a: utf8() });
@@ -97,6 +167,14 @@ describe("recursive value formatting", () => {
     expect(formatValuePreview(typedValue({ a: null }, type))).toBe("{a: null}");
     expect(valueChildCount(typedValue(null, type))).toBe(0);
     expect(valueChildCount(typedValue({ a: null }, type))).toBe(1);
+    expect(formatValuePreviewTokens(typedValue({ a: null }, type))).toEqual([
+      { text: "{", tone: "secondary" },
+      { text: "a", tone: "value" },
+      { text: ":", tone: "secondary" },
+      { text: " ", tone: "value" },
+      { text: "null", tone: "null" },
+      { text: "}", tone: "secondary" },
+    ]);
   });
 
   it("retains five levels for JSON while previewing only the first", () => {
@@ -135,11 +213,7 @@ describe("recursive value formatting", () => {
     );
   });
 
-  it("renders binary details as a byte-counted hex dump", () => {
-    expect(
-      fullValueText(typedValue(new Uint8Array([65, 0, 255]), binary())),
-    ).toBe(
-      "binary · 3 B\n00000000  41 00 ff                                         A..",
-    );
+  it("preserves null semantics in full scalar text", () => {
+    expect(fullValueText(typedValue(null, binary()))).toBe("null");
   });
 });

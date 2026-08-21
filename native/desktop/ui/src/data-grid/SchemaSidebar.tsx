@@ -163,6 +163,7 @@ export function SchemaSidebar({
                 field={field}
                 selected={selectedColumn === columnIndex}
                 onSelect={() => void selectColumn(columnIndex)}
+                mode="logical"
               />
             ))}
           </ul>

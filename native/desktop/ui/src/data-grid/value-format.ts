@@ -30,6 +30,11 @@ export interface ValueChild {
   value: TypedValue;
 }
 
+export interface PreviewToken {
+  text: string;
+  tone: "null" | "secondary" | "value";
+}
+
 export function typedValue(value: unknown, dataType: DataType): TypedValue {
   return { kind: "value", value, dataType };
 }
@@ -39,6 +44,17 @@ export function formatValuePreview(
   limit = VALUE_PREVIEW_LIMIT,
 ): string {
   return preview(input, Math.max(1, limit), 0);
+}
+
+export function formatValuePreviewTokens(
+  input: TypedValue,
+  limit = VALUE_PREVIEW_LIMIT,
+): PreviewToken[] {
+  return previewTokensFromText(formatValuePreview(input, limit));
+}
+
+export function previewTokensFromText(text: string): PreviewToken[] {
+  return tokenizePreview(text);
 }
 
 export function formatCellDisplay(input: TypedValue): string {
@@ -63,7 +79,7 @@ export function valueToJson(input: TypedValue): string {
     return JSON.stringify(bytesToBase64(asBytes(value)));
   }
   if (type.typeId === Type.Decimal) {
-    return decimalToText(value, type.scale);
+    return decimalToJson(value, type.scale);
   }
   if (type.typeId === Type.Date) {
     return JSON.stringify(formatScalarDisplay(value, type));
@@ -127,7 +143,9 @@ export function valueToJson(input: TypedValue): string {
   if (typeof value === "boolean") return value ? "true" : "false";
   if (typeof value === "bigint") return jsonInteger(value);
   if (typeof value === "number") {
-    return Number.isFinite(value) ? String(value) : "null";
+    return Number.isFinite(value)
+      ? String(value)
+      : JSON.stringify(String(value));
   }
   return JSON.stringify(String(value));
 }
@@ -242,13 +260,37 @@ export function formatValuePath(segments: readonly ValuePathSegment[]): string {
 export function fullValueText(input: TypedValue): string {
   if (input.kind === "mapEntry") return formatValuePreview(input);
   const type = unwrapDictionary(input.dataType);
-  if (isBinary(type)) return bytesToHexDump(asBytes(input.value));
+  if (input.value === null || input.value === undefined) return "null";
   if (isNested(type)) return formatValuePreview(input);
   return formatScalarDisplay(input.value, type, false);
 }
 
+export function binaryValueBytes(input: TypedValue): Uint8Array | null {
+  return isBinaryValue(input) ? asBytes(input.value) : null;
+}
+
+export function formatBinaryHexRow(
+  bytes: Uint8Array,
+  rowIndex: number,
+): string {
+  const offset = rowIndex * 16;
+  const chunk = bytes.subarray(offset, offset + 16);
+  const hex = Array.from(chunk, (byte) => byte.toString(16).padStart(2, "0"))
+    .join(" ")
+    .padEnd(47, " ");
+  const ascii = Array.from(chunk, (byte) =>
+    byte >= 32 && byte <= 126 ? String.fromCharCode(byte) : ".",
+  ).join("");
+  return `${offset.toString(16).padStart(8, "0")}  ${hex}  ${ascii}`;
+}
+
 export function isBinaryValue(input: TypedValue): boolean {
-  return input.kind === "value" && isBinary(unwrapDictionary(input.dataType));
+  return (
+    input.kind === "value" &&
+    input.value !== null &&
+    input.value !== undefined &&
+    isBinary(unwrapDictionary(input.dataType))
+  );
 }
 
 export function isNestedValue(input: TypedValue): boolean {
@@ -405,7 +447,82 @@ function preview(input: TypedValue, limit: number, depth: number): string {
       )} → ${preview(typedValue(entry[1], valueType), itemLimit, depth + 1)}`;
     });
   }
-  return fitToken(formatScalarDisplay(value, type), limit);
+  return formatPreviewScalar(value, type, limit);
+}
+
+function formatPreviewScalar(
+  value: unknown,
+  dataType: DataType,
+  limit: number,
+): string {
+  if (typeof value === "string") {
+    return formatPreviewString(value, limit);
+  }
+  return fitToken(formatScalarDisplay(value, dataType), limit);
+}
+
+function formatPreviewString(value: string, limit: number): string {
+  if (value.length === 0) return limit >= 2 ? '""' : "…";
+  if (limit < 3) return "…";
+
+  let output = '"';
+  let offset = 0;
+  while (offset < value.length) {
+    const codePoint = value.codePointAt(offset);
+    if (codePoint === undefined) break;
+    const character = String.fromCodePoint(codePoint);
+    const escaped = JSON.stringify(character).slice(1, -1);
+    const nextOffset = offset + character.length;
+    const reserved = nextOffset < value.length ? 2 : 1;
+    if (output.length + escaped.length + reserved > limit) break;
+    output += escaped;
+    offset = nextOffset;
+  }
+  if (offset < value.length) output += "…";
+  return `${output}"`;
+}
+
+function tokenizePreview(text: string): PreviewToken[] {
+  const tokens: PreviewToken[] = [];
+  const append = (value: string, tone: PreviewToken["tone"]) => {
+    const previous = tokens.at(-1);
+    if (previous?.tone === tone) previous.text += value;
+    else tokens.push({ text: value, tone });
+  };
+  let index = 0;
+  const counter = /^(\[\d+\]|\{\d+\})/.exec(text)?.[0];
+  if (counter !== undefined) {
+    append(counter, "secondary");
+    index = counter.length;
+  }
+  while (index < text.length) {
+    if (text[index] === '"') {
+      let end = index + 1;
+      while (end < text.length) {
+        if (text[end] === "\\") end += 2;
+        else if (text[end] === '"') {
+          end += 1;
+          break;
+        } else end += 1;
+      }
+      append(text.slice(index, end), "value");
+      index = end;
+      continue;
+    }
+    if (
+      text.startsWith("null", index) &&
+      !/[A-Za-z0-9_]/.test(text[index - 1] ?? "") &&
+      !/[A-Za-z0-9_]/.test(text[index + 4] ?? "")
+    ) {
+      append("null", "null");
+      index += 4;
+      continue;
+    }
+    const character = text[index]!;
+    append(character, "{}[],:→…".includes(character) ? "secondary" : "value");
+    index += 1;
+  }
+  return tokens;
 }
 
 function previewItems(
@@ -421,7 +538,7 @@ function previewItems(
     const remaining = limit - output.length - separator.length;
     const token = remaining > 0 ? item(index, remaining) : "";
     if (token.length === 0 || token.length > remaining) {
-      return appendEllipsis(output, limit);
+      return appendOmission(output, index === 0 ? " …" : ", …", limit);
     }
     output += `${separator}${token}`;
   }
@@ -442,7 +559,11 @@ function previewDelimited(
     const remaining = limit - output.length - separator.length - close.length;
     const token = remaining > 0 ? item(index, remaining) : "";
     if (token.length === 0 || token.length > remaining) {
-      return `${appendEllipsis(output, Math.max(1, limit - close.length))}${close}`;
+      return `${appendOmission(
+        output,
+        index === 0 ? "…" : ", …",
+        Math.max(1, limit - close.length),
+      )}${close}`;
     }
     output += `${separator}${token}`;
   }
@@ -488,6 +609,14 @@ function jsonInteger(value: unknown): string {
   return JSON.stringify(String(value));
 }
 
+function decimalToJson(value: unknown, scale: number): string {
+  const text = decimalToText(value, scale);
+  const number = Number(text);
+  return Number.isFinite(number) && String(number) === text
+    ? text
+    : JSON.stringify(text);
+}
+
 function fitToken(token: string, limit: number): string {
   if (token.length <= limit) return token;
   if (limit <= 1) return "…";
@@ -498,6 +627,15 @@ function appendEllipsis(output: string, limit: number): string {
   if (output.endsWith("…")) return output;
   if (output.length < limit) return `${output}…`;
   return fitToken(output, limit);
+}
+
+function appendOmission(
+  output: string,
+  omission: string,
+  limit: number,
+): string {
+  if (output.length + omission.length <= limit) return `${output}${omission}`;
+  return appendEllipsis(output, limit);
 }
 
 function unwrapDictionary(dataType: DataType): DataType {
@@ -638,21 +776,6 @@ function bytesToBase64(bytes: Uint8Array): string {
     );
   }
   return encodedChunks.join("");
-}
-
-function bytesToHexDump(bytes: Uint8Array): string {
-  const lines = [`binary · ${formatByteSize(bytes.byteLength)}`];
-  for (let offset = 0; offset < bytes.length; offset += 16) {
-    const chunk = bytes.subarray(offset, offset + 16);
-    const hex = Array.from(chunk, (byte) => byte.toString(16).padStart(2, "0"))
-      .join(" ")
-      .padEnd(47, " ");
-    const ascii = Array.from(chunk, (byte) =>
-      byte >= 32 && byte <= 126 ? String.fromCharCode(byte) : ".",
-    ).join("");
-    lines.push(`${offset.toString(16).padStart(8, "0")}  ${hex}  ${ascii}`);
-  }
-  return lines.join("\n");
 }
 
 function timeUnitLabel(unit: number): string {

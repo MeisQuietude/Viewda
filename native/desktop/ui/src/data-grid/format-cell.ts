@@ -4,8 +4,10 @@ import {
   formatCellDisplay,
   formatValuePreview,
   isNumericType,
+  previewTokensFromText,
   typedValue,
   valueToJson,
+  type PreviewToken,
 } from "./value-format";
 
 export interface CellPresentation {
@@ -13,6 +15,7 @@ export interface CellPresentation {
   copyData: string;
   align: "left" | "right";
   faded: boolean;
+  previewTokens?: readonly PreviewToken[];
 }
 
 export function formatCellValue(
@@ -33,7 +36,10 @@ export function formatCellValue(
       ? valueToJson(input)
       : scalarCopyData(value, type, input)
     : "";
-  return presentation(displayData, copyData, isNumericType(type), false);
+  return {
+    ...presentation(displayData, copyData, isNumericType(type), false),
+    ...(nested ? { previewTokens: previewTokensFromText(displayData) } : {}),
+  };
 }
 
 export function usesMonospaceCells(dataType: DataType): boolean {

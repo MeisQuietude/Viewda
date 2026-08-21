@@ -440,6 +440,18 @@ button {
   font-family: var(--font-ui);
 }
 
+.cell-preview-secondary {
+  color: var(--grid-text-muted);
+}
+
+.cell-preview-null {
+  color: var(--grid-text-faint);
+}
+
+.cell-preview-value {
+  color: var(--grid-text);
+}
+
 .viewda-grid-cell.is-loading {
   color: transparent;
 }
@@ -1326,6 +1338,223 @@ button {
   border-radius: 5px;
   font-size: 12px;
   text-align: left;
+}
+
+.value-peek {
+  position: fixed;
+  z-index: 26;
+  box-sizing: border-box;
+  display: flex;
+  min-width: 0;
+  min-height: 0;
+  overflow: hidden;
+  resize: both;
+  border: 1px solid var(--grid-border);
+  border-radius: 9px;
+  color: var(--grid-text);
+  background: var(--grid-header);
+  box-shadow: 0 12px 34px rgb(27 29 30 / 24%);
+  flex-direction: column;
+  font: 11px/1.35 var(--font-mono);
+}
+
+.value-peek-header {
+  display: flex;
+  min-height: 38px;
+  align-items: center;
+  gap: 8px;
+  padding: 5px 34px 5px 9px;
+  border-bottom: 1px solid var(--grid-border);
+}
+
+.value-peek-header strong {
+  min-width: 0;
+  overflow: hidden;
+  flex: 1;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.value-peek-actions {
+  display: flex;
+  gap: 4px;
+}
+
+.value-peek-actions button,
+.value-peek-close {
+  border: 0;
+  border-radius: 4px;
+  color: var(--grid-text-muted);
+  background: transparent;
+  font: inherit;
+  cursor: pointer;
+}
+
+.value-peek-actions button {
+  min-height: 25px;
+  padding: 0 6px;
+}
+
+.value-peek-actions button:hover,
+.value-peek-close:hover {
+  color: var(--grid-text);
+  background: var(--grid-selection);
+}
+
+.value-peek-close {
+  position: absolute;
+  top: 6px;
+  right: 6px;
+  width: 25px;
+  height: 25px;
+  font-size: 16px;
+}
+
+.value-peek-content,
+.value-tree-wrap {
+  display: flex;
+  min-width: 0;
+  min-height: 0;
+  flex: 1;
+  flex-direction: column;
+}
+
+.value-tree {
+  position: relative;
+  min-height: 80px;
+  overflow: auto;
+  outline: none;
+  flex: 1;
+  overscroll-behavior: contain;
+}
+
+.value-tree:focus-visible {
+  outline: 2px solid var(--grid-selection-strong);
+  outline-offset: -2px;
+}
+
+.value-tree-spacer {
+  position: relative;
+  min-width: 100%;
+}
+
+.value-tree-row {
+  position: absolute;
+  right: 0;
+  left: 0;
+  box-sizing: border-box;
+  display: grid;
+  height: 28px;
+  grid-template-columns: 16px minmax(48px, auto) minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 6px;
+  padding-right: 8px;
+  border-bottom: 1px solid var(--grid-border-soft);
+  white-space: nowrap;
+}
+
+.value-tree-row.is-active {
+  background: var(--grid-selection);
+}
+
+.value-tree-chevron {
+  width: 16px;
+  height: 22px;
+  padding: 0;
+  border: 0;
+  color: var(--grid-text-muted);
+  background: transparent;
+  font: inherit;
+  cursor: pointer;
+}
+
+.value-tree-chevron:disabled {
+  cursor: default;
+}
+
+.value-tree-name,
+.value-tree-preview,
+.value-tree-type {
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.value-tree-name {
+  color: var(--grid-text-muted);
+}
+
+.value-tree-preview {
+  color: var(--grid-text);
+}
+
+.value-tree-type {
+  color: var(--grid-text-faint);
+  text-align: right;
+}
+
+.value-tree-row.is-null .value-tree-preview {
+  color: var(--grid-text-faint);
+}
+
+.value-peek-detail {
+  min-height: 64px;
+  max-height: 45%;
+  margin: 0;
+  overflow: auto;
+  padding: 10px;
+  border-top: 1px solid var(--grid-border);
+  color: var(--grid-text);
+  background: var(--grid-cell);
+  font: inherit;
+  overflow-wrap: anywhere;
+  user-select: text;
+  white-space: pre-wrap;
+}
+
+.value-peek-detail.is-binary {
+  display: flex;
+  overflow: hidden;
+  padding: 0;
+  flex-direction: column;
+  overflow-wrap: normal;
+  white-space: pre;
+}
+
+.value-peek-binary-summary {
+  padding: 8px 10px;
+  border-bottom: 1px solid var(--grid-border-soft);
+  color: var(--grid-text-muted);
+}
+
+.value-peek-binary-viewport {
+  min-height: 40px;
+  overflow: auto;
+  flex: 1;
+}
+
+.value-peek-binary-spacer {
+  position: relative;
+  min-width: max-content;
+}
+
+.value-peek-binary-row {
+  position: absolute;
+  left: 0;
+  height: 20px;
+  padding: 0 10px;
+  font: inherit;
+  white-space: pre;
+}
+
+.value-peek-resize-hint {
+  position: absolute;
+  right: 2px;
+  bottom: 2px;
+  width: 8px;
+  height: 8px;
+  border-right: 1px solid var(--grid-text-faint);
+  border-bottom: 1px solid var(--grid-text-faint);
+  pointer-events: none;
 }
 
 .column-menu button:disabled,
