@@ -7,6 +7,7 @@ import {
   TimeUnit,
   timestamp,
   utf8,
+  type DataType,
 } from "@uwdata/flechette";
 import { describe, expect, it } from "vitest";
 
@@ -66,13 +67,13 @@ describe("formatCellValue", () => {
     });
   });
 
-  it("renders nested values as compact JSON and copies the full JSON", () => {
+  it("renders nested values with the preview grammar and copies full JSON", () => {
     const type = struct({ tags: list(int64()) });
     const value = { tags: [1n, 2n] };
 
     expect(formatCellValue(value, type)).toEqual({
-      displayData: '{"tags":["1","2"]}',
-      copyData: '{"tags":["1","2"]}',
+      displayData: "{tags: […]}",
+      copyData: '{"tags":[1,2]}',
       align: "left",
       faded: false,
     });
@@ -95,27 +96,33 @@ describe("formatCellValue", () => {
     expect(presentation.copyData).toBe("");
   });
 
-  it("matches full formatting for deeply nested values within the preview budget", () => {
+  it("collapses nesting below the first preview level", () => {
     let value: unknown = 1;
-    for (let depth = 0; depth < 40; depth += 1) value = [value];
+    let type: DataType = int64();
+    for (let depth = 0; depth < 40; depth += 1) {
+      value = [value];
+      type = list(type);
+    }
 
-    const full = formatCellValue(value, list(utf8()));
-    const displayOnly = formatCellValue(value, list(utf8()), false);
+    const full = formatCellValue(value, type);
+    const displayOnly = formatCellValue(value, type, false);
 
-    expect(displayOnly.displayData).toBe(full.displayData);
+    expect(displayOnly.displayData).toBe("[1] […]");
+    expect(full.displayData).toBe("[1] […]");
     expect(displayOnly.copyData).toBe("");
   });
 
-  it("matches full formatting for maps with bigint and binary values", () => {
+  it("uses count-first map previews without serializing copy data on scroll", () => {
     const value = new Map<unknown, unknown>([
-      ["count", 7n],
-      ["bytes", new Uint8Array([1, 2, 3])],
+      ["count", "7"],
+      ["bytes", "three"],
     ]);
     const type = map(utf8(), utf8());
 
     expect(formatCellValue(value, type, false).displayData).toBe(
-      formatCellValue(value, type).displayData,
+      '{2} "count" → "7", "bytes" → "three"',
     );
+    expect(formatCellValue(value, type, false).copyData).toBe("");
   });
 
   it("keeps large nested copy data complete when its display is truncated", () => {

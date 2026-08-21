@@ -8,6 +8,12 @@ Backward-incompatible entries start with **Breaking:**.
 
 ## Unreleased
 
+### Added
+
+- Read typed previews for nested values in the data grid and copy them as
+  lossless JSON, including decimals, temporal values, binary data, large
+  integers, lists, structs, and maps.
+
 ## 0.2.0 — 2026-08-21
 
 ### Added
