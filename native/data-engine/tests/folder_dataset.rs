@@ -14,7 +14,8 @@ use parquet::arrow::ArrowWriter;
 use parquet::file::reader::{FileReader, SerializedFileReader};
 use tempfile::TempDir;
 use viewda_data_engine::{
-    DataFilter, DataFilterOperator, DatasetError, DatasetSource, DatasetWindowReader,
+    DataFilter, DataFilterOperator, DatasetError, DatasetPartitionNode, DatasetPartitionPage,
+    DatasetSource, DatasetWindowReader, PartitionValue,
 };
 
 #[test]
@@ -321,9 +322,196 @@ fn rejects_empty_folders_and_bounds_member_pages() {
 
     write_ints(&directory.path().join("part.parquet"), "value", &[1]);
     let source = DatasetSource::open_folder(directory.path()).expect("folder dataset");
+    assert_eq!(source.member_page(0, 257), Err(DatasetError::PageTooLarge));
+}
+
+#[test]
+fn pages_hive_partition_children_with_descendant_counts() {
+    let directory = TempDir::new().expect("dataset directory");
+    for path in [
+        "Country=US/year=2025/a.parquet",
+        "country=US/year=2026/b.parquet",
+        "country=US/plain.parquet",
+        "country=CA/year=2025/c.parquet",
+        "region=EU/d.parquet",
+        "unpartitioned.parquet",
+    ] {
+        let path = directory.path().join(path);
+        fs::create_dir_all(path.parent().expect("member parent")).expect("member parent");
+        fs::write(&path, b"footer intentionally absent")
+            .unwrap_or_else(|error| panic!("write {}: {error}", path.display()));
+    }
+    let source = DatasetSource::open_folder(directory.path()).expect("folder dataset");
+
+    let root: DatasetPartitionPage = source
+        .partition_page(&[], None, 16)
+        .expect("root partitions");
     assert_eq!(
-        source.member_page(0, 257),
-        Err(DatasetError::MemberPageTooLarge)
+        root.nodes
+            .iter()
+            .map(|node| {
+                (
+                    node.partition.key.to_ascii_lowercase(),
+                    node.partition.value.as_str(),
+                    node.member_count,
+                )
+            })
+            .collect::<Vec<_>>(),
+        [
+            ("country".to_owned(), "CA", 1),
+            ("country".to_owned(), "US", 3),
+            ("region".to_owned(), "EU", 1),
+        ]
+    );
+    assert_eq!(root.next_after, None);
+
+    let parent = PartitionValue {
+        key: "COUNTRY".to_owned(),
+        value: "US".to_owned(),
+    };
+    let children = source
+        .partition_page(std::slice::from_ref(&parent), None, 16)
+        .expect("country children");
+    assert_eq!(
+        children.nodes,
+        [
+            DatasetPartitionNode {
+                partition: PartitionValue {
+                    key: "year".to_owned(),
+                    value: "2025".to_owned(),
+                },
+                member_count: 1,
+            },
+            DatasetPartitionNode {
+                partition: PartitionValue {
+                    key: "year".to_owned(),
+                    value: "2026".to_owned(),
+                },
+                member_count: 1,
+            },
+        ]
+    );
+}
+
+#[test]
+fn partition_cursors_continue_without_duplicates() {
+    let directory = TempDir::new().expect("dataset directory");
+    for value in ["d", "a", "c", "b"] {
+        let path = directory.path().join(format!("key={value}/part.parquet"));
+        fs::create_dir_all(path.parent().expect("partition parent")).expect("partition parent");
+        fs::write(path, b"footer intentionally absent").expect("lazy member");
+    }
+    let source = DatasetSource::open_folder(directory.path()).expect("folder dataset");
+
+    let first = source
+        .partition_page(&[], None, 2)
+        .expect("first partition page");
+    assert_eq!(
+        first
+            .nodes
+            .iter()
+            .map(|node| node.partition.value.as_str())
+            .collect::<Vec<_>>(),
+        ["a", "b"]
+    );
+    let cursor = first.next_after.as_ref().expect("continuation cursor");
+    assert_eq!(cursor.value, "b");
+
+    let second = source
+        .partition_page(&[], Some(cursor), 2)
+        .expect("second partition page");
+    assert_eq!(
+        second
+            .nodes
+            .iter()
+            .map(|node| node.partition.value.as_str())
+            .collect::<Vec<_>>(),
+        ["c", "d"]
+    );
+    assert_eq!(second.next_after, None);
+}
+
+#[test]
+fn partition_pages_keep_exact_counts_after_bounded_map_eviction() {
+    let directory = TempDir::new().expect("dataset directory");
+    for path in [
+        "Yield=y/part.parquet",
+        "Zulu=z/part.parquet",
+        "alpha=a/one.parquet",
+        "alpha=a/two.parquet",
+        "alpha=a/three.parquet",
+    ] {
+        let path = directory.path().join(path);
+        fs::create_dir_all(path.parent().expect("partition parent")).expect("partition parent");
+        fs::write(path, b"footer intentionally absent").expect("lazy member");
+    }
+    let source = DatasetSource::open_folder(directory.path()).expect("folder dataset");
+
+    let page = source
+        .partition_page(&[], None, 1)
+        .expect("bounded partition page");
+
+    assert_eq!(page.nodes.len(), 1);
+    assert_eq!(page.nodes[0].partition.key, "alpha");
+    assert_eq!(page.nodes[0].member_count, 3);
+    assert_eq!(page.next_after, Some(page.nodes[0].partition.clone()));
+}
+
+#[test]
+fn bounds_partition_pages_and_large_partition_sets() {
+    let directory = TempDir::new().expect("dataset directory");
+    for index in 0..1_000 {
+        let path = directory
+            .path()
+            .join(format!("bucket={index:04}/part.parquet"));
+        fs::create_dir_all(path.parent().expect("partition parent")).expect("partition parent");
+        fs::write(path, b"footer intentionally absent").expect("lazy member");
+    }
+    for name in ["another.parquet", "third.parquet"] {
+        fs::write(
+            directory.path().join("bucket=0000").join(name),
+            b"footer intentionally absent",
+        )
+        .expect("repeated partition member");
+    }
+    let source = DatasetSource::open_folder(directory.path()).expect("folder dataset");
+
+    assert_eq!(
+        source.partition_page(&[], None, 257),
+        Err(DatasetError::PageTooLarge)
+    );
+    assert_eq!(
+        source.partition_page(
+            &vec![
+                PartitionValue {
+                    key: "key".to_owned(),
+                    value: "value".to_owned(),
+                };
+                257
+            ],
+            None,
+            1
+        ),
+        Err(DatasetError::PageTooLarge)
+    );
+    assert_eq!(
+        source.partition_page(&[], None, 0),
+        Ok(DatasetPartitionPage {
+            nodes: Vec::new(),
+            next_after: None,
+        })
+    );
+
+    let page = source
+        .partition_page(&[], None, 8)
+        .expect("bounded partition page");
+    assert_eq!(page.nodes.len(), 8);
+    assert_eq!(page.nodes[0].partition.value, "0000");
+    assert_eq!(page.nodes[0].member_count, 3);
+    assert_eq!(page.nodes[7].partition.value, "0007");
+    assert_eq!(
+        page.next_after.as_ref().map(|cursor| cursor.value.as_str()),
+        Some("0007")
     );
 }
 

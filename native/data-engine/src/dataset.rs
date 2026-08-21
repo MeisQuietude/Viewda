@@ -2,7 +2,7 @@
 
 use std::{
     any::Any,
-    collections::{HashMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     fs,
     panic::{AssertUnwindSafe, catch_unwind},
     path::{Path, PathBuf},
@@ -30,7 +30,7 @@ use duckdb::{
     Config, Connection, Error as DuckDbError, appender_params_from_iter, params_from_iter,
     types::Value,
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use tempfile::NamedTempFile;
 use thiserror::Error;
 
@@ -44,10 +44,11 @@ use crate::{
 };
 
 const MAX_MEMBER_PAGE_SIZE: u32 = 256;
+const MAX_PARTITION_DEPTH: usize = 256;
 const PROVENANCE_COLUMN: &str = "file";
 
 /// A Hive partition key and its text value for one member.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PartitionValue {
     /// Column name derived from a `key=value` directory component.
@@ -104,6 +105,26 @@ pub struct DatasetMemberPage {
     pub members: Vec<DatasetMemberSummary>,
 }
 
+/// One immediate child in a dataset's Hive partition tree.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DatasetPartitionNode {
+    /// Hive key and value represented by this tree node.
+    pub partition: PartitionValue,
+    /// Fixed-composition members below this node.
+    pub member_count: u64,
+}
+
+/// A cursor-bounded page of immediate Hive partition children.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DatasetPartitionPage {
+    /// Children ordered by ASCII-case-insensitive key, then exact value.
+    pub nodes: Vec<DatasetPartitionNode>,
+    /// Cursor to pass as `after` when more children are available.
+    pub next_after: Option<PartitionValue>,
+}
+
 /// Aggregate facts produced by an incremental footer pass.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -143,9 +164,9 @@ pub enum DatasetError {
     /// Discovery found no supported member.
     #[error("The selected source does not contain any Parquet files.")]
     NoParquetFiles,
-    /// A requested member page exceeds the bounded protocol limit.
-    #[error("The requested dataset member page is too large.")]
-    MemberPageTooLarge,
+    /// A requested dataset page exceeds the bounded protocol limit.
+    #[error("The requested dataset page is too large.")]
+    PageTooLarge,
     /// One incremental footer step exceeds the bounded protocol limit.
     #[error("The requested dataset inspection step is too large.")]
     InspectionStepTooLarge,
@@ -310,7 +331,7 @@ impl DatasetSource {
     /// Returns a bounded page without exposing absolute filesystem paths.
     pub fn member_page(&self, offset: u64, limit: u32) -> Result<DatasetMemberPage, DatasetError> {
         if limit > MAX_MEMBER_PAGE_SIZE {
-            return Err(DatasetError::MemberPageTooLarge);
+            return Err(DatasetError::PageTooLarge);
         }
         let start = usize::try_from(offset)
             .unwrap_or(usize::MAX)
@@ -328,6 +349,76 @@ impl DatasetSource {
             total: self.member_count(),
             members,
         })
+    }
+
+    /// Returns immediate Hive children below an exact parent chain.
+    ///
+    /// Parent keys are matched without ASCII case sensitivity and values are
+    /// matched exactly. Pass `next_after` from one page as `after` for the next.
+    pub fn partition_page(
+        &self,
+        parent: &[PartitionValue],
+        after: Option<&PartitionValue>,
+        limit: u32,
+    ) -> Result<DatasetPartitionPage, DatasetError> {
+        if limit > MAX_MEMBER_PAGE_SIZE || parent.len() > MAX_PARTITION_DEPTH {
+            return Err(DatasetError::PageTooLarge);
+        }
+        if limit == 0 {
+            return Ok(DatasetPartitionPage {
+                nodes: Vec::new(),
+                next_after: None,
+            });
+        }
+
+        let after = after.map(partition_order_key);
+        let capacity = limit as usize + 1;
+        let mut nodes = BTreeMap::<(String, String), DatasetPartitionNode>::new();
+        for member in self.members.iter() {
+            if !partition_prefix_matches(&member.partitions, parent) {
+                continue;
+            }
+            let Some(partition) = member.partitions.get(parent.len()) else {
+                continue;
+            };
+            let key = partition_order_key(partition);
+            if after.as_ref().is_some_and(|cursor| key <= *cursor) {
+                continue;
+            }
+            if let Some(node) = nodes.get_mut(&key) {
+                node.member_count += 1;
+                continue;
+            }
+            // The largest retained key only decreases, so a discarded key can
+            // never re-enter and the retained nodes keep exact counts.
+            if nodes.len() == capacity
+                && nodes.last_key_value().is_some_and(|(last, _)| key >= *last)
+            {
+                continue;
+            }
+            if nodes.len() == capacity {
+                nodes.pop_last();
+            }
+            nodes.insert(
+                key,
+                DatasetPartitionNode {
+                    partition: partition.clone(),
+                    member_count: 1,
+                },
+            );
+        }
+
+        let has_next = nodes.len() > limit as usize;
+        if has_next {
+            nodes.pop_last();
+        }
+        let nodes = nodes.into_values().collect::<Vec<_>>();
+        let next_after = if has_next {
+            nodes.last().map(|node| node.partition.clone())
+        } else {
+            None
+        };
+        Ok(DatasetPartitionPage { nodes, next_after })
     }
 
     /// Creates a cancellable footer inspector that advances by a bounded member budget.
@@ -1283,6 +1374,17 @@ fn parse_partitions(relative_path: &Path) -> Result<Vec<PartitionValue>, Dataset
     Ok(partitions)
 }
 
+fn partition_prefix_matches(partitions: &[PartitionValue], parent: &[PartitionValue]) -> bool {
+    partitions.len() >= parent.len()
+        && partitions.iter().zip(parent).all(|(member, expected)| {
+            member.key.eq_ignore_ascii_case(&expected.key) && member.value == expected.value
+        })
+}
+
+fn partition_order_key(partition: &PartitionValue) -> (String, String) {
+    (partition.key.to_ascii_lowercase(), partition.value.clone())
+}
+
 fn merge_schema(
     union: &mut Vec<SchemaField>,
     member_schema: Vec<SchemaField>,
@@ -1457,7 +1559,7 @@ fn drift_page(
     limit: u32,
 ) -> Result<DatasetMemberPage, DatasetError> {
     if limit > MAX_MEMBER_PAGE_SIZE {
-        return Err(DatasetError::MemberPageTooLarge);
+        return Err(DatasetError::PageTooLarge);
     }
     let start = usize::try_from(offset)
         .unwrap_or(usize::MAX)
@@ -2099,7 +2201,7 @@ mod tests {
         assert_eq!(page.members[0].relative_path, "part-255.parquet");
         assert_eq!(
             drift_page(&members, &deviations, 0, 257),
-            Err(DatasetError::MemberPageTooLarge)
+            Err(DatasetError::PageTooLarge)
         );
     }
 
