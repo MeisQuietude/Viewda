@@ -3,8 +3,9 @@
 //! The footer is parsed once into a [`StructureReader`], which every later query
 //! reads without touching the file again. The single exception is
 //! [`StructureReader::probe_bloom_filter`], which reads the byte range that holds
-//! one bloom filter. No data page is ever decoded, so a file whose data pages are
-//! damaged still produces a complete layout description.
+//! one bloom filter from the retained source snapshot. No data page is ever
+//! decoded, so damaged page contents still produce a layout description. Page
+//! ranges that no longer fit before the footer are marked unreadable.
 
 use std::{
     cmp::Reverse,
@@ -19,23 +20,33 @@ use std::{
     },
 };
 
+#[cfg(test)]
+use std::{
+    sync::{
+        Mutex,
+        mpsc::{self, Receiver, Sender},
+    },
+    time::Duration,
+};
+
 use parquet::{
-    basic::{Compression, Encoding, Type as PhysicalType},
+    basic::{Compression, ConvertedType, Encoding, LogicalType, Type as PhysicalType},
     bloom_filter::Sbbf,
     data_type::{ByteArray, FixedLenByteArray},
     errors::ParquetError,
     file::{
-        FOOTER_SIZE,
-        metadata::{ColumnChunkMetaData, ParquetMetaData, ParquetMetaDataReader, RowGroupMetaData},
+        metadata::{ColumnChunkMetaData, ParquetMetaData, RowGroupMetaData},
         reader::{ChunkReader, Length},
         statistics::Statistics,
     },
+    thrift::TSerializable,
 };
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
+use thrift::protocol::TCompactInputProtocol;
 
 use crate::source::{
-    SourceError, converted_type_name, logical_type_name, map_parquet_error, open_local_source,
+    SourceError, SourceIdentity, SourceSnapshot, converted_type_name, logical_type_name,
     physical_type_name,
 };
 
@@ -76,6 +87,9 @@ pub enum StructureError {
     /// The operating system denied access to the selected source.
     #[error("Viewda does not have permission to read the selected file.")]
     PermissionDenied,
+    /// The source path or retained file changed after open.
+    #[error("The selected file changed after it was opened.")]
+    SourceChanged,
     /// The selected source does not have Parquet file markers.
     #[error("The selected file is not a Parquet file.")]
     NotParquet,
@@ -110,6 +124,7 @@ impl From<SourceError> for StructureError {
         match error {
             SourceError::NotFound => Self::NotFound,
             SourceError::PermissionDenied => Self::PermissionDenied,
+            SourceError::SourceChanged => Self::SourceChanged,
             SourceError::NotParquet => Self::NotParquet,
             SourceError::CorruptFooter => Self::CorruptFooter,
             SourceError::Unsupported => Self::Unsupported,
@@ -119,9 +134,9 @@ impl From<SourceError> for StructureError {
 
 /// Cancellation shared with an in-flight structure load or bloom probe.
 ///
-/// Cancellation is observed between whole steps: after opening the file, after
-/// the footer decode, and once per row group. The footer decode itself is a
-/// single call into the Parquet crate and cannot be interrupted part-way.
+/// Cancellation is observed after opening, after the footer decode, and within
+/// row-group chunk/range passes. The Thrift footer decode is one library call
+/// and cannot be interrupted part-way.
 #[derive(Clone, Default)]
 pub struct StructureCancellation {
     cancelled: Arc<AtomicBool>,
@@ -151,6 +166,16 @@ impl StructureCancellation {
 pub struct StructureLoadProgress {
     completed_row_groups: Arc<AtomicU64>,
     total_row_groups: Arc<AtomicU64>,
+    completed_chunks: Arc<AtomicU64>,
+    total_chunks: Arc<AtomicU64>,
+    #[cfg(test)]
+    chunk_checkpoint: Arc<Mutex<Option<ChunkProgressCheckpoint>>>,
+}
+
+#[cfg(test)]
+struct ChunkProgressCheckpoint {
+    reached: Sender<()>,
+    resume: Receiver<()>,
 }
 
 impl StructureLoadProgress {
@@ -159,7 +184,41 @@ impl StructureLoadProgress {
         StructureLoadSnapshot {
             completed_row_groups: self.completed_row_groups.load(Ordering::Acquire),
             total_row_groups: self.total_row_groups.load(Ordering::Acquire),
+            completed_chunks: self.completed_chunks.load(Ordering::Acquire),
+            total_chunks: self.total_chunks.load(Ordering::Acquire),
         }
+    }
+
+    fn complete_chunks(&self, count: u64) {
+        self.completed_chunks.fetch_add(count, Ordering::Release);
+        #[cfg(test)]
+        if let Some(checkpoint) = self
+            .chunk_checkpoint
+            .lock()
+            .expect("chunk checkpoint lock")
+            .take()
+        {
+            checkpoint
+                .reached
+                .send(())
+                .expect("progress observer remains available");
+            checkpoint
+                .resume
+                .recv_timeout(Duration::from_secs(5))
+                .expect("progress observer resumes the worker");
+        }
+    }
+
+    #[cfg(test)]
+    fn checkpoint_after_next_chunk(&self) -> (Receiver<()>, Sender<()>) {
+        let (reached_tx, reached_rx) = mpsc::channel();
+        let (resume_tx, resume_rx) = mpsc::channel();
+        *self.chunk_checkpoint.lock().expect("chunk checkpoint lock") =
+            Some(ChunkProgressCheckpoint {
+                reached: reached_tx,
+                resume: resume_rx,
+            });
+        (reached_rx, resume_tx)
     }
 }
 
@@ -171,6 +230,10 @@ pub struct StructureLoadSnapshot {
     pub completed_row_groups: u64,
     /// Row groups to summarize, or zero while the footer is still being decoded.
     pub total_row_groups: u64,
+    /// Column chunks already summarized.
+    pub completed_chunks: u64,
+    /// Column chunks recorded in the decoded footer.
+    pub total_chunks: u64,
 }
 
 /// Which stored size a request ranks, shares, and sums by.
@@ -213,6 +276,8 @@ pub enum StructureRowGroupSort {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub enum StructureColumnSort {
+    /// Leaf position in the file schema.
+    Index,
     /// Dotted schema path.
     Name,
     /// Stored bytes in the requested unit.
@@ -253,12 +318,15 @@ pub struct StructureSummary {
     pub chunks_with_statistics: u64,
     /// Column chunks that carry a bloom filter.
     pub chunks_with_bloom_filter: u64,
-    /// Row groups whose footer entry is inconsistent and excluded from the totals.
+    /// Row groups whose local data-page ranges cannot be opened safely.
+    /// Structurally valid footer facts still contribute to totals and layout.
     pub unreadable_row_group_count: usize,
     /// Key-value metadata entries in the footer.
     pub key_value_count: usize,
     /// The first [`MAX_KEY_VALUE_ENTRIES`] key-value entries, values excluded.
     pub key_value_metadata: Vec<StructureKeyValueEntry>,
+    /// Whether any footer-controlled display string was shortened for the wire payload.
+    pub strings_truncated: bool,
 }
 
 /// One key-value metadata entry described without its value.
@@ -335,7 +403,7 @@ pub struct StructureCodecTotal {
 #[derive(Debug, Clone, Copy, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct StructureRatioStep {
-    /// Exclusive upper ratio bound, absent for the unbounded final step.
+    /// Inclusive upper ratio bound, absent for the unbounded final step.
     pub max_ratio: Option<f64>,
     /// Chunks and bytes inside this step.
     pub total: StructureLensTotal,
@@ -359,8 +427,8 @@ pub struct StructureLensTotals {
     pub codecs: Vec<StructureCodecTotal>,
     /// Ratio lens, ordered from the lowest step upwards.
     pub ratio_steps: Vec<StructureRatioStep>,
-    /// Chunks that store nothing and therefore have no ratio.
-    pub unrated_chunk_count: u64,
+    /// Chunks that store no compressed bytes and therefore have no ratio.
+    pub unrated: StructureLensTotal,
     /// Statistics lens.
     pub statistics: StructurePresenceTotals,
     /// Bloom-filter lens.
@@ -415,7 +483,7 @@ pub struct StructureLayoutRow {
     pub compressed_bytes: u64,
     /// Uncompressed bytes of the whole row.
     pub uncompressed_bytes: u64,
-    /// Whether the row group's footer entry is consistent.
+    /// Whether every recorded local data-page range is available in the opened file.
     pub is_readable: bool,
     /// Largest segments in the requested unit, largest first.
     pub segments: Vec<StructureLayoutSegment>,
@@ -431,9 +499,9 @@ pub struct StructureLayout {
     pub offset: usize,
     /// Rows available in the source.
     pub total_count: usize,
-    /// Largest readable row group in stored bytes, for stable width normalization.
+    /// Largest row group with structurally valid footer facts, in stored bytes.
     pub max_compressed_bytes: u64,
-    /// Largest readable row group in uncompressed bytes.
+    /// Largest row group with structurally valid footer facts, in uncompressed bytes.
     pub max_uncompressed_bytes: u64,
     /// Bounded whole-file overview for the minimap.
     pub overview: Vec<StructureLayoutOverviewBucket>,
@@ -456,7 +524,10 @@ pub struct StructureLayoutOverviewBucket {
     pub statistics_share_compressed: f64,
     pub statistics_share_uncompressed: f64,
     pub has_bloom_filter: bool,
-    pub has_readable_group: bool,
+    pub has_layout_facts: bool,
+    /// Bytes of the optionally focused column within this bucket.
+    pub focused_compressed_bytes: u64,
+    pub focused_uncompressed_bytes: u64,
 }
 
 /// One row of the row-group table.
@@ -477,8 +548,10 @@ pub struct StructureRowGroupSummary {
     pub chunk_count: usize,
     /// Column chunks that carry a bloom filter.
     pub chunks_with_bloom_filter: u64,
-    /// Whether the row group's footer entry is consistent.
+    /// Whether every recorded local data-page range is available in the opened file.
     pub is_readable: bool,
+    /// Whether recorded footer facts are structurally usable for visualization.
+    pub has_layout_facts: bool,
 }
 
 /// A bounded window of the row-group table.
@@ -643,6 +716,7 @@ struct RowGroupFacts {
     chunk_count: usize,
     chunks_with_bloom_filter: u64,
     is_readable: bool,
+    has_layout_facts: bool,
     first_row_offset: Option<u64>,
 }
 
@@ -662,8 +736,8 @@ struct ColumnFacts {
 /// Construction is the only step that reads the footer. Callers are expected to
 /// keep one reader per opened source for as long as that source stays open.
 pub struct StructureReader {
-    path: PathBuf,
-    metadata: ParquetMetaData,
+    file: Option<File>,
+    metadata: Arc<ParquetMetaData>,
     summary: StructureSummary,
     lens_totals: StructureLensTotals,
     row_groups: Vec<RowGroupFacts>,
@@ -671,6 +745,9 @@ pub struct StructureReader {
     max_compressed_row_group_bytes: u64,
     max_uncompressed_row_group_bytes: u64,
     layout_overview: Vec<StructureLayoutOverviewBucket>,
+    file_bytes: u64,
+    data_end: u64,
+    source_identity: Option<SourceIdentity>,
 }
 
 impl StructureReader {
@@ -683,27 +760,36 @@ impl StructureReader {
         progress: &StructureLoadProgress,
         cancellation: &StructureCancellation,
     ) -> Result<Self, StructureError> {
-        let (file, _) = open_local_source(&path)?;
+        let snapshot = SourceSnapshot::open(&path)?;
         cancellation.check()?;
+        Self::from_snapshot(&snapshot, progress, cancellation)
+    }
 
-        let mut metadata_reader = ParquetMetaDataReader::new();
-        metadata_reader
-            .try_parse(&file)
-            .map_err(map_structure_parquet_error)?;
-        let footer_bytes = u64::try_from(metadata_reader.metadata_size().unwrap_or(FOOTER_SIZE))
-            .map_err(|_| StructureError::CorruptFooter)?;
-        let metadata = metadata_reader
-            .finish()
-            .map_err(map_structure_parquet_error)?;
+    /// Adds cancellable structure facts to a footer snapshot decoded during source open.
+    pub fn from_snapshot(
+        snapshot: &SourceSnapshot,
+        progress: &StructureLoadProgress,
+        cancellation: &StructureCancellation,
+    ) -> Result<Self, StructureError> {
         cancellation.check()?;
-
-        Self::summarize(path, metadata, footer_bytes, progress, cancellation)
+        let mut reader = Self::summarize(
+            snapshot.metadata_snapshot(),
+            snapshot.file_bytes(),
+            snapshot.footer_bytes(),
+            snapshot.data_end(),
+            progress,
+            cancellation,
+        )?;
+        reader.file = Some(snapshot.cloned_file()?);
+        reader.source_identity = Some(snapshot.identity().clone());
+        Ok(reader)
     }
 
     fn summarize(
-        path: PathBuf,
-        metadata: ParquetMetaData,
+        metadata: Arc<ParquetMetaData>,
+        file_bytes: u64,
         footer_bytes: u64,
+        data_end: u64,
         progress: &StructureLoadProgress,
         cancellation: &StructureCancellation,
     ) -> Result<Self, StructureError> {
@@ -717,24 +803,39 @@ impl StructureReader {
             u64::try_from(row_group_count).map_err(|_| StructureError::CorruptFooter)?,
             Ordering::Release,
         );
+        let total_chunks = metadata
+            .row_groups()
+            .iter()
+            .try_fold(0_u64, |total, row_group| {
+                total
+                    .checked_add(
+                        u64::try_from(row_group.columns().len())
+                            .map_err(|_| StructureError::CorruptFooter)?,
+                    )
+                    .ok_or(StructureError::CorruptFooter)
+            })?;
+        progress.total_chunks.store(total_chunks, Ordering::Release);
 
         let mut columns = schema
             .columns()
             .iter()
-            .map(|descriptor| ColumnFacts {
-                name: descriptor.path().string(),
-                physical_type: physical_type_name(&descriptor.physical_type()).to_owned(),
-                logical_type: descriptor
-                    .logical_type_ref()
-                    .map(logical_type_name)
-                    .or_else(|| {
-                        converted_type_name(descriptor.self_type(), descriptor.converted_type())
-                    }),
-                compressed_bytes: 0,
-                uncompressed_bytes: 0,
-                encodings: 0,
-                cumulative_share_compressed: 0.0,
-                cumulative_share_uncompressed: 0.0,
+            .map(|descriptor| {
+                let (name, _) = bounded_column_path(descriptor.path());
+                ColumnFacts {
+                    name,
+                    physical_type: physical_type_name(&descriptor.physical_type()).to_owned(),
+                    logical_type: descriptor
+                        .logical_type_ref()
+                        .map(logical_type_name)
+                        .or_else(|| {
+                            converted_type_name(descriptor.self_type(), descriptor.converted_type())
+                        }),
+                    compressed_bytes: 0,
+                    uncompressed_bytes: 0,
+                    encodings: 0,
+                    cumulative_share_compressed: 0.0,
+                    cumulative_share_uncompressed: 0.0,
+                }
             })
             .collect::<Vec<_>>();
         let mut row_groups = Vec::with_capacity(row_group_count);
@@ -756,16 +857,24 @@ impl StructureReader {
 
         for (index, row_group) in metadata.row_groups().iter().enumerate() {
             cancellation.check()?;
-            let is_readable = is_readable_row_group(row_group, column_count);
+            let has_layout_facts =
+                has_valid_row_group_facts(row_group, column_count, cancellation)?;
+            let is_readable =
+                has_layout_facts && row_group_data_is_readable(row_group, data_end, cancellation)?;
             let row_group_rows = u64::try_from(row_group.num_rows()).unwrap_or(0);
             let mut row_group_compressed = 0_u64;
             let mut row_group_uncompressed = 0_u64;
             let mut row_group_blooms = 0_u64;
+            if !is_readable {
+                unreadable_row_group_count = unreadable_row_group_count
+                    .checked_add(1)
+                    .ok_or(StructureError::CorruptFooter)?;
+            }
 
-            if is_readable {
+            if has_layout_facts {
                 if !overview.is_empty() {
                     let bucket = index * overview.len() / row_group_count;
-                    overview[bucket].has_readable_group = true;
+                    overview[bucket].has_layout_facts = true;
                 }
                 for (column_index, chunk) in row_group.columns().iter().enumerate() {
                     cancellation.check()?;
@@ -811,6 +920,7 @@ impl StructureReader {
                     for encoding in chunk.encodings() {
                         facts.encodings |= encoding_bit(encoding);
                     }
+                    progress.complete_chunks(1);
                 }
                 compressed_bytes = compressed_bytes
                     .checked_add(row_group_compressed)
@@ -822,7 +932,8 @@ impl StructureReader {
                     .checked_add(row_group_blooms)
                     .ok_or(StructureError::CorruptFooter)?;
             } else {
-                unreadable_row_group_count += 1;
+                progress
+                    .complete_chunks(u64::try_from(row_group.columns().len()).unwrap_or(u64::MAX));
             }
             max_compressed_row_group_bytes =
                 max_compressed_row_group_bytes.max(row_group_compressed);
@@ -836,6 +947,7 @@ impl StructureReader {
                 chunk_count: row_group.columns().len(),
                 chunks_with_bloom_filter: row_group_blooms,
                 is_readable,
+                has_layout_facts,
                 first_row_offset,
             });
             first_row_offset = if row_group.num_rows() < 0 {
@@ -862,6 +974,18 @@ impl StructureReader {
 
         let key_value_metadata = file_metadata.key_value_metadata();
         let key_value_count = key_value_metadata.map_or(0, Vec::len);
+        let strings_truncated = file_metadata
+            .created_by()
+            .is_some_and(|value| value.len() > MAX_REPORT_FIELD_BYTES)
+            || schema
+                .columns()
+                .iter()
+                .any(|column| column_path_len(column.path()) > MAX_REPORT_FIELD_BYTES)
+            || key_value_metadata.is_some_and(|entries| {
+                entries
+                    .iter()
+                    .any(|entry| entry.key.len() > MAX_REPORT_FIELD_BYTES)
+            });
         let key_value_entries = key_value_metadata
             .map(|entries| {
                 entries
@@ -870,7 +994,7 @@ impl StructureReader {
                     .enumerate()
                     .map(|(index, entry)| StructureKeyValueEntry {
                         index,
-                        key: entry.key.clone(),
+                        key: bounded_wire_field(&entry.key).0,
                         value_bytes: entry.value.as_ref().map(|value| value.len() as u64),
                     })
                     .collect()
@@ -882,7 +1006,9 @@ impl StructureReader {
             uncompressed_bytes,
             compression_ratio: compression_ratio(compressed_bytes, uncompressed_bytes),
             format_version: file_metadata.version(),
-            created_by: file_metadata.created_by().map(str::to_owned),
+            created_by: file_metadata
+                .created_by()
+                .map(|value| bounded_wire_field(value).0),
             row_count,
             row_group_count,
             column_count,
@@ -896,10 +1022,11 @@ impl StructureReader {
             unreadable_row_group_count,
             key_value_count,
             key_value_metadata: key_value_entries,
+            strings_truncated,
         };
 
         Ok(Self {
-            path,
+            file: None,
             lens_totals: lens.finish(),
             summary,
             row_groups,
@@ -917,6 +1044,9 @@ impl StructureReader {
                     )
                 })
                 .collect(),
+            file_bytes,
+            data_end,
+            source_identity: None,
             metadata,
         })
     }
@@ -952,7 +1082,7 @@ impl StructureReader {
         };
         Ok(StructureKeyValue {
             index,
-            key: entry.key.clone(),
+            key: bounded_wire_field(&entry.key).0,
             value,
             is_truncated,
         })
@@ -980,30 +1110,53 @@ impl StructureReader {
         offset: usize,
         limit: usize,
         segment_limit: usize,
+        focused_column: Option<usize>,
     ) -> StructureLayout {
         let limit = limit.min(MAX_LAYOUT_ROWS);
         let segment_limit = segment_limit.min(MAX_LAYOUT_SEGMENTS);
         let end = offset.saturating_add(limit).min(self.row_groups.len());
         let rows = (offset.min(end)..end)
-            .map(|index| self.layout_row(index, unit, segment_limit))
+            .map(|index| self.layout_row(index, unit, segment_limit, focused_column))
             .collect();
+        let mut overview = self.layout_overview.clone();
+        if let Some(column_index) = focused_column.filter(|index| *index < self.columns.len()) {
+            let bucket_count = overview.len();
+            if bucket_count > 0 {
+                for (row_index, row_group) in self.metadata.row_groups().iter().enumerate() {
+                    if !self.row_groups[row_index].has_layout_facts {
+                        continue;
+                    }
+                    let Some(chunk) = row_group.columns().get(column_index) else {
+                        continue;
+                    };
+                    let bucket = row_index.saturating_mul(bucket_count) / self.row_groups.len();
+                    overview[bucket].focused_compressed_bytes = overview[bucket]
+                        .focused_compressed_bytes
+                        .saturating_add(u64::try_from(chunk.compressed_size()).unwrap_or(0));
+                    overview[bucket].focused_uncompressed_bytes = overview[bucket]
+                        .focused_uncompressed_bytes
+                        .saturating_add(u64::try_from(chunk.uncompressed_size()).unwrap_or(0));
+                }
+            }
+        }
 
         StructureLayout {
             offset: offset.min(self.row_groups.len()),
             total_count: self.row_groups.len(),
             max_compressed_bytes: self.max_compressed_row_group_bytes,
             max_uncompressed_bytes: self.max_uncompressed_row_group_bytes,
-            overview: self.layout_overview.clone(),
+            overview,
             rows,
         }
     }
 
-    /// Marks bounded minimap buckets that contain bytes for one leaf column.
+    /// Builds one exact row-group bar while bounding its named column segments.
     fn layout_row(
         &self,
         index: usize,
         unit: StructureByteUnit,
         segment_limit: usize,
+        focused_column: Option<usize>,
     ) -> StructureLayoutRow {
         let facts = &self.row_groups[index];
         let mut segments = Vec::new();
@@ -1013,15 +1166,20 @@ impl StructureReader {
             uncompressed_bytes: 0,
         };
 
-        if facts.is_readable && segment_limit > 0 {
+        if facts.has_layout_facts && segment_limit > 0 {
             let chunks = self.metadata.row_group(index).columns();
             // A bounded min-heap keeps the pass linear in the number of columns,
             // which matters on the hundred-thousand-column files this must survive.
             // Ties keep the lower column index so repeated requests agree.
-            let mut largest = BinaryHeap::with_capacity(segment_limit + 1);
+            let focused_column = focused_column.filter(|column| *column < chunks.len());
+            let largest_limit = segment_limit.saturating_sub(usize::from(focused_column.is_some()));
+            let mut largest = BinaryHeap::with_capacity(largest_limit + 1);
             for (column_index, chunk) in chunks.iter().enumerate() {
+                if Some(column_index) == focused_column {
+                    continue;
+                }
                 largest.push(Reverse((chunk_bytes(chunk, unit), Reverse(column_index))));
-                if largest.len() > segment_limit {
+                if largest.len() > largest_limit {
                     let Reverse((_, Reverse(dropped_index))) =
                         largest.pop().expect("the heap just grew past its limit");
                     let dropped = &chunks[dropped_index];
@@ -1035,6 +1193,9 @@ impl StructureReader {
                 .into_iter()
                 .map(|Reverse((bytes, Reverse(column_index)))| (bytes, column_index))
                 .collect::<Vec<_>>();
+            if let Some(column_index) = focused_column {
+                kept.push((chunk_bytes(&chunks[column_index], unit), column_index));
+            }
             kept.sort_unstable_by(|left, right| {
                 right.0.cmp(&left.0).then_with(|| left.1.cmp(&right.1))
             });
@@ -1063,11 +1224,7 @@ impl StructureReader {
         let uncompressed_bytes = u64::try_from(chunk.uncompressed_size()).unwrap_or(0);
         StructureLayoutSegment {
             column_index,
-            column_name: self
-                .columns
-                .get(column_index)
-                .map(|facts| facts.name.clone())
-                .unwrap_or_else(|| chunk.column_path().string()),
+            column_name: self.columns[column_index].name.clone(),
             compressed_bytes,
             uncompressed_bytes,
             compression_ratio: compression_ratio(compressed_bytes, uncompressed_bytes),
@@ -1145,6 +1302,7 @@ impl StructureReader {
             chunk_count: facts.chunk_count,
             chunks_with_bloom_filter: facts.chunks_with_bloom_filter,
             is_readable: facts.is_readable,
+            has_layout_facts: facts.has_layout_facts,
         }
     }
 
@@ -1159,6 +1317,7 @@ impl StructureReader {
     ) -> StructureColumnPage {
         let mut order = (0..self.columns.len()).collect::<Vec<_>>();
         match sort {
+            StructureColumnSort::Index => {}
             StructureColumnSort::Name => order.sort_by(|left, right| {
                 let ordering = self.columns[*left].name.cmp(&self.columns[*right].name);
                 direction_ordering(ordering, direction).then_with(|| left.cmp(right))
@@ -1167,7 +1326,9 @@ impl StructureReader {
                 let left_facts = &self.columns[*left];
                 let right_facts = &self.columns[*right];
                 let ordering = match sort {
-                    StructureColumnSort::Name => std::cmp::Ordering::Equal,
+                    StructureColumnSort::Index | StructureColumnSort::Name => {
+                        std::cmp::Ordering::Equal
+                    }
                     StructureColumnSort::Bytes => structure_bytes(
                         left_facts.compressed_bytes,
                         left_facts.uncompressed_bytes,
@@ -1264,7 +1425,7 @@ impl StructureReader {
         Ok(StructureChunkDetails {
             row_group_index,
             column_index,
-            column_name: chunk.column_path().string(),
+            column_name: self.columns[column_index].name.clone(),
             physical_type: physical_type_name(&chunk.column_type()).to_owned(),
             codec: codec_name(chunk.compression()).to_owned(),
             encodings: chunk_encoding_names(chunk),
@@ -1315,6 +1476,7 @@ impl StructureReader {
 
         writeln!(report, "## File facts\n").expect("writing to a string cannot fail");
         for (label, value) in [
+            ("File bytes", self.file_bytes.to_string()),
             ("Rows", summary.row_count.to_string()),
             ("Row groups", summary.row_group_count.to_string()),
             ("Columns", summary.column_count.to_string()),
@@ -1358,7 +1520,15 @@ impl StructureReader {
         writeln!(report, "- Codecs: {}\n", summary.codecs.join(" + "))
             .expect("writing to a string cannot fail");
 
-        writeln!(report, "## Lens totals\n").expect("writing to a string cannot fail");
+        writeln!(
+            report,
+            "## Lens totals\n\n- Byte unit: {}",
+            match unit {
+                StructureByteUnit::Compressed => "compressed",
+                StructureByteUnit::Uncompressed => "uncompressed",
+            }
+        )
+        .expect("writing to a string cannot fail");
         for codec in &self.lens_totals.codecs {
             writeln!(
                 report,
@@ -1382,6 +1552,13 @@ impl StructureReader {
             )
             .expect("writing to a string cannot fail");
         }
+        writeln!(
+            report,
+            "- No stored bytes: {} chunks · {} bytes",
+            self.lens_totals.unrated.chunk_count,
+            lens_bytes(self.lens_totals.unrated, unit)
+        )
+        .expect("writing to a string cannot fail");
         writeln!(
             report,
             "- Statistics present: {} chunks · {} bytes",
@@ -1495,8 +1672,8 @@ impl StructureReader {
 
     /// Asks each row group's bloom filter whether one value can be present.
     ///
-    /// The probe text is read as a value of the column's physical type, because a
-    /// bloom filter only answers for the exact bytes the writer hashed.
+    /// Supported logical annotations are converted to the exact physical value
+    /// the writer hashed. Other annotations fail instead of guessing membership.
     pub fn probe_bloom_filter(
         &self,
         column_index: usize,
@@ -1512,8 +1689,19 @@ impl StructureReader {
             .columns()
             .get(column_index)
             .ok_or(StructureError::UnknownColumn)?;
-        let probe = ProbeValue::parse(descriptor.physical_type(), descriptor.type_length(), value)?;
-        let (file, _) = open_local_source(&self.path)?;
+        let probe = ProbeValue::parse(
+            descriptor.physical_type(),
+            descriptor.type_length(),
+            descriptor.logical_type_ref(),
+            descriptor.converted_type(),
+            descriptor.type_scale(),
+            value,
+        )?;
+        let file = self.file.as_ref().ok_or(StructureError::Unsupported)?;
+        if let Some(identity) = &self.source_identity {
+            identity.validate_file(file)?;
+        }
+        let file = file.try_clone().map_err(|_| StructureError::Unsupported)?;
         let reader = BoundedBloomReader::new(file, MAX_BLOOM_PROBE_BYTES);
 
         let limit = limit.min(MAX_PROBE_ROW_GROUPS);
@@ -1522,23 +1710,13 @@ impl StructureReader {
         for index in offset.min(end)..end {
             cancellation.check()?;
             let chunk = self.metadata.row_group(index).columns().get(column_index);
-            let outcome = match chunk {
-                None => StructureBloomProbeOutcome::Unreadable,
-                Some(chunk) if chunk.bloom_filter_offset().is_none() => {
-                    StructureBloomProbeOutcome::NoFilter
-                }
-                Some(chunk) => match Sbbf::read_from_column_chunk(chunk, &reader) {
-                    Ok(Some(filter)) if probe.check(&filter) => {
-                        StructureBloomProbeOutcome::MayContain
-                    }
-                    Ok(Some(_)) => StructureBloomProbeOutcome::DefinitelyAbsent,
-                    Ok(None) => StructureBloomProbeOutcome::NoFilter,
-                    Err(_) => StructureBloomProbeOutcome::Unreadable,
-                },
-            };
+            let outcome = probe_chunk_bloom(chunk, &probe, &reader, self.data_end);
             results.push(StructureBloomProbeResult { index, outcome });
         }
 
+        if let (Some(identity), Some(file)) = (&self.source_identity, &self.file) {
+            identity.validate_file(file)?;
+        }
         Ok(StructureBloomProbe {
             column_index,
             offset: offset.min(self.row_groups.len()),
@@ -1546,6 +1724,89 @@ impl StructureReader {
             row_groups: results,
         })
     }
+}
+
+fn probe_chunk_bloom(
+    chunk: Option<&ColumnChunkMetaData>,
+    probe: &ProbeValue,
+    reader: &BoundedBloomReader,
+    data_end: u64,
+) -> StructureBloomProbeOutcome {
+    match chunk {
+        None => StructureBloomProbeOutcome::Unreadable,
+        Some(chunk) if chunk.file_path().is_some() => StructureBloomProbeOutcome::Unreadable,
+        Some(chunk) if chunk.bloom_filter_offset().is_none() => {
+            StructureBloomProbeOutcome::NoFilter
+        }
+        Some(chunk) => match read_validated_bloom_filter(chunk, reader, data_end) {
+            Ok(Some(filter)) if probe.check(&filter) => StructureBloomProbeOutcome::MayContain,
+            Ok(Some(_)) => StructureBloomProbeOutcome::DefinitelyAbsent,
+            Ok(None) => StructureBloomProbeOutcome::NoFilter,
+            Err(_) => StructureBloomProbeOutcome::Unreadable,
+        },
+    }
+}
+
+#[allow(deprecated)] // parquet exposes no maintained BloomFilterHeader decoder yet.
+fn read_validated_bloom_filter(
+    chunk: &ColumnChunkMetaData,
+    reader: &BoundedBloomReader,
+    data_end: u64,
+) -> Result<Option<Sbbf>, ParquetError> {
+    let Some(raw_offset) = chunk.bloom_filter_offset() else {
+        return Ok(None);
+    };
+    let offset = u64::try_from(raw_offset)
+        .map_err(|_| ParquetError::General("Bloom filter offset is invalid".to_owned()))?;
+    let declared_length = chunk
+        .bloom_filter_length()
+        .map(|length| {
+            usize::try_from(length)
+                .map_err(|_| ParquetError::General("Bloom filter length is invalid".to_owned()))
+        })
+        .transpose()?;
+    let initial_length = declared_length.unwrap_or(20);
+    let initial_end = offset
+        .checked_add(initial_length as u64)
+        .filter(|end| *end <= data_end)
+        .ok_or_else(|| ParquetError::General("Bloom filter range is invalid".to_owned()))?;
+    let initial = reader.get_bytes(offset, initial_length)?;
+    let mut cursor = Cursor::new(initial.as_ref());
+    let mut protocol = TCompactInputProtocol::new(&mut cursor);
+    let header = parquet::format::BloomFilterHeader::read_from_in_protocol(&mut protocol)
+        .map_err(|_| ParquetError::General("Bloom filter header is invalid".to_owned()))?;
+    drop(protocol);
+    let header_length = usize::try_from(cursor.position())
+        .map_err(|_| ParquetError::General("Bloom filter header is invalid".to_owned()))?;
+    let bitset_length = usize::try_from(header.num_bytes)
+        .map_err(|_| ParquetError::General("Bloom filter bitset is invalid".to_owned()))?;
+    if bitset_length < 32 || bitset_length % 32 != 0 {
+        return Err(ParquetError::General(
+            "Bloom filter bitset is invalid".to_owned(),
+        ));
+    }
+
+    let bitset = match declared_length {
+        Some(length) => {
+            if header_length.checked_add(bitset_length) != Some(length) {
+                return Err(ParquetError::General(
+                    "Bloom filter length does not match its header".to_owned(),
+                ));
+            }
+            initial.slice(header_length..)
+        }
+        None => {
+            let bitset_offset = offset
+                .checked_add(header_length as u64)
+                .ok_or_else(|| ParquetError::General("Bloom filter range is invalid".to_owned()))?;
+            bitset_offset
+                .checked_add(bitset_length as u64)
+                .filter(|end| *end <= data_end && *end >= initial_end)
+                .ok_or_else(|| ParquetError::General("Bloom filter range is invalid".to_owned()))?;
+            reader.get_bytes(bitset_offset, bitset_length)?
+        }
+    };
+    Ok(Some(Sbbf::new(&bitset)))
 }
 
 struct BoundedBloomReader {
@@ -1622,7 +1883,7 @@ fn cut_report_field(value: &str) -> String {
     if value.len() <= MAX_REPORT_FIELD_BYTES {
         return value.to_owned();
     }
-    let mut end = MAX_REPORT_FIELD_BYTES;
+    let mut end = MAX_REPORT_FIELD_BYTES - '…'.len_utf8();
     while end > 0 && !value.is_char_boundary(end) {
         end -= 1;
     }
@@ -1662,8 +1923,22 @@ impl ProbeValue {
     fn parse(
         physical_type: PhysicalType,
         type_length: i32,
+        logical_type: Option<&LogicalType>,
+        converted_type: ConvertedType,
+        converted_scale: i32,
         value: &str,
     ) -> Result<Self, StructureError> {
+        let decimal_scale = match logical_type {
+            Some(LogicalType::Decimal { scale, .. }) => Some(*scale),
+            Some(LogicalType::String) => None,
+            Some(_) => return Err(StructureError::UnsupportedProbeColumn),
+            None if converted_type == ConvertedType::DECIMAL => Some(converted_scale),
+            None if matches!(converted_type, ConvertedType::NONE | ConvertedType::UTF8) => None,
+            None => return Err(StructureError::UnsupportedProbeColumn),
+        };
+        if let Some(scale) = decimal_scale {
+            return Self::decimal(physical_type, type_length, value, scale);
+        }
         Ok(match physical_type {
             PhysicalType::BOOLEAN => Self::Boolean(
                 value
@@ -1680,16 +1955,24 @@ impl ProbeValue {
                     .parse()
                     .map_err(|_| StructureError::InvalidProbeValue)?,
             ),
-            PhysicalType::FLOAT => Self::Float(
-                value
-                    .parse()
-                    .map_err(|_| StructureError::InvalidProbeValue)?,
-            ),
-            PhysicalType::DOUBLE => Self::Double(
-                value
-                    .parse()
-                    .map_err(|_| StructureError::InvalidProbeValue)?,
-            ),
+            PhysicalType::FLOAT => {
+                let value = value
+                    .parse::<f32>()
+                    .map_err(|_| StructureError::InvalidProbeValue)?;
+                if value.is_nan() {
+                    return Err(StructureError::UnsupportedProbeColumn);
+                }
+                Self::Float(value)
+            }
+            PhysicalType::DOUBLE => {
+                let value = value
+                    .parse::<f64>()
+                    .map_err(|_| StructureError::InvalidProbeValue)?;
+                if value.is_nan() {
+                    return Err(StructureError::UnsupportedProbeColumn);
+                }
+                Self::Double(value)
+            }
             PhysicalType::BYTE_ARRAY => Self::ByteArray(value.as_bytes().to_vec().into()),
             PhysicalType::FIXED_LEN_BYTE_ARRAY => {
                 if usize::try_from(type_length) != Ok(value.len()) {
@@ -1703,11 +1986,47 @@ impl ProbeValue {
         })
     }
 
+    fn decimal(
+        physical_type: PhysicalType,
+        type_length: i32,
+        value: &str,
+        scale: i32,
+    ) -> Result<Self, StructureError> {
+        let unscaled = parse_decimal_unscaled(value, scale)?;
+        Ok(match physical_type {
+            PhysicalType::INT32 => {
+                Self::Int32(i32::try_from(unscaled).map_err(|_| StructureError::InvalidProbeValue)?)
+            }
+            PhysicalType::INT64 => {
+                Self::Int64(i64::try_from(unscaled).map_err(|_| StructureError::InvalidProbeValue)?)
+            }
+            PhysicalType::BYTE_ARRAY => Self::ByteArray(decimal_bytes(unscaled).into()),
+            PhysicalType::FIXED_LEN_BYTE_ARRAY => {
+                let length = usize::try_from(type_length)
+                    .map_err(|_| StructureError::UnsupportedProbeColumn)?;
+                let bytes = decimal_bytes(unscaled);
+                if bytes.len() > length {
+                    return Err(StructureError::InvalidProbeValue);
+                }
+                let mut padded = vec![if unscaled < 0 { 0xff } else { 0 }; length];
+                padded[length - bytes.len()..].copy_from_slice(&bytes);
+                Self::FixedLenByteArray(FixedLenByteArray::from(padded))
+            }
+            _ => return Err(StructureError::UnsupportedProbeColumn),
+        })
+    }
+
     fn check(&self, filter: &Sbbf) -> bool {
         match self {
             Self::Boolean(value) => filter.check(value),
             Self::Int32(value) => filter.check(value),
             Self::Int64(value) => filter.check(value),
+            Self::Float(value) if *value == 0.0 => {
+                filter.check(&0.0_f32) || filter.check(&-0.0_f32)
+            }
+            Self::Double(value) if *value == 0.0 => {
+                filter.check(&0.0_f64) || filter.check(&-0.0_f64)
+            }
             Self::Float(value) => filter.check(value),
             Self::Double(value) => filter.check(value),
             Self::ByteArray(value) => filter.check(value),
@@ -1716,11 +2035,51 @@ impl ProbeValue {
     }
 }
 
+fn parse_decimal_unscaled(value: &str, scale: i32) -> Result<i128, StructureError> {
+    let scale = usize::try_from(scale).map_err(|_| StructureError::UnsupportedProbeColumn)?;
+    let (negative, unsigned) = value
+        .strip_prefix('-')
+        .map_or((false, value), |rest| (true, rest));
+    let (whole, fraction) = unsigned.split_once('.').unwrap_or((unsigned, ""));
+    if whole.is_empty()
+        || fraction.len() > scale
+        || !whole
+            .bytes()
+            .chain(fraction.bytes())
+            .all(|byte| byte.is_ascii_digit())
+    {
+        return Err(StructureError::InvalidProbeValue);
+    }
+    let digits = format!("{whole}{fraction}{}", "0".repeat(scale - fraction.len()));
+    let magnitude = digits
+        .parse::<i128>()
+        .map_err(|_| StructureError::InvalidProbeValue)?;
+    if negative {
+        magnitude
+            .checked_neg()
+            .ok_or(StructureError::InvalidProbeValue)
+    } else {
+        Ok(magnitude)
+    }
+}
+
+fn decimal_bytes(value: i128) -> Vec<u8> {
+    let bytes = value.to_be_bytes();
+    let mut first = 0;
+    while first < bytes.len() - 1
+        && ((bytes[first] == 0 && bytes[first + 1] & 0x80 == 0)
+            || (bytes[first] == 0xff && bytes[first + 1] & 0x80 != 0))
+    {
+        first += 1;
+    }
+    bytes[first..].to_vec()
+}
+
 #[derive(Default)]
 struct LensAccumulator {
     codecs: Vec<(usize, StructureLensTotal)>,
     ratio_steps: [StructureLensTotal; RATIO_STEP_BOUNDS.len() + 1],
-    unrated_chunk_count: u64,
+    unrated: StructureLensTotal,
     statistics: StructurePresenceTotalsAccumulator,
     bloom_filters: StructurePresenceTotalsAccumulator,
 }
@@ -1736,7 +2095,7 @@ struct LayoutOverviewAccumulator {
     statistics_compressed_bytes: u64,
     statistics_uncompressed_bytes: u64,
     has_bloom_filter: bool,
-    has_readable_group: bool,
+    has_layout_facts: bool,
 }
 
 impl LayoutOverviewAccumulator {
@@ -1822,7 +2181,9 @@ impl LayoutOverviewAccumulator {
                 self.statistics_uncompressed_bytes as f64 / self.uncompressed_bytes as f64
             },
             has_bloom_filter: self.has_bloom_filter,
-            has_readable_group: self.has_readable_group,
+            has_layout_facts: self.has_layout_facts,
+            focused_compressed_bytes: 0,
+            focused_uncompressed_bytes: 0,
         }
     }
 }
@@ -1884,10 +2245,7 @@ impl LensAccumulator {
 
         match compression_ratio(compressed_bytes, uncompressed_bytes) {
             None => {
-                self.unrated_chunk_count = self
-                    .unrated_chunk_count
-                    .checked_add(1)
-                    .ok_or(StructureError::CorruptFooter)?;
+                self.unrated.add(compressed_bytes, uncompressed_bytes)?;
             }
             Some(ratio) => {
                 let step = RATIO_STEP_BOUNDS
@@ -1931,7 +2289,7 @@ impl LensAccumulator {
                     total,
                 })
                 .collect(),
-            unrated_chunk_count: self.unrated_chunk_count,
+            unrated: self.unrated,
             statistics: self.statistics.finish(),
             bloom_filters: self.bloom_filters.finish(),
         }
@@ -1974,14 +2332,70 @@ fn assign_cumulative_shares(columns: &mut [ColumnFacts], total: u64, unit: Struc
 ///
 /// An inconsistent entry is excluded from every total and counted separately, so
 /// one damaged row group cannot silently distort the file card.
-fn is_readable_row_group(row_group: &RowGroupMetaData, column_count: usize) -> bool {
-    row_group.num_rows() >= 0
-        && row_group.total_byte_size() >= 0
-        && row_group.columns().len() == column_count
-        && row_group
-            .columns()
-            .iter()
-            .all(|chunk| chunk.compressed_size() >= 0 && chunk.uncompressed_size() >= 0)
+fn has_valid_row_group_facts(
+    row_group: &RowGroupMetaData,
+    column_count: usize,
+    cancellation: &StructureCancellation,
+) -> Result<bool, StructureError> {
+    if row_group.num_rows() < 0
+        || row_group.total_byte_size() < 0
+        || row_group.columns().len() != column_count
+    {
+        return Ok(false);
+    }
+    for chunk in row_group.columns() {
+        cancellation.check()?;
+        if chunk.compressed_size() < 0 || chunk.uncompressed_size() < 0 {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+fn chunk_range_is_readable(chunk: &ColumnChunkMetaData, data_end: u64) -> bool {
+    if chunk.file_path().is_some() || chunk.compressed_size() < 0 || chunk.uncompressed_size() < 0 {
+        return false;
+    }
+    let Ok(data_start) = u64::try_from(chunk.data_page_offset()) else {
+        return false;
+    };
+    let dictionary_start = match chunk.dictionary_page_offset() {
+        Some(offset) => match u64::try_from(offset) {
+            Ok(offset) => Some(offset),
+            Err(_) => return false,
+        },
+        None => None,
+    };
+    if data_start < 4
+        || data_start >= data_end
+        || dictionary_start.is_some_and(|offset| offset < 4 || offset >= data_end)
+    {
+        return false;
+    }
+    if dictionary_start.is_some_and(|offset| offset > data_start) {
+        return false;
+    }
+    let start = dictionary_start.map_or(data_start, |offset| offset.min(data_start));
+    let Ok(length) = u64::try_from(chunk.compressed_size()) else {
+        return false;
+    };
+    start
+        .checked_add(length)
+        .is_some_and(|end| data_start < end && end <= data_end)
+}
+
+fn row_group_data_is_readable(
+    row_group: &RowGroupMetaData,
+    data_end: u64,
+    cancellation: &StructureCancellation,
+) -> Result<bool, StructureError> {
+    for chunk in row_group.columns() {
+        cancellation.check()?;
+        if !chunk_range_is_readable(chunk, data_end) {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
 fn chunk_bytes(chunk: &ColumnChunkMetaData, unit: StructureByteUnit) -> u64 {
@@ -1990,6 +2404,62 @@ fn chunk_bytes(chunk: &ColumnChunkMetaData, unit: StructureByteUnit) -> u64 {
         StructureByteUnit::Uncompressed => chunk.uncompressed_size(),
     };
     u64::try_from(size).unwrap_or(0)
+}
+
+fn bounded_wire_field(value: &str) -> (String, bool) {
+    if value.len() <= MAX_REPORT_FIELD_BYTES {
+        return (value.to_owned(), false);
+    }
+    let mut end = MAX_REPORT_FIELD_BYTES - '…'.len_utf8();
+    while !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    (format!("{}…", &value[..end]), true)
+}
+
+fn column_path_len(path: &parquet::schema::types::ColumnPath) -> usize {
+    path.parts()
+        .iter()
+        .enumerate()
+        .fold(0, |total, (index, part)| {
+            total
+                .saturating_add(usize::from(index > 0))
+                .saturating_add(part.len())
+        })
+}
+
+fn bounded_column_path(path: &parquet::schema::types::ColumnPath) -> (String, bool) {
+    let full_length = column_path_len(path);
+    let truncated = full_length > MAX_REPORT_FIELD_BYTES;
+    let content_limit = if truncated {
+        MAX_REPORT_FIELD_BYTES - '…'.len_utf8()
+    } else {
+        MAX_REPORT_FIELD_BYTES
+    };
+    let mut value = String::with_capacity(full_length.min(MAX_REPORT_FIELD_BYTES));
+    for (index, part) in path.parts().iter().enumerate() {
+        let separator_bytes = usize::from(index > 0);
+        let available = content_limit.saturating_sub(value.len());
+        if available <= separator_bytes {
+            break;
+        }
+        let remaining = available - separator_bytes;
+        let mut end = remaining.min(part.len());
+        while !part.is_char_boundary(end) {
+            end -= 1;
+        }
+        if end == 0 {
+            break;
+        }
+        if index > 0 {
+            value.push('.');
+        }
+        value.push_str(&part[..end]);
+    }
+    if truncated {
+        value.push('…');
+    }
+    (value, truncated)
 }
 
 fn compression_ratio(compressed_bytes: u64, uncompressed_bytes: u64) -> Option<f64> {
@@ -2048,18 +2518,26 @@ fn chunk_statistics(statistics: &Statistics) -> StructureChunkStatistics {
             values.max_opt().map(f64::to_string),
         ),
         Statistics::ByteArray(values) => (
-            values.min_opt().map(|value| render_bytes(value.data())),
-            values.max_opt().map(|value| render_bytes(value.data())),
+            values
+                .min_opt()
+                .map(|value| render_bounded_bytes(value.data())),
+            values
+                .max_opt()
+                .map(|value| render_bounded_bytes(value.data())),
         ),
         Statistics::FixedLenByteArray(values) => (
-            values.min_opt().map(|value| render_bytes(value.data())),
-            values.max_opt().map(|value| render_bytes(value.data())),
+            values
+                .min_opt()
+                .map(|value| render_bounded_bytes(value.data())),
+            values
+                .max_opt()
+                .map(|value| render_bounded_bytes(value.data())),
         ),
     };
 
     StructureChunkStatistics {
-        minimum: minimum.map(cut_statistic),
-        maximum: maximum.map(cut_statistic),
+        minimum: minimum.map(|value| cut_statistic(&value)),
+        maximum: maximum.map(|value| cut_statistic(&value)),
         minimum_is_exact: statistics.min_is_exact(),
         maximum_is_exact: statistics.max_is_exact(),
         null_count: statistics.null_count_opt(),
@@ -2067,25 +2545,36 @@ fn chunk_statistics(statistics: &Statistics) -> StructureChunkStatistics {
     }
 }
 
-fn render_bytes(bytes: &[u8]) -> String {
+fn render_bounded_bytes(bytes: &[u8]) -> String {
     match std::str::from_utf8(bytes) {
-        Ok(text) => text.to_owned(),
-        Err(_) => bytes
-            .iter()
-            .map(|byte| format!("{byte:02x}"))
-            .collect::<String>(),
+        Ok(text) => cut_statistic(text),
+        Err(_) => {
+            let byte_limit = MAX_STATISTIC_CHARACTERS / 2;
+            let mut rendered = String::with_capacity(MAX_STATISTIC_CHARACTERS + 1);
+            for byte in bytes.iter().take(byte_limit) {
+                write!(rendered, "{byte:02x}").expect("writing to a string cannot fail");
+            }
+            if bytes.len() > byte_limit {
+                rendered.push('…');
+            }
+            rendered
+        }
     }
 }
 
-fn cut_statistic(value: String) -> String {
-    if value.chars().count() <= MAX_STATISTIC_CHARACTERS {
-        return value;
+fn cut_statistic(value: &str) -> String {
+    let mut chars = value.chars();
+    let mut bounded = String::with_capacity(MAX_STATISTIC_CHARACTERS + 1);
+    for _ in 0..MAX_STATISTIC_CHARACTERS {
+        let Some(character) = chars.next() else {
+            return bounded;
+        };
+        bounded.push(character);
     }
-    value
-        .chars()
-        .take(MAX_STATISTIC_CHARACTERS)
-        .chain(std::iter::once('\u{2026}'))
-        .collect()
+    if chars.next().is_some() {
+        bounded.push('…');
+    }
+    bounded
 }
 
 /// Stable codec names, in the order a mixed-codec file card lists them.
@@ -2172,10 +2661,6 @@ fn encoding_names(mask: u16) -> Vec<String> {
         .collect()
 }
 
-fn map_structure_parquet_error(error: ParquetError) -> StructureError {
-    map_parquet_error(error).into()
-}
-
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
@@ -2187,6 +2672,83 @@ mod tests {
     };
 
     use super::*;
+
+    #[test]
+    fn converts_decimal_probe_text_to_exact_physical_values() {
+        let value = ProbeValue::parse(
+            PhysicalType::INT64,
+            0,
+            Some(&LogicalType::Decimal {
+                precision: 12,
+                scale: 2,
+            }),
+            ConvertedType::NONE,
+            0,
+            "-12.34",
+        )
+        .expect("decimal probe");
+        assert!(matches!(value, ProbeValue::Int64(-1234)));
+        assert!(matches!(
+            ProbeValue::parse(
+                PhysicalType::INT32,
+                0,
+                None,
+                ConvertedType::DECIMAL,
+                2,
+                "12.34",
+            ),
+            Ok(ProbeValue::Int32(1234))
+        ));
+        assert_eq!(
+            ProbeValue::parse(
+                PhysicalType::INT32,
+                0,
+                Some(&LogicalType::Date),
+                ConvertedType::NONE,
+                0,
+                "2026-08-21",
+            )
+            .err(),
+            Some(StructureError::UnsupportedProbeColumn)
+        );
+    }
+
+    #[test]
+    fn float_zero_probes_cover_both_signed_hash_inputs_and_reject_nan() {
+        for stored in [0.0_f32, -0.0_f32] {
+            let mut filter = Sbbf::new_with_num_of_bytes(32);
+            filter.insert(&stored);
+            let probe =
+                ProbeValue::parse(PhysicalType::FLOAT, 0, None, ConvertedType::NONE, 0, "0")
+                    .expect("zero float probe");
+            assert!(probe.check(&filter));
+        }
+        for stored in [0.0_f64, -0.0_f64] {
+            let mut filter = Sbbf::new_with_num_of_bytes(32);
+            filter.insert(&stored);
+            let probe =
+                ProbeValue::parse(PhysicalType::DOUBLE, 0, None, ConvertedType::NONE, 0, "-0")
+                    .expect("zero double probe");
+            assert!(probe.check(&filter));
+        }
+        for bits in [
+            0x7ff8_0000_0000_0000,
+            0x7ff8_0000_0000_0001,
+            0xfff8_0000_0000_0042,
+        ] {
+            let nan = f64::from_bits(bits);
+            let mut filter = Sbbf::new_with_num_of_bytes(32);
+            filter.insert(&nan);
+            assert!(filter.check(&nan), "direct filter stores each NaN payload");
+        }
+        for nan in ["NaN", "nan", "-NaN"] {
+            assert_eq!(
+                ProbeValue::parse(PhysicalType::DOUBLE, 0, None, ConvertedType::NONE, 0, nan,)
+                    .err(),
+                Some(StructureError::UnsupportedProbeColumn),
+            );
+        }
+    }
 
     #[test]
     fn treats_a_row_group_with_negative_sizes_as_unreadable() {
@@ -2337,15 +2899,65 @@ mod tests {
 
         assert_eq!(
             StructureReader::summarize(
-                PathBuf::new(),
-                metadata,
+                Arc::new(metadata),
+                u64::MAX,
                 8,
+                u64::MAX - 8,
                 &StructureLoadProgress::default(),
                 &cancellation,
             )
             .err(),
             Some(StructureError::Cancelled)
         );
+    }
+
+    #[test]
+    fn publishes_chunk_progress_inside_one_wide_row_group() {
+        const COLUMN_COUNT: usize = 10_000;
+        let schema = test_schema_with_columns(COLUMN_COUNT);
+        let chunks = (0..COLUMN_COUNT)
+            .map(|index| {
+                ColumnChunkMetaData::builder(schema.column(index))
+                    .set_total_compressed_size(1)
+                    .set_total_uncompressed_size(1)
+                    .build()
+                    .expect("column chunk metadata is valid")
+            })
+            .collect();
+        let row_group = RowGroupMetaData::builder(Arc::clone(&schema))
+            .set_num_rows(1)
+            .set_total_byte_size(COLUMN_COUNT as i64)
+            .set_column_metadata(chunks)
+            .build()
+            .expect("wide row group metadata is valid");
+        let metadata = test_metadata(vec![row_group]);
+        let progress = StructureLoadProgress::default();
+        let observed = progress.clone();
+        let (reached, resume) = progress.checkpoint_after_next_chunk();
+        let worker = std::thread::spawn(move || {
+            StructureReader::summarize(
+                Arc::new(metadata),
+                u64::MAX,
+                8,
+                u64::MAX - 8,
+                &progress,
+                &StructureCancellation::default(),
+            )
+        });
+
+        reached
+            .recv_timeout(Duration::from_secs(5))
+            .expect("summary publishes the first chunk");
+        let intermediate = observed.snapshot();
+        resume.send(()).expect("resume summary worker");
+        let reader = worker
+            .join()
+            .expect("summary worker does not panic")
+            .expect("wide footer is summarizable");
+
+        assert_eq!(reader.summary().column_count, COLUMN_COUNT);
+        assert_eq!(intermediate.total_chunks, COLUMN_COUNT as u64);
+        assert_eq!(intermediate.completed_chunks, 1);
     }
 
     #[test]
@@ -2382,9 +2994,10 @@ mod tests {
             row_groups,
         );
         let reader = StructureReader::summarize(
-            PathBuf::from("/private/SOURCE_IDENTITY.parquet"),
-            metadata,
+            Arc::new(metadata),
+            u64::MAX,
             8,
+            u64::MAX - 8,
             &StructureLoadProgress::default(),
             &StructureCancellation::default(),
         )
@@ -2400,6 +3013,100 @@ mod tests {
         assert!(!report.contains("SOURCE_IDENTITY"));
         assert!(!report.contains("SECRET_METADATA_VALUE"));
         assert!(report.len() <= MAX_REPORT_BYTES);
+        let key = &reader.summary().key_value_metadata[0].key;
+        assert!(key.ends_with('…'));
+        assert!(key.len() <= MAX_REPORT_FIELD_BYTES);
+    }
+
+    #[test]
+    fn bounded_wire_fields_keep_the_ellipsis_inside_the_byte_limit() {
+        let source = "界|\\".repeat(100);
+        let (value, truncated) = bounded_wire_field(&source);
+
+        assert!(truncated);
+        assert!(value.ends_with('…'));
+        assert!(value.len() <= MAX_REPORT_FIELD_BYTES);
+    }
+
+    #[test]
+    fn never_treats_external_column_offsets_as_local_data_ranges() {
+        let schema = test_schema();
+        let chunk = ColumnChunkMetaData::builder(schema.column(0))
+            .set_file_path("external.parquet".to_owned())
+            .set_data_page_offset(4)
+            .set_total_compressed_size(32)
+            .set_total_uncompressed_size(32)
+            .build()
+            .expect("external chunk metadata");
+
+        assert!(!chunk_range_is_readable(&chunk, 1_024));
+        let source = tempfile::NamedTempFile::new().expect("temporary file");
+        let reader = BoundedBloomReader::new(source.reopen().expect("fixture can reopen"), 32);
+        assert_eq!(
+            probe_chunk_bloom(Some(&chunk), &ProbeValue::Int32(1), &reader, 1_024),
+            StructureBloomProbeOutcome::Unreadable,
+        );
+    }
+
+    #[test]
+    fn requires_data_pages_to_fall_inside_the_recorded_chunk_range() {
+        let schema = test_schema();
+        let after_chunk = ColumnChunkMetaData::builder(schema.column(0))
+            .set_dictionary_page_offset(Some(4))
+            .set_data_page_offset(999)
+            .set_total_compressed_size(32)
+            .set_total_uncompressed_size(32)
+            .build()
+            .expect("chunk metadata");
+        let reversed = ColumnChunkMetaData::builder(schema.column(0))
+            .set_dictionary_page_offset(Some(128))
+            .set_data_page_offset(64)
+            .set_total_compressed_size(128)
+            .set_total_uncompressed_size(128)
+            .build()
+            .expect("chunk metadata");
+
+        assert!(!chunk_range_is_readable(&after_chunk, 1_024));
+        assert!(!chunk_range_is_readable(&reversed, 1_024));
+    }
+
+    #[test]
+    #[allow(deprecated)] // Test headers use the same generated Parquet boundary type.
+    fn rejects_empty_and_length_mismatched_bloom_bitsets_before_membership_checks() {
+        use parquet::format::{
+            BloomFilterAlgorithm, BloomFilterCompression, BloomFilterHash, BloomFilterHeader,
+            SplitBlockAlgorithm, Uncompressed, XxHash,
+        };
+        use std::io::Write as _;
+        use thrift::protocol::TCompactOutputProtocol;
+
+        let schema = test_schema();
+        for (declared_bitset, actual_bitset) in [(0, 0), (32, 64)] {
+            let header = BloomFilterHeader::new(
+                declared_bitset,
+                BloomFilterAlgorithm::BLOCK(SplitBlockAlgorithm::new()),
+                BloomFilterHash::XXHASH(XxHash::new()),
+                BloomFilterCompression::UNCOMPRESSED(Uncompressed::new()),
+            );
+            let mut bytes = Vec::new();
+            header
+                .write_to_out_protocol(&mut TCompactOutputProtocol::new(&mut bytes))
+                .expect("header serializes");
+            bytes.resize(bytes.len() + actual_bitset as usize, 0);
+            let mut source = tempfile::NamedTempFile::new().expect("temporary file");
+            source.write_all(&bytes).expect("fixture bytes");
+            let chunk = ColumnChunkMetaData::builder(schema.column(0))
+                .set_bloom_filter_offset(Some(0))
+                .set_bloom_filter_length(Some(bytes.len() as i32))
+                .build()
+                .expect("bloom metadata");
+            let reader = BoundedBloomReader::new(
+                source.reopen().expect("fixture can reopen"),
+                MAX_BLOOM_PROBE_BYTES,
+            );
+
+            assert!(read_validated_bloom_filter(&chunk, &reader, bytes.len() as u64).is_err());
+        }
     }
 
     #[test]
@@ -2446,40 +3153,76 @@ mod tests {
     #[test]
     fn reads_probe_text_as_the_column_physical_type() {
         assert!(matches!(
-            ProbeValue::parse(PhysicalType::INT32, 0, "17"),
+            ProbeValue::parse(PhysicalType::INT32, 0, None, ConvertedType::NONE, 0, "17"),
             Ok(ProbeValue::Int32(17))
         ));
         assert_eq!(
-            ProbeValue::parse(PhysicalType::INT32, 0, "seventeen").err(),
+            ProbeValue::parse(
+                PhysicalType::INT32,
+                0,
+                None,
+                ConvertedType::NONE,
+                0,
+                "seventeen",
+            )
+            .err(),
             Some(StructureError::InvalidProbeValue)
         );
         assert_eq!(
-            ProbeValue::parse(PhysicalType::FIXED_LEN_BYTE_ARRAY, 4, "abc").err(),
+            ProbeValue::parse(
+                PhysicalType::FIXED_LEN_BYTE_ARRAY,
+                4,
+                None,
+                ConvertedType::NONE,
+                0,
+                "abc",
+            )
+            .err(),
             Some(StructureError::InvalidProbeValue)
         );
-        assert!(ProbeValue::parse(PhysicalType::FIXED_LEN_BYTE_ARRAY, 4, "abcd").is_ok());
+        assert!(
+            ProbeValue::parse(
+                PhysicalType::FIXED_LEN_BYTE_ARRAY,
+                4,
+                None,
+                ConvertedType::NONE,
+                0,
+                "abcd",
+            )
+            .is_ok()
+        );
         assert_eq!(
-            ProbeValue::parse(PhysicalType::INT96, 0, "17").err(),
+            ProbeValue::parse(PhysicalType::INT96, 0, None, ConvertedType::NONE, 0, "17").err(),
             Some(StructureError::UnsupportedProbeColumn)
         );
     }
 
     #[test]
     fn renders_non_text_statistics_as_hexadecimal() {
-        assert_eq!(render_bytes(b"north"), "north");
-        assert_eq!(render_bytes(&[0xff, 0x00]), "ff00");
+        assert_eq!(render_bounded_bytes(b"north"), "north");
+        assert_eq!(render_bounded_bytes(&[0xff, 0x00]), "ff00");
+        let text = "界".repeat(MAX_STATISTIC_CHARACTERS + 10);
+        let rendered_text = render_bounded_bytes(text.as_bytes());
+        assert_eq!(rendered_text.chars().count(), MAX_STATISTIC_CHARACTERS + 1);
+        assert!(rendered_text.ends_with('…'));
+        let rendered_binary = render_bounded_bytes(&vec![0xff; 10_000]);
+        assert_eq!(
+            rendered_binary.chars().count(),
+            MAX_STATISTIC_CHARACTERS + 1
+        );
+        assert!(rendered_binary.ends_with('…'));
     }
 
     #[test]
     fn marks_a_cut_statistics_value_with_an_ellipsis() {
         let long = "a".repeat(MAX_STATISTIC_CHARACTERS + 1);
 
-        let cut = cut_statistic(long);
+        let cut = cut_statistic(&long);
 
         assert_eq!(cut.chars().count(), MAX_STATISTIC_CHARACTERS + 1);
         assert!(cut.ends_with('\u{2026}'));
         assert_eq!(
-            cut_statistic("short".to_owned()),
+            cut_statistic("short"),
             "short".to_owned(),
             "values within the limit stay untouched"
         );
@@ -2500,9 +3243,10 @@ mod tests {
 
     fn summarize_metadata(metadata: ParquetMetaData) -> Result<StructureReader, StructureError> {
         StructureReader::summarize(
-            PathBuf::new(),
-            metadata,
+            Arc::new(metadata),
+            u64::MAX,
             8,
+            u64::MAX - 8,
             &StructureLoadProgress::default(),
             &StructureCancellation::default(),
         )
@@ -2558,6 +3302,7 @@ mod tests {
     ) -> RowGroupMetaData {
         let chunk = ColumnChunkMetaData::builder(schema.column(0))
             .set_compression(Compression::SNAPPY)
+            .set_data_page_offset(4)
             .set_total_compressed_size(compressed_size)
             .set_total_uncompressed_size(uncompressed_size)
             .build()

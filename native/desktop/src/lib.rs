@@ -10,7 +10,7 @@ mod updates;
 mod view_settings;
 
 use std::{
-    collections::{HashMap, hash_map::Entry},
+    collections::{HashMap, VecDeque, hash_map::Entry},
     path::PathBuf,
     sync::{
         Arc, Condvar, Mutex,
@@ -32,7 +32,7 @@ use launch::open_from_args;
 use launch::open_path;
 use launch::{PendingOpenedSource, take_opened_source};
 use recents::{RecentSource, RecentSourceError, RecentSourcesStore};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use structure::{
     StructureJobs, cancel_structure_bloom_probe, cancel_structure_load, get_structure_chunk,
     get_structure_columns, get_structure_key_value, get_structure_layout,
@@ -58,9 +58,10 @@ use viewda_data_engine::{
     ColumnStatistics, ColumnStatisticsError, ColumnStatisticsReader, DataFilter,
     DataFilterOperator, DataSort, DataViewBuilder, DataViewError, DataViewInterruptHandle,
     DataViewResourceDiagnostics, DataWindowError, DataWindowReader, EngineError, EngineStatus,
-    PreparedDataView, SourceError, SourceSummary, StatisticsInterruptHandle, StructureReader,
-    TextValueSuggestions, TextValueSuggestionsInterruptHandle, TextValueSuggestionsReader,
-    engine_status, inspect_local_source,
+    PreparedDataView, SchemaField, SourceError, SourceIdentity, SourceOpenPhase, SourceSnapshot,
+    SourceSummary, StatisticsInterruptHandle, StructureReader, TextValueSuggestions,
+    TextValueSuggestionsInterruptHandle, TextValueSuggestionsReader, engine_status,
+    inspect_local_source_snapshot_cancellable,
 };
 
 const OPEN_SOURCE_MENU_ID: &str = "open-local-source";
@@ -196,11 +197,60 @@ pub(crate) struct OpenedSource {
     state: Arc<Mutex<OpenedSourceState>>,
     recents: RecentSourcesStore,
     data_exports: DataExportJobs,
+    source_open_decode: Mutex<()>,
+    source_open_progress: Mutex<Option<ActiveSourceOpenProgress>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+enum SourceOpenProgressPhase {
+    Waiting,
+    ReadingFooter,
+    DecodingFooter,
+    Summarizing,
+}
+
+struct ActiveSourceOpenProgress {
+    request: u64,
+    phase: SourceOpenProgressPhase,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ClientSourceOpenStatus {
+    Pending,
+    Cancelled,
+    Published,
+}
+
+#[derive(Debug, Clone)]
+struct ClientSourceOpenAttempt {
+    id: String,
+    open_request: u64,
+    status: ClientSourceOpenStatus,
+}
+
+const RECENT_CLIENT_SOURCE_OPEN_ATTEMPTS: usize = 16;
+
+#[derive(Clone, Copy)]
+struct SourceOpenPublication<'a> {
+    request: u64,
+    client_attempt: Option<&'a str>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+enum SourceOpenCancelOutcome {
+    Cancelled,
+    Published,
 }
 
 #[derive(Default)]
 struct OpenedSourceState {
     generation: u64,
+    open_request: u64,
+    client_open_attempt: Option<ClientSourceOpenAttempt>,
+    cancelled_client_open_before_registration: Option<String>,
+    recent_client_open_attempts: VecDeque<ClientSourceOpenAttempt>,
     /// Open sessions in most-recently-used order; the first one is the active source.
     sessions: Vec<Arc<OpenedSourceSession>>,
     blocks_restore: bool,
@@ -242,12 +292,17 @@ struct OpenedSourceSession {
     generation: u64,
     path: PathBuf,
     summary: SourceSummary,
+    schema: Vec<SchemaField>,
+    schema_complete: bool,
+    schema_node_count: usize,
+    source_identity: Option<SourceIdentity>,
     state: Mutex<OpenedSourceSessionState>,
     lifecycle: Arc<SessionLifecycle>,
     structure_jobs: StructureJobs,
 }
 
 struct OpenedSourceSessionState {
+    source_snapshot: Option<Arc<SourceSnapshot>>,
     view_revision: u64,
     view: Option<PreparedDataView>,
     reader: DataWindowReader,
@@ -294,6 +349,15 @@ impl OpenedSourceSession {
             state.cancel_jobs();
         }
         self.lifecycle.wait_until_idle();
+    }
+
+    fn validate_source_identity(&self) -> Result<(), DataWindowSessionError> {
+        match &self.source_identity {
+            Some(identity) => identity
+                .validate_path(&self.path)
+                .map_err(|_| DataWindowSessionError::SourceChanged),
+            None => Ok(()),
+        }
     }
 }
 
@@ -568,6 +632,170 @@ struct OpenedSourceEntry {
     active: bool,
 }
 
+const MAX_SOURCE_SCHEMA_PAGE_COLUMNS: usize = 256;
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SourceSchemaPage {
+    offset: usize,
+    total_count: usize,
+    /// Bounded top-level Data column stubs. Nested leaves stay in Structure pages.
+    columns: Vec<SchemaField>,
+}
+
+const MAX_SOURCE_SCHEMA_PAGE_NODES: usize = 256;
+const MAX_SOURCE_SCHEMA_PAGE_PATH_COMPONENTS: usize = 4_096;
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SourceSchemaNodeCursor {
+    path: Vec<usize>,
+    leaf_index: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SourceSchemaNode {
+    path: Vec<usize>,
+    name: String,
+    physical_type: String,
+    logical_type: Option<String>,
+    has_children: bool,
+    leaf_index: Option<usize>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SourceSchemaNodePage {
+    nodes: Vec<SourceSchemaNode>,
+    next_cursor: Option<SourceSchemaNodeCursor>,
+    total_count: usize,
+}
+
+fn bounded_source_schema_field(field: &SchemaField) -> SchemaField {
+    const MAX_LABEL_BYTES: usize = 128;
+    let mut end = field.name.len().min(MAX_LABEL_BYTES);
+    while !field.name.is_char_boundary(end) {
+        end -= 1;
+    }
+    let name = if end == field.name.len() {
+        field.name.clone()
+    } else {
+        let ellipsis_bytes = '…'.len_utf8();
+        let mut prefix_end = MAX_LABEL_BYTES.saturating_sub(ellipsis_bytes);
+        while !field.name.is_char_boundary(prefix_end) {
+            prefix_end -= 1;
+        }
+        format!("{}…", &field.name[..prefix_end])
+    };
+    SchemaField {
+        name,
+        physical_type: field.physical_type.clone(),
+        logical_type: field.logical_type.clone(),
+        children: Vec::new(),
+    }
+}
+
+fn source_schema_page(
+    session: &OpenedSourceSession,
+    offset: usize,
+    limit: usize,
+) -> Result<SourceSchemaPage, DataWindowCommandError> {
+    if limit == 0 || limit > MAX_SOURCE_SCHEMA_PAGE_COLUMNS || offset > session.schema.len() {
+        return Err(DataWindowError::Unsupported.into());
+    }
+    let end = offset.saturating_add(limit).min(session.schema.len());
+    Ok(SourceSchemaPage {
+        offset,
+        total_count: session.schema.len(),
+        columns: session.schema[offset..end]
+            .iter()
+            .map(bounded_source_schema_field)
+            .collect(),
+    })
+}
+
+fn source_schema_node_page(
+    session: &OpenedSourceSession,
+    cursor: Option<SourceSchemaNodeCursor>,
+    limit: usize,
+) -> Result<SourceSchemaNodePage, DataWindowCommandError> {
+    if limit == 0 || limit > MAX_SOURCE_SCHEMA_PAGE_NODES {
+        return Err(DataWindowError::Unsupported.into());
+    }
+    let mut cursor = cursor.or_else(|| {
+        (!session.schema.is_empty()).then_some(SourceSchemaNodeCursor {
+            path: vec![0],
+            leaf_index: 0,
+        })
+    });
+    let mut nodes = Vec::with_capacity(limit);
+    let mut path_components = 0usize;
+    while let Some(current) = cursor.clone() {
+        let field = schema_field_at_path(&session.schema, &current.path)
+            .ok_or(DataWindowError::Unsupported)?;
+        let next_components = path_components.saturating_add(current.path.len());
+        if !nodes.is_empty() && next_components > MAX_SOURCE_SCHEMA_PAGE_PATH_COMPONENTS {
+            break;
+        }
+        if current.path.len() > MAX_SOURCE_SCHEMA_PAGE_PATH_COMPONENTS {
+            return Err(DataWindowError::Unsupported.into());
+        }
+        let has_children = !field.children.is_empty();
+        nodes.push(SourceSchemaNode {
+            path: current.path.clone(),
+            name: bounded_source_schema_field(field).name,
+            physical_type: field.physical_type.clone(),
+            logical_type: field.logical_type.clone(),
+            has_children,
+            leaf_index: (!has_children).then_some(current.leaf_index),
+        });
+        path_components = next_components;
+        cursor = next_schema_cursor(&session.schema, current, has_children);
+        if nodes.len() == limit {
+            break;
+        }
+    }
+    Ok(SourceSchemaNodePage {
+        nodes,
+        next_cursor: cursor,
+        total_count: session.schema_node_count,
+    })
+}
+
+fn schema_field_at_path<'a>(schema: &'a [SchemaField], path: &[usize]) -> Option<&'a SchemaField> {
+    let (&first, rest) = path.split_first()?;
+    let mut field = schema.get(first)?;
+    for &index in rest {
+        field = field.children.get(index)?;
+    }
+    Some(field)
+}
+
+fn next_schema_cursor(
+    schema: &[SchemaField],
+    mut cursor: SourceSchemaNodeCursor,
+    has_children: bool,
+) -> Option<SourceSchemaNodeCursor> {
+    if has_children {
+        cursor.path.push(0);
+        return Some(cursor);
+    }
+    cursor.leaf_index = cursor.leaf_index.saturating_add(1);
+    loop {
+        let index = cursor.path.pop()?;
+        let siblings = if cursor.path.is_empty() {
+            schema
+        } else {
+            &schema_field_at_path(schema, &cursor.path)?.children
+        };
+        if index + 1 < siblings.len() {
+            cursor.path.push(index + 1);
+            return Some(cursor);
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct DataViewStatus {
@@ -630,6 +858,12 @@ fn missing_data_window_session(state: &OpenedSourceState) -> DataWindowCommandEr
     ))
 }
 
+impl From<DataWindowSessionError> for DataWindowCommandError {
+    fn from(error: DataWindowSessionError) -> Self {
+        Self::Session(error)
+    }
+}
+
 #[derive(Debug, PartialEq, Eq, Serialize)]
 #[serde(tag = "code", rename_all = "camelCase")]
 enum ColumnStatisticsCommandError {
@@ -652,6 +886,7 @@ impl From<ColumnStatisticsError> for ColumnStatisticsCommandError {
         match error {
             ColumnStatisticsError::NotFound => Self::NotFound,
             ColumnStatisticsError::PermissionDenied => Self::PermissionDenied,
+            ColumnStatisticsError::SourceChanged => Self::SourceChanged,
             ColumnStatisticsError::NotParquet => Self::NotParquet,
             ColumnStatisticsError::CorruptSource => Self::CorruptSource,
             ColumnStatisticsError::Unsupported => Self::Unsupported,
@@ -668,6 +903,7 @@ impl From<DataWindowError> for ColumnStatisticsCommandError {
             DataWindowError::Cancelled => Self::Cancelled,
             DataWindowError::NotFound => Self::NotFound,
             DataWindowError::PermissionDenied => Self::PermissionDenied,
+            DataWindowError::SourceChanged => Self::SourceChanged,
             DataWindowError::NotParquet => Self::NotParquet,
             DataWindowError::CorruptSource => Self::CorruptSource,
             DataWindowError::ResourceExhausted => Self::ResourceExhausted,
@@ -723,6 +959,38 @@ enum SourceOpenIntent {
 }
 
 impl OpenedSource {
+    fn remember_client_source_open_terminal(
+        state: &mut OpenedSourceState,
+        attempt: ClientSourceOpenAttempt,
+    ) {
+        if let Some(index) = state
+            .recent_client_open_attempts
+            .iter()
+            .position(|recent| recent.id == attempt.id)
+        {
+            state.recent_client_open_attempts.remove(index);
+        }
+        state.recent_client_open_attempts.push_back(attempt);
+        while state.recent_client_open_attempts.len() > RECENT_CLIENT_SOURCE_OPEN_ATTEMPTS {
+            state.recent_client_open_attempts.pop_front();
+        }
+    }
+
+    fn finish_client_source_open(&self, attempt: &str) -> Result<(), OpenSourceError> {
+        let mut state = self.lock_state()?;
+        let Some(mut current) = state
+            .client_open_attempt
+            .take_if(|current| current.id == attempt)
+        else {
+            return Ok(());
+        };
+        if current.status == ClientSourceOpenStatus::Pending {
+            current.status = ClientSourceOpenStatus::Cancelled;
+        }
+        Self::remember_client_source_open_terminal(&mut state, current);
+        Ok(())
+    }
+
     fn lock_state(&self) -> Result<std::sync::MutexGuard<'_, OpenedSourceState>, OpenSourceError> {
         self.state
             .lock()
@@ -738,6 +1006,7 @@ impl OpenedSource {
     ///
     /// A path that is already open activates its existing session instead of
     /// opening a second one, so its reading state and its running jobs survive.
+    #[cfg(test)]
     fn install(
         &self,
         recent_sources_path: Option<&std::path::Path>,
@@ -745,64 +1014,126 @@ impl OpenedSource {
         summary: SourceSummary,
         intent: SourceOpenIntent,
     ) -> Result<Option<OpenedSourceInfo>, OpenSourceError> {
+        self.install_with_snapshot(recent_sources_path, path, summary, None, intent, None)
+    }
+
+    fn install_with_snapshot(
+        &self,
+        recent_sources_path: Option<&std::path::Path>,
+        path: PathBuf,
+        summary: SourceSummary,
+        source_snapshot: Option<SourceSnapshot>,
+        intent: SourceOpenIntent,
+        publication: Option<SourceOpenPublication<'_>>,
+    ) -> Result<Option<OpenedSourceInfo>, OpenSourceError> {
+        if let Some(snapshot) = source_snapshot.as_ref() {
+            snapshot.validate_for_install(&path)?;
+        }
+        let incoming_identity = source_snapshot
+            .as_ref()
+            .map(|snapshot| snapshot.identity().clone());
         let mut state = self.lock_state()?;
+        if publication.is_some_and(|publication| publication.request != state.open_request) {
+            return Ok(None);
+        }
+        if let Some((publication, client_attempt)) = publication.and_then(|publication| {
+            publication
+                .client_attempt
+                .map(|client_attempt| (publication, client_attempt))
+        }) && !state.client_open_attempt.as_ref().is_some_and(|attempt| {
+            attempt.id == client_attempt
+                && attempt.open_request == publication.request
+                && attempt.status == ClientSourceOpenStatus::Pending
+        }) {
+            return Ok(None);
+        }
         if intent == SourceOpenIntent::Restore && state.blocks_restore {
             return Ok(None);
         }
         if intent == SourceOpenIntent::Explicit {
             state.blocks_restore = true;
         }
-        let opened = state
+        let existing = state
             .sessions
             .iter()
-            .find(|session| session.path == path)
-            .map(|session| OpenedSourceInfo {
-                generation: session.generation,
-                summary: session.summary.clone(),
-            });
-        let info = match opened {
-            Some(info) => {
+            .position(|session| session.path == path);
+        let mut replaced = None;
+        let info = match existing {
+            Some(index)
+                if state.sessions[index].source_identity.as_ref() == incoming_identity.as_ref() =>
+            {
+                let session = &state.sessions[index];
+                let info = OpenedSourceInfo {
+                    generation: session.generation,
+                    summary: session.summary.clone(),
+                };
                 state.activate(info.generation);
                 info
             }
-            None => {
+            existing => {
+                let schema = source_snapshot
+                    .as_ref()
+                    .map_or_else(|| summary.schema.clone(), SourceSnapshot::query_schema);
+                let schema_complete = source_snapshot.is_some() || !summary.schema_is_truncated;
                 let generation = state
                     .generation
                     .checked_add(1)
                     .ok_or(SourceError::Unsupported)?;
                 state.generation = generation;
-                state.sessions.insert(
-                    0,
-                    Arc::new(OpenedSourceSession {
-                        generation,
-                        path: path.clone(),
-                        summary: summary.clone(),
-                        state: Mutex::new(OpenedSourceSessionState {
-                            reader: DataWindowReader::new(path.clone()),
-                            view_revision: 0,
-                            view: None,
-                            text_suggestion_reader: None,
-                            statistics_cache: HashMap::new(),
-                            data_view_jobs: DataViewJobsState::default(),
-                            text_suggestion_jobs: TextValueSuggestionJobsState::default(),
-                            statistics_job: None,
-                            structure: None,
-                        }),
-                        lifecycle: Arc::new(SessionLifecycle::default()),
-                        structure_jobs: StructureJobs::default(),
+                let session = Arc::new(OpenedSourceSession {
+                    generation,
+                    path: path.clone(),
+                    summary: summary.clone(),
+                    schema,
+                    schema_complete,
+                    schema_node_count: summary.schema_node_count,
+                    source_identity: incoming_identity,
+                    state: Mutex::new(OpenedSourceSessionState {
+                        reader: DataWindowReader::new(path.clone()),
+                        view_revision: 0,
+                        view: None,
+                        text_suggestion_reader: None,
+                        statistics_cache: HashMap::new(),
+                        data_view_jobs: DataViewJobsState::default(),
+                        text_suggestion_jobs: TextValueSuggestionJobsState::default(),
+                        statistics_job: None,
+                        source_snapshot: source_snapshot.map(Arc::new),
+                        structure: None,
                     }),
-                );
+                    lifecycle: Arc::new(SessionLifecycle::default()),
+                    structure_jobs: StructureJobs::default(),
+                });
+                if let Some(index) = existing {
+                    let previous = state.sessions.remove(index);
+                    previous.lifecycle.start_closing();
+                    replaced = Some(previous);
+                }
+                state.sessions.insert(0, session);
                 OpenedSourceInfo {
                     generation,
                     summary,
                 }
             }
         };
+        if let Some(attempt) = publication.and_then(|publication| publication.client_attempt)
+            && let Some(client_open) = state
+                .client_open_attempt
+                .as_mut()
+                .filter(|client_open| client_open.id == attempt)
+        {
+            client_open.status = ClientSourceOpenStatus::Published;
+        }
         if let Some(recent_sources_path) = recent_sources_path {
             // Recorded under the source lock so a restore racing an explicit open
             // cannot invert the history order. The source is open either way, so
             // history stays best-effort.
             let _ = self.recents.record_path(recent_sources_path, &path);
+        }
+        drop(state);
+        if let Some(previous) = replaced {
+            self.data_exports
+                .cancel_source_and_wait(previous.generation);
+            previous.close_and_wait();
         }
         Ok(Some(info))
     }
@@ -835,6 +1166,203 @@ impl OpenedSource {
 
     fn blocks_restore(&self) -> Result<bool, OpenSourceError> {
         Ok(self.lock_state()?.blocks_restore)
+    }
+
+    fn begin_source_open(&self) -> Result<u64, OpenSourceError> {
+        let mut state = self.lock_state()?;
+        if let Some(mut attempt) = state.client_open_attempt.take() {
+            if attempt.status == ClientSourceOpenStatus::Pending {
+                attempt.status = ClientSourceOpenStatus::Cancelled;
+            }
+            Self::remember_client_source_open_terminal(&mut state, attempt);
+        }
+        state.open_request = state
+            .open_request
+            .checked_add(1)
+            .ok_or(SourceError::Unsupported)?;
+        let request = state.open_request;
+        drop(state);
+        self.source_open_progress
+            .lock()
+            .map_err(|_| SourceError::Unsupported)?
+            .take();
+        Ok(request)
+    }
+
+    fn begin_client_source_open(&self, attempt: &str) -> Result<Option<u64>, OpenSourceError> {
+        let mut state = self.lock_state()?;
+        if state.cancelled_client_open_before_registration.as_deref() == Some(attempt) {
+            state.cancelled_client_open_before_registration = None;
+            let open_request = state.open_request;
+            Self::remember_client_source_open_terminal(
+                &mut state,
+                ClientSourceOpenAttempt {
+                    id: attempt.to_owned(),
+                    open_request,
+                    status: ClientSourceOpenStatus::Cancelled,
+                },
+            );
+            return Ok(None);
+        }
+        if let Some(mut previous) = state.client_open_attempt.take() {
+            if previous.status == ClientSourceOpenStatus::Pending {
+                previous.status = ClientSourceOpenStatus::Cancelled;
+            }
+            Self::remember_client_source_open_terminal(&mut state, previous);
+        }
+        state.open_request = state
+            .open_request
+            .checked_add(1)
+            .ok_or(SourceError::Unsupported)?;
+        let request = state.open_request;
+        state.client_open_attempt = Some(ClientSourceOpenAttempt {
+            id: attempt.to_owned(),
+            open_request: request,
+            status: ClientSourceOpenStatus::Pending,
+        });
+        drop(state);
+        self.source_open_progress
+            .lock()
+            .map_err(|_| SourceError::Unsupported)?
+            .take();
+        Ok(Some(request))
+    }
+
+    fn cancel_source_open(
+        &self,
+        attempt: &str,
+    ) -> Result<SourceOpenCancelOutcome, OpenSourceError> {
+        let mut state = self.lock_state()?;
+        let current = state
+            .client_open_attempt
+            .as_ref()
+            .filter(|current| current.id == attempt)
+            .cloned();
+        match current {
+            Some(ClientSourceOpenAttempt {
+                status: ClientSourceOpenStatus::Published,
+                ..
+            }) => return Ok(SourceOpenCancelOutcome::Published),
+            Some(ClientSourceOpenAttempt {
+                status: ClientSourceOpenStatus::Cancelled,
+                ..
+            }) => return Ok(SourceOpenCancelOutcome::Cancelled),
+            None => {
+                if let Some(terminal) = state
+                    .recent_client_open_attempts
+                    .iter()
+                    .find(|terminal| terminal.id == attempt)
+                {
+                    return Ok(match terminal.status {
+                        ClientSourceOpenStatus::Published => SourceOpenCancelOutcome::Published,
+                        ClientSourceOpenStatus::Pending | ClientSourceOpenStatus::Cancelled => {
+                            SourceOpenCancelOutcome::Cancelled
+                        }
+                    });
+                }
+                state.cancelled_client_open_before_registration = Some(attempt.to_owned());
+                return Ok(SourceOpenCancelOutcome::Cancelled);
+            }
+            Some(ClientSourceOpenAttempt {
+                status: ClientSourceOpenStatus::Pending,
+                ..
+            }) => {}
+        }
+        let mut current = state
+            .client_open_attempt
+            .take()
+            .expect("the pending client source open was matched above");
+        if current.open_request == state.open_request {
+            state.open_request = state
+                .open_request
+                .checked_add(1)
+                .ok_or(SourceError::Unsupported)?;
+        }
+        current.status = ClientSourceOpenStatus::Cancelled;
+        Self::remember_client_source_open_terminal(&mut state, current);
+        drop(state);
+        self.source_open_progress
+            .lock()
+            .map_err(|_| SourceError::Unsupported)?
+            .take();
+        Ok(SourceOpenCancelOutcome::Cancelled)
+    }
+
+    fn source_open_is_current(&self, request: u64) -> Result<bool, OpenSourceError> {
+        Ok(self.lock_state()?.open_request == request)
+    }
+
+    fn set_source_open_progress(
+        &self,
+        request: u64,
+        phase: SourceOpenProgressPhase,
+    ) -> Result<bool, OpenSourceError> {
+        if !self.source_open_is_current(request)? {
+            return Ok(false);
+        }
+        *self
+            .source_open_progress
+            .lock()
+            .map_err(|_| SourceError::Unsupported)? =
+            Some(ActiveSourceOpenProgress { request, phase });
+        Ok(true)
+    }
+
+    fn clear_source_open_progress(&self, request: u64) -> Result<(), OpenSourceError> {
+        let mut progress = self
+            .source_open_progress
+            .lock()
+            .map_err(|_| SourceError::Unsupported)?;
+        if progress
+            .as_ref()
+            .is_some_and(|active| active.request == request)
+        {
+            progress.take();
+        }
+        Ok(())
+    }
+
+    fn source_open_progress(&self) -> Result<Option<SourceOpenProgressPhase>, OpenSourceError> {
+        let request = self.lock_state()?.open_request;
+        Ok(self
+            .source_open_progress
+            .lock()
+            .map_err(|_| SourceError::Unsupported)?
+            .as_ref()
+            .filter(|active| active.request == request)
+            .map(|active| active.phase))
+    }
+
+    fn run_source_open_job<T>(
+        &self,
+        request: u64,
+        operation: impl FnOnce(
+            &mut dyn FnMut(SourceOpenPhase) -> bool,
+        ) -> Result<Option<T>, OpenSourceError>,
+    ) -> Result<Option<T>, OpenSourceError> {
+        self.set_source_open_progress(request, SourceOpenProgressPhase::Waiting)?;
+        let decode_guard = self
+            .source_open_decode
+            .lock()
+            .map_err(|_| SourceError::Unsupported)?;
+        if !self.source_open_is_current(request)? {
+            drop(decode_guard);
+            self.clear_source_open_progress(request)?;
+            return Ok(None);
+        }
+        let mut keep_going = |phase| {
+            let phase = match phase {
+                SourceOpenPhase::ReadingFooter => SourceOpenProgressPhase::ReadingFooter,
+                SourceOpenPhase::DecodingFooter => SourceOpenProgressPhase::DecodingFooter,
+                SourceOpenPhase::Summarizing => SourceOpenProgressPhase::Summarizing,
+            };
+            self.set_source_open_progress(request, phase)
+                .unwrap_or(false)
+        };
+        let result = operation(&mut keep_going);
+        drop(decode_guard);
+        self.clear_source_open_progress(request)?;
+        result
     }
 
     fn cancel_all_jobs(&self) -> Result<(), OpenSourceError> {
@@ -929,7 +1457,11 @@ fn fetch_opened_source_window(
             DataWindowSessionError::ViewChanged,
         ));
     }
-    match &state.view {
+    session.validate_source_identity()?;
+    if !session.schema_complete {
+        return Err(DataWindowError::Unsupported.into());
+    }
+    let result = match &state.view {
         Some(view) => view
             .fetch_window_columns(row_offset, row_count, source_indices)
             .map_err(Into::into),
@@ -938,7 +1470,7 @@ fn fetch_opened_source_window(
             // Keep this predicate aligned with DataWindowReader::fetch_columns: this fast path
             // avoids parsing the footer, while the reader still protects direct library callers.
             let identity_projection = !source_indices.is_empty()
-                && source_indices.len() == session.summary.schema.len()
+                && source_indices.len() == session.schema.len()
                 && source_indices
                     .iter()
                     .enumerate()
@@ -955,7 +1487,45 @@ fn fetch_opened_source_window(
                     .map_err(Into::into)
             }
         }
-    }
+    };
+    session.validate_source_identity()?;
+    result
+}
+
+/// Returns one bounded page of query columns without exposing full names or the source path.
+#[tauri::command]
+fn get_source_schema_page(
+    generation: u64,
+    offset: usize,
+    limit: usize,
+    opened_source: tauri::State<'_, OpenedSource>,
+) -> Result<SourceSchemaPage, DataWindowCommandError> {
+    let state = opened_source
+        .state
+        .lock()
+        .map_err(|_| DataWindowError::Unsupported)?;
+    let missing = missing_data_window_session(&state);
+    let session = state.session(generation).ok_or(missing)?;
+    session.validate_source_identity()?;
+    source_schema_page(&session, offset, limit)
+}
+
+/// Returns one bounded DFS page for merging into the existing Structure tree.
+#[tauri::command]
+fn get_source_schema_node_page(
+    generation: u64,
+    cursor: Option<SourceSchemaNodeCursor>,
+    limit: usize,
+    opened_source: tauri::State<'_, OpenedSource>,
+) -> Result<SourceSchemaNodePage, DataWindowCommandError> {
+    let state = opened_source
+        .state
+        .lock()
+        .map_err(|_| DataWindowError::Unsupported)?;
+    let missing = missing_data_window_session(&state);
+    let session = state.session(generation).ok_or(missing)?;
+    session.validate_source_identity()?;
+    source_schema_node_page(&session, cursor, limit)
 }
 
 /// Prepares one filtered and sorted position index, then atomically publishes it.
@@ -980,6 +1550,7 @@ async fn prepare_data_view(
         state.session(generation).ok_or(missing)?
     };
     let _work = session.begin_work()?;
+    session.validate_source_identity()?;
     let builder = DataViewBuilder::with_memory_limit(
         session.path.clone(),
         &filters,
@@ -1005,6 +1576,7 @@ async fn prepare_data_view(
         return Err(DataWindowError::Cancelled.into());
     }
     let view = result.map_err(|_| DataWindowError::QueryEngineUnavailable)??;
+    session.validate_source_identity()?;
     if view_revision <= state.view_revision {
         return Err(DataWindowError::Cancelled.into());
     }
@@ -1030,6 +1602,7 @@ fn activate_direct_data_view(
         let missing = missing_data_window_session(&state);
         state.session(generation).ok_or(missing)?
     };
+    session.validate_source_identity()?;
     let mut state = session.lock_state()?;
     if view_revision <= state.view_revision {
         return Err(DataWindowError::Cancelled.into());
@@ -1121,8 +1694,8 @@ async fn get_text_value_suggestions(
         state.session(generation).ok_or(missing)?
     };
     let _work = session.begin_work()?;
+    session.validate_source_identity()?;
     let column = session
-        .summary
         .schema
         .get(column_index)
         .cloned()
@@ -1156,7 +1729,9 @@ async fn get_text_value_suggestions(
         )
     };
 
-    if cancelled || !is_current {
+    if session.validate_source_identity().is_err() {
+        Err(DataWindowSessionError::SourceChanged.into())
+    } else if cancelled || !is_current {
         Err(DataWindowError::Cancelled.into())
     } else {
         result
@@ -1260,6 +1835,9 @@ async fn get_column_statistics(
     let statistics = result
         .map_err(|_| ColumnStatisticsCommandError::QueryEngineUnavailable)?
         .map_err(ColumnStatisticsCommandError::from)?;
+    session
+        .validate_source_identity()
+        .map_err(|_| ColumnStatisticsCommandError::SourceChanged)?;
     cache_statistics(&session, column_index, statistics.clone())?;
     Ok(statistics)
 }
@@ -1272,6 +1850,9 @@ fn statistics_request(
     let state = session
         .lock_state()
         .map_err(ColumnStatisticsCommandError::from)?;
+    session
+        .validate_source_identity()
+        .map_err(|_| ColumnStatisticsCommandError::SourceChanged)?;
     if let Some(statistics) = state
         .statistics_cache
         .get(&column_index)
@@ -1280,7 +1861,6 @@ fn statistics_request(
         return Ok(ColumnStatisticsRequest::Cached(statistics.clone()));
     }
     let column_name = session
-        .summary
         .schema
         .get(column_index)
         .ok_or(ColumnStatisticsCommandError::UnsupportedColumn)?
@@ -1297,7 +1877,7 @@ fn cache_statistics(
     column_index: usize,
     statistics: ColumnStatistics,
 ) -> Result<(), ColumnStatisticsCommandError> {
-    if session.summary.schema.get(column_index).is_none() {
+    if session.schema.get(column_index).is_none() {
         return Err(ColumnStatisticsCommandError::UnsupportedColumn);
     }
     let mut state = session
@@ -1358,10 +1938,18 @@ fn cancel_column_statistics(
 #[tauri::command]
 async fn open_local_source(
     app: tauri::AppHandle,
+    attempt: String,
 ) -> Result<Option<OpenedSourceInfo>, OpenSourceError> {
+    let Some(open_request) = app
+        .state::<OpenedSource>()
+        .begin_client_source_open(&attempt)?
+    else {
+        return Ok(None);
+    };
     let command_app = app.clone();
+    let job_attempt = attempt.clone();
     // blocking_pick_file would stall the async runtime thread.
-    let inspected = tauri::async_runtime::spawn_blocking(move || {
+    let inspected = match tauri::async_runtime::spawn_blocking(move || {
         let selected = command_app
             .dialog()
             .file()
@@ -1372,10 +1960,27 @@ async fn open_local_source(
         };
         let path = selected.into_path().map_err(|_| SourceError::Unsupported)?;
 
-        inspect_selected_source(&command_app, path, SourceOpenIntent::Explicit)
+        let opened_source = command_app.state::<OpenedSource>();
+        let recent_sources_path = recents::state_path(&command_app).ok();
+        inspect_selected_source_at_path_for_request(
+            recent_sources_path.as_deref(),
+            opened_source.inner(),
+            path,
+            SourceOpenIntent::Explicit,
+            SourceOpenPublication {
+                request: open_request,
+                client_attempt: Some(&job_attempt),
+            },
+        )
     })
     .await
-    .map_err(|_| SourceError::Unsupported)??;
+    {
+        Ok(result) => result,
+        Err(_) => Err(SourceError::Unsupported.into()),
+    };
+    app.state::<OpenedSource>()
+        .finish_client_source_open(&attempt)?;
+    let inspected = inspected?;
 
     if inspected.is_some() {
         let _ = recent_sources_changed(&app);
@@ -1407,16 +2012,76 @@ fn inspect_selected_source_at_path(
     if intent == SourceOpenIntent::Restore && opened_source.blocks_restore()? {
         return Ok(None);
     }
-    let summary = match inspect_local_source(&path) {
-        Ok(summary) => summary,
+    let open_request = opened_source.begin_source_open()?;
+    inspect_selected_source_at_path_for_request(
+        recent_sources_path,
+        opened_source,
+        path,
+        intent,
+        SourceOpenPublication {
+            request: open_request,
+            client_attempt: None,
+        },
+    )
+}
+
+fn inspect_selected_source_at_path_for_request(
+    recent_sources_path: Option<&std::path::Path>,
+    opened_source: &OpenedSource,
+    path: PathBuf,
+    intent: SourceOpenIntent,
+    publication: SourceOpenPublication<'_>,
+) -> Result<Option<(PathBuf, OpenedSourceInfo)>, OpenSourceError> {
+    if !opened_source.source_open_is_current(publication.request)? {
+        return Ok(None);
+    }
+    if intent == SourceOpenIntent::Restore && opened_source.blocks_restore()? {
+        return Ok(None);
+    }
+    let inspected = opened_source.run_source_open_job(publication.request, |keep_going| {
+        inspect_local_source_snapshot_cancellable(&path, keep_going).map_err(Into::into)
+    });
+    let (summary, snapshot) = match inspected {
+        Ok(Some(inspected)) => inspected,
+        Ok(None) => return Ok(None),
         Err(_) if intent == SourceOpenIntent::Restore && opened_source.blocks_restore()? => {
             return Ok(None);
         }
-        Err(error) => return Err(error.into()),
+        Err(error) => return Err(error),
     };
-    remember_inspected_source(recent_sources_path, opened_source, path, summary, intent)
+    remember_inspected_source_with_snapshot(
+        recent_sources_path,
+        opened_source,
+        path,
+        summary,
+        snapshot,
+        intent,
+        publication,
+    )
 }
 
+fn remember_inspected_source_with_snapshot(
+    recent_sources_path: Option<&std::path::Path>,
+    opened_source: &OpenedSource,
+    path: PathBuf,
+    summary: SourceSummary,
+    snapshot: SourceSnapshot,
+    intent: SourceOpenIntent,
+    publication: SourceOpenPublication<'_>,
+) -> Result<Option<(PathBuf, OpenedSourceInfo)>, OpenSourceError> {
+    let canonical_path = std::fs::canonicalize(&path).unwrap_or(path);
+    let source = opened_source.install_with_snapshot(
+        recent_sources_path,
+        canonical_path.clone(),
+        summary,
+        Some(snapshot),
+        intent,
+        Some(publication),
+    )?;
+    Ok(source.map(|source| (canonical_path, source)))
+}
+
+#[cfg(test)]
 fn remember_inspected_source(
     recent_sources_path: Option<&std::path::Path>,
     opened_source: &OpenedSource,
@@ -1433,10 +2098,6 @@ fn remember_inspected_source(
 fn require_explicit_source(
     source: Option<(PathBuf, OpenedSourceInfo)>,
 ) -> Result<(PathBuf, OpenedSourceInfo), OpenSourceError> {
-    debug_assert!(
-        source.is_some(),
-        "an explicit source open cannot be superseded by restore"
-    );
     source.ok_or_else(|| SourceError::Unsupported.into())
 }
 
@@ -1456,13 +2117,35 @@ async fn get_recent_sources(app: tauri::AppHandle) -> Result<Vec<RecentSource>, 
 async fn open_recent_source(
     app: tauri::AppHandle,
     id: String,
+    attempt: String,
 ) -> Result<OpenedSourceInfo, OpenSourceError> {
+    let Some(open_request) = app
+        .state::<OpenedSource>()
+        .begin_client_source_open(&attempt)?
+    else {
+        return Err(SourceError::Unsupported.into());
+    };
     let command_app = app.clone();
-    let result = tauri::async_runtime::spawn_blocking(move || {
-        open_recent_source_with_app(&command_app, &id)
+    let job_attempt = attempt.clone();
+    let result = match tauri::async_runtime::spawn_blocking(move || {
+        let opened_source = command_app.state::<OpenedSource>();
+        open_recent_source_at_path_for_request(
+            &recents::state_path(&command_app)?,
+            opened_source.inner(),
+            &id,
+            SourceOpenPublication {
+                request: open_request,
+                client_attempt: Some(&job_attempt),
+            },
+        )
     })
     .await
-    .map_err(|_| SourceError::Unsupported)?;
+    {
+        Ok(result) => result,
+        Err(_) => Err(SourceError::Unsupported.into()),
+    };
+    app.state::<OpenedSource>()
+        .finish_client_source_open(&attempt)?;
     let _ = recent_sources_changed(&app);
     result.map(|(_, source)| source)
 }
@@ -1474,20 +2157,38 @@ pub(crate) fn open_recent_source_with_app(
     let opened_source = app.state::<OpenedSource>();
     open_recent_source_at_path(&recents::state_path(app)?, opened_source.inner(), id)
 }
-
 fn open_recent_source_at_path(
     recent_sources_path: &std::path::Path,
     opened_source: &OpenedSource,
     id: &str,
 ) -> Result<(PathBuf, OpenedSourceInfo), OpenSourceError> {
+    let open_request = opened_source.begin_source_open()?;
+    open_recent_source_at_path_for_request(
+        recent_sources_path,
+        opened_source,
+        id,
+        SourceOpenPublication {
+            request: open_request,
+            client_attempt: None,
+        },
+    )
+}
+
+fn open_recent_source_at_path_for_request(
+    recent_sources_path: &std::path::Path,
+    opened_source: &OpenedSource,
+    id: &str,
+    publication: SourceOpenPublication<'_>,
+) -> Result<(PathBuf, OpenedSourceInfo), OpenSourceError> {
     let path = opened_source
         .recents
         .path_for_id_path(recent_sources_path, id)?;
-    let result = inspect_selected_source_at_path(
+    let result = inspect_selected_source_at_path_for_request(
         Some(recent_sources_path),
         opened_source,
         path,
         SourceOpenIntent::Explicit,
+        publication,
     )
     .and_then(require_explicit_source);
     if result == Err(SourceError::NotFound.into()) {
@@ -1706,6 +2407,21 @@ fn request_source_close(app: &tauri::AppHandle) {
     } else if let Some(window) = app.get_webview_window("main") {
         let _ = window.close();
     }
+}
+
+#[tauri::command]
+fn cancel_source_open(
+    attempt: String,
+    opened_source: tauri::State<'_, OpenedSource>,
+) -> Result<SourceOpenCancelOutcome, OpenSourceError> {
+    opened_source.cancel_source_open(&attempt)
+}
+
+#[tauri::command]
+fn get_source_open_progress(
+    opened_source: tauri::State<'_, OpenedSource>,
+) -> Result<Option<SourceOpenProgressPhase>, OpenSourceError> {
+    opened_source.source_open_progress()
 }
 
 fn check_for_updates_from_menu(app: &tauri::AppHandle) {
@@ -2151,10 +2867,14 @@ pub fn run() {
             cycle_opened_source,
             close_opened_source,
             reveal_opened_source,
+            cancel_source_open,
+            get_source_open_progress,
             take_opened_source,
             get_default_application_status,
             set_default_application,
             get_data_window,
+            get_source_schema_page,
+            get_source_schema_node_page,
             prepare_data_view,
             get_data_view_status,
             cancel_data_view,
@@ -2255,8 +2975,11 @@ pub fn run() {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::mpsc;
+    use std::{fs, sync::mpsc};
 
+    use arrow_array::{Int64Array, RecordBatch};
+    use arrow_schema::{DataType, Field, Schema};
+    use parquet::arrow::ArrowWriter;
     use viewda_data_engine::SchemaField;
 
     use super::*;
@@ -2383,6 +3106,138 @@ mod tests {
                     .map(|state| state.closing)
             })
             .unwrap_or(true)
+    }
+
+    #[test]
+    fn source_open_jobs_report_progress_cancel_and_never_overlap_decode() {
+        use std::sync::{
+            Barrier,
+            atomic::{AtomicUsize, Ordering},
+        };
+
+        let opened_source = Arc::new(OpenedSource::default());
+        let first_request = opened_source.begin_source_open().expect("first request");
+        let first_barrier = Arc::new(Barrier::new(2));
+        let active = Arc::new(AtomicUsize::new(0));
+        let maximum = Arc::new(AtomicUsize::new(0));
+        let first = {
+            let opened_source = Arc::clone(&opened_source);
+            let first_barrier = Arc::clone(&first_barrier);
+            let active = Arc::clone(&active);
+            let maximum = Arc::clone(&maximum);
+            std::thread::spawn(move || {
+                opened_source.run_source_open_job(first_request, |keep_going| {
+                    let now = active.fetch_add(1, Ordering::SeqCst) + 1;
+                    maximum.fetch_max(now, Ordering::SeqCst);
+                    assert!(keep_going(SourceOpenPhase::ReadingFooter));
+                    first_barrier.wait();
+                    first_barrier.wait();
+                    active.fetch_sub(1, Ordering::SeqCst);
+                    assert!(!keep_going(SourceOpenPhase::DecodingFooter));
+                    Ok(None::<u8>)
+                })
+            })
+        };
+        first_barrier.wait();
+        assert_eq!(
+            opened_source.source_open_progress(),
+            Ok(Some(SourceOpenProgressPhase::ReadingFooter))
+        );
+
+        let second_request = opened_source.begin_source_open().expect("second request");
+        let (second_entered, second_entered_rx) = std::sync::mpsc::sync_channel(1);
+        let second = {
+            let opened_source = Arc::clone(&opened_source);
+            let active = Arc::clone(&active);
+            let maximum = Arc::clone(&maximum);
+            std::thread::spawn(move || {
+                opened_source.run_source_open_job(second_request, |_keep_going| {
+                    let now = active.fetch_add(1, Ordering::SeqCst) + 1;
+                    maximum.fetch_max(now, Ordering::SeqCst);
+                    second_entered.send(()).expect("second entered signal");
+                    active.fetch_sub(1, Ordering::SeqCst);
+                    Ok(Some(2))
+                })
+            })
+        };
+        assert!(second_entered_rx.try_recv().is_err());
+        first_barrier.wait();
+
+        assert_eq!(first.join().expect("first open thread"), Ok(None));
+        second_entered_rx.recv().expect("serialized second open");
+        assert_eq!(second.join().expect("second open thread"), Ok(Some(2)));
+        assert_eq!(maximum.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn schema_node_pages_continue_through_a_partially_cut_nested_group() {
+        let nested_children = (0..300)
+            .map(|index| SchemaField {
+                name: format!("nested_{index}"),
+                physical_type: "INT64".into(),
+                logical_type: None,
+                children: Vec::new(),
+            })
+            .collect::<Vec<_>>();
+        let schema = vec![
+            SchemaField {
+                name: "prefix".into(),
+                physical_type: "INT64".into(),
+                logical_type: None,
+                children: Vec::new(),
+            },
+            SchemaField {
+                name: "wrapper".into(),
+                physical_type: "GROUP".into(),
+                logical_type: None,
+                children: nested_children,
+            },
+        ];
+        let opened_source = OpenedSource::default();
+        opened_source
+            .install(
+                None,
+                PathBuf::from("nested-schema.parquet"),
+                SourceSummary {
+                    display_name: "nested-schema.parquet".into(),
+                    size_bytes: 8,
+                    row_count: 0,
+                    row_group_count: 0,
+                    column_count: 301,
+                    schema,
+                    schema_node_count: 302,
+                    schema_is_truncated: true,
+                    strings_truncated: false,
+                },
+                SourceOpenIntent::Explicit,
+            )
+            .expect("source state")
+            .expect("source is accepted");
+        let state = opened_source.state.lock().expect("source state");
+        let session = state.sessions.first().expect("source session");
+
+        let first = source_schema_node_page(session, None, 256).expect("first page");
+        assert_eq!(first.nodes.len(), 256);
+        assert_eq!(first.total_count, 302);
+        assert_eq!(first.nodes[0].path, [0]);
+        assert_eq!(first.nodes[1].path, [1]);
+        assert!(first.nodes[1].has_children);
+        let second = source_schema_node_page(session, first.next_cursor.clone(), 256)
+            .expect("continuation page");
+        assert_eq!(second.nodes.len(), 46);
+        assert_eq!(second.nodes.last().expect("last node").path, [1, 299]);
+        assert_eq!(
+            second.nodes.last().expect("last node").leaf_index,
+            Some(300)
+        );
+        assert!(second.next_cursor.is_none());
+        for page in [&first, &second] {
+            assert!(page.nodes.len() <= MAX_SOURCE_SCHEMA_PAGE_NODES);
+            assert!(
+                page.nodes.iter().map(|node| node.path.len()).sum::<usize>()
+                    <= MAX_SOURCE_SCHEMA_PAGE_PATH_COMPONENTS
+            );
+        }
     }
 
     #[test]
@@ -2648,7 +3503,11 @@ mod tests {
             size_bytes: 31,
             row_count: 1,
             row_group_count: 1,
+            column_count: 0,
             schema: Vec::new(),
+            schema_node_count: 0,
+            schema_is_truncated: false,
+            strings_truncated: false,
         };
 
         let opened = remember_inspected_source(
@@ -2749,7 +3608,11 @@ mod tests {
             size_bytes: 1,
             row_count: 1,
             row_group_count: 1,
+            column_count: 0,
             schema: Vec::new(),
+            schema_node_count: 0,
+            schema_is_truncated: false,
+            strings_truncated: false,
         };
 
         opened_source
@@ -2776,6 +3639,167 @@ mod tests {
     }
 
     #[test]
+    fn cancelled_or_superseded_open_result_never_installs() {
+        let opened_source = OpenedSource::default();
+        let stale_request = opened_source.begin_source_open().expect("first open");
+        let current_request = opened_source.begin_source_open().expect("replacement open");
+        let summary = SourceSummary {
+            display_name: "source.parquet".to_owned(),
+            size_bytes: 8,
+            row_count: 0,
+            row_group_count: 0,
+            column_count: 0,
+            schema: Vec::new(),
+            schema_node_count: 0,
+            schema_is_truncated: false,
+            strings_truncated: false,
+        };
+
+        assert!(
+            opened_source
+                .install_with_snapshot(
+                    None,
+                    PathBuf::from("stale.parquet"),
+                    summary.clone(),
+                    None,
+                    SourceOpenIntent::Explicit,
+                    Some(SourceOpenPublication {
+                        request: stale_request,
+                        client_attempt: None,
+                    }),
+                )
+                .expect("stale result is discarded")
+                .is_none()
+        );
+        assert_eq!(opened_source.open_paths(), Ok(Vec::new()));
+        assert!(
+            opened_source
+                .install_with_snapshot(
+                    None,
+                    PathBuf::from("current.parquet"),
+                    summary,
+                    None,
+                    SourceOpenIntent::Explicit,
+                    Some(SourceOpenPublication {
+                        request: current_request,
+                        client_attempt: None,
+                    }),
+                )
+                .expect("current result installs")
+                .is_some()
+        );
+        assert_eq!(
+            opened_source.open_paths(),
+            Ok(vec![PathBuf::from("current.parquet")])
+        );
+        assert_eq!(
+            require_explicit_source(None),
+            Err(SourceError::Unsupported.into())
+        );
+    }
+
+    #[test]
+    fn cancel_wins_before_install_and_discards_the_source() {
+        let opened_source = OpenedSource::default();
+        let attempt = "local-cancel";
+        let request = opened_source
+            .begin_client_source_open(attempt)
+            .expect("source open")
+            .expect("registered source open");
+
+        assert_eq!(
+            opened_source.cancel_source_open(attempt),
+            Ok(SourceOpenCancelOutcome::Cancelled)
+        );
+        assert!(
+            opened_source
+                .install_with_snapshot(
+                    None,
+                    PathBuf::from("cancelled.parquet"),
+                    test_summary("cancelled.parquet"),
+                    None,
+                    SourceOpenIntent::Explicit,
+                    Some(SourceOpenPublication {
+                        request,
+                        client_attempt: Some(attempt),
+                    }),
+                )
+                .expect("cancelled result is discarded")
+                .is_none()
+        );
+        assert_eq!(opened_source.open_paths(), Ok(Vec::new()));
+    }
+
+    #[test]
+    fn install_wins_before_cancel_and_keeps_the_published_generation() {
+        let opened_source = OpenedSource::default();
+        let attempt = "recent-published";
+        let request = opened_source
+            .begin_client_source_open(attempt)
+            .expect("source open")
+            .expect("registered source open");
+        let source = opened_source
+            .install_with_snapshot(
+                None,
+                PathBuf::from("published.parquet"),
+                test_summary("published.parquet"),
+                None,
+                SourceOpenIntent::Explicit,
+                Some(SourceOpenPublication {
+                    request,
+                    client_attempt: Some(attempt),
+                }),
+            )
+            .expect("source install")
+            .expect("published source");
+
+        assert_eq!(
+            opened_source.cancel_source_open(attempt),
+            Ok(SourceOpenCancelOutcome::Published)
+        );
+        assert_eq!(source.generation, 1);
+        assert_eq!(
+            opened_source.open_paths(),
+            Ok(vec![PathBuf::from("published.parquet")])
+        );
+    }
+
+    #[test]
+    fn cancelled_recent_open_returns_a_safe_error_before_inspection() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let recent_sources_path = directory.path().join("recents.json");
+        let source_path = directory.path().join("cancelled.parquet");
+        std::fs::write(&source_path, b"inspection must not run").expect("source fixture");
+        let opened_source = OpenedSource::default();
+        opened_source
+            .recents
+            .record_path(&recent_sources_path, &source_path)
+            .expect("recent source");
+        let attempt = "recent-cancelled";
+        let stale_request = opened_source
+            .begin_client_source_open(attempt)
+            .expect("source open")
+            .expect("registered source open");
+        opened_source
+            .cancel_source_open(attempt)
+            .expect("cancel source open");
+
+        assert_eq!(
+            open_recent_source_at_path_for_request(
+                &recent_sources_path,
+                &opened_source,
+                "recent-1",
+                SourceOpenPublication {
+                    request: stale_request,
+                    client_attempt: Some(attempt),
+                },
+            ),
+            Err(SourceError::Unsupported.into()),
+        );
+        assert_eq!(opened_source.open_paths(), Ok(Vec::new()));
+    }
+
+    #[test]
     fn restore_bumps_recents_only_when_it_becomes_the_opened_source() {
         let directory = tempfile::tempdir().expect("temporary directory");
         let recent_sources_path = directory.path().join("recents.json");
@@ -2797,7 +3821,11 @@ mod tests {
             size_bytes: 1,
             row_count: 1,
             row_group_count: 1,
+            column_count: 0,
             schema: Vec::new(),
+            schema_node_count: 0,
+            schema_is_truncated: false,
+            strings_truncated: false,
         };
         let first_recent_id = || {
             let stored: serde_json::Value = serde_json::from_slice(
@@ -2939,6 +3967,98 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn reopening_a_replaced_path_refreshes_only_that_source_session() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let path = directory.path().join("source.parquet");
+        write_test_parquet(&path, &[1]);
+        let opened_source = OpenedSource::default();
+        let (first_summary, first_snapshot) =
+            inspect_local_source_snapshot_cancellable(&path, &mut |_| true)
+                .expect("first source snapshot")
+                .expect("first inspection completes");
+        let first = opened_source
+            .install_with_snapshot(
+                None,
+                path.clone(),
+                first_summary,
+                Some(first_snapshot),
+                SourceOpenIntent::Explicit,
+                None,
+            )
+            .expect("first source install")
+            .expect("first source publishes");
+        let first_session = opened_source
+            .state
+            .lock()
+            .expect("source state")
+            .session(first.generation)
+            .expect("first session");
+
+        let (same_summary, same_snapshot) =
+            inspect_local_source_snapshot_cancellable(&path, &mut |_| true)
+                .expect("unchanged source snapshot")
+                .expect("unchanged inspection completes");
+        let unchanged = opened_source
+            .install_with_snapshot(
+                None,
+                path.clone(),
+                same_summary,
+                Some(same_snapshot),
+                SourceOpenIntent::Explicit,
+                None,
+            )
+            .expect("unchanged source install")
+            .expect("unchanged source publishes");
+        assert_eq!(unchanged.generation, first.generation);
+
+        let old_view = register_test_view_job(&opened_source, first.generation);
+        let replacement = directory.path().join("replacement.parquet");
+        write_test_parquet(&replacement, &[2, 3]);
+        fs::rename(&replacement, &path).expect("replacement changes the path identity atomically");
+        assert_eq!(
+            fetch_opened_source_window(&first_session, 0, 0, 1, &[0]),
+            Err(DataWindowCommandError::Session(
+                DataWindowSessionError::SourceChanged,
+            ))
+        );
+
+        let (replacement_summary, replacement_snapshot) =
+            inspect_local_source_snapshot_cancellable(&path, &mut |_| true)
+                .expect("replacement source snapshot")
+                .expect("replacement inspection completes");
+        let refreshed = opened_source
+            .install_with_snapshot(
+                None,
+                path.clone(),
+                replacement_summary,
+                Some(replacement_snapshot),
+                SourceOpenIntent::Explicit,
+                None,
+            )
+            .expect("replacement source install")
+            .expect("replacement source publishes");
+
+        assert!(refreshed.generation > first.generation);
+        assert_eq!(refreshed.summary.row_count, 2);
+        assert!(old_view.is_cancelled());
+        assert!(matches!(
+            first_session.with_open_state(|_| ()),
+            Err(DataWindowError::Cancelled)
+        ));
+        let state = opened_source.state.lock().expect("source state");
+        assert_eq!(state.sessions.len(), 1);
+        let refreshed_session = state
+            .session(refreshed.generation)
+            .expect("refreshed session");
+        drop(state);
+        assert!(
+            fetch_opened_source_window(&refreshed_session, 0, 0, 2, &[0]).is_ok(),
+            "the refreshed session reads rows from the replacement file"
+        );
+    }
+
     #[test]
     fn closing_the_active_source_activates_the_next_most_recently_used_one() {
         let opened_source = OpenedSource::default();
@@ -3016,6 +4136,7 @@ mod tests {
                     size_bytes: 8,
                     row_count: 1,
                     row_group_count: 1,
+                    column_count: 2,
                     schema: vec![
                         SchemaField {
                             name: "value".into(),
@@ -3030,6 +4151,9 @@ mod tests {
                             children: Vec::new(),
                         },
                     ],
+                    schema_node_count: 2,
+                    schema_is_truncated: false,
+                    strings_truncated: false,
                 },
                 SourceOpenIntent::Explicit,
             )
@@ -3045,6 +4169,47 @@ mod tests {
         assert_eq!(
             fetch_opened_source_window(&session, 0, 0, 1, &[1]),
             Err(DataWindowCommandError::Engine(DataWindowError::NotFound))
+        );
+    }
+
+    #[test]
+    fn direct_windows_reject_a_capped_schema_before_selecting_all_columns() {
+        let opened_source = OpenedSource::default();
+        let opened = opened_source
+            .install(
+                None,
+                PathBuf::from("missing-wide-source.parquet"),
+                SourceSummary {
+                    display_name: "wide.parquet".into(),
+                    size_bytes: 8,
+                    row_count: 1,
+                    row_group_count: 1,
+                    column_count: 100_000,
+                    schema: vec![viewda_data_engine::SchemaField {
+                        name: "first".into(),
+                        physical_type: "INT64".into(),
+                        logical_type: None,
+                        children: Vec::new(),
+                    }],
+                    schema_node_count: 100_000,
+                    schema_is_truncated: true,
+                    strings_truncated: false,
+                },
+                SourceOpenIntent::Explicit,
+            )
+            .expect("source state")
+            .expect("source is accepted");
+        let session = opened_source
+            .state
+            .lock()
+            .expect("opened source state")
+            .session(opened.generation)
+            .expect("opened session");
+
+        assert_eq!(
+            fetch_opened_source_window(&session, 0, 0, 1, &[0]),
+            Err(DataWindowCommandError::Engine(DataWindowError::Unsupported)),
+            "a capped prefix can never become an identity projection"
         );
     }
 
@@ -3354,12 +4519,16 @@ mod tests {
             size_bytes: 8,
             row_count: 1,
             row_group_count: 1,
+            column_count: 1,
             schema: vec![SchemaField {
                 name: "trusted_name".into(),
                 physical_type: "INT64".into(),
                 logical_type: None,
                 children: Vec::new(),
             }],
+            schema_node_count: 1,
+            schema_is_truncated: false,
+            strings_truncated: false,
         };
         let opened = opened_source
             .install(
@@ -3395,12 +4564,16 @@ mod tests {
             size_bytes: 8,
             row_count: 1,
             row_group_count: 1,
+            column_count: 1,
             schema: vec![SchemaField {
                 name: "label".into(),
                 physical_type: "BYTE_ARRAY".into(),
                 logical_type: Some("String".into()),
                 children: Vec::new(),
             }],
+            schema_node_count: 1,
+            schema_is_truncated: false,
+            strings_truncated: false,
         };
         let opened = opened_source
             .install(
@@ -3539,7 +4712,11 @@ mod tests {
             size_bytes: 8,
             row_count: 1,
             row_group_count: 1,
+            column_count: 0,
             schema: Vec::new(),
+            schema_node_count: 0,
+            schema_is_truncated: false,
+            strings_truncated: false,
         }
     }
 
@@ -3637,5 +4814,22 @@ mod tests {
             .expect("session state")
             .statistics_job = Some(Arc::clone(&job));
         job
+    }
+
+    fn write_test_parquet(path: &std::path::Path, values: &[i64]) {
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "value",
+            DataType::Int64,
+            false,
+        )]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(Int64Array::from(values.to_vec()))],
+        )
+        .expect("test batch");
+        let file = fs::File::create(path).expect("test Parquet file");
+        let mut writer = ArrowWriter::try_new(file, schema, None).expect("test Parquet writer");
+        writer.write(&batch).expect("test Parquet rows");
+        writer.close().expect("test Parquet footer");
     }
 }

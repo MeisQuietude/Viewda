@@ -29,7 +29,10 @@ pub use export::{
 };
 #[cfg(feature = "query-engine")]
 pub use filter::{DataFilter, DataFilterOperator};
-pub use source::{SchemaField, SourceError, SourceSummary, inspect_local_source};
+pub use source::{
+    SchemaField, SourceError, SourceIdentity, SourceOpenPhase, SourceSnapshot, SourceSummary,
+    inspect_local_source, inspect_local_source_snapshot, inspect_local_source_snapshot_cancellable,
+};
 #[cfg(feature = "query-engine")]
 pub use statistics::{
     ColumnStatistics, ColumnStatisticsError, ColumnStatisticsReader, StatisticsInterruptHandle,

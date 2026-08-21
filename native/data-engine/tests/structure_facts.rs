@@ -17,8 +17,46 @@ use tempfile::NamedTempFile;
 use viewda_data_engine::{
     StructureBloomProbeOutcome, StructureByteUnit, StructureCancellation, StructureColumnSort,
     StructureError, StructureLoadProgress, StructureReader, StructureRowGroupSort,
-    StructureSortDirection,
+    StructureSortDirection, inspect_local_source_snapshot,
 };
+
+#[test]
+fn source_summary_and_structure_share_the_opened_file_snapshot() {
+    let source = write_parquet(
+        WriterProperties::builder()
+            .set_max_row_group_row_count(Some(4))
+            .build(),
+    );
+    let (summary, snapshot) =
+        inspect_local_source_snapshot(source.path()).expect("source opens once");
+    let replacement = write_wide_parquet(3);
+    fs::rename(replacement.path(), source.path()).expect("path can name a new inode after open");
+
+    let reader = StructureReader::from_snapshot(
+        &snapshot,
+        &StructureLoadProgress::default(),
+        &StructureCancellation::default(),
+    )
+    .expect("retained footer remains summarizable");
+
+    assert_eq!(reader.summary().row_count, summary.row_count);
+    assert_eq!(reader.summary().column_count, summary.column_count);
+    assert_ne!(
+        reader.summary().column_count,
+        StructureReader::open(
+            source.path().to_owned(),
+            &StructureLoadProgress::default(),
+            &StructureCancellation::default(),
+        )
+        .expect("replacement source opens")
+        .summary()
+        .column_count,
+        "Structure used the retained snapshot rather than reopening the path"
+    );
+    let report = reader.report("test", StructureByteUnit::Compressed);
+    assert!(report.contains(&format!("File bytes: {}", summary.size_bytes)));
+    assert!(report.contains("Byte unit: compressed"));
+}
 
 #[test]
 fn reports_the_file_card_facts_of_a_mixed_codec_file() {
@@ -177,6 +215,62 @@ fn answers_bloom_probes_per_row_group_and_names_columns_without_a_filter() {
 }
 
 #[test]
+fn bloom_probes_keep_the_opened_source_snapshot_after_path_replacement() {
+    let source = write_parquet(
+        WriterProperties::builder()
+            .set_max_row_group_row_count(Some(4))
+            .set_column_bloom_filter_enabled(ColumnPath::from("name"), true)
+            .build(),
+    );
+    let replacement = write_parquet(
+        WriterProperties::builder()
+            .set_max_row_group_row_count(Some(12))
+            .build(),
+    );
+    let reader = open_structure(source.path());
+    let moved_path = source.path().with_extension("opened.parquet");
+
+    fs::rename(source.path(), &moved_path).expect("opened fixture can be moved");
+    fs::copy(replacement.path(), source.path()).expect("path can point at a different source");
+
+    let probe = reader
+        .probe_bloom_filter(1, "name-0", 0, 16, &StructureCancellation::default())
+        .expect("the retained source remains probeable");
+    assert_eq!(
+        probe.total_count, 3,
+        "metadata and bloom bytes share one snapshot"
+    );
+    assert_eq!(
+        probe.row_groups[0].outcome,
+        StructureBloomProbeOutcome::MayContain
+    );
+
+    fs::remove_file(moved_path).expect("moved fixture can be removed");
+}
+
+#[test]
+fn bloom_probes_reject_in_place_changes_to_the_retained_file() {
+    let source = write_parquet(
+        WriterProperties::builder()
+            .set_column_bloom_filter_enabled(ColumnPath::from("name"), true)
+            .build(),
+    );
+    let reader = open_structure(source.path());
+    let mut changed = fs::OpenOptions::new()
+        .append(true)
+        .open(source.path())
+        .expect("source can be mutated");
+    std::io::Write::write_all(&mut changed, b"changed").expect("mutate source in place");
+
+    assert_eq!(
+        reader
+            .probe_bloom_filter(1, "name-0", 0, 16, &StructureCancellation::default())
+            .err(),
+        Some(StructureError::SourceChanged),
+    );
+}
+
+#[test]
 fn describes_a_file_that_holds_no_row_group() {
     let source = write_empty_parquet();
 
@@ -192,7 +286,7 @@ fn describes_a_file_that_holds_no_row_group() {
     assert_eq!(summary.chunk_count, 0);
     assert!(
         reader
-            .layout(StructureByteUnit::Compressed, 0, 16, 8)
+            .layout(StructureByteUnit::Compressed, 0, 16, 8, None)
             .rows
             .is_empty()
     );
@@ -217,7 +311,7 @@ fn collapses_columns_below_the_segment_limit_into_one_tail() {
     let source = write_wide_parquet(40);
 
     let reader = open_structure(source.path());
-    let layout = reader.layout(StructureByteUnit::Compressed, 0, 4, 5);
+    let layout = reader.layout(StructureByteUnit::Compressed, 0, 4, 5, None);
 
     assert_eq!(layout.total_count, 1);
     let row = &layout.rows[0];
@@ -248,8 +342,42 @@ fn collapses_columns_below_the_segment_limit_into_one_tail() {
     );
     assert!(row.is_readable);
 
-    let unlimited = reader.layout(StructureByteUnit::Compressed, 0, 4, 4096);
+    let unlimited = reader.layout(StructureByteUnit::Compressed, 0, 4, 4096, None);
     assert_eq!(unlimited.rows[0].segments.len(), 32, "engine caps segments");
+}
+
+#[test]
+fn focused_tiny_column_is_named_without_changing_exact_tail_totals() {
+    let source = write_wide_parquet(40);
+    let reader = open_structure(source.path());
+    let layout = reader.layout(StructureByteUnit::Compressed, 0, 4, 5, Some(25));
+    let row = &layout.rows[0];
+    let tail = row.tail.expect("unfocused columns remain collapsed");
+
+    assert_eq!(row.segments.len(), 5);
+    assert!(
+        row.segments
+            .iter()
+            .any(|segment| segment.column_index == 25)
+    );
+    assert_eq!(tail.segment_count, 35);
+    assert_eq!(
+        row.segments
+            .iter()
+            .map(|segment| segment.compressed_bytes)
+            .sum::<u64>()
+            + tail.compressed_bytes,
+        row.compressed_bytes
+    );
+    assert!(layout.overview.len() <= 256);
+    assert_eq!(
+        layout.overview[0].focused_compressed_bytes,
+        row.segments
+            .iter()
+            .find(|segment| segment.column_index == 25)
+            .expect("focused segment")
+            .compressed_bytes
+    );
 }
 
 #[test]
@@ -536,6 +664,43 @@ fn describes_a_file_whose_data_pages_are_damaged() {
 }
 
 #[test]
+fn marks_footer_entries_unreadable_when_their_page_ranges_were_truncated() {
+    let source = write_parquet(
+        WriterProperties::builder()
+            .set_max_row_group_row_count(Some(4))
+            .build(),
+    );
+    let bytes = fs::read(source.path()).expect("fixture is readable");
+    let metadata_bytes = u32::from_le_bytes(
+        bytes[bytes.len() - 8..bytes.len() - 4]
+            .try_into()
+            .expect("footer length bytes"),
+    ) as usize;
+    let footer_start = bytes.len() - 8 - metadata_bytes;
+    let truncated = [&bytes[..4], &bytes[footer_start..]].concat();
+    fs::write(source.path(), truncated).expect("fixture can lose its data pages");
+
+    let reader = open_structure(source.path());
+
+    assert_eq!(reader.summary().row_group_count, 3);
+    assert_eq!(reader.summary().unreadable_row_group_count, 3);
+    assert!(reader.summary().compressed_bytes > 0);
+    assert!(
+        reader
+            .layout(StructureByteUnit::Compressed, 0, 16, 8, None)
+            .rows
+            .iter()
+            .all(|row| !row.is_readable && !row.segments.is_empty()),
+        "footer-recorded layout facts remain visible under the unreadable hatch"
+    );
+    assert_eq!(
+        reader.first_row_offset(0),
+        Err(StructureError::CorruptFooter),
+        "Data navigation must not use an unreadable row group"
+    );
+}
+
+#[test]
 fn reports_chunk_facts_including_statistics_exactness() {
     let source = write_parquet(
         WriterProperties::builder()
@@ -593,6 +758,14 @@ fn reports_progress_while_it_summarizes_row_groups() {
     assert_eq!(
         progress.snapshot().completed_row_groups,
         reader.summary().row_group_count as u64
+    );
+    assert_eq!(
+        progress.snapshot().total_chunks,
+        reader.summary().chunk_count
+    );
+    assert_eq!(
+        progress.snapshot().completed_chunks,
+        reader.summary().chunk_count
     );
 }
 

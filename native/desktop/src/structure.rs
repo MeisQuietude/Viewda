@@ -1,21 +1,18 @@
 //! Commands for the footer-only structure view.
 //!
-//! The footer is parsed once per opened source and kept on the session, so the
-//! paged queries behind the tables, the layout and the chunk panel are reads of
-//! that one parse. Only the summary load and the bloom probe do file work, and
-//! both are cancellable.
+//! Source open retains its one decoded footer and file handle on the session.
+//! Structure adds cancellable per-chunk facts to that snapshot, then keeps the
+//! resulting reader for the tables, layout, chunk panel, and bloom probes.
 
-use std::{
-    path::PathBuf,
-    sync::{Arc, Mutex},
-};
+use std::sync::{Arc, Mutex};
 
 use serde::Serialize;
 use viewda_data_engine::{
-    StructureBloomProbe, StructureByteUnit, StructureCancellation, StructureChunkDetails,
-    StructureColumnPage, StructureColumnSort, StructureError, StructureKeyValue, StructureLayout,
-    StructureLensTotals, StructureLoadProgress, StructureLoadSnapshot, StructureReader,
-    StructureRowGroupPage, StructureRowGroupSort, StructureSortDirection, StructureSummary,
+    SourceSnapshot, StructureBloomProbe, StructureByteUnit, StructureCancellation,
+    StructureChunkDetails, StructureColumnPage, StructureColumnSort, StructureError,
+    StructureKeyValue, StructureLayout, StructureLensTotals, StructureLoadProgress,
+    StructureLoadSnapshot, StructureReader, StructureRowGroupPage, StructureRowGroupSort,
+    StructureSortDirection, StructureSummary,
 };
 
 use crate::{OpenedSource, OpenedSourceSession};
@@ -45,6 +42,7 @@ impl From<StructureError> for StructureCommandError {
         match error {
             StructureError::NotFound => Self::NotFound,
             StructureError::PermissionDenied => Self::PermissionDenied,
+            StructureError::SourceChanged => Self::SourceChanged,
             StructureError::NotParquet => Self::NotParquet,
             StructureError::CorruptFooter => Self::CorruptFooter,
             StructureError::Unsupported => Self::Unsupported,
@@ -153,17 +151,53 @@ fn structure_session(
     })
 }
 
-fn structure_source_path(
+fn map_session_error(error: viewda_data_engine::DataWindowError) -> StructureCommandError {
+    match error {
+        viewda_data_engine::DataWindowError::Cancelled => StructureCommandError::Cancelled,
+        _ => StructureCommandError::Unsupported,
+    }
+}
+
+enum StructureLoadRequest {
+    Cached(Arc<StructureReader>),
+    Start {
+        snapshot: Option<Arc<SourceSnapshot>>,
+        job: ActiveStructureJob,
+    },
+}
+
+fn register_structure_load(
     session: &OpenedSourceSession,
-) -> Result<Result<Arc<StructureReader>, PathBuf>, StructureCommandError> {
-    let state = session
-        .state
-        .lock()
-        .map_err(|_| StructureCommandError::Unsupported)?;
-    Ok(match &state.structure {
-        Some(structure) => Ok(Arc::clone(structure)),
-        None => Err(session.path.clone()),
-    })
+    generation: u64,
+) -> Result<StructureLoadRequest, StructureCommandError> {
+    // Closing takes the lifecycle lock before cancelling jobs. Registration
+    // under that lock is therefore either rejected or visible to cancellation.
+    session
+        .with_open_state(|state| match &state.structure {
+            Some(reader) => Ok(StructureLoadRequest::Cached(Arc::clone(reader))),
+            None => Ok(StructureLoadRequest::Start {
+                snapshot: state.source_snapshot.as_ref().map(Arc::clone),
+                job: StructureJobs::start(&session.structure_jobs.load, generation)?,
+            }),
+        })
+        .map_err(map_session_error)?
+}
+
+fn structure_reader_and_job(
+    session: &OpenedSourceSession,
+    generation: u64,
+) -> Result<(Arc<StructureReader>, ActiveStructureJob), StructureCommandError> {
+    session
+        .with_open_state(|state| {
+            let reader = state
+                .structure
+                .as_ref()
+                .map(Arc::clone)
+                .ok_or(StructureCommandError::NotLoaded)?;
+            let job = StructureJobs::start(&session.structure_jobs.probe, generation)?;
+            Ok((reader, job))
+        })
+        .map_err(map_session_error)?
 }
 
 fn structure_reader(
@@ -192,6 +226,7 @@ fn install_structure(
         .state
         .lock()
         .map_err(|_| StructureCommandError::Unsupported)?;
+    state.source_snapshot.take();
     Ok(Arc::clone(state.structure.insert(Arc::new(reader))))
 }
 
@@ -202,20 +237,17 @@ pub(crate) async fn get_structure_summary(
     opened_source: tauri::State<'_, OpenedSource>,
 ) -> Result<StructureSummary, StructureCommandError> {
     let session = structure_session(&opened_source, generation)?;
-    let _work = session.begin_work().map_err(|error| match error {
-        viewda_data_engine::DataWindowError::Cancelled => StructureCommandError::Cancelled,
-        _ => StructureCommandError::Unsupported,
-    })?;
-    let path = match structure_source_path(&session)? {
-        Ok(structure) => return Ok(structure.summary().clone()),
-        Err(path) => path,
+    let _work = session.begin_work().map_err(map_session_error)?;
+    let (snapshot, job) = match register_structure_load(&session, generation)? {
+        StructureLoadRequest::Cached(reader) => return Ok(reader.summary().clone()),
+        StructureLoadRequest::Start { snapshot, job } => (snapshot, job),
     };
-
-    let job = StructureJobs::start(&session.structure_jobs.load, generation)?;
     let progress = job.progress.clone();
     let cancellation = job.cancellation.clone();
     let result = tauri::async_runtime::spawn_blocking(move || {
-        StructureReader::open(path, &progress, &cancellation)
+        let snapshot = snapshot.ok_or(StructureCommandError::Unsupported)?;
+        StructureReader::from_snapshot(&snapshot, &progress, &cancellation)
+            .map_err(StructureCommandError::from)
     })
     .await;
     StructureJobs::finish(&session.structure_jobs.load, &job);
@@ -223,9 +255,7 @@ pub(crate) async fn get_structure_summary(
         return Err(StructureCommandError::Cancelled);
     }
 
-    let reader = result
-        .map_err(|_| StructureCommandError::Unsupported)?
-        .map_err(StructureCommandError::from)?;
+    let reader = result.map_err(|_| StructureCommandError::Unsupported)??;
     Ok(install_structure(&opened_source, generation, reader)?
         .summary()
         .clone())
@@ -238,15 +268,14 @@ pub(crate) fn get_structure_load_progress(
     opened_source: tauri::State<'_, OpenedSource>,
 ) -> Option<StructureLoadSnapshot> {
     let session = structure_session(&opened_source, generation).ok()?;
-    let snapshot = session
+    session
         .structure_jobs
         .load
         .lock()
         .ok()?
         .as_ref()
         .filter(|job| job.generation == generation)
-        .map(|job| job.progress.snapshot());
-    snapshot
+        .map(|job| job.progress.snapshot())
 }
 
 /// Interrupts the running footer parse for an opened-source generation.
@@ -279,11 +308,12 @@ pub(crate) async fn get_structure_layout(
     row_offset: usize,
     row_limit: usize,
     segment_limit: usize,
+    focused_column: Option<usize>,
     opened_source: tauri::State<'_, OpenedSource>,
 ) -> Result<StructureLayout, StructureCommandError> {
     let reader = structure_reader(&opened_source, generation)?;
     tauri::async_runtime::spawn_blocking(move || {
-        reader.layout(unit, row_offset, row_limit, segment_limit)
+        reader.layout(unit, row_offset, row_limit, segment_limit, focused_column)
     })
     .await
     .map_err(|_| StructureCommandError::Unsupported)
@@ -359,6 +389,21 @@ pub(crate) fn get_structure_row_offset(
     row_group_index: usize,
     opened_source: tauri::State<'_, OpenedSource>,
 ) -> Result<u64, StructureCommandError> {
+    {
+        let state = opened_source
+            .state
+            .lock()
+            .map_err(|_| StructureCommandError::Unsupported)?;
+        let session = state.session(generation).ok_or_else(|| {
+            state.missing_session(
+                StructureCommandError::NoSourceOpen,
+                StructureCommandError::SourceChanged,
+            )
+        })?;
+        session
+            .validate_source_identity()
+            .map_err(|_| StructureCommandError::SourceChanged)?;
+    }
     structure_reader(&opened_source, generation)?
         .first_row_offset(row_group_index)
         .map_err(StructureCommandError::from)
@@ -385,12 +430,8 @@ pub(crate) async fn probe_structure_bloom_filter(
     opened_source: tauri::State<'_, OpenedSource>,
 ) -> Result<StructureBloomProbe, StructureCommandError> {
     let session = structure_session(&opened_source, generation)?;
-    let _work = session.begin_work().map_err(|error| match error {
-        viewda_data_engine::DataWindowError::Cancelled => StructureCommandError::Cancelled,
-        _ => StructureCommandError::Unsupported,
-    })?;
-    let reader = structure_reader(&opened_source, generation)?;
-    let job = StructureJobs::start(&session.structure_jobs.probe, generation)?;
+    let _work = session.begin_work().map_err(map_session_error)?;
+    let (reader, job) = structure_reader_and_job(&session, generation)?;
     let cancellation = job.cancellation.clone();
     let result = tauri::async_runtime::spawn_blocking(move || {
         reader.probe_bloom_filter(column_index, &value, offset, limit, &cancellation)
@@ -419,14 +460,17 @@ pub(crate) fn cancel_structure_bloom_probe(
 
 #[cfg(test)]
 mod tests {
+    use std::{path::PathBuf, sync::Arc, thread};
+
     use viewda_data_engine::{
-        StructureBloomProbeOutcome, StructureBloomProbeResult, StructureChunkStatistics,
-        StructureCodecTotal, StructureColumnSummary, StructureKeyValueEntry, StructureLayoutRow,
-        StructureLayoutSegment, StructureLayoutTail, StructureLensTotal, StructurePresenceTotals,
-        StructureRatioStep, StructureRowGroupSummary,
+        SourceSummary, StructureBloomProbeOutcome, StructureBloomProbeResult,
+        StructureChunkStatistics, StructureCodecTotal, StructureColumnSummary,
+        StructureKeyValueEntry, StructureLayoutRow, StructureLayoutSegment, StructureLayoutTail,
+        StructureLensTotal, StructurePresenceTotals, StructureRatioStep, StructureRowGroupSummary,
     };
 
     use super::*;
+    use crate::SourceOpenIntent;
 
     #[test]
     fn command_errors_keep_stable_wire_codes() {
@@ -508,6 +552,7 @@ mod tests {
                 key: "pandas".to_owned(),
                 value_bytes: Some(4_096),
             }],
+            strings_truncated: false,
         };
 
         assert_eq!(
@@ -531,7 +576,8 @@ mod tests {
                 "keyValueCount": 3,
                 "keyValueMetadata": [
                     { "index": 0, "key": "pandas", "valueBytes": 4_096 }
-                ]
+                ],
+                "stringsTruncated": false
             })
         );
     }
@@ -565,7 +611,11 @@ mod tests {
                     },
                 },
             ],
-            unrated_chunk_count: 2,
+            unrated: StructureLensTotal {
+                chunk_count: 2,
+                compressed_bytes: 0,
+                uncompressed_bytes: 64,
+            },
             statistics: StructurePresenceTotals {
                 present: StructureLensTotal {
                     chunk_count: 4,
@@ -613,7 +663,11 @@ mod tests {
                         }
                     }
                 ],
-                "unratedChunkCount": 2,
+                "unrated": {
+                    "chunkCount": 2,
+                    "compressedBytes": 0,
+                    "uncompressedBytes": 64
+                },
                 "statistics": {
                     "present": {
                         "chunkCount": 4,
@@ -724,6 +778,7 @@ mod tests {
                 chunk_count: 12,
                 chunks_with_bloom_filter: 1,
                 is_readable: false,
+                has_layout_facts: true,
             }],
         };
         let columns = StructureColumnPage {
@@ -758,7 +813,8 @@ mod tests {
                     "compressionRatio": 3.0,
                     "chunkCount": 12,
                     "chunksWithBloomFilter": 1,
-                    "isReadable": false
+                    "isReadable": false,
+                    "hasLayoutFacts": true
                 }]
             })
         );
@@ -886,9 +942,16 @@ mod tests {
             serde_json::to_value(StructureLoadSnapshot {
                 completed_row_groups: 40,
                 total_row_groups: 96,
+                completed_chunks: 400,
+                total_chunks: 960,
             })
             .expect("serializable progress"),
-            serde_json::json!({ "completedRowGroups": 40, "totalRowGroups": 96 })
+            serde_json::json!({
+                "completedRowGroups": 40,
+                "totalRowGroups": 96,
+                "completedChunks": 400,
+                "totalChunks": 960
+            })
         );
         assert_eq!(
             serde_json::to_value(StructureKeyValue {
@@ -974,5 +1037,84 @@ mod tests {
 
         assert!(load.cancellation.is_cancelled());
         assert!(probe.cancellation.is_cancelled());
+    }
+
+    #[test]
+    fn source_close_cannot_miss_a_registering_structure_job() {
+        let opened_source = Arc::new(OpenedSource::default());
+        opened_source
+            .install(
+                None,
+                PathBuf::from("first.parquet"),
+                empty_source_summary("first.parquet"),
+                SourceOpenIntent::Explicit,
+            )
+            .expect("first source installs");
+        let session = opened_source
+            .state
+            .lock()
+            .expect("source state")
+            .session(1)
+            .expect("source session");
+        let load_slot = session
+            .structure_jobs
+            .load
+            .lock()
+            .expect("load registry locks");
+
+        let registering_session = Arc::clone(&session);
+        let registering = thread::spawn(move || register_structure_load(&registering_session, 1));
+        for _ in 0..10_000 {
+            if session.lifecycle.state.try_lock().is_err() {
+                break;
+            }
+            thread::yield_now();
+        }
+        assert!(
+            session.lifecycle.state.try_lock().is_err(),
+            "registration keeps the session lifecycle locked until its job is visible"
+        );
+
+        let closing_source = Arc::clone(&opened_source);
+        let closing = thread::spawn(move || closing_source.close(1));
+        drop(load_slot);
+
+        let request = registering
+            .join()
+            .expect("registration thread completes")
+            .expect("current generation registers");
+        closing
+            .join()
+            .expect("close thread completes")
+            .expect("source closes");
+        let StructureLoadRequest::Start { job, .. } = request else {
+            panic!("an unloaded source starts a job");
+        };
+        assert!(
+            job.cancellation.is_cancelled(),
+            "close observes and cancels the registered job"
+        );
+        assert!(
+            session
+                .structure_jobs
+                .load
+                .lock()
+                .expect("load registry")
+                .is_none()
+        );
+    }
+
+    fn empty_source_summary(display_name: &str) -> SourceSummary {
+        SourceSummary {
+            display_name: display_name.to_owned(),
+            size_bytes: 8,
+            row_count: 0,
+            row_group_count: 0,
+            column_count: 0,
+            schema: Vec::new(),
+            schema_node_count: 0,
+            schema_is_truncated: false,
+            strings_truncated: false,
+        }
     }
 }

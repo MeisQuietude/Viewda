@@ -30,7 +30,7 @@ use tempfile::TempDir;
 
 use crate::{
     filter::{DataFilter, build_filter_predicate_with_names, quote_identifier},
-    source::{inspect_local_source, open_local_source},
+    source::{inspect_local_source, inspect_local_source_for_query, open_local_source},
     window::{
         DataWindowError, MAX_WINDOW_ROWS, classify_query_error, set_utc_session_timezone,
         validate_projection,
@@ -288,7 +288,8 @@ impl DataViewBuilder {
 
     /// Builds one position index shared by counts and all subsequent windows.
     pub fn build(self) -> Result<PreparedDataView, DataViewError> {
-        let summary = inspect_local_source(&self.source_path).map_err(DataWindowError::from)?;
+        let summary =
+            inspect_local_source_for_query(&self.source_path).map_err(DataWindowError::from)?;
         self.require_active()?;
         validate_sort(&summary.schema, &self.sort)?;
 

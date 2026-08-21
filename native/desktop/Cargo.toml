@@ -45,4 +45,7 @@ objc2-foundation = { version = "=0.3.2", default-features = false, features = ["
 objc2-uniform-type-identifiers = { version = "=0.3.2", default-features = false, features = ["UTType", "std"] }
 
 [dev-dependencies]
+arrow-array = "=58.4.0"
+arrow-schema = "=58.4.0"
+parquet = "=58.4.0"
 tempfile = "=3.27.0"
