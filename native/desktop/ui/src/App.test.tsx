@@ -9,11 +9,15 @@ import {
 } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-import { App, formatFileSize } from "./App";
+import { App } from "./App";
 import * as desktop from "./desktop";
 
+const dataGridProps = vi.hoisted(() => vi.fn());
 vi.mock("./data-grid/DataGrid", () => ({
-  DataGrid: () => <section aria-label="Data">Grid data</section>,
+  DataGrid: (props: unknown) => {
+    dataGridProps(props);
+    return <section aria-label="Data">Grid data</section>;
+  },
 }));
 
 let requestSettings: (() => void) | undefined;
@@ -23,6 +27,26 @@ let reportUpdate: ((update: desktop.UpdateInfo) => void) | undefined;
 let reportOpenedSource: (() => void) | undefined;
 let requestDataExportClose:
   ((dialog: desktop.DataExportCloseDialog) => void) | undefined;
+const structureSummary: desktop.StructureSummary = {
+  compressedBytes: 1_200_000,
+  uncompressedBytes: 3_600_000,
+  compressionRatio: 3,
+  formatVersion: 2,
+  createdBy: "parquet-mr version 1.13.1",
+  rowCount: 1_234_567,
+  rowGroupCount: 12,
+  columnCount: 2,
+  rowsPerRowGroup: 102_880.58,
+  footerBytes: 4_096,
+  codecs: ["snappy", "zstd"],
+  chunkCount: 24,
+  chunksWithStatistics: 24,
+  chunksWithBloomFilter: 0,
+  unreadableRowGroupCount: 0,
+  keyValueCount: 0,
+  keyValueMetadata: [],
+};
+
 let systemDark = false;
 let themeChangeListeners = new Set<EventListener>();
 let listedSources: desktop.OpenedSourceEntry[] = [];
@@ -56,6 +80,7 @@ beforeEach(() => {
   reportUpdate = undefined;
   reportOpenedSource = undefined;
   requestDataExportClose = undefined;
+  dataGridProps.mockClear();
   systemDark = false;
   themeChangeListeners = new Set();
   listedSources = [];
@@ -77,6 +102,44 @@ beforeEach(() => {
     queryEngineVersion: "v1.5.5",
   });
   vi.spyOn(desktop, "getRecentSources").mockResolvedValue([]);
+  vi.spyOn(desktop, "getStructureSummary").mockResolvedValue(structureSummary);
+  vi.spyOn(desktop, "getStructureLoadProgress").mockResolvedValue(null);
+  vi.spyOn(desktop, "cancelStructureLoad").mockResolvedValue();
+  vi.spyOn(desktop, "getStructureLensTotals").mockResolvedValue({
+    codecs: [],
+    ratioSteps: [],
+    unratedChunkCount: 0,
+    statistics: {
+      present: { chunkCount: 0, compressedBytes: 0, uncompressedBytes: 0 },
+      absent: { chunkCount: 0, compressedBytes: 0, uncompressedBytes: 0 },
+    },
+    bloomFilters: {
+      present: { chunkCount: 0, compressedBytes: 0, uncompressedBytes: 0 },
+      absent: { chunkCount: 0, compressedBytes: 0, uncompressedBytes: 0 },
+    },
+  });
+  vi.spyOn(desktop, "getStructureLayout").mockResolvedValue({
+    offset: 0,
+    totalCount: 0,
+    maxCompressedBytes: 0,
+    maxUncompressedBytes: 0,
+    overview: [],
+    rows: [],
+  });
+  vi.spyOn(desktop, "getStructureRowOffset").mockResolvedValue(0);
+  vi.spyOn(desktop, "getStructureReport").mockResolvedValue("# report");
+  vi.spyOn(desktop, "getStructureRowGroups").mockResolvedValue({
+    offset: 0,
+    totalCount: 0,
+    rowGroups: [],
+  });
+  vi.spyOn(desktop, "getStructureColumns").mockResolvedValue({
+    offset: 0,
+    totalCount: 0,
+    totalCompressedBytes: 0,
+    totalUncompressedBytes: 0,
+    columns: [],
+  });
   vi.spyOn(desktop, "openRecentSource").mockRejectedValue(
     new desktop.OpenSourceError("unsupported"),
   );
@@ -404,26 +467,42 @@ describe("App", () => {
     );
 
     const facts = screen.getByLabelText("File facts");
+    expect(factLabels(facts)).toEqual([
+      "Rows",
+      "Row groups",
+      "Columns",
+      "Rows per group",
+      "File size",
+    ]);
     expect(
       Array.from(
-        facts.querySelectorAll("dt"),
+        facts.querySelectorAll(".fact-value"),
         ({ textContent }) => textContent,
       ),
-    ).toEqual(["Rows", "Row groups", "Fields", "Size"]);
-    const factValues = Array.from(facts.querySelectorAll("dd"));
-    expect(factValues.map(({ textContent }) => textContent)).toEqual([
-      "1,234,567",
-      "12",
-      "2",
-      "1.3 MB",
-    ]);
-    for (const value of factValues) {
-      expect(value).toHaveClass("fact-value");
-    }
+    ).toEqual(["1,234,567", "12", "2", "—", "1.3 MB"]);
     expect(within(facts).getByText("1.3 MB")).toHaveAttribute(
       "title",
       "1,300,000 bytes",
     );
+    await waitFor(() =>
+      expect(factLabels(facts)).toEqual([
+        "Rows",
+        "Row groups",
+        "Columns",
+        "Rows per group",
+        "File size",
+        "Stored chunks",
+        "Uncompressed chunks",
+        "Format",
+        "Footer",
+        "Codec",
+        "Statistics",
+        "Bloom filters",
+      ]),
+    );
+    expect(within(facts).getByText("≈ 102,881")).toHaveClass("fact-value");
+    expect(within(facts).getByText("snappy + zstd")).toHaveClass("fact-value");
+    expect(within(facts).getByText("24 of 24 chunks")).toBeInTheDocument();
 
     const schema = screen.getByRole("heading", {
       name: "Schema",
@@ -1555,6 +1634,223 @@ describe("App", () => {
     ).toHaveAttribute("aria-valuenow", "63");
   });
 
+  it("reads the structure only once the mode is first opened", async () => {
+    const summary = vi.mocked(desktop.getStructureSummary);
+    vi.spyOn(desktop, "openLocalSource").mockResolvedValue(sourceSummary());
+
+    render(<App />);
+    fireEvent.click(await readyOpenButton());
+    await screen.findByText("people.parquet");
+
+    expect(summary).not.toHaveBeenCalled();
+
+    fireEvent.click(screen.getByRole("button", { name: "Structure" }));
+    await waitFor(() => expect(summary).toHaveBeenCalledWith(1));
+
+    fireEvent.keyDown(window, { key: "1", ctrlKey: true });
+    fireEvent.keyDown(window, { key: "2", ctrlKey: true });
+    await waitFor(() =>
+      expect(
+        screen.getByRole("group", { name: "Byte unit" }),
+      ).toBeInTheDocument(),
+    );
+    expect(summary).toHaveBeenCalledTimes(1);
+  });
+
+  it("offers a retry after the structure read is cancelled", async () => {
+    vi.spyOn(desktop, "openLocalSource").mockResolvedValue(sourceSummary());
+    const summary = vi
+      .mocked(desktop.getStructureSummary)
+      .mockRejectedValueOnce(new desktop.StructureCommandError("cancelled"))
+      .mockResolvedValueOnce(structureSummary);
+
+    render(<App />);
+    fireEvent.click(await readyOpenButton());
+    await screen.findByText("people.parquet");
+    fireEvent.click(screen.getByRole("button", { name: "Structure" }));
+
+    const retry = await screen.findByRole("button", { name: "Read again" });
+    expect(
+      screen.getByText("Reading the structure was cancelled."),
+    ).toBeInTheDocument();
+
+    fireEvent.click(retry);
+
+    await waitFor(() =>
+      expect(
+        screen.getByRole("group", { name: "Byte unit" }),
+      ).toBeInTheDocument(),
+    );
+    expect(summary).toHaveBeenCalledTimes(2);
+  });
+
+  it("cancels a running structure read for the open source", async () => {
+    vi.spyOn(desktop, "openLocalSource").mockResolvedValue(sourceSummary());
+    vi.mocked(desktop.getStructureSummary).mockReturnValue(
+      new Promise(() => {}),
+    );
+
+    render(<App />);
+    fireEvent.click(await readyOpenButton());
+    await screen.findByText("people.parquet");
+    fireEvent.click(screen.getByRole("button", { name: "Structure" }));
+
+    fireEvent.click(await screen.findByRole("button", { name: "Cancel" }));
+
+    expect(desktop.cancelStructureLoad).toHaveBeenCalledWith(1);
+  });
+
+  it("applies the unit toggle to every table in the mode", async () => {
+    vi.spyOn(desktop, "openLocalSource").mockResolvedValue(sourceSummary());
+    vi.mocked(desktop.getStructureRowGroups).mockResolvedValue({
+      offset: 0,
+      totalCount: 1,
+      rowGroups: [
+        {
+          index: 0,
+          rowCount: 10,
+          compressedBytes: 100,
+          uncompressedBytes: 400,
+          compressionRatio: 4,
+          chunkCount: 2,
+          chunksWithBloomFilter: 0,
+          isReadable: true,
+        },
+      ],
+    });
+    vi.mocked(desktop.getStructureColumns).mockResolvedValue({
+      offset: 0,
+      totalCount: 1,
+      totalCompressedBytes: 100,
+      totalUncompressedBytes: 400,
+      columns: [
+        {
+          index: 0,
+          name: "id",
+          physicalType: "INT64",
+          logicalType: null,
+          compressedBytes: 100,
+          uncompressedBytes: 400,
+          compressionRatio: 4,
+          encodings: ["PLAIN"],
+          share: 1,
+          cumulativeShare: 1,
+        },
+      ],
+    });
+
+    render(<App />);
+    fireEvent.click(await readyOpenButton());
+    await screen.findByText("people.parquet");
+    fireEvent.click(screen.getByRole("button", { name: "Structure" }));
+
+    const toggle = await screen.findByRole("group", { name: "Byte unit" });
+    await waitFor(() =>
+      expect(desktop.getStructureRowGroups).toHaveBeenCalledWith(
+        1,
+        "compressed",
+        expect.anything(),
+        expect.anything(),
+        expect.anything(),
+        expect.anything(),
+      ),
+    );
+
+    fireEvent.click(
+      within(toggle).getByRole("button", { name: "Uncompressed" }),
+    );
+
+    await waitFor(() =>
+      expect(desktop.getStructureRowGroups).toHaveBeenLastCalledWith(
+        1,
+        "uncompressed",
+        expect.anything(),
+        expect.anything(),
+        expect.anything(),
+        expect.anything(),
+      ),
+    );
+    expect(desktop.getStructureColumns).toHaveBeenLastCalledWith(
+      1,
+      "uncompressed",
+      expect.anything(),
+      expect.anything(),
+      expect.anything(),
+      expect.anything(),
+    );
+  });
+
+  it("reissues navigation when the same row group opens in Data twice", async () => {
+    vi.spyOn(desktop, "openLocalSource").mockResolvedValue(sourceSummary());
+    vi.mocked(desktop.getStructureLayout).mockResolvedValue({
+      offset: 0,
+      totalCount: 1,
+      rows: [
+        {
+          index: 0,
+          compressedBytes: 100,
+          uncompressedBytes: 200,
+          isReadable: true,
+          segments: [],
+          tail: null,
+        },
+      ],
+      maxCompressedBytes: 100,
+      maxUncompressedBytes: 200,
+      overview: [],
+    });
+
+    render(<App />);
+    fireEvent.click(await readyOpenButton());
+    await screen.findByText("people.parquet");
+    fireEvent.click(screen.getByRole("button", { name: "Structure" }));
+    const row = await screen.findByRole("button", { name: "RG 0" });
+
+    fireEvent.doubleClick(row);
+    await waitFor(() =>
+      expect(dataGridProps).toHaveBeenLastCalledWith(
+        expect.objectContaining({ requestedRow: { row: 0, request: 1 } }),
+      ),
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Structure" }));
+    fireEvent.doubleClick(row);
+    await waitFor(() =>
+      expect(dataGridProps).toHaveBeenLastCalledWith(
+        expect.objectContaining({ requestedRow: { row: 0, request: 2 } }),
+      ),
+    );
+  });
+
+  it("captions a file that holds no row group instead of showing empty tables", async () => {
+    vi.spyOn(desktop, "openLocalSource").mockResolvedValue({
+      ...sourceSummary(),
+      rowCount: 0,
+      rowGroupCount: 0,
+    });
+    vi.mocked(desktop.getStructureSummary).mockResolvedValue({
+      ...structureSummary,
+      rowCount: 0,
+      rowGroupCount: 0,
+      rowsPerRowGroup: null,
+      chunkCount: 0,
+      chunksWithStatistics: 0,
+      chunksWithBloomFilter: 0,
+    });
+
+    render(<App />);
+    fireEvent.click(await readyOpenButton());
+    await screen.findByText("people.parquet");
+    fireEvent.click(screen.getByRole("button", { name: "Structure" }));
+
+    expect(await screen.findByText("No row groups")).toHaveClass(
+      "structure-empty",
+    );
+    expect(screen.queryByLabelText("Row groups")).not.toBeInTheDocument();
+    expect(screen.queryByLabelText("Columns")).not.toBeInTheDocument();
+    expect(screen.getByRole("heading", { name: "Schema" })).toBeInTheDocument();
+    expect(desktop.getStructureRowGroups).not.toHaveBeenCalled();
+  });
+
   it("explains why a Debian package cannot update itself", async () => {
     vi.spyOn(desktop, "getUpdateSettings").mockResolvedValue({
       channel: "stable",
@@ -1584,14 +1880,22 @@ describe("shortcutModifierFor", () => {
   });
 });
 
-describe("formatFileSize", () => {
-  it.each([
-    [999, "999 B"],
-    [1_000, "1.0 kB"],
-    [999_999, "1.0 MB"],
-    [1_300_000, "1.3 MB"],
-    [2_500_000_000, "2.5 GB"],
-  ])("formats %i bytes as %s", (bytes, expected) => {
-    expect(formatFileSize(bytes)).toBe(expected);
-  });
-});
+function sourceSummary(): desktop.SourceSummary {
+  return {
+    generation: 1,
+    displayName: "people.parquet",
+    sizeBytes: 1_300_000,
+    rowCount: 1_234_567,
+    rowGroupCount: 12,
+    schema: [
+      { name: "id", physicalType: "INT64", logicalType: null, children: [] },
+    ],
+  };
+}
+
+function factLabels(facts: HTMLElement): string[] {
+  return Array.from(
+    facts.querySelectorAll("dt"),
+    ({ textContent }) => textContent ?? "",
+  );
+}

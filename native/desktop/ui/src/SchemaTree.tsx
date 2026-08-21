@@ -6,11 +6,24 @@ export function SchemaTreeNode({
   field,
   selected = false,
   onSelect,
+  leafOffset = 0,
+  selectedLeaf,
+  onSelectLeaf,
 }: {
   field: SchemaField;
   selected?: boolean;
   onSelect?: () => void;
+  leafOffset?: number;
+  selectedLeaf?: number | null;
+  onSelectLeaf?: (columnIndex: number) => void;
 }) {
+  const isLeaf = field.children.length === 0;
+  const selectable =
+    onSelect ??
+    (isLeaf && onSelectLeaf !== undefined
+      ? () => onSelectLeaf(leafOffset)
+      : undefined);
+  const childOffsets = leafOffsets(field.children, leafOffset);
   const type = schemaType(field);
   const content = (
     <>
@@ -23,14 +36,14 @@ export function SchemaTreeNode({
 
   return (
     <li>
-      {onSelect === undefined ? (
+      {selectable === undefined ? (
         <div className="schema-field">{content}</div>
       ) : (
         <button
           className="schema-field"
           type="button"
-          aria-pressed={selected}
-          onClick={onSelect}
+          aria-pressed={selected || (isLeaf && selectedLeaf === leafOffset)}
+          onClick={selectable}
         >
           {content}
         </button>
@@ -38,12 +51,33 @@ export function SchemaTreeNode({
       {field.children.length > 0 && (
         <ul>
           {field.children.map((child, childIndex) => (
-            <SchemaTreeNode key={childIndex} field={child} />
+            <SchemaTreeNode
+              key={childIndex}
+              field={child}
+              leafOffset={childOffsets[childIndex] ?? leafOffset}
+              selectedLeaf={selectedLeaf}
+              onSelectLeaf={onSelectLeaf}
+            />
           ))}
         </ul>
       )}
     </li>
   );
+}
+
+function leafCount(field: SchemaField): number {
+  return field.children.length === 0
+    ? 1
+    : field.children.reduce((count, child) => count + leafCount(child), 0);
+}
+
+function leafOffsets(fields: readonly SchemaField[], start: number): number[] {
+  let offset = start;
+  return fields.map((field) => {
+    const current = offset;
+    offset += leafCount(field);
+    return current;
+  });
 }
 
 function schemaType(field: SchemaField): string {

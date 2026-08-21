@@ -5200,6 +5200,7 @@ dependencies = [
  "arrow-ipc",
  "arrow-schema",
  "arrow-select",
+ "bytes",
  "duckdb",
  "half",
  "parquet",

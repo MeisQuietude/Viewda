@@ -364,6 +364,16 @@ pub(crate) fn get_structure_row_offset(
         .map_err(StructureCommandError::from)
 }
 
+/// Builds the bounded, path-free Markdown digest copied from Structure mode.
+#[tauri::command]
+pub(crate) fn get_structure_report(
+    generation: u64,
+    unit: StructureByteUnit,
+    opened_source: tauri::State<'_, OpenedSource>,
+) -> Result<String, StructureCommandError> {
+    Ok(structure_reader(&opened_source, generation)?.report(env!("CARGO_PKG_VERSION"), unit))
+}
+
 /// Asks a bounded run of row groups whether their bloom filters admit a value.
 #[tauri::command]
 pub(crate) async fn probe_structure_bloom_filter(
@@ -637,6 +647,9 @@ mod tests {
         let layout = StructureLayout {
             offset: 2,
             total_count: 9,
+            max_compressed_bytes: 900,
+            max_uncompressed_bytes: 2_700,
+            overview: Vec::new(),
             rows: vec![StructureLayoutRow {
                 index: 2,
                 compressed_bytes: 500,
@@ -667,6 +680,9 @@ mod tests {
             serde_json::json!({
                 "offset": 2,
                 "totalCount": 9,
+                "maxCompressedBytes": 900,
+                "maxUncompressedBytes": 2_700,
+                "overview": [],
                 "rows": [{
                     "index": 2,
                     "compressedBytes": 500,
@@ -785,6 +801,8 @@ mod tests {
             data_page_offset: 4_120,
             dictionary_page_offset: Some(4_000),
             bloom_filter_bytes: Some(2_048),
+            has_bloom_filter: true,
+            column_has_bloom_filter: true,
             has_page_index: true,
             has_offset_index: false,
             statistics: Some(StructureChunkStatistics {
@@ -813,6 +831,8 @@ mod tests {
                 "dataPageOffset": 4_120,
                 "dictionaryPageOffset": 4_000,
                 "bloomFilterBytes": 2_048,
+                "hasBloomFilter": true,
+                "columnHasBloomFilter": true,
                 "hasPageIndex": true,
                 "hasOffsetIndex": false,
                 "statistics": {

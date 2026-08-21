@@ -261,7 +261,25 @@ export interface StructureLayoutRow {
 export interface StructureLayout {
   offset: number;
   totalCount: number;
+  maxCompressedBytes: number;
+  maxUncompressedBytes: number;
+  overview: StructureLayoutOverviewBucket[];
   rows: StructureLayoutRow[];
+}
+
+export interface StructureLayoutOverviewBucket {
+  rowStart: number;
+  rowEnd: number;
+  compressedBytes: number;
+  uncompressedBytes: number;
+  dominantRatioStepCompressed: number | null;
+  dominantRatioStepUncompressed: number | null;
+  dominantCodecCompressed: string | null;
+  dominantCodecUncompressed: string | null;
+  statisticsShareCompressed: number;
+  statisticsShareUncompressed: number;
+  hasBloomFilter: boolean;
+  hasReadableGroup: boolean;
 }
 
 export interface StructureRowGroupSummary {
@@ -327,6 +345,8 @@ export interface StructureChunkDetails {
   dataPageOffset: number;
   dictionaryPageOffset: number | null;
   bloomFilterBytes: number | null;
+  hasBloomFilter: boolean;
+  columnHasBloomFilter: boolean;
   hasPageIndex: boolean;
   hasOffsetIndex: boolean;
   statistics: StructureChunkStatistics | null;
@@ -951,6 +971,13 @@ export function getStructureRowOffset(
     generation,
     rowGroupIndex,
   });
+}
+
+export function getStructureReport(
+  generation: number,
+  unit: StructureByteUnit,
+): Promise<string> {
+  return invokeStructure<string>("get_structure_report", { generation, unit });
 }
 
 export function probeStructureBloomFilter(

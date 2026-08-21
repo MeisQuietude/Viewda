@@ -38,11 +38,11 @@ pub use structure::{
     StructureBloomProbe, StructureBloomProbeOutcome, StructureBloomProbeResult, StructureByteUnit,
     StructureCancellation, StructureChunkDetails, StructureChunkStatistics, StructureCodecTotal,
     StructureColumnPage, StructureColumnSort, StructureColumnSummary, StructureError,
-    StructureKeyValue, StructureKeyValueEntry, StructureLayout, StructureLayoutRow,
-    StructureLayoutSegment, StructureLayoutTail, StructureLensTotal, StructureLensTotals,
-    StructureLoadProgress, StructureLoadSnapshot, StructurePresenceTotals, StructureRatioStep,
-    StructureReader, StructureRowGroupPage, StructureRowGroupSort, StructureRowGroupSummary,
-    StructureSortDirection, StructureSummary,
+    StructureKeyValue, StructureKeyValueEntry, StructureLayout, StructureLayoutOverviewBucket,
+    StructureLayoutRow, StructureLayoutSegment, StructureLayoutTail, StructureLensTotal,
+    StructureLensTotals, StructureLoadProgress, StructureLoadSnapshot, StructurePresenceTotals,
+    StructureRatioStep, StructureReader, StructureRowGroupPage, StructureRowGroupSort,
+    StructureRowGroupSummary, StructureSortDirection, StructureSummary,
 };
 #[cfg(feature = "query-engine")]
 pub use suggestions::{

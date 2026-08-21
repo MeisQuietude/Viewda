@@ -8,6 +8,12 @@ Backward-incompatible entries start with **Breaking:**.
 
 ## Unreleased
 
+### Added
+
+- Inspect Parquet storage layout in Structure view with compression, codec,
+  statistics and bloom-filter lenses; sortable row-group and column tables;
+  chunk details and bloom probes; and a privacy-safe Markdown report.
+
 ## 0.2.0 — 2026-08-21
 
 ### Added

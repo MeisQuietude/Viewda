@@ -36,8 +36,9 @@ use serde::Serialize;
 use structure::{
     StructureJobs, cancel_structure_bloom_probe, cancel_structure_load, get_structure_chunk,
     get_structure_columns, get_structure_key_value, get_structure_layout,
-    get_structure_lens_totals, get_structure_load_progress, get_structure_row_groups,
-    get_structure_row_offset, get_structure_summary, probe_structure_bloom_filter,
+    get_structure_lens_totals, get_structure_load_progress, get_structure_report,
+    get_structure_row_groups, get_structure_row_offset, get_structure_summary,
+    probe_structure_bloom_filter,
 };
 use tauri::{
     Emitter, Manager,
@@ -2176,6 +2177,7 @@ pub fn run() {
             get_structure_chunk,
             get_structure_key_value,
             get_structure_row_offset,
+            get_structure_report,
             probe_structure_bloom_filter,
             cancel_structure_bloom_probe,
             get_update_settings,

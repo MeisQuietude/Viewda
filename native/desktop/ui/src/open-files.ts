@@ -10,6 +10,7 @@ export interface OpenFile extends OpenedSourceEntry {
   summary: SourceSummary;
   mode: SourceMode;
   busy: boolean;
+  dataTargetRow?: { row: number; request: number };
 }
 
 /**
@@ -35,6 +36,7 @@ export function mergeOpenFiles(
         summary,
         mode: kept?.mode ?? "data",
         busy: kept?.busy ?? false,
+        dataTargetRow: kept?.dataTargetRow,
       },
     ];
   });
@@ -58,7 +60,8 @@ function sameOpenFiles(
         file.active === other.active &&
         file.summary === other.summary &&
         file.mode === other.mode &&
-        file.busy === other.busy
+        file.busy === other.busy &&
+        file.dataTargetRow === other.dataTargetRow
       );
     })
   );

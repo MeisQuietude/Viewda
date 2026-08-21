@@ -457,12 +457,14 @@ function ViewErrorAlert({
 
 export function DataGrid({
   source,
+  requestedRow = null,
   viewSettings = DEFAULT_DATA_VIEW_SETTINGS,
   diagnostics = gridDiagnosticsNoopSink,
   active = true,
   onOperationChange,
 }: {
   source: SourceSummary;
+  requestedRow?: { row: number; request: number } | null;
   viewSettings?: DataViewSettings;
   diagnostics?: GridDiagnosticsSink;
   active?: boolean;
@@ -524,6 +526,17 @@ export function DataGrid({
   >(null);
   const [schemaFocusRequest, setSchemaFocusRequest] = useState(0);
   const gridRef = useRef<ViewdaGridHandle>(null);
+  const appliedRequestedRow = useRef<number | null>(null);
+  useEffect(() => {
+    if (
+      requestedRow === null ||
+      appliedRequestedRow.current === requestedRow.request
+    ) {
+      return;
+    }
+    appliedRequestedRow.current = requestedRow.request;
+    gridRef.current?.scrollToRow(requestedRow.row);
+  }, [requestedRow]);
   const schemaFocusColumnRef = useRef<number | null>(null);
   const visibleColumnStatesRef = useRef<readonly ColumnState[]>([]);
   // The display cache holds one row window and one column supplement. The row

@@ -17,6 +17,8 @@ use serde::Serialize;
 use thiserror::Error;
 
 const PARQUET_MAGIC: &[u8; 4] = b"PAR1";
+/// Schema nodes handed to the UI when a source opens.
+const MAX_SOURCE_SCHEMA_NODES: usize = 10_000;
 
 /// A path-free description of an inspected local Parquet source.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -79,12 +81,13 @@ pub fn inspect_local_source(path: &Path) -> Result<SourceSummary, SourceError> {
     let file_metadata = parquet_metadata.file_metadata();
     let row_count =
         u64::try_from(file_metadata.num_rows()).map_err(|_| SourceError::CorruptFooter)?;
+    let mut remaining_schema_nodes = MAX_SOURCE_SCHEMA_NODES;
     let schema = file_metadata
         .schema_descr()
         .root_schema()
         .get_fields()
         .iter()
-        .map(|field| schema_field(field))
+        .filter_map(|field| schema_field_bounded(field, &mut remaining_schema_nodes))
         .collect();
     let display_name = path
         .file_name()
@@ -150,7 +153,8 @@ pub(crate) fn map_parquet_error(error: ParquetError) -> SourceError {
     }
 }
 
-fn schema_field(field: &Type) -> SchemaField {
+fn schema_field_bounded(field: &Type, remaining: &mut usize) -> Option<SchemaField> {
+    *remaining = remaining.checked_sub(1)?;
     let basic = field.get_basic_info();
     let logical_type = basic
         .logical_type_ref()
@@ -158,21 +162,21 @@ fn schema_field(field: &Type) -> SchemaField {
         .or_else(|| converted_type_name(field, basic.converted_type()));
 
     match field {
-        Type::PrimitiveType { physical_type, .. } => SchemaField {
+        Type::PrimitiveType { physical_type, .. } => Some(SchemaField {
             name: field.name().to_owned(),
             physical_type: physical_type_name(physical_type).to_owned(),
             logical_type,
             children: Vec::new(),
-        },
-        Type::GroupType { fields, .. } => SchemaField {
+        }),
+        Type::GroupType { fields, .. } => Some(SchemaField {
             name: field.name().to_owned(),
             physical_type: "GROUP".to_owned(),
             logical_type,
             children: fields
                 .iter()
-                .map(|child| schema_field(child))
+                .filter_map(|child| schema_field_bounded(child, remaining))
                 .collect::<Vec<_>>(),
-        },
+        }),
     }
 }
 
@@ -319,6 +323,38 @@ mod tests {
     use tempfile::NamedTempFile;
 
     use super::*;
+
+    #[test]
+    fn bounds_schema_nodes_before_the_summary_crosses_the_ui_boundary() {
+        let children = (0..4)
+            .map(|index| {
+                Arc::new(
+                    Type::primitive_type_builder(
+                        match index {
+                            0 => "column_0",
+                            1 => "column_1",
+                            2 => "column_2",
+                            _ => "column_3",
+                        },
+                        ParquetPhysicalType::INT64,
+                    )
+                    .with_repetition(parquet::basic::Repetition::OPTIONAL)
+                    .build()
+                    .expect("field"),
+                )
+            })
+            .collect();
+        let group = Type::group_type_builder("record")
+            .with_fields(children)
+            .build()
+            .expect("group");
+        let mut remaining = 3;
+
+        let bounded = schema_field_bounded(&group, &mut remaining).expect("root fits");
+
+        assert_eq!(bounded.children.len(), 2);
+        assert_eq!(remaining, 0);
+    }
 
     #[test]
     fn inspects_basic_parquet_metadata_without_returning_a_path() {

@@ -23,6 +23,7 @@ import {
   getDataViewSettings,
   getEngineStatus,
   getRecentSources,
+  getStructureRowOffset,
   getUpdateSettings,
   installPendingUpdate,
   listOpenedSources,
@@ -55,6 +56,7 @@ import {
   type OpenedSourceEntry,
   type RecentSource,
   type SourceErrorCode,
+  type StructureByteUnit,
   type SourceSummary,
   type UpdateChannel,
   type UpdateInfo,
@@ -72,6 +74,17 @@ import { SchemaTreeNode } from "./SchemaTree";
 import { FileContextMenu, FileSwitcher } from "./FileSwitcher";
 import { GridPerformanceDebug } from "./data-grid/GridPerformanceDebug";
 import type { GridDiagnosticsSink } from "./data-grid/diagnostics/session";
+import {
+  StructureCard,
+  StructureLoadStatus,
+  StructureUnitToggle,
+} from "./structure/StructureCard";
+import { KeyValueMetadata } from "./structure/KeyValueMetadata";
+import { CopyStructureReport } from "./structure/CopyStructureReport";
+import { ColumnTable, RowGroupTable } from "./structure/StructureTables";
+import { StructureLayoutView } from "./structure/StructureLayout";
+import { formatNumber } from "./structure/format";
+import { useStructureSummary } from "./structure/use-structure-summary";
 import {
   applyDocumentTheme,
   SYSTEM_THEME_QUERY,
@@ -371,6 +384,23 @@ export function App({
   const setActiveMode = useCallback((mode: SourceMode) => {
     setOpenFiles((files) =>
       files.map((file) => (file.active ? { ...file, mode } : file)),
+    );
+  }, []);
+
+  const openDataForFile = useCallback((generation: number, row: number) => {
+    setOpenFiles((files) =>
+      files.map((file) =>
+        file.generation === generation
+          ? {
+              ...file,
+              mode: "data",
+              dataTargetRow: {
+                row,
+                request: (file.dataTargetRow?.request ?? 0) + 1,
+              },
+            }
+          : file,
+      ),
     );
   }, []);
 
@@ -1156,10 +1186,14 @@ export function App({
                     hidden={!file.active || file.mode !== "structure"}
                   >
                     <SourceDetails
+                      active={file.active && file.mode === "structure"}
                       opening={opening}
                       source={file.summary}
                       sourceError={file.active ? sourceError : null}
                       onOpen={openSource}
+                      onOpenData={(row) =>
+                        openDataForFile(file.generation, row)
+                      }
                     />
                   </div>
                 </Fragment>
@@ -1238,6 +1272,7 @@ function OpenFileDataGrid({
     >
       <DataGrid
         source={file.summary}
+        requestedRow={file.dataTargetRow ?? null}
         viewSettings={viewSettings}
         diagnostics={diagnostics}
         active={file.active}
@@ -1948,64 +1983,141 @@ function ShortcutHints({ modifier }: { modifier: string }) {
 }
 
 function SourceDetails({
+  active,
   opening,
   source,
   sourceError,
   onOpen,
+  onOpenData,
 }: {
+  active: boolean;
   opening: boolean;
   source: SourceSummary;
   sourceError: SourceErrorCode | null;
   onOpen: () => Promise<void>;
+  onOpenData: (row: number) => void;
 }) {
+  const { state, cancel, retry } = useStructureSummary(
+    source.generation,
+    active,
+  );
+  const [unit, setUnit] = useState<StructureByteUnit>("compressed");
+  const [highlightedColumn, setHighlightedColumn] = useState<number | null>(
+    null,
+  );
+  const [dataBridgeError, setDataBridgeError] = useState<string | null>(null);
+  const leafOffsets = schemaLeafOffsets(source.schema);
+  const summary = state.kind === "ready" ? state.summary : null;
+
   return (
     <section className="source-view" aria-label="Parquet source">
       <div className="source-heading">
+        {summary !== null && (
+          <>
+            <StructureUnitToggle unit={unit} onUnit={setUnit} />
+            <CopyStructureReport generation={source.generation} unit={unit} />
+          </>
+        )}
         <OpenButton opening={opening} onOpen={onOpen} />
       </div>
 
-      <dl className="source-facts" aria-label="File facts">
-        <Fact label="Rows" value={formatNumber(source.rowCount)} />
-        <Fact label="Row groups" value={formatNumber(source.rowGroupCount)} />
-        <Fact label="Fields" value={formatNumber(source.schema.length)} />
-        <Fact
-          label="Size"
-          value={formatFileSize(source.sizeBytes)}
-          title={`${formatNumber(source.sizeBytes)} bytes`}
-        />
-      </dl>
+      <StructureCard source={source} summary={summary} />
+      <StructureLoadStatus state={state} onCancel={cancel} onRetry={retry} />
 
       {sourceError !== null && <SourceErrorMessage code={sourceError} />}
+
+      {summary !== null && (
+        <>
+          <KeyValueMetadata generation={source.generation} summary={summary} />
+          {summary.rowGroupCount === 0 ? (
+            <p className="structure-empty">No row groups</p>
+          ) : (
+            <>
+              <StructureLayoutView
+                generation={source.generation}
+                unit={unit}
+                rowGroupCount={summary.rowGroupCount}
+                highlightedColumn={highlightedColumn}
+                onHighlightColumn={setHighlightedColumn}
+                onOpenRow={(rowGroupIndex) => {
+                  setDataBridgeError(null);
+                  void getStructureRowOffset(
+                    source.generation,
+                    rowGroupIndex,
+                  ).then(onOpenData, () => {
+                    setDataBridgeError(
+                      "This row group could not be located in Data.",
+                    );
+                  });
+                }}
+              />
+              {dataBridgeError !== null && (
+                <p className="structure-status-error" role="alert">
+                  {dataBridgeError}
+                </p>
+              )}
+              <RowGroupTable
+                generation={source.generation}
+                unit={unit}
+                rowGroupCount={summary.rowGroupCount}
+              />
+              <ColumnTable
+                generation={source.generation}
+                unit={unit}
+                columnCount={summary.columnCount}
+              />
+            </>
+          )}
+        </>
+      )}
 
       <div className="schema-card">
         <h2>Schema</h2>
         <ul className="schema-tree">
           {source.schema.map((field, fieldIndex) => (
-            <SchemaTreeNode key={fieldIndex} field={field} />
+            <SchemaTreeNode
+              key={fieldIndex}
+              field={field}
+              leafOffset={leafOffsets[fieldIndex] ?? 0}
+              selectedLeaf={highlightedColumn}
+              onSelectLeaf={setHighlightedColumn}
+            />
           ))}
         </ul>
+        {summary !== null &&
+          summary.columnCount > schemaLeafCountForFields(source.schema) && (
+            <p className="structure-truncation">
+              {formatNumber(
+                summary.columnCount - schemaLeafCountForFields(source.schema),
+              )}{" "}
+              further columns are not rendered in the schema tree.
+            </p>
+          )}
       </div>
     </section>
   );
 }
 
-function Fact({
-  label,
-  value,
-  title,
-}: {
-  label: string;
-  value: string;
-  title?: string;
-}) {
-  return (
-    <div>
-      <dt>{label}</dt>
-      <dd className="fact-value" title={title}>
-        {value}
-      </dd>
-    </div>
-  );
+function schemaLeafCount(field: SourceSummary["schema"][number]): number {
+  return field.children.length === 0
+    ? 1
+    : field.children.reduce(
+        (count, child) => count + schemaLeafCount(child),
+        0,
+      );
+}
+
+function schemaLeafOffsets(schema: SourceSummary["schema"]): number[] {
+  let offset = 0;
+  return schema.map((field) => {
+    const current = offset;
+    offset += schemaLeafCount(field);
+    return current;
+  });
+}
+
+function schemaLeafCountForFields(schema: SourceSummary["schema"]): number {
+  return schema.reduce((count, field) => count + schemaLeafCount(field), 0);
 }
 
 function SourceErrorMessage({ code }: { code: SourceErrorCode }) {
@@ -2024,29 +2136,4 @@ function SourceErrorMessage({ code }: { code: SourceErrorCode }) {
       {messages[code]}
     </p>
   );
-}
-
-function formatNumber(value: number): string {
-  return new Intl.NumberFormat("en-US").format(value);
-}
-
-export function formatFileSize(bytes: number): string {
-  const units = ["B", "kB", "MB", "GB", "TB"];
-  if (bytes < 1_000) {
-    return `${bytes} B`;
-  }
-
-  let value = bytes;
-  let unit = 0;
-  while (value >= 1_000 && unit < units.length - 1) {
-    value /= 1_000;
-    unit += 1;
-  }
-
-  if (value >= 999.95 && unit < units.length - 1) {
-    value /= 1_000;
-    unit += 1;
-  }
-
-  return `${value.toFixed(1)} ${units[unit]}`;
 }

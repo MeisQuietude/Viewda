@@ -9,10 +9,13 @@
 use std::{
     cmp::Reverse,
     collections::BinaryHeap,
+    fmt::Write,
+    fs::File,
+    io::Cursor,
     path::PathBuf,
     sync::{
         Arc,
-        atomic::{AtomicBool, AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     },
 };
 
@@ -24,6 +27,7 @@ use parquet::{
     file::{
         FOOTER_SIZE,
         metadata::{ColumnChunkMetaData, ParquetMetaData, ParquetMetaDataReader, RowGroupMetaData},
+        reader::{ChunkReader, Length},
         statistics::Statistics,
     },
 };
@@ -43,12 +47,22 @@ const MAX_KEY_VALUE_BYTES: usize = 1 << 20;
 const MAX_LAYOUT_ROWS: usize = 256;
 /// Named segments per layout row; everything below them collapses into the tail.
 const MAX_LAYOUT_SEGMENTS: usize = 32;
+/// Minimap buckets returned with any layout window.
+const MAX_LAYOUT_OVERVIEW_BUCKETS: usize = 256;
 /// Rows returned by one row-group or column page.
 const MAX_PAGE_SIZE: usize = 1_000;
 /// Bloom filters read by one probe request.
 const MAX_PROBE_ROW_GROUPS: usize = 256;
+/// Largest bloom-filter byte range one probe may read from a chunk.
+const MAX_BLOOM_PROBE_BYTES: usize = 16 << 20;
 /// Characters kept from one rendered statistics value.
 const MAX_STATISTIC_CHARACTERS: usize = 128;
+/// Rows from either detail table included in a copied report.
+const MAX_REPORT_TABLE_ROWS: usize = 256;
+/// UTF-8 bytes retained from any footer-controlled report field before escaping.
+const MAX_REPORT_FIELD_BYTES: usize = 128;
+/// Hard upper bound for the copied Markdown report.
+const MAX_REPORT_BYTES: usize = 256 << 10;
 /// Upper compression-ratio bound of each lens step. The final step is unbounded.
 const RATIO_STEP_BOUNDS: [f64; 4] = [1.1, 2.0, 4.0, 10.0];
 
@@ -286,10 +300,24 @@ pub struct StructureLensTotal {
 }
 
 impl StructureLensTotal {
-    fn add(&mut self, compressed_bytes: u64, uncompressed_bytes: u64) {
-        self.chunk_count += 1;
-        self.compressed_bytes += compressed_bytes;
-        self.uncompressed_bytes += uncompressed_bytes;
+    fn add(
+        &mut self,
+        compressed_bytes: u64,
+        uncompressed_bytes: u64,
+    ) -> Result<(), StructureError> {
+        self.chunk_count = self
+            .chunk_count
+            .checked_add(1)
+            .ok_or(StructureError::CorruptFooter)?;
+        self.compressed_bytes = self
+            .compressed_bytes
+            .checked_add(compressed_bytes)
+            .ok_or(StructureError::CorruptFooter)?;
+        self.uncompressed_bytes = self
+            .uncompressed_bytes
+            .checked_add(uncompressed_bytes)
+            .ok_or(StructureError::CorruptFooter)?;
+        Ok(())
     }
 }
 
@@ -403,8 +431,32 @@ pub struct StructureLayout {
     pub offset: usize,
     /// Rows available in the source.
     pub total_count: usize,
+    /// Largest readable row group in stored bytes, for stable width normalization.
+    pub max_compressed_bytes: u64,
+    /// Largest readable row group in uncompressed bytes.
+    pub max_uncompressed_bytes: u64,
+    /// Bounded whole-file overview for the minimap.
+    pub overview: Vec<StructureLayoutOverviewBucket>,
     /// Returned rows in file order.
     pub rows: Vec<StructureLayoutRow>,
+}
+
+/// One bounded whole-file minimap bucket.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StructureLayoutOverviewBucket {
+    pub row_start: usize,
+    pub row_end: usize,
+    pub compressed_bytes: u64,
+    pub uncompressed_bytes: u64,
+    pub dominant_ratio_step_compressed: Option<usize>,
+    pub dominant_ratio_step_uncompressed: Option<usize>,
+    pub dominant_codec_compressed: Option<String>,
+    pub dominant_codec_uncompressed: Option<String>,
+    pub statistics_share_compressed: f64,
+    pub statistics_share_uncompressed: f64,
+    pub has_bloom_filter: bool,
+    pub has_readable_group: bool,
 }
 
 /// One row of the row-group table.
@@ -534,6 +586,10 @@ pub struct StructureChunkDetails {
     pub dictionary_page_offset: Option<u64>,
     /// Bloom-filter size in bytes, absent when the chunk carries no filter.
     pub bloom_filter_bytes: Option<u64>,
+    /// Whether this chunk records a bloom filter, even when its size is absent.
+    pub has_bloom_filter: bool,
+    /// Whether any row group records a bloom filter for this column.
+    pub column_has_bloom_filter: bool,
     /// Whether the chunk carries a page index.
     pub has_page_index: bool,
     /// Whether the chunk carries an offset index.
@@ -587,7 +643,7 @@ struct RowGroupFacts {
     chunk_count: usize,
     chunks_with_bloom_filter: u64,
     is_readable: bool,
-    first_row_offset: u64,
+    first_row_offset: Option<u64>,
 }
 
 struct ColumnFacts {
@@ -612,6 +668,9 @@ pub struct StructureReader {
     lens_totals: StructureLensTotals,
     row_groups: Vec<RowGroupFacts>,
     columns: Vec<ColumnFacts>,
+    max_compressed_row_group_bytes: u64,
+    max_uncompressed_row_group_bytes: u64,
+    layout_overview: Vec<StructureLayoutOverviewBucket>,
 }
 
 impl StructureReader {
@@ -687,7 +746,13 @@ impl StructureReader {
         let mut chunks_with_statistics = 0_u64;
         let mut chunks_with_bloom_filter = 0_u64;
         let mut unreadable_row_group_count = 0_usize;
-        let mut first_row_offset = 0_u64;
+        let mut max_compressed_row_group_bytes = 0_u64;
+        let mut max_uncompressed_row_group_bytes = 0_u64;
+        let mut first_row_offset = Some(0_u64);
+        let mut overview = vec![
+            LayoutOverviewAccumulator::default();
+            row_group_count.min(MAX_LAYOUT_OVERVIEW_BUCKETS)
+        ];
 
         for (index, row_group) in metadata.row_groups().iter().enumerate() {
             cancellation.check()?;
@@ -698,36 +763,71 @@ impl StructureReader {
             let mut row_group_blooms = 0_u64;
 
             if is_readable {
+                if !overview.is_empty() {
+                    let bucket = index * overview.len() / row_group_count;
+                    overview[bucket].has_readable_group = true;
+                }
                 for (column_index, chunk) in row_group.columns().iter().enumerate() {
+                    cancellation.check()?;
                     let chunk_compressed = u64::try_from(chunk.compressed_size()).unwrap_or(0);
                     let chunk_uncompressed = u64::try_from(chunk.uncompressed_size()).unwrap_or(0);
-                    row_group_compressed += chunk_compressed;
-                    row_group_uncompressed += chunk_uncompressed;
+                    row_group_compressed = row_group_compressed
+                        .checked_add(chunk_compressed)
+                        .ok_or(StructureError::CorruptFooter)?;
+                    row_group_uncompressed = row_group_uncompressed
+                        .checked_add(chunk_uncompressed)
+                        .ok_or(StructureError::CorruptFooter)?;
                     let has_statistics = chunk.statistics().is_some();
                     let has_bloom_filter = chunk.bloom_filter_offset().is_some();
                     if has_statistics {
-                        chunks_with_statistics += 1;
+                        chunks_with_statistics = chunks_with_statistics
+                            .checked_add(1)
+                            .ok_or(StructureError::CorruptFooter)?;
                     }
                     if has_bloom_filter {
-                        row_group_blooms += 1;
+                        row_group_blooms = row_group_blooms
+                            .checked_add(1)
+                            .ok_or(StructureError::CorruptFooter)?;
                     }
-                    chunk_count += 1;
+                    chunk_count = chunk_count
+                        .checked_add(1)
+                        .ok_or(StructureError::CorruptFooter)?;
                     codecs |= codec_bit(chunk.compression());
-                    lens.add(chunk, chunk_compressed, chunk_uncompressed);
+                    lens.add(chunk, chunk_compressed, chunk_uncompressed)?;
+                    if !overview.is_empty() {
+                        let bucket = index * overview.len() / row_group_count;
+                        overview[bucket].add(chunk, chunk_compressed, chunk_uncompressed)?;
+                    }
 
                     let facts = &mut columns[column_index];
-                    facts.compressed_bytes += chunk_compressed;
-                    facts.uncompressed_bytes += chunk_uncompressed;
+                    facts.compressed_bytes = facts
+                        .compressed_bytes
+                        .checked_add(chunk_compressed)
+                        .ok_or(StructureError::CorruptFooter)?;
+                    facts.uncompressed_bytes = facts
+                        .uncompressed_bytes
+                        .checked_add(chunk_uncompressed)
+                        .ok_or(StructureError::CorruptFooter)?;
                     for encoding in chunk.encodings() {
                         facts.encodings |= encoding_bit(encoding);
                     }
                 }
-                compressed_bytes += row_group_compressed;
-                uncompressed_bytes += row_group_uncompressed;
-                chunks_with_bloom_filter += row_group_blooms;
+                compressed_bytes = compressed_bytes
+                    .checked_add(row_group_compressed)
+                    .ok_or(StructureError::CorruptFooter)?;
+                uncompressed_bytes = uncompressed_bytes
+                    .checked_add(row_group_uncompressed)
+                    .ok_or(StructureError::CorruptFooter)?;
+                chunks_with_bloom_filter = chunks_with_bloom_filter
+                    .checked_add(row_group_blooms)
+                    .ok_or(StructureError::CorruptFooter)?;
             } else {
                 unreadable_row_group_count += 1;
             }
+            max_compressed_row_group_bytes =
+                max_compressed_row_group_bytes.max(row_group_compressed);
+            max_uncompressed_row_group_bytes =
+                max_uncompressed_row_group_bytes.max(row_group_uncompressed);
 
             row_groups.push(RowGroupFacts {
                 row_count: row_group_rows,
@@ -738,7 +838,11 @@ impl StructureReader {
                 is_readable,
                 first_row_offset,
             });
-            first_row_offset = first_row_offset.saturating_add(row_group_rows);
+            first_row_offset = if row_group.num_rows() < 0 {
+                None
+            } else {
+                first_row_offset.and_then(|offset| offset.checked_add(row_group_rows))
+            };
             progress.completed_row_groups.store(
                 u64::try_from(index + 1).unwrap_or(u64::MAX),
                 Ordering::Release,
@@ -800,6 +904,19 @@ impl StructureReader {
             summary,
             row_groups,
             columns,
+            max_compressed_row_group_bytes,
+            max_uncompressed_row_group_bytes,
+            layout_overview: overview
+                .into_iter()
+                .enumerate()
+                .map(|(bucket, facts)| {
+                    facts.finish(
+                        bucket,
+                        row_group_count.min(MAX_LAYOUT_OVERVIEW_BUCKETS),
+                        row_group_count,
+                    )
+                })
+                .collect(),
             metadata,
         })
     }
@@ -843,10 +960,14 @@ impl StructureReader {
 
     /// Returns the zero-based source row at which a row group starts.
     pub fn first_row_offset(&self, row_group_index: usize) -> Result<u64, StructureError> {
-        self.row_groups
+        let facts = self
+            .row_groups
             .get(row_group_index)
-            .map(|facts| facts.first_row_offset)
-            .ok_or(StructureError::UnknownRowGroup)
+            .ok_or(StructureError::UnknownRowGroup)?;
+        if !facts.is_readable {
+            return Err(StructureError::CorruptFooter);
+        }
+        facts.first_row_offset.ok_or(StructureError::CorruptFooter)
     }
 
     /// Returns a bounded window of layout rows in file order.
@@ -870,10 +991,14 @@ impl StructureReader {
         StructureLayout {
             offset: offset.min(self.row_groups.len()),
             total_count: self.row_groups.len(),
+            max_compressed_bytes: self.max_compressed_row_group_bytes,
+            max_uncompressed_bytes: self.max_uncompressed_row_group_bytes,
+            overview: self.layout_overview.clone(),
             rows,
         }
     }
 
+    /// Marks bounded minimap buckets that contain bytes for one leaf column.
     fn layout_row(
         &self,
         index: usize,
@@ -965,10 +1090,36 @@ impl StructureReader {
     ) -> StructureRowGroupPage {
         let mut order = (0..self.row_groups.len()).collect::<Vec<_>>();
         order.sort_by(|left, right| {
-            let ordering = self
-                .row_group_sort_key(*left, unit, sort)
-                .partial_cmp(&self.row_group_sort_key(*right, unit, sort))
-                .unwrap_or(std::cmp::Ordering::Equal);
+            let left_facts = &self.row_groups[*left];
+            let right_facts = &self.row_groups[*right];
+            let ordering = match sort {
+                StructureRowGroupSort::Index => left.cmp(right),
+                StructureRowGroupSort::RowCount => left_facts.row_count.cmp(&right_facts.row_count),
+                StructureRowGroupSort::Bytes => structure_bytes(
+                    left_facts.compressed_bytes,
+                    left_facts.uncompressed_bytes,
+                    unit,
+                )
+                .cmp(&structure_bytes(
+                    right_facts.compressed_bytes,
+                    right_facts.uncompressed_bytes,
+                    unit,
+                )),
+                StructureRowGroupSort::CompressionRatio => {
+                    compression_ratio(left_facts.compressed_bytes, left_facts.uncompressed_bytes)
+                        .unwrap_or(0.0)
+                        .total_cmp(
+                            &compression_ratio(
+                                right_facts.compressed_bytes,
+                                right_facts.uncompressed_bytes,
+                            )
+                            .unwrap_or(0.0),
+                        )
+                }
+                StructureRowGroupSort::BloomFilters => left_facts
+                    .chunks_with_bloom_filter
+                    .cmp(&right_facts.chunks_with_bloom_filter),
+            };
             direction_ordering(ordering, direction).then_with(|| left.cmp(right))
         });
 
@@ -980,27 +1131,6 @@ impl StructureReader {
                 .iter()
                 .map(|index| self.row_group_summary(*index))
                 .collect(),
-        }
-    }
-
-    fn row_group_sort_key(
-        &self,
-        index: usize,
-        unit: StructureByteUnit,
-        sort: StructureRowGroupSort,
-    ) -> f64 {
-        let facts = &self.row_groups[index];
-        match sort {
-            StructureRowGroupSort::Index => index as f64,
-            StructureRowGroupSort::RowCount => facts.row_count as f64,
-            StructureRowGroupSort::Bytes => match unit {
-                StructureByteUnit::Compressed => facts.compressed_bytes as f64,
-                StructureByteUnit::Uncompressed => facts.uncompressed_bytes as f64,
-            },
-            StructureRowGroupSort::CompressionRatio => {
-                compression_ratio(facts.compressed_bytes, facts.uncompressed_bytes).unwrap_or(0.0)
-            }
-            StructureRowGroupSort::BloomFilters => facts.chunks_with_bloom_filter as f64,
         }
     }
 
@@ -1034,10 +1164,33 @@ impl StructureReader {
                 direction_ordering(ordering, direction).then_with(|| left.cmp(right))
             }),
             _ => order.sort_by(|left, right| {
-                let ordering = self
-                    .column_sort_key(*left, unit, sort)
-                    .partial_cmp(&self.column_sort_key(*right, unit, sort))
-                    .unwrap_or(std::cmp::Ordering::Equal);
+                let left_facts = &self.columns[*left];
+                let right_facts = &self.columns[*right];
+                let ordering = match sort {
+                    StructureColumnSort::Name => std::cmp::Ordering::Equal,
+                    StructureColumnSort::Bytes => structure_bytes(
+                        left_facts.compressed_bytes,
+                        left_facts.uncompressed_bytes,
+                        unit,
+                    )
+                    .cmp(&structure_bytes(
+                        right_facts.compressed_bytes,
+                        right_facts.uncompressed_bytes,
+                        unit,
+                    )),
+                    StructureColumnSort::CompressionRatio => compression_ratio(
+                        left_facts.compressed_bytes,
+                        left_facts.uncompressed_bytes,
+                    )
+                    .unwrap_or(0.0)
+                    .total_cmp(
+                        &compression_ratio(
+                            right_facts.compressed_bytes,
+                            right_facts.uncompressed_bytes,
+                        )
+                        .unwrap_or(0.0),
+                    ),
+                };
                 direction_ordering(ordering, direction).then_with(|| left.cmp(right))
             }),
         }
@@ -1056,25 +1209,6 @@ impl StructureReader {
                 .iter()
                 .map(|index| self.column_summary(*index, unit, total))
                 .collect(),
-        }
-    }
-
-    fn column_sort_key(
-        &self,
-        index: usize,
-        unit: StructureByteUnit,
-        sort: StructureColumnSort,
-    ) -> f64 {
-        let facts = &self.columns[index];
-        match sort {
-            StructureColumnSort::Name => 0.0,
-            StructureColumnSort::Bytes => match unit {
-                StructureByteUnit::Compressed => facts.compressed_bytes as f64,
-                StructureByteUnit::Uncompressed => facts.uncompressed_bytes as f64,
-            },
-            StructureColumnSort::CompressionRatio => {
-                compression_ratio(facts.compressed_bytes, facts.uncompressed_bytes).unwrap_or(0.0)
-            }
         }
     }
 
@@ -1145,10 +1279,218 @@ impl StructureReader {
             bloom_filter_bytes: chunk
                 .bloom_filter_length()
                 .and_then(|length| u64::try_from(length).ok()),
+            has_bloom_filter: chunk.bloom_filter_offset().is_some(),
+            column_has_bloom_filter: self.metadata.row_groups().iter().any(|row_group| {
+                row_group
+                    .columns()
+                    .get(column_index)
+                    .is_some_and(|column| column.bloom_filter_offset().is_some())
+            }),
             has_page_index: chunk.column_index_offset().is_some(),
             has_offset_index: chunk.offset_index_offset().is_some(),
             statistics: chunk.statistics().map(chunk_statistics),
         })
+    }
+
+    /// Builds a deterministic, bounded, path-free Markdown structure digest.
+    pub fn report(&self, viewda_version: &str, unit: StructureByteUnit) -> String {
+        let summary = &self.summary;
+        let mut report = String::with_capacity(48 * 1024);
+        writeln!(report, "# Viewda structure report\n").expect("writing to a string cannot fail");
+        writeln!(report, "## Versions\n").expect("writing to a string cannot fail");
+        writeln!(report, "- Viewda: {}", markdown_cell(viewda_version))
+            .expect("writing to a string cannot fail");
+        writeln!(report, "- Parquet format: v{}", summary.format_version)
+            .expect("writing to a string cannot fail");
+        writeln!(
+            report,
+            "- Created by: {}\n",
+            summary
+                .created_by
+                .as_deref()
+                .map(markdown_cell)
+                .unwrap_or_else(|| "—".to_owned())
+        )
+        .expect("writing to a string cannot fail");
+
+        writeln!(report, "## File facts\n").expect("writing to a string cannot fail");
+        for (label, value) in [
+            ("Rows", summary.row_count.to_string()),
+            ("Row groups", summary.row_group_count.to_string()),
+            ("Columns", summary.column_count.to_string()),
+            (
+                "Compressed chunk bytes",
+                summary.compressed_bytes.to_string(),
+            ),
+            (
+                "Uncompressed chunk bytes",
+                summary.uncompressed_bytes.to_string(),
+            ),
+            ("Footer bytes", summary.footer_bytes.to_string()),
+            ("Chunks", summary.chunk_count.to_string()),
+            (
+                "Chunks with statistics",
+                summary.chunks_with_statistics.to_string(),
+            ),
+            (
+                "Chunks with bloom filters",
+                summary.chunks_with_bloom_filter.to_string(),
+            ),
+            (
+                "Unreadable row groups",
+                summary.unreadable_row_group_count.to_string(),
+            ),
+        ] {
+            writeln!(report, "- {label}: {value}").expect("writing to a string cannot fail");
+        }
+        writeln!(
+            report,
+            "- Compression ratio: {}",
+            report_ratio(summary.compression_ratio)
+        )
+        .expect("writing to a string cannot fail");
+        writeln!(
+            report,
+            "- Rows per group: {}",
+            report_ratio(summary.rows_per_row_group)
+        )
+        .expect("writing to a string cannot fail");
+        writeln!(report, "- Codecs: {}\n", summary.codecs.join(" + "))
+            .expect("writing to a string cannot fail");
+
+        writeln!(report, "## Lens totals\n").expect("writing to a string cannot fail");
+        for codec in &self.lens_totals.codecs {
+            writeln!(
+                report,
+                "- Codec {}: {} chunks · {} bytes",
+                markdown_cell(&codec.codec),
+                codec.total.chunk_count,
+                lens_bytes(codec.total, unit)
+            )
+            .expect("writing to a string cannot fail");
+        }
+        for (index, step) in self.lens_totals.ratio_steps.iter().enumerate() {
+            let label = step
+                .max_ratio
+                .map_or_else(|| "> 10".to_owned(), |value| format!("≤ {value:.1}"));
+            writeln!(
+                report,
+                "- Ratio step {} ({label}): {} chunks · {} bytes",
+                index + 1,
+                step.total.chunk_count,
+                lens_bytes(step.total, unit)
+            )
+            .expect("writing to a string cannot fail");
+        }
+        writeln!(
+            report,
+            "- Statistics present: {} chunks · {} bytes",
+            self.lens_totals.statistics.present.chunk_count,
+            lens_bytes(self.lens_totals.statistics.present, unit)
+        )
+        .expect("writing to a string cannot fail");
+        writeln!(
+            report,
+            "- Statistics absent: {} chunks · {} bytes",
+            self.lens_totals.statistics.absent.chunk_count,
+            lens_bytes(self.lens_totals.statistics.absent, unit)
+        )
+        .expect("writing to a string cannot fail");
+        writeln!(
+            report,
+            "- Bloom filters present: {} chunks · {} bytes",
+            self.lens_totals.bloom_filters.present.chunk_count,
+            lens_bytes(self.lens_totals.bloom_filters.present, unit)
+        )
+        .expect("writing to a string cannot fail");
+        writeln!(
+            report,
+            "- Bloom filters absent: {} chunks · {} bytes\n",
+            self.lens_totals.bloom_filters.absent.chunk_count,
+            lens_bytes(self.lens_totals.bloom_filters.absent, unit)
+        )
+        .expect("writing to a string cannot fail");
+
+        writeln!(report, "## Row groups ({} bytes)\n\n| Index | Rows | Bytes | Ratio | Bloom filters | Readable |\n| ---: | ---: | ---: | ---: | ---: | :--- |", report_unit(unit))
+            .expect("writing to a string cannot fail");
+        for index in 0..self.row_groups.len().min(MAX_REPORT_TABLE_ROWS) {
+            let row = self.row_group_summary(index);
+            writeln!(
+                report,
+                "| {} | {} | {} | {} | {} of {} | {} |",
+                row.index,
+                row.row_count,
+                structure_bytes(row.compressed_bytes, row.uncompressed_bytes, unit),
+                report_ratio(row.compression_ratio),
+                row.chunks_with_bloom_filter,
+                row.chunk_count,
+                if row.is_readable { "yes" } else { "no" }
+            )
+            .expect("writing to a string cannot fail");
+        }
+        if self.row_groups.len() > MAX_REPORT_TABLE_ROWS {
+            writeln!(
+                report,
+                "\n…and {} more row groups · {} bytes total",
+                self.row_groups.len() - MAX_REPORT_TABLE_ROWS,
+                structure_bytes(summary.compressed_bytes, summary.uncompressed_bytes, unit)
+            )
+            .expect("writing to a string cannot fail");
+        }
+
+        writeln!(report, "\n## Columns ({} bytes)\n\n| Column | Type | Bytes | Ratio | Encodings | Cumulative share |\n| :--- | :--- | ---: | ---: | :--- | ---: |", report_unit(unit))
+            .expect("writing to a string cannot fail");
+        let report_columns = self.column_page(
+            unit,
+            StructureColumnSort::Bytes,
+            StructureSortDirection::Descending,
+            0,
+            MAX_REPORT_TABLE_ROWS,
+        );
+        for column in report_columns.columns {
+            writeln!(
+                report,
+                "| {} | {} | {} | {} | {} | {:.2}% |",
+                markdown_cell(&column.name),
+                markdown_cell(&column.physical_type),
+                structure_bytes(column.compressed_bytes, column.uncompressed_bytes, unit),
+                report_ratio(column.compression_ratio),
+                markdown_cell(&column.encodings.join(" + ")),
+                column.cumulative_share * 100.0
+            )
+            .expect("writing to a string cannot fail");
+        }
+        if self.columns.len() > MAX_REPORT_TABLE_ROWS {
+            writeln!(
+                report,
+                "\n…and {} more columns · {} bytes total",
+                self.columns.len() - MAX_REPORT_TABLE_ROWS,
+                structure_bytes(summary.compressed_bytes, summary.uncompressed_bytes, unit)
+            )
+            .expect("writing to a string cannot fail");
+        }
+
+        writeln!(report, "\n## Key-value metadata\n").expect("writing to a string cannot fail");
+        if summary.key_value_metadata.is_empty() {
+            writeln!(report, "None").expect("writing to a string cannot fail");
+        } else {
+            for entry in &summary.key_value_metadata {
+                let size = entry
+                    .value_bytes
+                    .map_or_else(|| "—".to_owned(), |bytes| format!("{bytes} bytes"));
+                writeln!(report, "- {}: {size}", markdown_cell(&entry.key))
+                    .expect("writing to a string cannot fail");
+            }
+            if summary.key_value_count > summary.key_value_metadata.len() {
+                writeln!(
+                    report,
+                    "- …and {} more keys",
+                    summary.key_value_count - summary.key_value_metadata.len()
+                )
+                .expect("writing to a string cannot fail");
+            }
+        }
+        truncate_report(report)
     }
 
     /// Asks each row group's bloom filter whether one value can be present.
@@ -1172,6 +1514,7 @@ impl StructureReader {
             .ok_or(StructureError::UnknownColumn)?;
         let probe = ProbeValue::parse(descriptor.physical_type(), descriptor.type_length(), value)?;
         let (file, _) = open_local_source(&self.path)?;
+        let reader = BoundedBloomReader::new(file, MAX_BLOOM_PROBE_BYTES);
 
         let limit = limit.min(MAX_PROBE_ROW_GROUPS);
         let end = offset.saturating_add(limit).min(self.row_groups.len());
@@ -1184,7 +1527,7 @@ impl StructureReader {
                 Some(chunk) if chunk.bloom_filter_offset().is_none() => {
                     StructureBloomProbeOutcome::NoFilter
                 }
-                Some(chunk) => match Sbbf::read_from_column_chunk(chunk, &file) {
+                Some(chunk) => match Sbbf::read_from_column_chunk(chunk, &reader) {
                     Ok(Some(filter)) if probe.check(&filter) => {
                         StructureBloomProbeOutcome::MayContain
                     }
@@ -1203,6 +1546,101 @@ impl StructureReader {
             row_groups: results,
         })
     }
+}
+
+struct BoundedBloomReader {
+    file: File,
+    remaining: AtomicUsize,
+}
+
+impl BoundedBloomReader {
+    fn new(file: File, budget: usize) -> Self {
+        Self {
+            file,
+            remaining: AtomicUsize::new(budget),
+        }
+    }
+}
+
+impl Length for BoundedBloomReader {
+    fn len(&self) -> u64 {
+        self.file.len()
+    }
+}
+
+impl ChunkReader for BoundedBloomReader {
+    type T = Cursor<Vec<u8>>;
+
+    fn get_read(&self, _start: u64) -> Result<Self::T, ParquetError> {
+        Err(ParquetError::General(
+            "Sequential bloom reads are not supported.".to_owned(),
+        ))
+    }
+
+    fn get_bytes(&self, start: u64, length: usize) -> Result<bytes::Bytes, ParquetError> {
+        self.remaining
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |remaining| {
+                remaining.checked_sub(length)
+            })
+            .map_err(|_| {
+                ParquetError::General("Bloom probe exceeded its read limit.".to_owned())
+            })?;
+        self.file.get_bytes(start, length)
+    }
+}
+
+fn structure_bytes(compressed: u64, uncompressed: u64, unit: StructureByteUnit) -> u64 {
+    match unit {
+        StructureByteUnit::Compressed => compressed,
+        StructureByteUnit::Uncompressed => uncompressed,
+    }
+}
+
+fn lens_bytes(total: StructureLensTotal, unit: StructureByteUnit) -> u64 {
+    structure_bytes(total.compressed_bytes, total.uncompressed_bytes, unit)
+}
+
+fn report_ratio(value: Option<f64>) -> String {
+    value.map_or_else(|| "—".to_owned(), |value| format!("{value:.2}"))
+}
+
+fn report_unit(unit: StructureByteUnit) -> &'static str {
+    match unit {
+        StructureByteUnit::Compressed => "compressed",
+        StructureByteUnit::Uncompressed => "uncompressed",
+    }
+}
+
+fn markdown_cell(value: &str) -> String {
+    cut_report_field(value)
+        .replace('\\', "\\\\")
+        .replace('|', "\\|")
+        .replace(['\r', '\n'], " ")
+}
+
+fn cut_report_field(value: &str) -> String {
+    if value.len() <= MAX_REPORT_FIELD_BYTES {
+        return value.to_owned();
+    }
+    let mut end = MAX_REPORT_FIELD_BYTES;
+    while end > 0 && !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}…", &value[..end])
+}
+
+fn truncate_report(mut report: String) -> String {
+    if report.len() <= MAX_REPORT_BYTES {
+        return report;
+    }
+    let suffix = "\n\n…report truncated to stay within 256 KiB.\n";
+    let mut end = MAX_REPORT_BYTES.saturating_sub(suffix.len());
+    while end > 0 && !report.is_char_boundary(end) {
+        end -= 1;
+    }
+    report.truncate(end);
+    report.push_str(suffix);
+    report
 }
 
 /// A probe value already converted to the column's physical representation.
@@ -1287,6 +1725,117 @@ struct LensAccumulator {
     bloom_filters: StructurePresenceTotalsAccumulator,
 }
 
+#[derive(Clone, Default)]
+struct LayoutOverviewAccumulator {
+    compressed_bytes: u64,
+    uncompressed_bytes: u64,
+    ratio_compressed_bytes: [u64; RATIO_STEP_BOUNDS.len() + 1],
+    ratio_uncompressed_bytes: [u64; RATIO_STEP_BOUNDS.len() + 1],
+    codec_compressed_bytes: [u64; CODEC_NAMES.len()],
+    codec_uncompressed_bytes: [u64; CODEC_NAMES.len()],
+    statistics_compressed_bytes: u64,
+    statistics_uncompressed_bytes: u64,
+    has_bloom_filter: bool,
+    has_readable_group: bool,
+}
+
+impl LayoutOverviewAccumulator {
+    fn add(
+        &mut self,
+        chunk: &ColumnChunkMetaData,
+        compressed_bytes: u64,
+        uncompressed_bytes: u64,
+    ) -> Result<(), StructureError> {
+        self.compressed_bytes = self
+            .compressed_bytes
+            .checked_add(compressed_bytes)
+            .ok_or(StructureError::CorruptFooter)?;
+        self.uncompressed_bytes = self
+            .uncompressed_bytes
+            .checked_add(uncompressed_bytes)
+            .ok_or(StructureError::CorruptFooter)?;
+        let ratio_step = compression_ratio(compressed_bytes, uncompressed_bytes).map(|ratio| {
+            RATIO_STEP_BOUNDS
+                .iter()
+                .position(|bound| ratio <= *bound)
+                .unwrap_or(RATIO_STEP_BOUNDS.len())
+        });
+        if let Some(step) = ratio_step {
+            self.ratio_compressed_bytes[step] = self.ratio_compressed_bytes[step]
+                .checked_add(compressed_bytes)
+                .ok_or(StructureError::CorruptFooter)?;
+            self.ratio_uncompressed_bytes[step] = self.ratio_uncompressed_bytes[step]
+                .checked_add(uncompressed_bytes)
+                .ok_or(StructureError::CorruptFooter)?;
+        }
+        let codec = codec_index(chunk.compression());
+        self.codec_compressed_bytes[codec] = self.codec_compressed_bytes[codec]
+            .checked_add(compressed_bytes)
+            .ok_or(StructureError::CorruptFooter)?;
+        self.codec_uncompressed_bytes[codec] = self.codec_uncompressed_bytes[codec]
+            .checked_add(uncompressed_bytes)
+            .ok_or(StructureError::CorruptFooter)?;
+        if chunk.statistics().is_some() {
+            self.statistics_compressed_bytes = self
+                .statistics_compressed_bytes
+                .checked_add(compressed_bytes)
+                .ok_or(StructureError::CorruptFooter)?;
+            self.statistics_uncompressed_bytes = self
+                .statistics_uncompressed_bytes
+                .checked_add(uncompressed_bytes)
+                .ok_or(StructureError::CorruptFooter)?;
+        }
+        self.has_bloom_filter |= chunk.bloom_filter_offset().is_some();
+        Ok(())
+    }
+
+    fn finish(
+        self,
+        bucket: usize,
+        bucket_count: usize,
+        row_count: usize,
+    ) -> StructureLayoutOverviewBucket {
+        let row_start = bucket.saturating_mul(row_count).div_ceil(bucket_count);
+        let row_end = (bucket + 1)
+            .saturating_mul(row_count)
+            .div_ceil(bucket_count)
+            .min(row_count);
+        StructureLayoutOverviewBucket {
+            row_start,
+            row_end,
+            compressed_bytes: self.compressed_bytes,
+            uncompressed_bytes: self.uncompressed_bytes,
+            dominant_ratio_step_compressed: dominant_index(&self.ratio_compressed_bytes),
+            dominant_ratio_step_uncompressed: dominant_index(&self.ratio_uncompressed_bytes),
+            dominant_codec_compressed: dominant_index(&self.codec_compressed_bytes)
+                .map(|index| CODEC_NAMES[index].to_owned()),
+            dominant_codec_uncompressed: dominant_index(&self.codec_uncompressed_bytes)
+                .map(|index| CODEC_NAMES[index].to_owned()),
+            statistics_share_compressed: if self.compressed_bytes == 0 {
+                0.0
+            } else {
+                self.statistics_compressed_bytes as f64 / self.compressed_bytes as f64
+            },
+            statistics_share_uncompressed: if self.uncompressed_bytes == 0 {
+                0.0
+            } else {
+                self.statistics_uncompressed_bytes as f64 / self.uncompressed_bytes as f64
+            },
+            has_bloom_filter: self.has_bloom_filter,
+            has_readable_group: self.has_readable_group,
+        }
+    }
+}
+
+fn dominant_index<const N: usize>(values: &[u64; N]) -> Option<usize> {
+    values
+        .iter()
+        .enumerate()
+        .filter(|(_, value)| **value > 0)
+        .max_by_key(|(index, value)| (**value, Reverse(*index)))
+        .map(|(index, _)| index)
+}
+
 #[derive(Default)]
 struct StructurePresenceTotalsAccumulator {
     present: StructureLensTotal,
@@ -1294,13 +1843,18 @@ struct StructurePresenceTotalsAccumulator {
 }
 
 impl StructurePresenceTotalsAccumulator {
-    fn add(&mut self, present: bool, compressed_bytes: u64, uncompressed_bytes: u64) {
+    fn add(
+        &mut self,
+        present: bool,
+        compressed_bytes: u64,
+        uncompressed_bytes: u64,
+    ) -> Result<(), StructureError> {
         let side = if present {
             &mut self.present
         } else {
             &mut self.absent
         };
-        side.add(compressed_bytes, uncompressed_bytes);
+        side.add(compressed_bytes, uncompressed_bytes)
     }
 
     fn finish(self) -> StructurePresenceTotals {
@@ -1312,25 +1866,35 @@ impl StructurePresenceTotalsAccumulator {
 }
 
 impl LensAccumulator {
-    fn add(&mut self, chunk: &ColumnChunkMetaData, compressed_bytes: u64, uncompressed_bytes: u64) {
+    fn add(
+        &mut self,
+        chunk: &ColumnChunkMetaData,
+        compressed_bytes: u64,
+        uncompressed_bytes: u64,
+    ) -> Result<(), StructureError> {
         let codec = codec_index(chunk.compression());
         match self.codecs.iter_mut().find(|(index, _)| *index == codec) {
-            Some((_, total)) => total.add(compressed_bytes, uncompressed_bytes),
+            Some((_, total)) => total.add(compressed_bytes, uncompressed_bytes)?,
             None => {
                 let mut total = StructureLensTotal::default();
-                total.add(compressed_bytes, uncompressed_bytes);
+                total.add(compressed_bytes, uncompressed_bytes)?;
                 self.codecs.push((codec, total));
             }
         }
 
         match compression_ratio(compressed_bytes, uncompressed_bytes) {
-            None => self.unrated_chunk_count += 1,
+            None => {
+                self.unrated_chunk_count = self
+                    .unrated_chunk_count
+                    .checked_add(1)
+                    .ok_or(StructureError::CorruptFooter)?;
+            }
             Some(ratio) => {
                 let step = RATIO_STEP_BOUNDS
                     .iter()
                     .position(|bound| ratio <= *bound)
                     .unwrap_or(RATIO_STEP_BOUNDS.len());
-                self.ratio_steps[step].add(compressed_bytes, uncompressed_bytes);
+                self.ratio_steps[step].add(compressed_bytes, uncompressed_bytes)?;
             }
         }
 
@@ -1338,12 +1902,13 @@ impl LensAccumulator {
             chunk.statistics().is_some(),
             compressed_bytes,
             uncompressed_bytes,
-        );
+        )?;
         self.bloom_filters.add(
             chunk.bloom_filter_offset().is_some(),
             compressed_bytes,
             uncompressed_bytes,
-        );
+        )?;
+        Ok(())
     }
 
     fn finish(mut self) -> StructureLensTotals {
@@ -1642,6 +2207,87 @@ mod tests {
     }
 
     #[test]
+    fn rejects_footer_size_totals_that_overflow() {
+        let schema = test_schema_with_columns(3);
+        let chunks = (0..3)
+            .map(|index| {
+                ColumnChunkMetaData::builder(schema.column(index))
+                    .set_total_compressed_size(i64::MAX)
+                    .set_total_uncompressed_size(i64::MAX)
+                    .build()
+                    .expect("chunk metadata")
+            })
+            .collect();
+        let row_group = RowGroupMetaData::builder(Arc::clone(&schema))
+            .set_num_rows(1)
+            .set_total_byte_size(i64::MAX)
+            .set_column_metadata(chunks)
+            .build()
+            .expect("row group metadata");
+
+        assert_eq!(
+            summarize_metadata(test_metadata(vec![row_group])).err(),
+            Some(StructureError::CorruptFooter)
+        );
+    }
+
+    #[test]
+    fn sorts_integer_sizes_without_losing_precision() {
+        let schema = test_schema();
+        let metadata = test_metadata(vec![
+            test_row_group(&schema, 1, 40, 10, 30),
+            test_row_group(&schema, 1, 40, 10, 30),
+        ]);
+        let mut reader = summarize_metadata(metadata).expect("fixture is summarizable");
+        reader.row_groups[0].compressed_bytes = (1_u64 << 53) + 1;
+        reader.row_groups[1].compressed_bytes = 1_u64 << 53;
+
+        let page = reader.row_group_page(
+            StructureByteUnit::Compressed,
+            StructureRowGroupSort::Bytes,
+            StructureSortDirection::Descending,
+            0,
+            2,
+        );
+
+        assert_eq!(
+            page.row_groups
+                .iter()
+                .map(|row| row.index)
+                .collect::<Vec<_>>(),
+            vec![0, 1]
+        );
+    }
+
+    #[test]
+    fn overview_uses_the_selected_unit_for_its_dominant_codec() {
+        let schema = test_schema_with_columns(2);
+        let snappy = ColumnChunkMetaData::builder(schema.column(0))
+            .set_compression(Compression::SNAPPY)
+            .set_total_compressed_size(100)
+            .set_total_uncompressed_size(1_000)
+            .build()
+            .expect("snappy chunk");
+        let zstd = ColumnChunkMetaData::builder(schema.column(1))
+            .set_compression(Compression::ZSTD(Default::default()))
+            .set_total_compressed_size(200)
+            .set_total_uncompressed_size(300)
+            .build()
+            .expect("zstd chunk");
+        let mut overview = LayoutOverviewAccumulator::default();
+        overview.add(&snappy, 100, 1_000).expect("bounded totals");
+        overview.add(&zstd, 200, 300).expect("bounded totals");
+
+        let bucket = overview.finish(0, 1, 1);
+
+        assert_eq!(bucket.dominant_codec_compressed.as_deref(), Some("zstd"));
+        assert_eq!(
+            bucket.dominant_codec_uncompressed.as_deref(),
+            Some("snappy")
+        );
+    }
+
+    #[test]
     fn keeps_row_offsets_of_row_groups_it_cannot_summarize() {
         let schema = test_schema();
         let metadata = test_metadata(vec![
@@ -1651,11 +2297,34 @@ mod tests {
 
         let reader = summarize_metadata(metadata).expect("inconsistent entries stay summarizable");
 
-        assert_eq!(reader.first_row_offset(0), Ok(0));
+        assert_eq!(
+            reader.first_row_offset(0),
+            Err(StructureError::CorruptFooter)
+        );
         assert_eq!(reader.first_row_offset(1), Ok(5));
         assert_eq!(
             reader.first_row_offset(2),
             Err(StructureError::UnknownRowGroup)
+        );
+    }
+
+    #[test]
+    fn rejects_offsets_after_a_negative_row_count() {
+        let schema = test_schema();
+        let metadata = test_metadata(vec![
+            test_row_group(&schema, -1, 40, 10, 30),
+            test_row_group(&schema, 7, 40, 10, 30),
+        ]);
+
+        let reader = summarize_metadata(metadata).expect("footer remains inspectable");
+
+        assert_eq!(
+            reader.first_row_offset(0),
+            Err(StructureError::CorruptFooter)
+        );
+        assert_eq!(
+            reader.first_row_offset(1),
+            Err(StructureError::CorruptFooter)
         );
     }
 
@@ -1677,6 +2346,60 @@ mod tests {
             .err(),
             Some(StructureError::Cancelled)
         );
+    }
+
+    #[test]
+    fn bounds_total_bloom_bytes_read_by_one_probe() {
+        use std::io::Write as _;
+
+        let mut source = tempfile::NamedTempFile::new().expect("temporary file");
+        source.write_all(&[0; 32]).expect("fixture bytes");
+        let reader = BoundedBloomReader::new(source.reopen().expect("fixture can reopen"), 8);
+
+        assert!(reader.get_bytes(0, 4).is_ok());
+        assert!(reader.get_bytes(4, 4).is_ok());
+        assert!(reader.get_bytes(8, 1).is_err());
+    }
+
+    #[test]
+    fn report_is_bounded_and_excludes_source_identity_and_values() {
+        let schema = test_schema();
+        let row_groups = (0..MAX_REPORT_TABLE_ROWS + 1)
+            .map(|_| test_row_group(&schema, 2, 40, 10, 30))
+            .collect::<Vec<_>>();
+        let metadata = ParquetMetaData::new(
+            FileMetaData::new(
+                2,
+                row_groups.iter().map(RowGroupMetaData::num_rows).sum(),
+                Some("writer-version".to_owned()),
+                Some(vec![KeyValue::new(
+                    format!("metadata-key-{}", "K".repeat(10_000)),
+                    Some("SECRET_METADATA_VALUE".to_owned()),
+                )]),
+                Arc::clone(&schema),
+                None,
+            ),
+            row_groups,
+        );
+        let reader = StructureReader::summarize(
+            PathBuf::from("/private/SOURCE_IDENTITY.parquet"),
+            metadata,
+            8,
+            &StructureLoadProgress::default(),
+            &StructureCancellation::default(),
+        )
+        .expect("fixture is summarizable");
+
+        let report = reader.report("9.8.7", StructureByteUnit::Compressed);
+
+        assert!(report.contains("Viewda: 9.8.7"));
+        assert!(report.contains("Created by: writer-version"));
+        assert!(report.contains("metadata-key-"));
+        assert!(report.contains("…: 21 bytes"));
+        assert!(report.contains("…and 1 more row groups"));
+        assert!(!report.contains("SOURCE_IDENTITY"));
+        assert!(!report.contains("SECRET_METADATA_VALUE"));
+        assert!(report.len() <= MAX_REPORT_BYTES);
     }
 
     #[test]
@@ -1786,12 +2509,29 @@ mod tests {
     }
 
     fn test_schema() -> Arc<SchemaDescriptor> {
-        let value = Type::primitive_type_builder("value", PhysicalType::INT64)
-            .with_repetition(Repetition::REQUIRED)
-            .build()
-            .expect("primitive field is valid");
+        test_schema_with_columns(1)
+    }
+
+    fn test_schema_with_columns(count: usize) -> Arc<SchemaDescriptor> {
+        let fields = (0..count)
+            .map(|index| {
+                Arc::new(
+                    Type::primitive_type_builder(
+                        match index {
+                            0 => "value_0",
+                            1 => "value_1",
+                            _ => "value_2",
+                        },
+                        PhysicalType::INT64,
+                    )
+                    .with_repetition(Repetition::REQUIRED)
+                    .build()
+                    .expect("primitive field is valid"),
+                )
+            })
+            .collect();
         let root = Type::group_type_builder("schema")
-            .with_fields(vec![Arc::new(value)])
+            .with_fields(fields)
             .build()
             .expect("schema is valid");
         Arc::new(SchemaDescriptor::new(Arc::new(root)))
