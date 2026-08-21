@@ -14,8 +14,8 @@ use tauri::{Emitter, Manager};
 use viewda_data_engine::SourceError;
 
 use crate::{
-    DatasetDropModifier, OpenSourceError, OpenedSource, OpenedSourceInfo, SourceDescriptor,
-    SourceOpenIntent, inspect_selected_source, open_dataset_descriptor_from_native,
+    OpenSourceError, OpenedSource, OpenedSourceInfo, SourceDescriptor, SourceOpenIntent,
+    inspect_selected_source, open_dataset_descriptor_from_native,
 };
 
 pub const OPENED_SOURCE_AVAILABLE_EVENT: &str = "opened-source-available";
@@ -96,10 +96,7 @@ pub fn open_recent(app: &tauri::AppHandle, id: &str) {
 ///
 /// Files open in drop order, so the last one dropped becomes the active source.
 pub fn open_dropped_paths(app: &tauri::AppHandle, paths: Vec<PathBuf>) {
-    let group_files = app
-        .state::<DatasetDropModifier>()
-        .0
-        .swap(false, std::sync::atomic::Ordering::AcqRel);
+    let group_files = platform_alt_modifier_active();
     match classify_dropped_paths(paths, group_files) {
         Ok(DroppedSource::Folder(path)) => publish_dataset(app, SourceDescriptor::Folder(path)),
         Ok(DroppedSource::FileDataset(paths)) => {
@@ -112,6 +109,37 @@ pub fn open_dropped_paths(app: &tauri::AppHandle, paths: Vec<PathBuf>) {
         }
         Err(error) => report_source_error(app, error),
     }
+}
+
+// WRY's cross-platform drop event omits keyboard modifiers, so the native
+// callback samples the platform state at Drop instead of trusting webview focus.
+#[cfg(target_os = "linux")]
+fn platform_alt_modifier_active() -> bool {
+    use gtk::gdk::{Display, Keymap, ModifierType};
+
+    Display::default()
+        .and_then(|display| Keymap::for_display(&display))
+        .is_some_and(|keymap| keymap.modifier_state() & ModifierType::MOD1_MASK.bits() != 0)
+}
+
+#[cfg(target_os = "windows")]
+fn platform_alt_modifier_active() -> bool {
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, VK_MENU};
+
+    // The high bit is the key's current state; the low bit is historical.
+    unsafe { GetAsyncKeyState(VK_MENU.into()) as u16 & 0x8000 != 0 }
+}
+
+#[cfg(target_os = "macos")]
+fn platform_alt_modifier_active() -> bool {
+    use objc2_app_kit::{NSEvent, NSEventModifierFlags};
+
+    NSEvent::modifierFlags_class().contains(NSEventModifierFlags::Option)
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "macos")))]
+fn platform_alt_modifier_active() -> bool {
+    false
 }
 
 #[derive(Debug, PartialEq, Eq)]

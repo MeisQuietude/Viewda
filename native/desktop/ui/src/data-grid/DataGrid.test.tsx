@@ -939,6 +939,27 @@ describe("DataGrid window rendering", () => {
     ).toHaveTextContent("*");
   });
 
+  it("starts an exact virtual provenance column hidden but selectable", async () => {
+    render(
+      <DataGrid source={source} defaultHiddenSourceIndices={new Set([7])} />,
+    );
+
+    expect(screen.getByLabelText("Query")).toHaveTextContent("[7/8 cols]");
+    const picker = openSelectPicker();
+    expect(
+      within(picker).getByRole("checkbox", { name: "Show column_7" }),
+    ).not.toBeChecked();
+    await waitFor(() =>
+      expect(desktop.getDataWindow).toHaveBeenCalledWith(
+        7,
+        0,
+        0,
+        512,
+        [0, 1, 2, 3, 4, 5, 6],
+      ),
+    );
+  });
+
   it("keeps the SELECT picker and grid column menu on one visibility state", async () => {
     render(<DataGrid source={source} />);
     await waitFor(() => expect(desktop.getDataWindow).toHaveBeenCalledOnce());
@@ -2760,6 +2781,21 @@ describe("DataGrid window rendering", () => {
       within(alert).getByRole("button", { name: "Dismiss view error" }),
     );
     expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+  });
+
+  it("names a damaged dataset member and offers reload recovery", async () => {
+    vi.mocked(desktop.getDataWindow).mockRejectedValue(
+      new desktop.DataWindowCommandError("invalidMember", undefined, {
+        code: "invalidMember",
+        member: "year=2026/broken.parquet",
+      }),
+    );
+
+    render(<DataGrid source={source} />);
+
+    expect(await screen.findByRole("alert")).toHaveTextContent(
+      "Dataset member year=2026/broken.parquet is damaged or unsupported. Reload the dataset.",
+    );
   });
 
   it.each([

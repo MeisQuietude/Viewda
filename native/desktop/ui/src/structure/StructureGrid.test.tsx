@@ -87,3 +87,36 @@ it("copies only exact held rows from a 100k-row column selection", () => {
     "Copied 80 loaded rows. 99,920 selected rows were not copied.",
   );
 });
+
+it("reports the absolute virtual row selected by the shared grid", () => {
+  const onSelectRow = vi.fn();
+  render(
+    <StructureGrid
+      label="Members"
+      columns={columns}
+      rowCount={100_000}
+      sortColumnId="name"
+      sortDirection="ascending"
+      contentRevision={1}
+      heldPage={{ offset: 400, length: 200 }}
+      getCell={() => ({ text: "member", faded: false })}
+      onSort={() => {}}
+      onViewportChange={() => {}}
+      onSelectRow={onSelectRow}
+    />,
+  );
+
+  act(() => {
+    grid.props?.onSelectionChange({
+      columns: CompactSelection.empty(),
+      rows: CompactSelection.empty(),
+      current: {
+        cell: { row: 450, column: 0 },
+        range: { x: 0, y: 450, width: 1, height: 1 },
+        rangeStack: [],
+      },
+    });
+  });
+
+  expect(onSelectRow).toHaveBeenCalledWith(450);
+});

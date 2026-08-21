@@ -84,14 +84,6 @@ const DATA_EXPORT_CLOSE_REQUESTED_EVENT: &str = "data-export-close-requested";
 #[cfg(target_os = "macos")]
 const QUIT_MENU_ID: &str = "quit";
 
-#[derive(Default)]
-pub(crate) struct DatasetDropModifier(AtomicBool);
-
-#[tauri::command]
-fn set_dataset_drop_modifier(active: bool, modifier: tauri::State<'_, DatasetDropModifier>) {
-    modifier.0.store(active, Ordering::Release);
-}
-
 fn open_dataset_descriptor_from_native(
     app: &tauri::AppHandle,
     descriptor: SourceDescriptor,
@@ -511,6 +503,7 @@ struct DatasetSummaryStatus {
     size_bytes: u64,
     row_count: u64,
     row_group_count: u64,
+    column_count: usize,
     schema: Vec<SchemaField>,
     schema_node_count: usize,
     schema_is_truncated: bool,
@@ -650,6 +643,7 @@ impl From<&DatasetSummary> for DatasetSummaryStatus {
             size_bytes: summary.size_bytes,
             row_count: summary.row_count,
             row_group_count: summary.row_group_count,
+            column_count: summary.schema.iter().map(schema_leaf_count).sum(),
             schema,
             schema_node_count,
             schema_is_truncated,
@@ -4107,7 +4101,6 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
         .manage(OpenedSource::default())
-        .manage(DatasetDropModifier::default())
         .manage(RecentSourcesMenu::default())
         .manage(DataExportCloseDialog::default())
         .manage(PendingOpenedSource::default())
@@ -4276,12 +4269,6 @@ pub fn run() {
             if let tauri::WindowEvent::DragDrop(tauri::DragDropEvent::Drop { paths, .. }) = event {
                 launch::open_dropped_paths(window.app_handle(), paths.clone());
             }
-            if matches!(event, tauri::WindowEvent::Focused(false)) {
-                window
-                    .state::<DatasetDropModifier>()
-                    .0
-                    .store(false, Ordering::Release);
-            }
             if let tauri::WindowEvent::CloseRequested { api, .. } = event {
                 let file_names = running_data_export_file_names(window.app_handle());
                 if file_names.is_empty() {
@@ -4313,7 +4300,6 @@ pub fn run() {
             get_dataset_schema_drift_members,
             cancel_dataset_inspection,
             reload_opened_source,
-            set_dataset_drop_modifier,
             get_recent_sources,
             open_recent_source,
             remove_recent_source,
@@ -5028,6 +5014,7 @@ mod tests {
             size_bytes: 1,
             row_count: 1,
             row_group_count: 1,
+            column_count: 300,
             schema: bounded_wire_schema_with_marker(&full_schema).0,
             schema_node_count: full_schema.len(),
             schema_is_truncated: true,
@@ -5040,6 +5027,7 @@ mod tests {
 
         assert_eq!(value["schema"].as_array().map(Vec::len), Some(256));
         assert_eq!(value["schemaNodeCount"], 300);
+        assert_eq!(value["columnCount"], 300);
         assert_eq!(value["schemaIsTruncated"], true);
     }
 

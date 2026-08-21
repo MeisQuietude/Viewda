@@ -28,15 +28,16 @@ export interface StructureSummaryController {
 }
 
 /**
- * Parses the footer once per opened source, on first activation of the mode.
+ * Parses the selected source or dataset member on first Structure activation.
  *
  * The result stays in this hook for the life of the source, so leaving and
- * re-entering the mode never re-reads the file. A cancelled parse leaves a state
- * the caller can retry from.
+ * re-entering the mode keeps the result. A revision invalidates that result after
+ * a dataset member switch. A cancelled parse leaves a state the caller can retry.
  */
 export function useStructureSummary(
   generation: number,
   active: boolean,
+  revision = 0,
 ): StructureSummaryController {
   const [state, setState] = useState<StructureSummaryState>({ kind: "idle" });
   const requestVersion = useRef(0);
@@ -74,7 +75,12 @@ export function useStructureSummary(
         }
       },
     );
-  }, [generation]);
+  }, [generation, revision]);
+
+  useEffect(() => {
+    requestVersion.current += 1;
+    setState({ kind: "idle" });
+  }, [generation, revision]);
 
   useEffect(() => {
     if (active && state.kind === "idle") {
@@ -86,10 +92,15 @@ export function useStructureSummary(
     if (state.kind !== "loading") {
       return;
     }
+    const version = requestVersion.current;
     const timer = setInterval(() => {
       void getStructureLoadProgress(generation).then(
         (progress) => {
-          if (progress !== null && aliveRef.current) {
+          if (
+            progress !== null &&
+            aliveRef.current &&
+            requestVersion.current === version
+          ) {
             setState((current) =>
               current.kind === "loading" ? { ...current, progress } : current,
             );

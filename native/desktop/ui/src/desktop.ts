@@ -28,6 +28,13 @@ export interface SourceSummary {
   stringsTruncated: boolean;
 }
 
+export type SourceKind = "file" | "folderDataset" | "fileDataset";
+
+export interface OpenedSourceBatch {
+  sources: SourceSummary[];
+  sourceError: DatasetErrorDetail | null;
+}
+
 export type SourceOpenProgressPhase =
   "waiting" | "readingFooter" | "decodingFooter" | "summarizing";
 
@@ -40,14 +47,77 @@ export interface RecentSource {
   path: string;
 }
 
-/** One open file, as Rust lists them in most-recently-used order. */
+/** One open source, as Rust lists it in most-recently-used order. */
 export interface OpenedSourceEntry {
   generation: number;
+  kind: SourceKind;
+  datasetMemberCount: number | null;
+  datasetIgnoredFileCount: number | null;
   name: string;
   directory: string;
   path: string;
   active: boolean;
 }
+
+export interface PartitionValue {
+  key: string;
+  value: string;
+}
+
+export interface DatasetMemberSummary {
+  relativePath: string;
+  partitions: PartitionValue[];
+}
+
+export interface DatasetMemberPage {
+  offset: number;
+  total: number;
+  members: DatasetMemberSummary[];
+}
+
+export interface DatasetPartitionNode {
+  partition: PartitionValue;
+  memberCount: number;
+}
+
+export interface DatasetPartitionPage {
+  nodes: DatasetPartitionNode[];
+  nextAfter: PartitionValue | null;
+}
+
+export interface DatasetInspectionProgress {
+  completedMemberCount: number;
+  totalMemberCount: number;
+  rowCount: number;
+  rowGroupCount: number;
+  schema: SchemaField[] | null;
+  schemaNodeCount: number;
+  schemaIsTruncated: boolean;
+  stringsTruncated: boolean;
+  schemaComplete: boolean;
+}
+
+export interface DatasetReadySummary {
+  displayName: string;
+  memberCount: number;
+  ignoredFileCount: number;
+  sizeBytes: number;
+  rowCount: number;
+  rowGroupCount: number;
+  columnCount: number;
+  schema: SchemaField[];
+  schemaNodeCount: number;
+  schemaIsTruncated: boolean;
+  stringsTruncated: boolean;
+  schemaDriftMemberCount: number;
+  partitionColumnIndices: number[];
+  provenanceColumnIndex: number;
+}
+
+export type DatasetStatus =
+  | { state: "inspecting"; progress: DatasetInspectionProgress }
+  | { state: "ready"; summary: DatasetReadySummary }
+  | { state: "failed"; error: DatasetErrorDetail };
 
 export interface SchemaField {
   name: string;
@@ -458,7 +528,7 @@ export interface UpdateCheckOptions {
 export interface PostUpdateState {
   version: string;
   sources: SourceSummary[];
-  sourceError: SourceErrorCode | null;
+  sourceError: DatasetErrorDetail | null;
 }
 
 export type DefaultApplicationStatus =
@@ -470,22 +540,7 @@ export type DefaultApplicationStatus =
 
 export interface OpenedSourceActivation {
   source: SourceSummary | null;
-  sourceError: SourceErrorCode | null;
-}
-
-interface NativeSourceError {
-  code: SourceErrorCode;
-}
-
-interface NativePostUpdateState {
-  version: string;
-  sources: SourceSummary[];
-  sourceError: NativeSourceError | null;
-}
-
-interface NativeOpenedSourceActivation {
-  source: SourceSummary | null;
-  sourceError: NativeSourceError | null;
+  sourceError: DatasetErrorDetail | null;
 }
 
 export function shortcutModifierFor(platform: string): string {
@@ -502,6 +557,32 @@ export type SourceErrorCode =
   | "corruptFooter"
   | "unsupported";
 
+export type DatasetErrorCode =
+  | SourceErrorCode
+  | "noSourceOpen"
+  | "noParquetFiles"
+  | "pageTooLarge"
+  | "inspectionStepTooLarge"
+  | "cancelled"
+  | "schemaConflict"
+  | "invalidMember"
+  | "notDataset"
+  | "notReady"
+  | "window";
+
+export interface SourceErrorDetail {
+  code: Exclude<DatasetErrorCode, "window">;
+  member?: string;
+  column?: string;
+}
+
+export interface DatasetWindowErrorDetail {
+  code: "window";
+  error: { code: DataWindowErrorCode };
+}
+
+export type DatasetErrorDetail = SourceErrorDetail | DatasetWindowErrorDetail;
+
 export type DataWindowErrorCode =
   | "noSourceOpen"
   | "sourceChanged"
@@ -511,6 +592,7 @@ export type DataWindowErrorCode =
   | "permissionDenied"
   | "notParquet"
   | "corruptSource"
+  | "invalidMember"
   | "unsupported"
   | "windowTooLarge"
   | "invalidFilter"
@@ -556,9 +638,30 @@ export type UpdateErrorCode =
   "unavailable" | "storage" | "noPendingUpdate" | "manualInstall";
 
 export class OpenSourceError extends Error {
-  constructor(readonly code: SourceErrorCode) {
-    super(code);
+  readonly code: DatasetErrorCode;
+
+  readonly detail: DatasetErrorDetail;
+
+  constructor(detail: DatasetErrorDetail | SourceErrorDetail["code"]) {
+    const normalized = typeof detail === "string" ? { code: detail } : detail;
+    super(normalized.code);
+    this.detail = normalized;
+    this.code = normalized.code;
     this.name = "OpenSourceError";
+  }
+}
+
+export class DatasetCommandError extends Error {
+  readonly code: DatasetErrorCode;
+
+  readonly detail: DatasetErrorDetail;
+
+  constructor(detail: DatasetErrorDetail | SourceErrorDetail["code"]) {
+    const normalized = typeof detail === "string" ? { code: detail } : detail;
+    super(normalized.code);
+    this.detail = normalized;
+    this.code = normalized.code;
+    this.name = "DatasetCommandError";
   }
 }
 
@@ -566,6 +669,7 @@ export class DataWindowCommandError extends Error {
   constructor(
     readonly code: DataWindowErrorCode,
     readonly diagnostics?: DataViewResourceDiagnostics,
+    readonly detail?: SourceErrorDetail,
   ) {
     super(code);
     this.name = "DataWindowCommandError";
@@ -656,27 +760,11 @@ export function installPendingUpdate(
 }
 
 export function takePostUpdateState(): Promise<PostUpdateState | null> {
-  return invoke<NativePostUpdateState | null>("take_post_update_state").then(
-    (state) =>
-      state === null
-        ? null
-        : {
-            ...state,
-            sourceError: state.sourceError?.code ?? null,
-          },
-  );
+  return invoke<PostUpdateState | null>("take_post_update_state");
 }
 
 export function takeOpenedSource(): Promise<OpenedSourceActivation | null> {
-  return invoke<NativeOpenedSourceActivation | null>("take_opened_source").then(
-    (activation) =>
-      activation === null
-        ? null
-        : {
-            source: activation.source,
-            sourceError: activation.sourceError?.code ?? null,
-          },
-  );
+  return invoke<OpenedSourceActivation | null>("take_opened_source");
 }
 
 export function getDefaultApplicationStatus(): Promise<DefaultApplicationStatus> {
@@ -695,10 +783,22 @@ export function showMainWindow(): Promise<void> {
   return getCurrentWindow().show();
 }
 
-export async function openLocalSource(
+export function openLocalSource(
+  attempt: string,
+  groupAsDataset = false,
+): Promise<OpenedSourceBatch | null> {
+  return invokeSource<OpenedSourceBatch | null>("open_local_source", {
+    attempt,
+    groupAsDataset,
+  });
+}
+
+export function openLocalFolder(
   attempt: string,
 ): Promise<SourceSummary | null> {
-  return invokeSource<SourceSummary | null>("open_local_source", { attempt });
+  return invokeSource<SourceSummary | null>("open_local_folder", {
+    attempt,
+  });
 }
 
 export function cancelSourceOpen(
@@ -770,13 +870,77 @@ export function cycleOpenedSource(reverse: boolean): Promise<number | null> {
   return invoke<number | null>("cycle_opened_source", { reverse });
 }
 
-/** Closes one open file; `false` means a running export kept it open. */
+/** Closes one open source; `false` means a running export kept it open. */
 export function closeOpenedSource(generation: number): Promise<boolean> {
   return invoke<boolean>("close_opened_source", { generation });
 }
 
 export function revealOpenedSource(generation: number): Promise<void> {
   return invoke("reveal_opened_source", { generation });
+}
+
+export function reloadOpenedSource(generation: number): Promise<SourceSummary> {
+  return invokeSource<SourceSummary>("reload_opened_source", { generation });
+}
+
+export function getDatasetStatus(generation: number): Promise<DatasetStatus> {
+  return invokeDataset<DatasetStatus>("get_dataset_status", { generation });
+}
+
+export function getDatasetPreview(generation: number): Promise<ArrayBuffer> {
+  return invokeDataset<ArrayBuffer>("get_dataset_preview", { generation });
+}
+
+export function cancelDatasetInspection(generation: number): Promise<boolean> {
+  return invokeDataset<boolean>("cancel_dataset_inspection", { generation });
+}
+
+export function getDatasetMembers(
+  generation: number,
+  offset: number,
+  limit: number,
+): Promise<DatasetMemberPage> {
+  return invokeDataset<DatasetMemberPage>("get_dataset_members", {
+    generation,
+    offset,
+    limit,
+  });
+}
+
+export function getDatasetPartitions(
+  generation: number,
+  parent: PartitionValue[],
+  after: PartitionValue | null,
+  limit: number,
+): Promise<DatasetPartitionPage> {
+  return invokeDataset<DatasetPartitionPage>("get_dataset_partitions", {
+    generation,
+    parent,
+    after,
+    limit,
+  });
+}
+
+export function getDatasetSchemaDriftMembers(
+  generation: number,
+  offset: number,
+  limit: number,
+): Promise<DatasetMemberPage> {
+  return invokeDataset<DatasetMemberPage>("get_dataset_schema_drift_members", {
+    generation,
+    offset,
+    limit,
+  });
+}
+
+export function selectDatasetStructureMember(
+  generation: number,
+  ordinal: number,
+): Promise<DatasetMemberSummary> {
+  return invokeStructure<DatasetMemberSummary>(
+    "select_dataset_structure_member",
+    { generation, ordinal },
+  );
 }
 
 async function invokeSource<T>(
@@ -786,7 +950,18 @@ async function invokeSource<T>(
   try {
     return await invoke<T>(command, args);
   } catch (error) {
-    throw new OpenSourceError(readSourceErrorCode(error));
+    throw new OpenSourceError(readDatasetErrorDetail(error));
+  }
+}
+
+async function invokeDataset<T>(
+  command: string,
+  args?: Record<string, unknown>,
+): Promise<T> {
+  try {
+    return await invoke<T>(command, args);
+  } catch (error) {
+    throw new DatasetCommandError(readDatasetErrorDetail(error));
   }
 }
 
@@ -1107,6 +1282,12 @@ export function onOpenSourceRequested(
   return listen("open-source-requested", handler);
 }
 
+export function onOpenFolderRequested(
+  handler: () => void,
+): Promise<UnlistenFn> {
+  return listen("open-folder-requested", handler);
+}
+
 export function onCloseSourceRequested(
   handler: (generation: number) => void,
 ): Promise<UnlistenFn> {
@@ -1160,27 +1341,61 @@ export function onDataExportCloseRequested(
   );
 }
 
-function readSourceErrorCode(error: unknown): SourceErrorCode {
+function readSourceErrorDetail(error: unknown): SourceErrorDetail {
   if (typeof error === "object" && error !== null && "code" in error) {
     const code = error.code;
     if (
       code === "notFound" ||
+      code === "noSourceOpen" ||
       code === "permissionDenied" ||
       code === "sourceChanged" ||
       code === "notParquet" ||
       code === "corruptFooter" ||
+      code === "noParquetFiles" ||
+      code === "pageTooLarge" ||
+      code === "inspectionStepTooLarge" ||
+      code === "cancelled" ||
+      code === "schemaConflict" ||
+      code === "invalidMember" ||
+      code === "notDataset" ||
+      code === "notReady" ||
       code === "unsupported"
     ) {
-      return code;
+      const member = "member" in error ? error.member : undefined;
+      const column = "column" in error ? error.column : undefined;
+      return {
+        code,
+        ...(typeof member === "string" ? { member } : {}),
+        ...(typeof column === "string" ? { column } : {}),
+      };
     }
   }
 
-  return "unsupported";
+  return { code: "unsupported" };
+}
+
+function readDatasetErrorDetail(error: unknown): DatasetErrorDetail {
+  if (
+    typeof error === "object" &&
+    error !== null &&
+    "code" in error &&
+    error.code === "window" &&
+    "error" in error
+  ) {
+    return {
+      code: "window",
+      error: { code: readDataWindowErrorCode(error.error) },
+    };
+  }
+  return readSourceErrorDetail(error);
 }
 
 function readDataWindowErrorCode(error: unknown): DataWindowErrorCode {
   if (typeof error === "object" && error !== null && "code" in error) {
     const code = error.code;
+    if (code === "window" && "error" in error) {
+      return readDataWindowErrorCode(error.error);
+    }
     if (
       code === "noSourceOpen" ||
       code === "sourceChanged" ||
@@ -1190,6 +1405,7 @@ function readDataWindowErrorCode(error: unknown): DataWindowErrorCode {
       code === "permissionDenied" ||
       code === "notParquet" ||
       code === "corruptSource" ||
+      code === "invalidMember" ||
       code === "unsupported" ||
       code === "windowTooLarge" ||
       code === "invalidFilter" ||
@@ -1214,7 +1430,11 @@ function readDataWindowCommandError(error: unknown): DataWindowCommandError {
     code === "memoryExhausted" || code === "temporaryStorageExhausted"
       ? readDataViewResourceDiagnostics(error)
       : undefined;
-  return new DataWindowCommandError(code, diagnostics);
+  const detail =
+    code === "sourceChanged" || code === "invalidMember"
+      ? readSourceErrorDetail(error)
+      : undefined;
+  return new DataWindowCommandError(code, diagnostics, detail);
 }
 
 function readDataViewResourceDiagnostics(

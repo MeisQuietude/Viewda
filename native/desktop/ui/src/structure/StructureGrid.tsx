@@ -52,6 +52,7 @@ export function StructureGrid({
   getCell,
   onSort,
   onViewportChange,
+  onSelectRow,
   heldPage,
   requestedRow,
   measurementPort,
@@ -65,6 +66,7 @@ export function StructureGrid({
   getCell: (row: number, columnId: string) => StructureGridCell | null;
   onSort: (columnId: string) => void;
   onViewportChange: (rowStart: number, rowCount: number) => void;
+  onSelectRow?: (row: number) => void;
   heldPage: { offset: number; length: number } | null;
   requestedRow?: { row: number; request: number } | null;
   measurementPort?: GridMeasurementPort;
@@ -196,7 +198,11 @@ export function StructureGrid({
         contentRevision={contentRevision}
         getCellContent={getCellContent}
         measurementPort={measurementPort}
-        onSelectionChange={setSelection}
+        onSelectionChange={(next) => {
+          setSelection(next);
+          const row = next.current?.cell.row ?? next.rows.first();
+          if (row !== undefined) onSelectRow?.(row);
+        }}
         onViewportChange={(viewport) =>
           onViewportChange(viewport.rowStart, viewport.rowCount)
         }

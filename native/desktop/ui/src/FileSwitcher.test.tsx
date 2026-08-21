@@ -8,7 +8,7 @@ import {
 } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
-import { FileSwitcher, middleTruncate } from "./FileSwitcher";
+import { FileContextMenu, FileSwitcher, middleTruncate } from "./FileSwitcher";
 import { shortcutModifier } from "./desktop";
 import type { OpenFile } from "./open-files";
 
@@ -22,6 +22,9 @@ function file(
 ): OpenFile {
   return {
     generation,
+    kind: "file",
+    datasetMemberCount: null,
+    datasetIgnoredFileCount: null,
     name,
     directory,
     path: `/data/${directory}/${name}`,
@@ -66,6 +69,8 @@ function props(files: OpenFile[] = []) {
     onDismiss: vi.fn(),
     onContextMenu: vi.fn(),
     onOpenFile: vi.fn().mockResolvedValue(undefined),
+    onOpenFolder: vi.fn().mockResolvedValue(undefined),
+    onCancelOpen: vi.fn(),
     onOpenRecent: vi.fn().mockResolvedValue(undefined),
     onRemoveRecent: vi.fn().mockResolvedValue(undefined),
   };
@@ -102,6 +107,34 @@ describe("FileSwitcher", () => {
     const recent = within(screen.getByRole("group", { name: "Recent" }));
     expect(recent.getAllByRole("option")).toHaveLength(1);
     expect(recent.getByText("archive.parquet")).toBeInTheDocument();
+  });
+
+  it("shows dataset facts without expanding members into source rows", () => {
+    const dataset: OpenFile = {
+      ...file(3, "events", "~/Data", true),
+      kind: "folderDataset",
+      datasetMemberCount: 12,
+      datasetIgnoredFileCount: 2,
+    };
+    render(<FileSwitcher {...props([dataset])} />);
+
+    const open = within(screen.getByRole("group", { name: "Open files" }));
+    expect(open.getAllByRole("option")).toHaveLength(1);
+    expect(open.getByRole("option")).toHaveTextContent(
+      "12 files · 2 ignored · /data/~/Data/events",
+    );
+    expect(open.getByRole("option")).toHaveAccessibleName(
+      /12 files · 2 ignored · \/data\/.*events/,
+    );
+  });
+
+  it("keeps an in-progress batch open cancellable", () => {
+    const input = { ...props([]), opening: true };
+    render(<FileSwitcher {...input} />);
+
+    fireEvent.click(screen.getByRole("button", { name: "Cancel opening" }));
+    expect(input.onCancelOpen).toHaveBeenCalledOnce();
+    expect(input.onOpenFile).not.toHaveBeenCalled();
   });
 
   it("filters names and paths and opens the keyboard-highlighted result", () => {
@@ -294,4 +327,36 @@ describe("FileSwitcher", () => {
     expect(Array.from(truncated)).toHaveLength(7);
     expect(truncated).not.toContain("�");
   });
+});
+
+it("offers explicit reload only for a dataset source", () => {
+  const onReload = vi.fn();
+  const dataset: OpenFile = {
+    ...file(9, "events", "~/Data", true),
+    kind: "folderDataset",
+    datasetMemberCount: 12,
+    datasetIgnoredFileCount: 2,
+  };
+  const callbacks = {
+    x: 10,
+    y: 10,
+    onClose: vi.fn(),
+    onDismiss: vi.fn(),
+    onCloseOthers: vi.fn(),
+    onReload,
+  };
+  const view = render(<FileContextMenu file={dataset} {...callbacks} />);
+
+  fireEvent.click(screen.getByRole("menuitem", { name: "Reload dataset" }));
+  expect(onReload).toHaveBeenCalledOnce();
+
+  view.rerender(
+    <FileContextMenu
+      file={file(1, "events.parquet", "~/Data")}
+      {...callbacks}
+    />,
+  );
+  expect(
+    screen.queryByRole("menuitem", { name: "Reload dataset" }),
+  ).not.toBeInTheDocument();
 });

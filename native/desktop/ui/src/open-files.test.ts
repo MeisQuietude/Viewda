@@ -31,6 +31,9 @@ function entry(
   const name = path.split("/").at(-1) ?? path;
   return {
     generation,
+    kind: "file",
+    datasetMemberCount: null,
+    datasetIgnoredFileCount: null,
     name,
     directory: "~/data",
     path,

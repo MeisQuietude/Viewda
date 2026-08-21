@@ -109,6 +109,7 @@ const PROJECTION_REQUEST_IDLE_MS = 120;
 // profiles if workloads eventually need different defaults.
 const SUPPLEMENT_WINDOW_MULTIPLIER = 2;
 const DEFAULT_DATA_VIEW_SETTINGS: DataViewSettings = { memoryLimit: "mb384" };
+const EMPTY_SOURCE_INDICES: ReadonlySet<number> = new Set();
 
 // Detect clipboard support once per webview so copy format stays consistent.
 // There is no user choice here.
@@ -462,6 +463,7 @@ export function DataGrid({
   viewSettings = DEFAULT_DATA_VIEW_SETTINGS,
   diagnostics = gridDiagnosticsNoopSink,
   active = true,
+  defaultHiddenSourceIndices = EMPTY_SOURCE_INDICES,
   onOperationChange,
 }: {
   source: SourceSummary;
@@ -469,6 +471,7 @@ export function DataGrid({
   viewSettings?: DataViewSettings;
   diagnostics?: GridDiagnosticsSink;
   active?: boolean;
+  defaultHiddenSourceIndices?: ReadonlySet<number>;
   onOperationChange?: (running: boolean) => void;
 }) {
   const [schema, setSchema] = useState(() => source.schema);
@@ -487,7 +490,7 @@ export function DataGrid({
         Math.max(MIN_COLUMN_WIDTH, field.name.length * 8 + 48),
       ),
       pinned: false,
-      hidden: false,
+      hidden: defaultHiddenSourceIndices.has(sourceIndex),
     })),
   );
   const [monospaceColumns, setMonospaceColumns] = useState<ReadonlySet<number>>(
@@ -638,7 +641,7 @@ export function DataGrid({
                       Math.max(MIN_COLUMN_WIDTH, field.name.length * 8 + 48),
                     ),
                     pinned: false,
-                    hidden: false,
+                    hidden: defaultHiddenSourceIndices.has(sourceIndex),
                   };
                 }),
               ]
@@ -655,7 +658,7 @@ export function DataGrid({
         setSchemaPageLoading(false);
       }
     }
-  }, [schema.length, source.generation]);
+  }, [defaultHiddenSourceIndices, schema.length, source.generation]);
 
   const nextSuggestionRevision = useCallback(() => {
     nextSuggestionRevisionRef.current += 1;
@@ -3339,7 +3342,9 @@ function copySelectionShape(
 function dataWindowErrorMessage(error: unknown): string {
   if (error instanceof DataWindowCommandError) {
     if (error.code === "sourceChanged") {
-      return "The open file changed before this window finished loading.";
+      return error.detail?.member === undefined
+        ? "The open file changed before this window finished loading."
+        : `Dataset member ${error.detail.member} changed. Reload the dataset.`;
     }
     if (error.code === "notFound" || error.code === "noSourceOpen") {
       return "The open file is no longer available.";
@@ -3349,6 +3354,11 @@ function dataWindowErrorMessage(error: unknown): string {
     }
     if (error.code === "corruptSource" || error.code === "notParquet") {
       return "The open Parquet file is damaged or incomplete.";
+    }
+    if (error.code === "invalidMember") {
+      return error.detail?.member === undefined
+        ? "A dataset member is damaged or unsupported. Reload the dataset."
+        : `Dataset member ${error.detail.member} is damaged or unsupported. Reload the dataset.`;
     }
     if (error.code === "invalidFilter") {
       return "This condition does not match its column type or exceeds the limits of 32 conditions, 100 list values, and 4 KB per value.";
