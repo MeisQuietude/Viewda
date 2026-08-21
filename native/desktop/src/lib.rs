@@ -4,6 +4,7 @@ mod default_application;
 mod export;
 mod launch;
 mod recents;
+mod structure;
 mod theme;
 mod updates;
 mod view_settings;
@@ -32,6 +33,12 @@ use launch::open_path;
 use launch::{PendingOpenedSource, take_opened_source};
 use recents::{RecentSource, RecentSourceError, RecentSourcesStore};
 use serde::Serialize;
+use structure::{
+    StructureJobs, cancel_structure_bloom_probe, cancel_structure_load, get_structure_chunk,
+    get_structure_columns, get_structure_key_value, get_structure_layout,
+    get_structure_lens_totals, get_structure_load_progress, get_structure_row_groups,
+    get_structure_row_offset, get_structure_summary, probe_structure_bloom_filter,
+};
 use tauri::{
     Emitter, Manager,
     menu::{Menu, MenuItemBuilder, MenuItemKind, PredefinedMenuItem, Submenu, SubmenuBuilder},
@@ -50,9 +57,9 @@ use viewda_data_engine::{
     ColumnStatistics, ColumnStatisticsError, ColumnStatisticsReader, DataFilter,
     DataFilterOperator, DataSort, DataViewBuilder, DataViewError, DataViewInterruptHandle,
     DataViewResourceDiagnostics, DataWindowError, DataWindowReader, EngineError, EngineStatus,
-    PreparedDataView, SourceError, SourceSummary, StatisticsInterruptHandle, TextValueSuggestions,
-    TextValueSuggestionsInterruptHandle, TextValueSuggestionsReader, engine_status,
-    inspect_local_source,
+    PreparedDataView, SourceError, SourceSummary, StatisticsInterruptHandle, StructureReader,
+    TextValueSuggestions, TextValueSuggestionsInterruptHandle, TextValueSuggestionsReader,
+    engine_status, inspect_local_source,
 };
 
 const OPEN_SOURCE_MENU_ID: &str = "open-local-source";
@@ -236,6 +243,7 @@ struct OpenedSourceSession {
     summary: SourceSummary,
     state: Mutex<OpenedSourceSessionState>,
     lifecycle: Arc<SessionLifecycle>,
+    structure_jobs: StructureJobs,
 }
 
 struct OpenedSourceSessionState {
@@ -247,6 +255,8 @@ struct OpenedSourceSessionState {
     data_view_jobs: DataViewJobsState,
     text_suggestion_jobs: TextValueSuggestionJobsState,
     statistics_job: Option<Arc<ColumnStatisticsJob>>,
+    /// Footer parse of this source, installed by the first structure query.
+    structure: Option<Arc<StructureReader>>,
 }
 
 impl OpenedSourceSession {
@@ -278,6 +288,7 @@ impl OpenedSourceSession {
 
     fn close_and_wait(&self) {
         self.lifecycle.start_closing();
+        self.structure_jobs.cancel_all();
         if let Ok(mut state) = self.state.lock() {
             state.cancel_jobs();
         }
@@ -774,8 +785,10 @@ impl OpenedSource {
                             data_view_jobs: DataViewJobsState::default(),
                             text_suggestion_jobs: TextValueSuggestionJobsState::default(),
                             statistics_job: None,
+                            structure: None,
                         }),
                         lifecycle: Arc::new(SessionLifecycle::default()),
+                        structure_jobs: StructureJobs::default(),
                     }),
                 );
                 OpenedSourceInfo {
@@ -2153,6 +2166,18 @@ pub fn run() {
             cancel_text_value_suggestions,
             get_column_statistics,
             cancel_column_statistics,
+            get_structure_summary,
+            get_structure_load_progress,
+            cancel_structure_load,
+            get_structure_lens_totals,
+            get_structure_layout,
+            get_structure_row_groups,
+            get_structure_columns,
+            get_structure_chunk,
+            get_structure_key_value,
+            get_structure_row_offset,
+            probe_structure_bloom_filter,
+            cancel_structure_bloom_probe,
             get_update_settings,
             set_update_settings,
             get_data_view_settings,

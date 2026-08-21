@@ -3,6 +3,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import {
   activateOpenedSource,
   cancelDataView,
+  cancelStructureBloomProbe,
   cancelTextValueSuggestions,
   ColumnStatisticsCommandError,
   DataExportCommandError,
@@ -13,7 +14,12 @@ import {
   getDataViewSettings,
   getDataWindow,
   getDataViewStatus,
+  getStructureColumns,
+  getStructureLoadProgress,
+  getStructureSummary,
   getTextValueSuggestions,
+  probeStructureBloomFilter,
+  StructureCommandError,
   installPendingUpdate,
   listOpenedSources,
   prepareDataView,
@@ -116,6 +122,70 @@ describe("desktop seam", () => {
       ["remove_recent_source", { id: "recent-4" }],
       ["clear_recent_sources"],
     ]);
+  });
+
+  it("passes structure paging and probe arguments through the desktop seam", async () => {
+    invokeMock
+      .mockResolvedValueOnce({
+        offset: 0,
+        totalCount: 1,
+        totalCompressedBytes: 10,
+        totalUncompressedBytes: 30,
+        columns: [],
+      })
+      .mockResolvedValueOnce({
+        columnIndex: 1,
+        offset: 0,
+        totalCount: 1,
+        rowGroups: [{ index: 0, outcome: "definitelyAbsent" }],
+      })
+      .mockResolvedValueOnce(undefined);
+
+    await getStructureColumns(7, "uncompressed", "bytes", "descending", 20, 50);
+    await probeStructureBloomFilter(7, 1, "north", 0, 64);
+    await cancelStructureBloomProbe(7);
+
+    expect(invokeMock).toHaveBeenNthCalledWith(1, "get_structure_columns", {
+      generation: 7,
+      unit: "uncompressed",
+      sort: "bytes",
+      direction: "descending",
+      offset: 20,
+      limit: 50,
+    });
+    expect(invokeMock).toHaveBeenNthCalledWith(
+      2,
+      "probe_structure_bloom_filter",
+      { generation: 7, columnIndex: 1, value: "north", offset: 0, limit: 64 },
+    );
+    expect(invokeMock).toHaveBeenNthCalledWith(
+      3,
+      "cancel_structure_bloom_probe",
+      { generation: 7 },
+    );
+  });
+
+  it("narrows structure failures to their closed code set", async () => {
+    invokeMock
+      .mockRejectedValueOnce({ code: "notLoaded" })
+      .mockRejectedValueOnce({ code: "a code this build does not know" });
+
+    const known = await getStructureSummary(1).catch((error: unknown) => error);
+    expect(known).toBeInstanceOf(StructureCommandError);
+    expect(known).toMatchObject({ code: "notLoaded" });
+
+    await expect(getStructureSummary(1)).rejects.toMatchObject({
+      code: "unsupported",
+    });
+  });
+
+  it("reports an absent structure load as no progress", async () => {
+    invokeMock.mockResolvedValueOnce(null);
+
+    await expect(getStructureLoadProgress(3)).resolves.toBeNull();
+    expect(invokeMock).toHaveBeenCalledWith("get_structure_load_progress", {
+      generation: 3,
+    });
   });
 
   it("passes text suggestion revisions through the desktop seam", async () => {

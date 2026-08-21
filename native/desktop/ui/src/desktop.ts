@@ -159,6 +159,197 @@ export interface ColumnStatistics {
   approximateDistinctCount: number;
 }
 
+export type StructureByteUnit = "compressed" | "uncompressed";
+
+export type StructureSortDirection = "ascending" | "descending";
+
+export type StructureRowGroupSort =
+  "index" | "rowCount" | "bytes" | "compressionRatio" | "bloomFilters";
+
+export type StructureColumnSort = "name" | "bytes" | "compressionRatio";
+
+export interface StructureKeyValueEntry {
+  index: number;
+  key: string;
+  valueBytes: number | null;
+}
+
+export interface StructureKeyValue {
+  index: number;
+  key: string;
+  value: string | null;
+  isTruncated: boolean;
+}
+
+export interface StructureSummary {
+  compressedBytes: number;
+  uncompressedBytes: number;
+  compressionRatio: number | null;
+  formatVersion: number;
+  createdBy: string | null;
+  rowCount: number;
+  rowGroupCount: number;
+  columnCount: number;
+  rowsPerRowGroup: number | null;
+  footerBytes: number;
+  codecs: string[];
+  chunkCount: number;
+  chunksWithStatistics: number;
+  chunksWithBloomFilter: number;
+  unreadableRowGroupCount: number;
+  keyValueCount: number;
+  keyValueMetadata: StructureKeyValueEntry[];
+}
+
+export interface StructureLensTotal {
+  chunkCount: number;
+  compressedBytes: number;
+  uncompressedBytes: number;
+}
+
+export interface StructureCodecTotal {
+  codec: string;
+  total: StructureLensTotal;
+}
+
+export interface StructureRatioStep {
+  maxRatio: number | null;
+  total: StructureLensTotal;
+}
+
+export interface StructurePresenceTotals {
+  present: StructureLensTotal;
+  absent: StructureLensTotal;
+}
+
+export interface StructureLensTotals {
+  codecs: StructureCodecTotal[];
+  ratioSteps: StructureRatioStep[];
+  unratedChunkCount: number;
+  statistics: StructurePresenceTotals;
+  bloomFilters: StructurePresenceTotals;
+}
+
+export interface StructureLayoutSegment {
+  columnIndex: number;
+  columnName: string;
+  compressedBytes: number;
+  uncompressedBytes: number;
+  compressionRatio: number | null;
+  codec: string;
+  encodings: string[];
+  hasStatistics: boolean;
+  hasBloomFilter: boolean;
+  hasPageIndex: boolean;
+}
+
+export interface StructureLayoutTail {
+  segmentCount: number;
+  compressedBytes: number;
+  uncompressedBytes: number;
+}
+
+export interface StructureLayoutRow {
+  index: number;
+  compressedBytes: number;
+  uncompressedBytes: number;
+  isReadable: boolean;
+  segments: StructureLayoutSegment[];
+  tail: StructureLayoutTail | null;
+}
+
+export interface StructureLayout {
+  offset: number;
+  totalCount: number;
+  rows: StructureLayoutRow[];
+}
+
+export interface StructureRowGroupSummary {
+  index: number;
+  rowCount: number;
+  compressedBytes: number;
+  uncompressedBytes: number;
+  compressionRatio: number | null;
+  chunkCount: number;
+  chunksWithBloomFilter: number;
+  isReadable: boolean;
+}
+
+export interface StructureRowGroupPage {
+  offset: number;
+  totalCount: number;
+  rowGroups: StructureRowGroupSummary[];
+}
+
+export interface StructureColumnSummary {
+  index: number;
+  name: string;
+  physicalType: string;
+  logicalType: string | null;
+  compressedBytes: number;
+  uncompressedBytes: number;
+  compressionRatio: number | null;
+  encodings: string[];
+  share: number;
+}
+
+export interface StructureColumnPage {
+  offset: number;
+  totalCount: number;
+  totalCompressedBytes: number;
+  totalUncompressedBytes: number;
+  columns: StructureColumnSummary[];
+}
+
+export interface StructureChunkStatistics {
+  minimum: string | null;
+  maximum: string | null;
+  minimumIsExact: boolean;
+  maximumIsExact: boolean;
+  nullCount: number | null;
+  distinctCount: number | null;
+}
+
+export interface StructureChunkDetails {
+  rowGroupIndex: number;
+  columnIndex: number;
+  columnName: string;
+  physicalType: string;
+  codec: string;
+  encodings: string[];
+  valueCount: number;
+  compressedBytes: number;
+  uncompressedBytes: number;
+  compressionRatio: number | null;
+  dataPageOffset: number;
+  dictionaryPageOffset: number | null;
+  bloomFilterBytes: number | null;
+  hasPageIndex: boolean;
+  hasOffsetIndex: boolean;
+  statistics: StructureChunkStatistics | null;
+}
+
+export type StructureBloomProbeOutcome =
+  "mayContain" | "definitelyAbsent" | "noFilter" | "unreadable";
+
+export interface StructureBloomProbeResult {
+  index: number;
+  outcome: StructureBloomProbeOutcome;
+}
+
+export interface StructureBloomProbe {
+  columnIndex: number;
+  offset: number;
+  totalCount: number;
+  rowGroups: StructureBloomProbeResult[];
+}
+
+// Both counters stay zero while the footer itself is being decoded.
+export interface StructureLoadProgress {
+  completedRowGroups: number;
+  totalRowGroups: number;
+}
+
 export interface TextValueSuggestions {
   values: string[];
   isPartial: boolean;
@@ -277,6 +468,22 @@ export type ColumnStatisticsErrorCode =
   | "queryFailed"
   | "queryEngineUnavailable";
 
+export type StructureErrorCode =
+  | "noSourceOpen"
+  | "sourceChanged"
+  | "notLoaded"
+  | "cancelled"
+  | "notFound"
+  | "permissionDenied"
+  | "notParquet"
+  | "corruptFooter"
+  | "unsupported"
+  | "unknownRowGroup"
+  | "unknownColumn"
+  | "unknownKeyValue"
+  | "invalidProbeValue"
+  | "unsupportedProbeColumn";
+
 export type UpdateErrorCode =
   "unavailable" | "storage" | "noPendingUpdate" | "manualInstall";
 
@@ -308,6 +515,13 @@ export class ColumnStatisticsCommandError extends Error {
   constructor(readonly code: ColumnStatisticsErrorCode) {
     super(code);
     this.name = "ColumnStatisticsCommandError";
+  }
+}
+
+export class StructureCommandError extends Error {
+  constructor(readonly code: StructureErrorCode) {
+    super(code);
+    this.name = "StructureCommandError";
   }
 }
 
@@ -624,6 +838,149 @@ export function cancelColumnStatistics(generation: number): Promise<void> {
   return invoke("cancel_column_statistics", { generation });
 }
 
+export function getStructureSummary(
+  generation: number,
+): Promise<StructureSummary> {
+  return invokeStructure<StructureSummary>("get_structure_summary", {
+    generation,
+  });
+}
+
+export function getStructureLoadProgress(
+  generation: number,
+): Promise<StructureLoadProgress | null> {
+  return invoke<StructureLoadProgress | null>("get_structure_load_progress", {
+    generation,
+  });
+}
+
+export function cancelStructureLoad(generation: number): Promise<void> {
+  return invoke("cancel_structure_load", { generation });
+}
+
+export function getStructureLensTotals(
+  generation: number,
+): Promise<StructureLensTotals> {
+  return invokeStructure<StructureLensTotals>("get_structure_lens_totals", {
+    generation,
+  });
+}
+
+export function getStructureLayout(
+  generation: number,
+  unit: StructureByteUnit,
+  rowOffset: number,
+  rowLimit: number,
+  segmentLimit: number,
+): Promise<StructureLayout> {
+  return invokeStructure<StructureLayout>("get_structure_layout", {
+    generation,
+    unit,
+    rowOffset,
+    rowLimit,
+    segmentLimit,
+  });
+}
+
+export function getStructureRowGroups(
+  generation: number,
+  unit: StructureByteUnit,
+  sort: StructureRowGroupSort,
+  direction: StructureSortDirection,
+  offset: number,
+  limit: number,
+): Promise<StructureRowGroupPage> {
+  return invokeStructure<StructureRowGroupPage>("get_structure_row_groups", {
+    generation,
+    unit,
+    sort,
+    direction,
+    offset,
+    limit,
+  });
+}
+
+export function getStructureColumns(
+  generation: number,
+  unit: StructureByteUnit,
+  sort: StructureColumnSort,
+  direction: StructureSortDirection,
+  offset: number,
+  limit: number,
+): Promise<StructureColumnPage> {
+  return invokeStructure<StructureColumnPage>("get_structure_columns", {
+    generation,
+    unit,
+    sort,
+    direction,
+    offset,
+    limit,
+  });
+}
+
+export function getStructureChunk(
+  generation: number,
+  rowGroupIndex: number,
+  columnIndex: number,
+): Promise<StructureChunkDetails> {
+  return invokeStructure<StructureChunkDetails>("get_structure_chunk", {
+    generation,
+    rowGroupIndex,
+    columnIndex,
+  });
+}
+
+export function getStructureKeyValue(
+  generation: number,
+  index: number,
+): Promise<StructureKeyValue> {
+  return invokeStructure<StructureKeyValue>("get_structure_key_value", {
+    generation,
+    index,
+  });
+}
+
+export function getStructureRowOffset(
+  generation: number,
+  rowGroupIndex: number,
+): Promise<number> {
+  return invokeStructure<number>("get_structure_row_offset", {
+    generation,
+    rowGroupIndex,
+  });
+}
+
+export function probeStructureBloomFilter(
+  generation: number,
+  columnIndex: number,
+  value: string,
+  offset: number,
+  limit: number,
+): Promise<StructureBloomProbe> {
+  return invokeStructure<StructureBloomProbe>("probe_structure_bloom_filter", {
+    generation,
+    columnIndex,
+    value,
+    offset,
+    limit,
+  });
+}
+
+export function cancelStructureBloomProbe(generation: number): Promise<void> {
+  return invoke("cancel_structure_bloom_probe", { generation });
+}
+
+async function invokeStructure<T>(
+  command: string,
+  args?: Record<string, unknown>,
+): Promise<T> {
+  try {
+    return await invoke<T>(command, args);
+  } catch (error) {
+    throw new StructureCommandError(readStructureErrorCode(error));
+  }
+}
+
 export function onOpenSourceRequested(
   handler: () => void,
 ): Promise<UnlistenFn> {
@@ -875,6 +1232,32 @@ function readColumnStatisticsErrorCode(
       code === "resourceExhausted" ||
       code === "queryFailed" ||
       code === "queryEngineUnavailable"
+    ) {
+      return code;
+    }
+  }
+
+  return "unsupported";
+}
+
+function readStructureErrorCode(error: unknown): StructureErrorCode {
+  if (typeof error === "object" && error !== null && "code" in error) {
+    const code = error.code;
+    if (
+      code === "noSourceOpen" ||
+      code === "sourceChanged" ||
+      code === "notLoaded" ||
+      code === "cancelled" ||
+      code === "notFound" ||
+      code === "permissionDenied" ||
+      code === "notParquet" ||
+      code === "corruptFooter" ||
+      code === "unsupported" ||
+      code === "unknownRowGroup" ||
+      code === "unknownColumn" ||
+      code === "unknownKeyValue" ||
+      code === "invalidProbeValue" ||
+      code === "unsupportedProbeColumn"
     ) {
       return code;
     }
