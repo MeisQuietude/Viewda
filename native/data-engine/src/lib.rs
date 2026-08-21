@@ -28,8 +28,8 @@ use thiserror::Error;
 pub use dataset::{
     DatasetError, DatasetInspectionInterruptHandle, DatasetInspectionProgress, DatasetInspector,
     DatasetMemberPage, DatasetMemberSnapshot, DatasetMemberSummary, DatasetPartitionNode,
-    DatasetPartitionPage, DatasetPreview, DatasetSource, DatasetSummary, DatasetWindowReader,
-    PartitionValue,
+    DatasetPartitionPage, DatasetPreview, DatasetSource, DatasetSummary,
+    DatasetWindowInterruptHandle, DatasetWindowReader, PartitionValue,
 };
 #[cfg(feature = "query-engine")]
 pub use export::{

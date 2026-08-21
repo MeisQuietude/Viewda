@@ -1,8 +1,15 @@
 use std::{
-    fs::{File, Metadata},
+    fs::File,
     io::{self, Read, Seek, SeekFrom},
     path::Path,
     sync::Arc,
+};
+
+#[cfg(windows)]
+use std::os::windows::io::AsRawHandle as _;
+#[cfg(windows)]
+use windows_sys::Win32::Storage::FileSystem::{
+    BY_HANDLE_FILE_INFORMATION, GetFileInformationByHandle,
 };
 
 use parquet::{
@@ -132,7 +139,8 @@ pub struct SourceIdentity {
 }
 
 impl SourceIdentity {
-    fn from_metadata(metadata: &Metadata) -> Self {
+    fn from_file(file: &File) -> Result<Self, SourceError> {
+        let metadata = file.metadata().map_err(map_io_error)?;
         let modified_nanos = metadata.modified().ok().and_then(|modified| {
             modified
                 .duration_since(std::time::UNIX_EPOCH)
@@ -142,54 +150,85 @@ impl SourceIdentity {
         #[cfg(unix)]
         {
             use std::os::unix::fs::MetadataExt;
-            Self {
+            Ok(Self {
                 len: metadata.len(),
                 modified_nanos,
                 device: metadata.dev(),
                 inode: metadata.ino(),
                 change_seconds: metadata.ctime(),
                 change_nanos: metadata.ctime_nsec(),
-            }
+            })
         }
         #[cfg(windows)]
         {
-            use std::os::windows::fs::MetadataExt;
-            Self {
+            let (volume_serial_number, file_index) = windows_file_identity(file)
+                .map(|(volume, file_index)| (Some(volume), Some(file_index)))
+                .map_err(map_io_error)?;
+            Ok(Self {
                 len: metadata.len(),
                 modified_nanos,
-                volume_serial_number: metadata.volume_serial_number(),
-                file_index: metadata.file_index(),
-            }
+                volume_serial_number,
+                file_index,
+            })
         }
         #[cfg(not(any(unix, windows)))]
         {
-            Self {
+            Ok(Self {
                 len: metadata.len(),
                 modified_nanos,
-            }
+            })
         }
     }
 
     /// Rejects a path that no longer identifies the opened file.
     pub fn validate_path(&self, path: &Path) -> Result<(), SourceError> {
-        let metadata = File::open(path)
-            .map_err(map_io_error)?
-            .metadata()
-            .map_err(map_io_error)?;
-        self.validate_metadata(&metadata)
-    }
-
-    pub(crate) fn validate_file(&self, file: &File) -> Result<(), SourceError> {
-        self.validate_metadata(&file.metadata().map_err(map_io_error)?)
-    }
-
-    fn validate_metadata(&self, metadata: &Metadata) -> Result<(), SourceError> {
-        if Self::from_metadata(metadata) == *self {
+        let file = File::open(path).map_err(map_io_error)?;
+        if Self::from_file(&file)? == *self {
             Ok(())
         } else {
             Err(SourceError::SourceChanged)
         }
     }
+
+    pub(crate) fn validate_file(&self, file: &File) -> Result<(), SourceError> {
+        if self.matches_retained_file(&Self::from_file(file)?) {
+            Ok(())
+        } else {
+            Err(SourceError::SourceChanged)
+        }
+    }
+
+    #[cfg(unix)]
+    fn matches_retained_file(&self, current: &Self) -> bool {
+        // Renaming or unlinking a Unix directory entry may change inode ctime even
+        // though the retained descriptor still exposes unchanged bytes.
+        // Path validation keeps the strict ctime check. A retained descriptor
+        // cannot distinguish a ctime-only content change from a directory-entry
+        // rename, so it uses identity, size, and modification time.
+        self.len == current.len
+            && self.modified_nanos == current.modified_nanos
+            && self.device == current.device
+            && self.inode == current.inode
+    }
+
+    #[cfg(not(unix))]
+    fn matches_retained_file(&self, current: &Self) -> bool {
+        self == current
+    }
+}
+
+#[cfg(windows)]
+pub(crate) fn windows_file_identity(file: &File) -> io::Result<(u32, u64)> {
+    let mut information = BY_HANDLE_FILE_INFORMATION::default();
+    // SAFETY: `file` keeps the handle valid and `information` is writable for the call.
+    let succeeded = unsafe { GetFileInformationByHandle(file.as_raw_handle(), &mut information) };
+    if succeeded == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok((
+        information.dwVolumeSerialNumber,
+        (u64::from(information.nFileIndexHigh) << 32) | u64::from(information.nFileIndexLow),
+    ))
 }
 
 impl SourceSnapshot {
@@ -207,7 +246,7 @@ impl SourceSnapshot {
         mut keep_going: impl FnMut(SourceOpenPhase) -> bool,
     ) -> Result<Option<Self>, SourceError> {
         let (file, file_bytes) = open_local_source(path)?;
-        let identity = SourceIdentity::from_metadata(&file.metadata().map_err(map_io_error)?);
+        let identity = SourceIdentity::from_file(&file)?;
         if !keep_going(SourceOpenPhase::ReadingFooter) {
             return Ok(None);
         }
@@ -919,6 +958,18 @@ mod tests {
             mutated_snapshot.validate_for_install(mutated.path()),
             Err(SourceError::SourceChanged)
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn retained_file_ignores_entry_ctime_without_weakening_path_identity() {
+        let source = write_basic_parquet();
+        let identity = SourceIdentity::from_file(source.as_file()).expect("identity");
+        let mut changed_ctime = identity.clone();
+        changed_ctime.change_nanos = changed_ctime.change_nanos.wrapping_add(1);
+
+        assert_ne!(identity, changed_ctime);
+        assert!(identity.matches_retained_file(&changed_ctime));
     }
 
     #[test]

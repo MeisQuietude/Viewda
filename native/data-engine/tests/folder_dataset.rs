@@ -7,9 +7,10 @@ use std::{
 use arrow_array::{
     Array, ArrayRef, Float32Array, Float64Array, Int32Array, Int64Array, RecordBatch, StringArray,
     StructArray,
+    builder::{Int32Builder, Int64Builder, ListBuilder, StructBuilder},
 };
 use arrow_ipc::reader::StreamReader;
-use arrow_schema::{Field, Schema};
+use arrow_schema::{DataType, Field, Schema};
 use parquet::arrow::ArrowWriter;
 use parquet::file::reader::{FileReader, SerializedFileReader};
 use tempfile::TempDir;
@@ -622,6 +623,61 @@ fn discovers_a_thousand_members_without_reading_their_footers() {
     );
 }
 
+#[cfg(unix)]
+#[test]
+fn public_folder_boundary_pages_one_hundred_thousand_members() {
+    let directory = TempDir::new().expect("dataset directory");
+    let mut link_target = directory.path().join("part-000000.parquet");
+    write_ints(&link_target, "value", &[7]);
+    for index in 1..=100_000 {
+        let member = directory.path().join(format!("part-{index:06}.parquet"));
+        if index % 50_000 == 0 {
+            write_ints(&member, "value", &[7]);
+            link_target = member;
+        } else {
+            fs::hard_link(&link_target, member).expect("logical member hardlink");
+        }
+    }
+
+    let source = DatasetSource::open_folder(directory.path()).expect("high-cardinality source");
+    let page = source.member_page(100_000, 256).expect("bounded wire page");
+
+    assert_eq!(source.member_count(), 100_001);
+    assert_eq!(page.total, 100_001);
+    assert_eq!(page.members.len(), 1);
+    assert_eq!(page.members[0].relative_path, "part-100000.parquet");
+
+    let mut inspector = source.inspector();
+    while inspector
+        .advance(256)
+        .expect("bounded footer page")
+        .summary
+        .is_none()
+    {}
+    let mut reader = inspector.into_window_reader().expect("ready dataset");
+    let last = decode_one(&reader.fetch(100_000, 1, &[]).expect("last member row"));
+    assert_eq!(int64_values(&last, 0), [7]);
+}
+
+#[test]
+fn folder_open_cancels_during_discovery() {
+    let directory = TempDir::new().expect("dataset directory");
+    for index in 0..300 {
+        fs::write(
+            directory.path().join(format!("part-{index:03}.parquet")),
+            b"footer intentionally absent",
+        )
+        .expect("lazy member");
+    }
+    let mut polls = 0;
+    let result = DatasetSource::open_folder_cancellable(directory.path(), || {
+        polls += 1;
+        polls < 32
+    });
+
+    assert!(matches!(result, Err(DatasetError::Cancelled)));
+}
+
 #[test]
 fn inspection_is_incremental_cancellable_and_latches_member_read_failures() {
     let directory = TempDir::new().expect("dataset directory");
@@ -1152,6 +1208,134 @@ fn widens_safe_numeric_drift_and_rejects_data_partition_and_provenance_collision
         Err(DatasetError::SchemaConflict { column, member })
             if column == "file" && member == "FILE=archive/part.parquet"
     ));
+}
+
+#[test]
+fn widens_numeric_schema_across_the_catalog_page_boundary() {
+    let directory = TempDir::new().expect("dataset directory");
+    for index in 0..256 {
+        write_columns(
+            &directory.path().join(format!("part-{index:03}.parquet")),
+            vec![("value", Arc::new(Int32Array::from(vec![index])) as ArrayRef)],
+        );
+    }
+    write_columns(
+        &directory.path().join("part-256.parquet"),
+        vec![(
+            "value",
+            Arc::new(Int64Array::from(vec![i64::MAX])) as ArrayRef,
+        )],
+    );
+    let source = DatasetSource::open_folder(directory.path()).expect("folder dataset");
+    let mut inspector = source.inspector();
+    inspector.advance(256).expect("first footer page");
+    inspector.advance(1).expect("second footer page");
+    let mut reader = inspector.into_window_reader().expect("dataset reader");
+
+    let batch = decode_one(&reader.fetch(256, 1, &[]).expect("promoted window"));
+    assert_eq!(int64_values(&batch, 0), [i64::MAX]);
+
+    let statistics = ColumnStatisticsReader::for_dataset(&reader)
+        .expect("dataset statistics")
+        .fetch("value", true)
+        .expect("cross-page statistics");
+    assert_eq!(statistics.maximum.as_deref(), Some("9223372036854775807"));
+
+    let file_index = column_index(&reader, "file");
+    let file = &reader.summary().schema[file_index as usize];
+    let suggestions =
+        TextValueSuggestionsReader::for_dataset(&reader).expect("dataset suggestions");
+    let interrupt = suggestions.interrupt_handle();
+    assert_eq!(
+        suggestions
+            .fetch("256", file, DataFilterOperator::TextContains, &interrupt)
+            .expect("later-page suggestion")
+            .values,
+        ["part-256.parquet"]
+    );
+
+    let view = DataViewBuilder::for_dataset(
+        &reader,
+        &[],
+        &[DataSort {
+            source_index: 0,
+            direction: DataSortDirection::Descending,
+        }],
+        DataViewMemoryLimit::Mb384,
+    )
+    .expect("dataset view")
+    .build()
+    .expect("global sort");
+    let sorted = decode_one(
+        &view
+            .fetch_window_columns(0, 1, &[0])
+            .expect("sorted later-page row"),
+    );
+    assert_eq!(int64_values(&sorted, 0), [i64::MAX]);
+
+    let target = directory.path().join("all.csv");
+    DataExportReader::for_dataset(
+        &reader,
+        target.clone(),
+        dataset_csv_request(vec![0], Vec::new()),
+        None,
+    )
+    .expect("dataset export")
+    .export()
+    .expect("cross-page export");
+    let exported = fs::read_to_string(target).expect("exported csv");
+    assert_eq!(exported.lines().count(), 258);
+    assert!(exported.lines().any(|line| line == i64::MAX.to_string()));
+
+    let sorted_target = directory.path().join("sorted.csv");
+    let export = DataExportReader::for_dataset(
+        &reader,
+        sorted_target.clone(),
+        dataset_csv_request(vec![0], Vec::new()),
+        Some(view.export_snapshot()),
+    )
+    .expect("sorted dataset export");
+    let progress = export.progress();
+    export.export().expect("cross-page sorted export");
+    let sorted_export = fs::read_to_string(sorted_target).expect("sorted exported csv");
+    let lines = sorted_export.lines().collect::<Vec<_>>();
+
+    assert_eq!(lines.len(), 258);
+    assert_eq!(lines[0], "value");
+    assert_eq!(lines[1], i64::MAX.to_string());
+    assert_eq!(lines[257], "0");
+    assert_eq!(lines.iter().filter(|line| **line == "value").count(), 1);
+    assert_eq!(progress.bytes_written(), sorted_export.len() as u64);
+}
+
+#[test]
+fn merges_nested_list_schema_across_the_catalog_page_boundary() {
+    let directory = TempDir::new().expect("dataset directory");
+    for index in 0..256 {
+        write_columns(
+            &directory.path().join(format!("part-{index:03}.parquet")),
+            vec![("items", list_struct_a(index))],
+        );
+    }
+    write_columns(
+        &directory.path().join("part-256.parquet"),
+        vec![("items", list_struct_a_b(i64::MAX, 7))],
+    );
+    let mut reader = complete_reader(
+        DatasetSource::open_folder(directory.path()).expect("nested folder dataset"),
+    );
+
+    let batch = decode_one(&reader.fetch(256, 1, &[]).expect("nested union window"));
+    let schema = batch.schema();
+    let DataType::List(item) = schema.field(0).data_type() else {
+        panic!("expected list column");
+    };
+    let DataType::Struct(fields) = item.data_type() else {
+        panic!("expected list struct item");
+    };
+    assert_eq!(fields.len(), 2);
+    assert_eq!(fields[0].data_type(), &DataType::Int64);
+    assert_eq!(fields[1].name(), "b");
 }
 
 #[test]
@@ -2254,6 +2438,44 @@ fn write_ints(path: &std::path::Path, name: &str, values: &[i64]) {
         path,
         vec![(name, Arc::new(Int64Array::from(values.to_vec())))],
     );
+}
+
+fn list_struct_a(value: i32) -> ArrayRef {
+    let mut builder = ListBuilder::new(StructBuilder::from_fields(
+        vec![Field::new("a", DataType::Int32, true)],
+        1,
+    ));
+    builder
+        .values()
+        .field_builder::<Int32Builder>(0)
+        .expect("field a")
+        .append_value(value);
+    builder.values().append(true);
+    builder.append(true);
+    Arc::new(builder.finish())
+}
+
+fn list_struct_a_b(a: i64, b: i32) -> ArrayRef {
+    let mut builder = ListBuilder::new(StructBuilder::from_fields(
+        vec![
+            Field::new("a", DataType::Int64, true),
+            Field::new("b", DataType::Int32, true),
+        ],
+        1,
+    ));
+    builder
+        .values()
+        .field_builder::<Int64Builder>(0)
+        .expect("field a")
+        .append_value(a);
+    builder
+        .values()
+        .field_builder::<Int32Builder>(1)
+        .expect("field b")
+        .append_value(b);
+    builder.values().append(true);
+    builder.append(true);
+    Arc::new(builder.finish())
 }
 
 fn write_ordered_member(path: &std::path::Path, first_id: i64, groups: usize, rows: usize) {

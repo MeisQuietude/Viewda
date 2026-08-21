@@ -201,6 +201,7 @@ impl DataViewResourceFailure {
 }
 
 /// A thread-safe handle for interrupting one in-flight view preparation.
+#[derive(Clone)]
 pub struct DataViewInterruptHandle {
     inner: Arc<InterruptHandle>,
     cancelled: Arc<AtomicBool>,
@@ -271,10 +272,10 @@ impl DataViewSource {
         }
     }
 
-    fn validate(&self) -> Result<(), DatasetError> {
+    fn validate_while(&self, keep_going: impl FnMut() -> bool) -> Result<(), DatasetError> {
         match self {
             Self::File(_) => Ok(()),
-            Self::Dataset(dataset) => dataset.validate(),
+            Self::Dataset(dataset) => dataset.validate_while(keep_going),
         }
     }
 
@@ -332,13 +333,31 @@ impl DataViewBuilder {
         sort: &[DataSort],
         memory_limit: DataViewMemoryLimit,
     ) -> Result<Self, DataViewError> {
-        let source = reader.query_source().map_err(dataset_view_error)?;
-        Self::with_source(
+        Self::for_dataset_while(reader, filters, sort, memory_limit, || true)
+    }
+
+    /// Creates a dataset builder while the owning source session remains active.
+    pub fn for_dataset_while(
+        reader: &DatasetWindowReader,
+        filters: &[DataFilter],
+        sort: &[DataSort],
+        memory_limit: DataViewMemoryLimit,
+        mut keep_going: impl FnMut() -> bool,
+    ) -> Result<Self, DataViewError> {
+        let source = reader
+            .query_source_while(&mut keep_going)
+            .map_err(dataset_view_error)?;
+        let builder = Self::with_source(
             DataViewSource::Dataset(Box::new(source)),
             filters,
             sort,
             memory_limit,
-        )
+        )?;
+        if !keep_going() {
+            builder.interrupt_handle().interrupt();
+            return Err(DataWindowError::Cancelled.into());
+        }
+        Ok(builder)
     }
 
     fn with_source(
@@ -347,6 +366,7 @@ impl DataViewBuilder {
         sort: &[DataSort],
         memory_limit: DataViewMemoryLimit,
     ) -> Result<Self, DataViewError> {
+        let is_dataset = matches!(source, DataViewSource::Dataset(_));
         let temporary_directory = match &source {
             DataViewSource::File(path) => create_view_temporary_directory(path)?,
             DataViewSource::Dataset(dataset) => {
@@ -358,7 +378,8 @@ impl DataViewBuilder {
             .to_str()
             .ok_or(DataWindowError::QueryEngineUnavailable)?;
         let config = Config::default()
-            .max_memory(memory_limit.duckdb_value())
+            .enable_object_cache(!is_dataset)
+            .and_then(|config| config.max_memory(memory_limit.duckdb_value()))
             .and_then(|config| config.with("temp_directory", temporary_directory_path))
             // External sort keeps thread-local state. Reserve roughly 384 MB of the selected
             // budget per worker so the minimum can spill instead of exhausting ten core-local
@@ -372,7 +393,11 @@ impl DataViewBuilder {
             .map_err(|_| DataWindowError::QueryEngineUnavailable)?;
         set_utc_session_timezone(&connection)?;
         connection
-            .execute_batch("SET parquet_metadata_cache = true")
+            .execute_batch(if is_dataset {
+                "SET parquet_metadata_cache = false"
+            } else {
+                "SET parquet_metadata_cache = true"
+            })
             .map_err(|_| DataWindowError::QueryEngineUnavailable)?;
         let resource_settings = read_resource_settings(&connection)?;
 
@@ -422,8 +447,12 @@ impl DataViewBuilder {
             .map(quote_identifier)
             .collect::<Vec<_>>()
             .join(", ");
-        let prepared_relation =
-            self.prepare_relation(&facts, &relation_columns, &source_position)?;
+        let prepared_relation = self.prepare_relation(
+            &facts,
+            &source_column_names,
+            &relation_columns,
+            &source_position,
+        )?;
         let order = build_order_clause_with_names(
             &facts.schema,
             &source_column_names,
@@ -453,7 +482,9 @@ impl DataViewBuilder {
                 self.classify_prepare_error(error, &facts, !self.filters.is_empty())
             })?;
         self.require_active()?;
-        self.source.validate().map_err(dataset_view_error)?;
+        self.source
+            .validate_while(|| !self.cancelled.load(Ordering::Acquire))
+            .map_err(dataset_view_error)?;
         self.require_active()?;
 
         let index_summary = inspect_local_source(&position_index).map_err(DataWindowError::from)?;
@@ -487,12 +518,14 @@ impl DataViewBuilder {
             sort: self.sort,
             resource_diagnostics: window_resource_diagnostics,
             temporary_directory: Arc::new(self.temporary_directory),
+            interrupted: self.cancelled,
         })
     }
 
     fn prepare_relation(
         &self,
         facts: &DataViewSourceFacts,
+        source_column_names: &[&str],
         relation_columns: &str,
         source_position: &str,
     ) -> Result<PreparedRelation, DataViewError> {
@@ -539,20 +572,48 @@ impl DataViewBuilder {
                     .execute_batch("SET preserve_insertion_order = true")
                     .map_err(|error| self.classify_prepare_error(error, facts, false))?;
                 dataset
-                    .install(&self.connection)
-                    .map_err(|error| self.classify_setup_error(error, facts))?;
-                dataset
-                    .bind_candidates(&self.connection, &self.filters)
+                    .install_while(&self.connection, || !self.cancelled.load(Ordering::Acquire))
                     .map_err(|error| self.classify_setup_error(error, facts))?;
                 let ordinal = quote_identifier(dataset.ordinal_column());
                 let native_row = quote_identifier(dataset.row_column());
-                let aliases = format!("{relation_columns}, {ordinal}, {native_row}");
+                let mut needed_indices = self
+                    .filters
+                    .iter()
+                    .map(|filter| filter.column_index as usize)
+                    .chain(self.sort.iter().map(|sort| sort.source_index as usize))
+                    .collect::<Vec<_>>();
+                needed_indices.sort_unstable();
+                needed_indices.dedup();
+                let staging_projection = needed_indices
+                    .into_iter()
+                    .map(|index| {
+                        format!(
+                            "{} AS {}",
+                            quote_identifier(&facts.schema[index].name),
+                            quote_identifier(source_column_names[index]),
+                        )
+                    })
+                    .chain([
+                        format!("{ordinal} AS {ordinal}"),
+                        format!("{native_row} AS {native_row}"),
+                    ])
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                dataset
+                    .stage_candidate_batches(
+                        &self.connection,
+                        &self.filters,
+                        "__viewda_staged_dataset",
+                        (&staging_projection, ""),
+                        &[],
+                        || !self.cancelled.load(Ordering::Acquire),
+                    )
+                    .map_err(|error| self.classify_setup_error(error, facts))?;
+                self.connection
+                    .execute_batch("SET preserve_insertion_order = false")
+                    .map_err(|error| self.classify_prepare_error(error, facts, false))?;
                 Ok(PreparedRelation {
-                    sql: format!(
-                        "{} AS {}({aliases})",
-                        dataset.relation_sql(),
-                        quote_identifier("__viewda_source")
-                    ),
+                    sql: quote_identifier("__viewda_staged_dataset"),
                     position_projection: format!(
                         "{ordinal} AS {}, {native_row} AS {}",
                         quote_identifier("__viewda_member_ordinal"),
@@ -663,7 +724,10 @@ fn data_view_resource_failure(error: &DuckDbError) -> Option<(DataViewResourceFa
     };
     let lower_message = message.to_ascii_lowercase();
     if message.contains("max_temp_directory_size")
-        || (message.starts_with("IO Error:") && lower_message.contains("space"))
+        || (message.starts_with("IO Error:")
+            && ["no space left", "disk full", "not enough space"]
+                .iter()
+                .any(|marker| lower_message.contains(marker)))
     {
         Some((DataViewResourceFailure::TemporaryStorage, message))
     } else if message.starts_with("Out of Memory Error:") {
@@ -749,7 +813,9 @@ fn classify_view_window_query_error(
     error: DuckDbError,
     bound_ordinals: Option<&[u64]>,
 ) -> DataViewError {
-    if data_view_resource_failure(&error).is_some() {
+    if view.interrupted.load(Ordering::Acquire) {
+        DataWindowError::Cancelled.into()
+    } else if data_view_resource_failure(&error).is_some() {
         classify_view_window_error(
             error,
             &view.resource_diagnostics,
@@ -783,6 +849,7 @@ pub struct PreparedDataView {
     sort: Vec<DataSort>,
     resource_diagnostics: DataViewResourceDiagnostics,
     temporary_directory: Arc<TempDir>,
+    interrupted: Arc<AtomicBool>,
 }
 
 /// Snapshot of a completed view used by a background export.
@@ -805,6 +872,14 @@ pub(crate) enum PreparedDataViewExportSource {
 }
 
 impl PreparedDataView {
+    /// Returns a handle that interrupts an active window and retires this view.
+    pub fn interrupt_handle(&self) -> DataViewInterruptHandle {
+        DataViewInterruptHandle {
+            inner: self.source_connection.interrupt_handle(),
+            cancelled: Arc::clone(&self.interrupted),
+        }
+    }
+
     /// Returns the exact number of positions in this view.
     pub fn row_count(&self) -> u64 {
         self.row_count
@@ -883,6 +958,9 @@ impl PreparedDataView {
         source_indices: &[usize],
         before_prepare: impl FnOnce(),
     ) -> Result<Vec<u8>, DataViewError> {
+        if self.interrupted.load(Ordering::Acquire) {
+            return Err(DataWindowError::Cancelled.into());
+        }
         let position_index_path = self
             .position_index
             .to_str()
@@ -1342,6 +1420,9 @@ fn fetch_view_window_inner(
     bound_ordinals: Option<&[u64]>,
     before_prepare: impl FnOnce(),
 ) -> Result<Vec<u8>, DataViewError> {
+    if view.interrupted.load(Ordering::Acquire) {
+        return Err(DataWindowError::Cancelled.into());
+    }
     match &view.source {
         DataViewSource::File(path) => {
             let (file, _) = open_local_source(path).map_err(DataWindowError::from)?;
@@ -1381,6 +1462,9 @@ fn fetch_view_window_inner(
     }));
     let encoded = match encoded {
         Ok(result) => result.map_err(DataViewError::from)?,
+        Err(_) if view.interrupted.load(Ordering::Acquire) => {
+            return Err(DataWindowError::Cancelled.into());
+        }
         Err(panic) => match &view.source {
             DataViewSource::Dataset(dataset) => {
                 let Some(ordinals) = bound_ordinals else {
@@ -1395,6 +1479,9 @@ fn fetch_view_window_inner(
     };
     if let DataViewSource::Dataset(dataset) = &view.source {
         dataset.validate().map_err(dataset_view_error)?;
+    }
+    if view.interrupted.load(Ordering::Acquire) {
+        return Err(DataWindowError::Cancelled.into());
     }
     Ok(encoded)
 }
@@ -1512,6 +1599,45 @@ mod tests {
         assert_eq!(index.schema.len(), 1);
         assert_eq!(index.schema[0].name, POSITION_COLUMN);
         assert!(metadata_after.len() < fs::metadata(source.path()).expect("source metadata").len());
+    }
+
+    #[test]
+    fn dataset_staging_omits_columns_unused_by_filters_and_sort() {
+        let (_directory, reader) = write_dataset_fixture();
+        let builder = DataViewBuilder::for_dataset(
+            &reader,
+            &[],
+            &[DataSort {
+                source_index: 0,
+                direction: DataSortDirection::Ascending,
+            }],
+            DataViewMemoryLimit::Mb384,
+        )
+        .expect("dataset builder");
+        let facts = builder.source.facts().expect("dataset facts");
+        let source_columns = (0..facts.schema.len())
+            .map(|index| format!("__viewda_column_{index}"))
+            .collect::<Vec<_>>();
+        let names = source_columns
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>();
+        builder
+            .prepare_relation(&facts, &names, "", "\"__viewda_source_position\"")
+            .expect("staged relation");
+        let mut statement = builder
+            .connection
+            .prepare("SELECT name FROM pragma_table_info('__viewda_staged_dataset') ORDER BY cid")
+            .expect("staged schema");
+        let names = statement
+            .query_map([], |row| row.get::<_, String>(0))
+            .expect("staged columns")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("column names");
+
+        assert!(names.iter().any(|name| name == "__viewda_column_0"));
+        assert!(!names.iter().any(|name| name == "__viewda_column_1"));
+        assert_eq!(names.len(), 3);
     }
 
     #[test]
@@ -1933,12 +2059,16 @@ mod tests {
             .expect("prepared dataset view");
         let removed = directory.path().join("a[1].parquet");
 
-        assert!(matches!(
-            view.fetch_window_columns_with_duckdb_inner(0, 8, &[0], || {
-                fs::remove_file(&removed).expect("remove after preflight");
-            }),
-            Err(DataViewError::Engine(DataWindowError::SourceChanged))
-        ));
+        let result = view.fetch_window_columns_with_duckdb_inner(0, 8, &[0], || {
+            fs::remove_file(&removed).expect("remove after preflight");
+        });
+        assert!(
+            matches!(
+                result,
+                Err(DataViewError::Engine(DataWindowError::SourceChanged))
+            ),
+            "unexpected result: {result:?}"
+        );
         assert!(matches!(
             view.fetch_window(0, 8),
             Err(DataViewError::Engine(DataWindowError::SourceChanged))

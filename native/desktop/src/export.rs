@@ -764,6 +764,7 @@ pub(crate) async fn start_data_export(
         |name| name.to_string_lossy().into_owned(),
     );
     let id = jobs.next_id();
+    let start_cancelled = Arc::clone(&reservation.cancelled);
     let reader = match tauri::async_runtime::spawn_blocking({
         let target_path = target_path.clone();
         move || {
@@ -786,7 +787,9 @@ pub(crate) async fn start_data_export(
                 None => DataExportReader::new(session.path.clone(), target_path, request, view),
                 Some(reader) => {
                     let reader = reader.lock().map_err(|_| DataExportError::QueryFailed)?;
-                    DataExportReader::for_dataset(&reader, target_path, request, view)
+                    DataExportReader::for_dataset_while(&reader, target_path, request, view, || {
+                        !start_cancelled.load(Ordering::Acquire)
+                    })
                 }
             }
         }

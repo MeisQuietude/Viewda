@@ -11,7 +11,9 @@ Backward-incompatible entries start with **Breaking:**.
 ### Added
 
 - Open a folder and its Hive partitions as one dataset with combined filtering,
-  sorting, statistics, export, and member-level Structure details.
+  sorting, statistics, export, and member-level Structure details. Large
+  datasets page member metadata from disk instead of retaining every file in
+  memory.
 - Inspect Parquet storage layout in Structure view with compression, codec,
   statistics and bloom-filter lenses; sortable row-group and column tables;
   chunk details and bloom probes; and a privacy-safe Markdown report.

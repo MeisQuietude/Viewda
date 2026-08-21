@@ -1,8 +1,10 @@
 //! Parquet datasets with fixed membership and bounded windows.
 
+mod member_catalog;
+
 use std::{
     any::Any,
-    collections::{BTreeMap, HashMap, HashSet},
+    collections::HashMap,
     fs,
     panic::{AssertUnwindSafe, catch_unwind},
     path::{Path, PathBuf},
@@ -13,42 +15,45 @@ use std::{
     time::SystemTime,
 };
 
-#[cfg(unix)]
-use std::os::unix::fs::MetadataExt as _;
-#[cfg(windows)]
-use std::os::windows::io::AsRawHandle as _;
-
-#[cfg(windows)]
-use windows_sys::Win32::Storage::FileSystem::{
-    BY_HANDLE_FILE_INFORMATION, GetFileInformationByHandle,
-};
-
 use arrow_array::RecordBatch;
 use arrow_ipc::writer::StreamWriter;
-use arrow_schema::{Schema, SchemaRef};
+use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use duckdb::{
-    Config, Connection, Error as DuckDbError, appender_params_from_iter, params_from_iter,
-    types::Value,
+    Config, Connection, Error as DuckDbError, InterruptHandle, appender_params_from_iter,
+    params_from_iter, types::Value,
 };
 use serde::{Deserialize, Serialize};
+#[cfg(unix)]
+use std::os::unix::fs::MetadataExt as _;
 use tempfile::NamedTempFile;
+use tempfile::TempDir;
 use thiserror::Error;
 
 use parquet::arrow::ArrowWriter;
 
+#[cfg(windows)]
+use crate::source::windows_file_identity;
+
 use crate::{
     DataFilter, DataFilterOperator, SchemaField,
     filter::{build_filter_predicate, quote_identifier},
-    source::{SourceError, SourceSnapshot, inspect_local_source, inspect_local_source_for_query},
+    source::{
+        SourceError, SourceSnapshot, SourceSummary, inspect_local_source,
+        inspect_local_source_for_query,
+    },
     window::{
         DataWindowError, MAX_WINDOW_ROWS, classify_query_error, set_utc_session_timezone,
         validate_projection,
     },
 };
+use member_catalog::{CATALOG_PAGE_MEMBERS, MemberCatalog, MemberCatalogBuilder};
 
 const MAX_MEMBER_PAGE_SIZE: u32 = 256;
 const MAX_PREVIEW_COLUMNS: usize = 256;
 const MAX_PARTITION_DEPTH: usize = 256;
+const MAX_DATASET_SCHEMA_NODES: usize = 4_096;
+const MAX_DATASET_SCHEMA_BYTES: usize = 4 * 1024 * 1024;
+const DATASET_QUERY_MEMORY_LIMIT: &str = "384MB";
 const PROVENANCE_COLUMN: &str = "file";
 
 /// A Hive partition key and its text value for one member.
@@ -68,6 +73,7 @@ struct DatasetMember {
     relative_path: String,
     partitions: Vec<PartitionValue>,
     identity: MemberIdentity,
+    row_count: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -123,7 +129,12 @@ impl DatasetMemberSnapshot {
     /// Rechecks every fixed member and the retained selected snapshot.
     /// A changed member latches its relative path even when it is not selected.
     pub fn validate(&self) -> Result<(), DatasetError> {
-        self.source.ensure_members_unchanged(&self.source.members)?;
+        self.validate_while(|| true)
+    }
+
+    /// Rechecks the fixed composition while the caller still wants the work.
+    pub fn validate_while(&self, keep_going: impl FnMut() -> bool) -> Result<(), DatasetError> {
+        self.source.ensure_all_members_unchanged_while(keep_going)?;
         self.snapshot
             .validate_for_install(&self.member.path)
             .map_err(|error| self.source.latch_member_error(error, &self.member))
@@ -238,13 +249,25 @@ impl From<DataWindowError> for DatasetError {
 pub struct DatasetSource {
     display_name: String,
     ignored_file_count: u64,
-    members: Arc<[DatasetMember]>,
+    root: PathBuf,
+    catalog: Arc<MemberCatalog>,
     changed_member: Arc<Mutex<Option<String>>>,
 }
 
 impl DatasetSource {
     /// Discovers supported members without reading any Parquet footer.
     pub fn open_folder(root: &Path) -> Result<Self, DatasetError> {
+        Self::open_folder_cancellable(root, || true)
+    }
+
+    /// Discovers a folder while polling cancellation between filesystem and catalog batches.
+    pub fn open_folder_cancellable(
+        root: &Path,
+        mut keep_going: impl FnMut() -> bool,
+    ) -> Result<Self, DatasetError> {
+        if !keep_going() {
+            return Err(DatasetError::Cancelled);
+        }
         let root = std::path::absolute(root).map_err(map_discovery_error)?;
         root.to_str().ok_or(DatasetError::Unsupported)?;
         let metadata = fs::metadata(&root).map_err(map_discovery_error)?;
@@ -257,21 +280,25 @@ impl DatasetSource {
             .map(str::to_owned)
             .filter(|name| !name.is_empty())
             .ok_or(DatasetError::Unsupported)?;
-        let mut discovered = Vec::new();
+        let mut catalog = MemberCatalogBuilder::new()?;
         let mut ignored_file_count = 0_u64;
-        discover_members(&root, &root, &mut discovered, &mut ignored_file_count)?;
-        if discovered.is_empty() {
+        discover_members(
+            &root,
+            &root,
+            &mut catalog,
+            &mut ignored_file_count,
+            &mut keep_going,
+        )?;
+        let catalog = catalog.finish_while(&mut keep_going)?;
+        if catalog.member_count() == 0 {
             return Err(DatasetError::NoParquetFiles);
-        }
-        discovered.sort_by(|left, right| left.relative_path.cmp(&right.relative_path));
-        for (ordinal, member) in discovered.iter_mut().enumerate() {
-            member.ordinal = ordinal as u64;
         }
 
         Ok(Self {
             display_name: format!("{folder_name}/"),
             ignored_file_count,
-            members: discovered.into(),
+            root,
+            catalog: Arc::new(catalog),
             changed_member: Arc::new(Mutex::new(None)),
         })
     }
@@ -281,53 +308,81 @@ impl DatasetSource {
     /// Logical absolute paths determine provenance, Hive values, and lexicographic
     /// order. Canonical targets determine reads, identities, and duplicate rejection.
     pub fn open_files(paths: &[PathBuf]) -> Result<Self, DatasetError> {
+        Self::open_files_cancellable(paths, || true)
+    }
+
+    /// Opens explicit files while polling cancellation between members and catalog batches.
+    pub fn open_files_cancellable(
+        paths: &[PathBuf],
+        mut keep_going: impl FnMut() -> bool,
+    ) -> Result<Self, DatasetError> {
+        if !keep_going() {
+            return Err(DatasetError::Cancelled);
+        }
         if paths.is_empty() {
             return Err(DatasetError::NoParquetFiles);
         }
-        if paths.iter().any(|path| !has_parquet_extension(path)) {
-            return Err(DatasetError::Unsupported);
-        }
+        let root = explicit_common_parent(paths, &mut keep_going)?;
+        Self::open_file_selection_cancellable(&root, paths.iter().cloned().map(Ok), keep_going)
+    }
 
-        let mut canonical_targets = HashSet::with_capacity(paths.len());
-        let mut resolved_paths = Vec::with_capacity(paths.len());
-        for path in paths {
-            let logical = std::path::absolute(path).map_err(map_discovery_error)?;
+    /// Opens a streamed explicit selection rooted at `root` without collecting its paths.
+    pub fn open_file_selection_cancellable(
+        root: &Path,
+        paths: impl IntoIterator<Item = Result<PathBuf, DatasetError>>,
+        mut keep_going: impl FnMut() -> bool,
+    ) -> Result<Self, DatasetError> {
+        if !keep_going() {
+            return Err(DatasetError::Cancelled);
+        }
+        let mut root = std::path::absolute(root).map_err(map_discovery_error)?;
+        while root
+            .file_name()
+            .and_then(|component| component.to_str())
+            .is_some_and(is_hive_partition_component)
+        {
+            if !root.pop() {
+                return Err(DatasetError::Unsupported);
+            }
+        }
+        root.to_str().ok_or(DatasetError::Unsupported)?;
+        let mut catalog = MemberCatalogBuilder::new()?;
+        for requested in paths {
+            if !keep_going() {
+                return Err(DatasetError::Cancelled);
+            }
+            let requested = requested?;
+            if !has_parquet_extension(&requested) {
+                return Err(DatasetError::Unsupported);
+            }
+            let logical = std::path::absolute(requested).map_err(map_discovery_error)?;
             logical.to_str().ok_or(DatasetError::Unsupported)?;
             let path = query_compatible_canonical_path(
                 fs::canonicalize(&logical).map_err(map_discovery_error)?,
             )?;
             path.to_str().ok_or(DatasetError::Unsupported)?;
             let metadata = fs::metadata(&path).map_err(map_discovery_error)?;
-            if !metadata.is_file() || !canonical_targets.insert(path.clone()) {
+            if !metadata.is_file() {
                 return Err(DatasetError::Unsupported);
             }
-            resolved_paths.push((logical, path));
-        }
-        let logical_paths = resolved_paths
-            .iter()
-            .map(|(logical, _)| logical.clone())
-            .collect::<Vec<_>>();
-        let root = common_parent(&logical_paths).ok_or(DatasetError::Unsupported)?;
-        let mut members = Vec::with_capacity(resolved_paths.len());
-        for (logical, path) in resolved_paths {
-            let metadata = fs::metadata(&path).map_err(map_discovery_error)?;
             let relative = logical
                 .strip_prefix(&root)
                 .map_err(|_| DatasetError::Unsupported)?;
             let relative_path = slash_path(relative)?;
             let partitions = parse_partitions(relative)?;
             let identity = member_identity(&path, &metadata).map_err(map_discovery_error)?;
-            members.push(DatasetMember {
+            catalog.push(DatasetMember {
                 ordinal: 0,
                 path,
                 relative_path,
                 partitions,
                 identity,
-            });
+                row_count: None,
+            })?;
         }
-        members.sort_by(|left, right| left.relative_path.cmp(&right.relative_path));
-        for (ordinal, member) in members.iter_mut().enumerate() {
-            member.ordinal = ordinal as u64;
+        let catalog = catalog.finish_while(&mut keep_going)?;
+        if catalog.member_count() == 0 {
+            return Err(DatasetError::NoParquetFiles);
         }
         let display_name = root
             .file_name()
@@ -335,14 +390,15 @@ impl DatasetSource {
             .map(str::to_owned)
             .filter(|name| !name.is_empty())
             .map_or_else(
-                || format!("{} files/", members.len()),
+                || format!("{} files/", catalog.member_count()),
                 |name| format!("{name}/"),
             );
 
         Ok(Self {
             display_name,
             ignored_file_count: 0,
-            members: members.into(),
+            root,
+            catalog: Arc::new(catalog),
             changed_member: Arc::new(Mutex::new(None)),
         })
     }
@@ -354,7 +410,7 @@ impl DatasetSource {
 
     /// Number of members captured at open time.
     pub fn member_count(&self) -> u64 {
-        self.members.len() as u64
+        self.catalog.member_count()
     }
 
     /// Number of files excluded from membership at open time.
@@ -367,15 +423,14 @@ impl DatasetSource {
         if limit > MAX_MEMBER_PAGE_SIZE {
             return Err(DatasetError::PageTooLarge);
         }
-        let start = usize::try_from(offset)
-            .unwrap_or(usize::MAX)
-            .min(self.members.len());
-        let end = start.saturating_add(limit as usize).min(self.members.len());
-        let members = self.members[start..end]
-            .iter()
+        let members = self
+            .catalog
+            .page(offset.checked_sub(1), limit)?
+            .members
+            .into_iter()
             .map(|member| DatasetMemberSummary {
-                relative_path: member.relative_path.clone(),
-                partitions: member.partitions.clone(),
+                relative_path: member.relative_path,
+                partitions: member.partitions,
             })
             .collect();
         Ok(DatasetMemberPage {
@@ -398,61 +453,7 @@ impl DatasetSource {
         if limit > MAX_MEMBER_PAGE_SIZE || parent.len() > MAX_PARTITION_DEPTH {
             return Err(DatasetError::PageTooLarge);
         }
-        if limit == 0 {
-            return Ok(DatasetPartitionPage {
-                nodes: Vec::new(),
-                next_after: None,
-            });
-        }
-
-        let after = after.map(partition_order_key);
-        let capacity = limit as usize + 1;
-        let mut nodes = BTreeMap::<(String, String), DatasetPartitionNode>::new();
-        for member in self.members.iter() {
-            if !partition_prefix_matches(&member.partitions, parent) {
-                continue;
-            }
-            let Some(partition) = member.partitions.get(parent.len()) else {
-                continue;
-            };
-            let key = partition_order_key(partition);
-            if after.as_ref().is_some_and(|cursor| key <= *cursor) {
-                continue;
-            }
-            if let Some(node) = nodes.get_mut(&key) {
-                node.member_count += 1;
-                continue;
-            }
-            // The largest retained key only decreases, so a discarded key can
-            // never re-enter and the retained nodes keep exact counts.
-            if nodes.len() == capacity
-                && nodes.last_key_value().is_some_and(|(last, _)| key >= *last)
-            {
-                continue;
-            }
-            if nodes.len() == capacity {
-                nodes.pop_last();
-            }
-            nodes.insert(
-                key,
-                DatasetPartitionNode {
-                    partition: partition.clone(),
-                    member_count: 1,
-                },
-            );
-        }
-
-        let has_next = nodes.len() > limit as usize;
-        if has_next {
-            nodes.pop_last();
-        }
-        let nodes = nodes.into_values().collect::<Vec<_>>();
-        let next_after = if has_next {
-            nodes.last().map(|node| node.partition.clone())
-        } else {
-            None
-        };
-        Ok(DatasetPartitionPage { nodes, next_after })
+        self.catalog.partition_page(parent, after, limit)
     }
 
     /// Creates a cancellable footer inspector that advances by a bounded member budget.
@@ -472,11 +473,80 @@ impl DatasetSource {
         Ok(())
     }
 
-    fn ensure_members_unchanged(&self, members: &[DatasetMember]) -> Result<(), DatasetError> {
-        for member in members {
-            self.ensure_member_unchanged(member)?;
+    fn ensure_all_members_unchanged(&self) -> Result<(), DatasetError> {
+        self.ensure_all_members_unchanged_while(|| true)
+    }
+
+    fn ensure_all_members_unchanged_while(
+        &self,
+        keep_going: impl FnMut() -> bool,
+    ) -> Result<(), DatasetError> {
+        self.ensure_member_prefix_unchanged_while(self.member_count(), keep_going)
+    }
+
+    fn ensure_member_prefix_unchanged_while(
+        &self,
+        limit: u64,
+        mut keep_going: impl FnMut() -> bool,
+    ) -> Result<(), DatasetError> {
+        let mut after = None;
+        loop {
+            if !keep_going() {
+                return Err(DatasetError::Cancelled);
+            }
+            let page = self.catalog.page(after, CATALOG_PAGE_MEMBERS)?;
+            for member in page
+                .members
+                .iter()
+                .take_while(|member| member.ordinal < limit)
+            {
+                if !keep_going() {
+                    return Err(DatasetError::Cancelled);
+                }
+                self.ensure_member_unchanged(member)?;
+            }
+            let Some(next) = page.next_ordinal.filter(|next| *next < limit) else {
+                return Ok(());
+            };
+            after = Some(next);
         }
-        Ok(())
+    }
+
+    fn member(&self, ordinal: u64) -> Result<DatasetMember, DatasetError> {
+        self.catalog
+            .member(ordinal)?
+            .ok_or(DatasetError::Unsupported)
+    }
+
+    fn target_matches_member(&self, target: &Path) -> bool {
+        let canonical_target = fs::canonicalize(target).ok();
+        let target_platform = fs::metadata(target)
+            .ok()
+            .and_then(|metadata| platform_file_identity(target, &metadata).ok());
+        let mut after = None;
+        loop {
+            let Ok(page) = self.catalog.page(after, CATALOG_PAGE_MEMBERS) else {
+                return false;
+            };
+            if page.members.iter().any(|member| {
+                member.path == target
+                    || target_platform
+                        .as_ref()
+                        .is_some_and(|target| same_file_identity(target, &member.identity.platform))
+                    || canonical_target.as_ref().is_some_and(|target| {
+                        &member.path == target
+                            || fs::canonicalize(&member.path)
+                                .ok()
+                                .is_some_and(|member| member == *target)
+                    })
+            }) {
+                return true;
+            }
+            let Some(next) = page.next_ordinal else {
+                return false;
+            };
+            after = Some(next);
+        }
     }
 
     fn require_active(&self) -> Result<(), DatasetError> {
@@ -565,52 +635,40 @@ impl DatasetInspectionInterruptHandle {
 /// Incrementally merges member footers while retaining only aggregate schema and counts.
 pub struct DatasetInspector {
     source: DatasetSource,
-    next_member: usize,
+    next_member: u64,
     union_schema: Vec<SchemaField>,
     first_schema: Option<Vec<SchemaField>>,
     first_column_members: HashMap<String, String>,
     partition_names: Vec<String>,
+    partition_names_loaded: bool,
     size_bytes: u64,
     row_count: u64,
     row_group_count: u64,
-    member_row_counts: Vec<u64>,
     drift_count: u64,
-    deviating_members: Vec<usize>,
     initial_schema_reported: bool,
     preview_reader: Option<DatasetWindowReader>,
     cancelled: Arc<AtomicBool>,
+    footer_cache: Option<(MemberIdentity, SourceSummary)>,
 }
 
 impl DatasetInspector {
     fn new(source: DatasetSource) -> Self {
-        let member_count = source.members.len();
-        let mut partition_names = Vec::new();
-        for member in source.members.iter() {
-            for partition in &member.partitions {
-                if !partition_names
-                    .iter()
-                    .any(|name: &String| name.eq_ignore_ascii_case(&partition.key))
-                {
-                    partition_names.push(partition.key.clone());
-                }
-            }
-        }
         Self {
             source,
             next_member: 0,
             union_schema: Vec::new(),
             first_schema: None,
             first_column_members: HashMap::new(),
-            partition_names,
+            partition_names: Vec::new(),
+            partition_names_loaded: false,
             size_bytes: 0,
             row_count: 0,
             row_group_count: 0,
-            member_row_counts: Vec::with_capacity(member_count),
             drift_count: 0,
-            deviating_members: Vec::new(),
             initial_schema_reported: false,
             preview_reader: None,
             cancelled: Arc::new(AtomicBool::new(false)),
+            footer_cache: None,
         }
     }
 
@@ -623,25 +681,36 @@ impl DatasetInspector {
 
     /// Reads the first member's bounded rows and keeps its query session for completion.
     pub fn preview(&mut self, row_count: u32) -> Result<DatasetPreview, DatasetError> {
+        self.preview_while(row_count, || true)
+    }
+
+    /// Reads the first member's bounded rows while the owning open request remains current.
+    pub fn preview_while(
+        &mut self,
+        row_count: u32,
+        mut keep_going: impl FnMut() -> bool,
+    ) -> Result<DatasetPreview, DatasetError> {
         if row_count > MAX_WINDOW_ROWS {
             return Err(DataWindowError::WindowTooLarge.into());
         }
         if self.next_member != 0 || self.preview_reader.is_some() {
             return Err(DatasetError::Unsupported);
         }
-        let progress = self.advance(1)?;
+        let progress = self.advance_while(1, &mut keep_going)?;
+        if !keep_going() {
+            return Err(DatasetError::Cancelled);
+        }
         let summary = self.current_summary()?;
-        let mut reader = DatasetWindowReader::from_parts(
-            self.source.clone(),
-            summary,
-            Some(1),
-            self.deviating_members.clone(),
-            self.member_row_counts.clone(),
-        )?;
+        let mut reader =
+            DatasetWindowReader::from_parts(self.source.clone(), summary, Some(1), None)?;
         let projection = (0..reader.summary.schema.len().min(MAX_PREVIEW_COLUMNS))
             .map(|index| u32::try_from(index).map_err(|_| DatasetError::Unsupported))
             .collect::<Result<Vec<_>, _>>()?;
-        let arrow_ipc = reader.fetch_columns(0, row_count, &[], &projection)?;
+        let arrow_ipc =
+            reader.fetch_columns_while(0, row_count, &[], &projection, &mut keep_going)?;
+        if !keep_going() {
+            return Err(DatasetError::Cancelled);
+        }
         self.preview_reader = Some(reader);
         Ok(DatasetPreview {
             progress,
@@ -654,22 +723,77 @@ impl DatasetInspector {
         &mut self,
         member_budget: u32,
     ) -> Result<DatasetInspectionProgress, DatasetError> {
+        self.advance_while(member_budget, || true)
+    }
+
+    /// Reads a bounded footer batch while the owning request remains current.
+    pub fn advance_while(
+        &mut self,
+        member_budget: u32,
+        mut keep_going: impl FnMut() -> bool,
+    ) -> Result<DatasetInspectionProgress, DatasetError> {
         if member_budget == 0 || member_budget > MAX_MEMBER_PAGE_SIZE {
             return Err(DatasetError::InspectionStepTooLarge);
+        }
+        if !keep_going() {
+            return Err(DatasetError::Cancelled);
+        }
+        if !self.partition_names_loaded {
+            self.partition_names = self.source.catalog.partition_names()?;
+            self.partition_names_loaded = true;
         }
         self.source.require_active()?;
         let end = self
             .next_member
-            .saturating_add(member_budget as usize)
-            .min(self.source.members.len());
-        while self.next_member < end {
-            if self.cancelled.load(Ordering::Acquire) {
+            .saturating_add(u64::from(member_budget))
+            .min(self.source.member_count());
+        let page = self.source.catalog.page(
+            self.next_member.checked_sub(1),
+            u32::try_from(end - self.next_member).map_err(|_| DatasetError::Unsupported)?,
+        )?;
+        let mut inspection_facts = Vec::with_capacity(page.members.len());
+        for member in page.members {
+            if self.cancelled.load(Ordering::Acquire) || !keep_going() {
                 return Err(DatasetError::Cancelled);
             }
-            let member = &self.source.members[self.next_member];
-            self.source.ensure_member_unchanged(member)?;
-            let member_summary = inspect_local_source_for_query(&member.path)
-                .map_err(|error| self.source.latch_member_error(error, member))?;
+            if member.ordinal != self.next_member {
+                return Err(DatasetError::Unsupported);
+            }
+            self.source.ensure_member_unchanged(&member)?;
+            for partition in &member.partitions {
+                if !self
+                    .partition_names
+                    .iter()
+                    .any(|name| name.eq_ignore_ascii_case(&partition.key))
+                {
+                    if self
+                        .union_schema
+                        .iter()
+                        .any(|field| field.name.eq_ignore_ascii_case(&partition.key))
+                    {
+                        return Err(DatasetError::SchemaConflict {
+                            column: partition.key.clone(),
+                            member: member.relative_path.clone(),
+                        });
+                    }
+                    self.partition_names.push(partition.key.clone());
+                }
+            }
+            let member_summary = if let Some((_, summary)) = self
+                .footer_cache
+                .as_ref()
+                .filter(|(identity, _)| *identity == member.identity)
+            {
+                summary.clone()
+            } else {
+                let summary = inspect_local_source_for_query(&member.path)
+                    .map_err(|error| self.source.latch_member_error(error, &member))?;
+                if !keep_going() {
+                    return Err(DatasetError::Cancelled);
+                }
+                self.footer_cache = Some((member.identity, summary.clone()));
+                summary
+            };
             validate_member_schema(&member_summary.schema, &member.relative_path, "")?;
             self.size_bytes = self
                 .size_bytes
@@ -679,21 +803,25 @@ impl DatasetInspector {
                 .row_count
                 .checked_add(member_summary.row_count)
                 .ok_or(DatasetError::Unsupported)?;
-            self.member_row_counts.push(member_summary.row_count);
             self.row_group_count = self
                 .row_group_count
                 .checked_add(member_summary.row_group_count as u64)
                 .ok_or(DatasetError::Unsupported)?;
-            if self
+            let schema_drift = self
                 .first_schema
                 .as_ref()
-                .is_some_and(|first| first != &member_summary.schema)
-            {
+                .is_some_and(|first| first != &member_summary.schema);
+            let drift_rank = if schema_drift {
+                let rank = self.drift_count;
                 self.drift_count += 1;
-                self.deviating_members.push(self.next_member);
+                Some(rank)
             } else if self.first_schema.is_none() {
                 self.first_schema = Some(member_summary.schema.clone());
-            }
+                None
+            } else {
+                None
+            };
+            inspection_facts.push((self.next_member, member_summary.row_count, drift_rank));
             for field in &member_summary.schema {
                 if field.name.eq_ignore_ascii_case(PROVENANCE_COLUMN)
                     || self
@@ -715,10 +843,18 @@ impl DatasetInspector {
                 member_summary.schema,
                 &member.relative_path,
             )?;
+            validate_dataset_schema_bounds(
+                &self.union_schema,
+                &self.partition_names,
+                &self.first_column_members,
+            )?;
             self.next_member += 1;
         }
+        self.source
+            .catalog
+            .record_inspection_batch(&inspection_facts)?;
 
-        let schema_complete = self.next_member == self.source.members.len();
+        let schema_complete = self.next_member == self.source.member_count();
         let emit_initial_schema = !schema_complete && !self.initial_schema_reported;
         if emit_initial_schema {
             self.initial_schema_reported = true;
@@ -733,7 +869,7 @@ impl DatasetInspector {
             None
         };
         Ok(DatasetInspectionProgress {
-            completed_member_count: self.next_member as u64,
+            completed_member_count: self.next_member,
             total_member_count: self.source.member_count(),
             row_count: self.row_count,
             row_group_count: self.row_group_count,
@@ -744,11 +880,20 @@ impl DatasetInspector {
     }
 
     fn current_summary(&self) -> Result<DatasetSummary, DatasetError> {
+        if let Some(name) = self
+            .partition_names
+            .iter()
+            .find(|name| name.eq_ignore_ascii_case(PROVENANCE_COLUMN))
+        {
+            return Err(DatasetError::SchemaConflict {
+                column: PROVENANCE_COLUMN.to_owned(),
+                member: self.source.catalog.first_member_with_partition(name)?,
+            });
+        }
         let (schema, partition_column_indices, provenance_column_index) = visible_schema(
             &self.union_schema,
             &self.partition_names,
             &self.first_column_members,
-            &self.source.members,
         )?;
         Ok(DatasetSummary {
             display_name: self.source.display_name.clone(),
@@ -766,20 +911,17 @@ impl DatasetInspector {
 
     /// Consumes completed footer facts and binds the final Arrow schema once for future windows.
     pub fn into_window_reader(mut self) -> Result<DatasetWindowReader, DatasetError> {
-        if self.next_member != self.source.members.len() {
+        if self.next_member != self.source.member_count() {
             return Err(DatasetError::Unsupported);
         }
-        self.source.ensure_members_unchanged(&self.source.members)?;
+        self.source
+            .ensure_all_members_unchanged_while(|| !self.cancelled.load(Ordering::Acquire))?;
         let summary = self.current_summary()?;
         match self.preview_reader.take() {
-            Some(reader) => reader.upgrade(summary, self.deviating_members, self.member_row_counts),
-            None => DatasetWindowReader::from_parts(
-                self.source,
-                summary,
-                None,
-                self.deviating_members,
-                self.member_row_counts,
-            ),
+            Some(reader) => reader.upgrade(summary, &self.cancelled),
+            None => {
+                DatasetWindowReader::from_parts(self.source, summary, None, Some(&self.cancelled))
+            }
         }
     }
 }
@@ -795,17 +937,32 @@ pub struct DatasetPreview {
 
 /// Reuses one DuckDB connection for windows from one fixed dataset snapshot.
 pub struct DatasetWindowReader {
+    connection: Connection,
+    _temporary_directory: Option<TempDir>,
+    interrupt: Arc<InterruptHandle>,
+    interrupted: Arc<AtomicBool>,
     source: DatasetSource,
     summary: DatasetSummary,
-    connection: Connection,
     member_limit: Option<usize>,
-    deviating_members: Vec<usize>,
     arrow_schema: SchemaRef,
     filename_column: String,
     physical_column_count: usize,
-    initialized_member_count: usize,
     schema_seed: Option<NamedTempFile>,
-    member_row_counts: Vec<u64>,
+}
+
+/// Cancels the active direct dataset query without taking its reader lock.
+#[derive(Clone)]
+pub struct DatasetWindowInterruptHandle {
+    interrupt: Arc<InterruptHandle>,
+    interrupted: Arc<AtomicBool>,
+}
+
+impl DatasetWindowInterruptHandle {
+    /// Interrupts the active query and rejects later work on this reader.
+    pub fn interrupt(&self) {
+        self.interrupted.store(true, Ordering::Release);
+        self.interrupt.interrupt();
+    }
 }
 
 /// Completed dataset relation state reused by isolated query operations.
@@ -817,17 +974,23 @@ pub(crate) struct DatasetQuerySource {
     ordinal_column: String,
     physical_column_count: usize,
     schema_seed: NamedTempFile,
-    member_row_counts: Vec<u64>,
+    bound_members: Mutex<Vec<DatasetMember>>,
+}
+
+pub(crate) struct DatasetBatchCursor {
+    after_ordinal: Option<u64>,
+    filters: Vec<DataFilter>,
+    finished: bool,
 }
 
 #[derive(Clone)]
 pub(crate) struct DatasetSessionToken {
-    members: Arc<[DatasetMember]>,
+    catalog: Arc<MemberCatalog>,
 }
 
 impl DatasetSessionToken {
     fn matches(&self, source: &DatasetSource) -> bool {
-        Arc::ptr_eq(&self.members, &source.members)
+        Arc::ptr_eq(&self.catalog, &source.catalog)
     }
 }
 
@@ -859,9 +1022,106 @@ impl From<DuckDbError> for DatasetSetupError {
 }
 
 impl DatasetQuerySource {
+    pub(crate) fn candidate_batches(&self, filters: &[DataFilter]) -> DatasetBatchCursor {
+        DatasetBatchCursor {
+            after_ordinal: None,
+            filters: filters.to_vec(),
+            finished: false,
+        }
+    }
+
+    pub(crate) fn bind_next_candidate_batch(
+        &self,
+        connection: &Connection,
+        cursor: &mut DatasetBatchCursor,
+        mut keep_going: impl FnMut() -> bool,
+    ) -> Result<bool, DatasetSetupError> {
+        while !cursor.finished {
+            if !keep_going() {
+                return Err(DatasetError::Cancelled.into());
+            }
+            let page = self
+                .source
+                .catalog
+                .page(cursor.after_ordinal, CATALOG_PAGE_MEMBERS)?;
+            cursor.after_ordinal = page.next_ordinal;
+            cursor.finished = page.next_ordinal.is_none();
+            let candidates = page
+                .members
+                .into_iter()
+                .filter(|member| {
+                    member_matches_prunable_filters(member, &self.summary, &cursor.filters)
+                })
+                .collect::<Vec<_>>();
+            if !candidates.is_empty() {
+                self.bind_members(connection, &candidates)?;
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    pub(crate) fn bound_row_count(
+        &self,
+        connection: &Connection,
+    ) -> Result<u64, DatasetSetupError> {
+        connection
+            .query_row(
+                "SELECT getvariable('__viewda_candidate_row_count')::UBIGINT",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(DatasetSetupError::Query)
+    }
+
+    pub(crate) fn stage_candidate_batches(
+        &self,
+        connection: &Connection,
+        filters: &[DataFilter],
+        table: &str,
+        query: (&str, &str),
+        parameters: &[Value],
+        mut keep_going: impl FnMut() -> bool,
+    ) -> Result<(), DatasetSetupError> {
+        let (projection, where_clause) = query;
+        let table = quote_identifier(table);
+        self.bind_members(connection, &[])?;
+        connection
+            .execute(
+                &format!(
+                    "CREATE TEMP TABLE {table} AS SELECT {projection} FROM {} LIMIT 0",
+                    self.relation_sql(),
+                ),
+                params_from_iter(parameters.iter()),
+            )
+            .map_err(DatasetSetupError::Query)?;
+        let mut cursor = self.candidate_batches(filters);
+        while self.bind_next_candidate_batch(connection, &mut cursor, &mut keep_going)? {
+            if !keep_going() {
+                return Err(DatasetError::Cancelled.into());
+            }
+            let query = format!(
+                "INSERT INTO {table} SELECT {projection} FROM {}{where_clause}",
+                self.relation_sql(),
+            );
+            let result = connection.execute(&query, params_from_iter(parameters.iter()));
+            if !keep_going() {
+                return Err(DatasetError::Cancelled.into());
+            }
+            result.map_err(|error| {
+                DatasetSetupError::Dataset(self.classify_query_failure(
+                    error,
+                    filters,
+                    !where_clause.is_empty(),
+                ))
+            })?;
+        }
+        Ok(())
+    }
+
     pub(crate) fn session_token(&self) -> DatasetSessionToken {
         DatasetSessionToken {
-            members: Arc::clone(&self.source.members),
+            catalog: Arc::clone(&self.source.catalog),
         }
     }
 
@@ -870,22 +1130,7 @@ impl DatasetQuerySource {
     }
 
     pub(crate) fn target_matches_member(&self, target: &Path) -> bool {
-        let canonical_target = fs::canonicalize(target).ok();
-        let target_platform = fs::metadata(target)
-            .ok()
-            .and_then(|metadata| platform_file_identity(target, &metadata).ok());
-        self.source.members.iter().any(|member| {
-            member.path == target
-                || target_platform
-                    .as_ref()
-                    .is_some_and(|target| same_file_identity(target, &member.identity.platform))
-                || canonical_target.as_ref().is_some_and(|target| {
-                    &member.path == target
-                        || fs::canonicalize(&member.path)
-                            .ok()
-                            .is_some_and(|member| member == *target)
-                })
-        })
+        self.source.target_matches_member(target)
     }
     pub(crate) fn schema(&self) -> &[SchemaField] {
         &self.summary.schema
@@ -904,37 +1149,52 @@ impl DatasetQuerySource {
     }
 
     pub(crate) fn temporary_directory_hint(&self) -> Option<&Path> {
-        self.source.members.first()?.path.parent()
+        self.source.root.parent()
     }
 
     pub(crate) fn redact_paths(&self, message: &str) -> String {
-        let message = self
-            .source
-            .members
-            .iter()
-            .fold(message.to_owned(), |message, member| {
+        if self.source.root.parent().is_none() {
+            return "dataset query resource exhausted".to_owned();
+        }
+        let mut message = message.to_owned();
+        if let Ok(members) = self.bound_members.lock() {
+            for member in members.iter() {
                 let path = member.path.to_string_lossy();
-                message
-                    .replace(&escape_glob_path(&path), "<source>")
-                    .replace(path.as_ref(), "<source>")
-            });
+                message = message
+                    .replace(&escape_glob_path(&path), "<source member>")
+                    .replace(path.as_ref(), "<source member>");
+            }
+        }
+        let root = self.source.root.to_string_lossy();
+        if self.source.root.parent().is_some() {
+            let prefix = format!(
+                "{}{separator}",
+                root.trim_end_matches(std::path::MAIN_SEPARATOR),
+                separator = std::path::MAIN_SEPARATOR
+            );
+            message = message
+                .replace(&escape_glob_path(&prefix), "<source>/")
+                .replace(&prefix, "<source>/");
+        }
         let seed = self.schema_seed.path().to_string_lossy();
         message
             .replace(&escape_glob_path(&seed), "<temporary file>")
             .replace(seed.as_ref(), "<temporary file>")
     }
 
+    #[cfg(test)]
     pub(crate) fn install(&self, connection: &Connection) -> Result<(), DatasetSetupError> {
+        self.install_while(connection, || true)
+    }
+
+    pub(crate) fn install_while(
+        &self,
+        connection: &Connection,
+        keep_going: impl FnMut() -> bool,
+    ) -> Result<(), DatasetSetupError> {
         self.source.require_active()?;
-        self.source.ensure_members_unchanged(&self.source.members)?;
-        initialize_member_tables(
-            connection,
-            &self.source.members,
-            &self.summary,
-            &self.member_row_counts,
-        )?;
-        install_member_maps(connection, &self.summary)?;
-        install_ordinal_map(connection)?;
+        self.source.ensure_all_members_unchanged_while(keep_going)?;
+        initialize_member_tables(connection, &self.summary)?;
         let seed_path = self
             .schema_seed
             .path()
@@ -949,37 +1209,71 @@ impl DatasetQuerySource {
         Ok(())
     }
 
-    pub(crate) fn bind_candidates(
-        &self,
-        connection: &Connection,
-        filters: &[DataFilter],
-    ) -> Result<(), DatasetSetupError> {
-        self.source.require_active()?;
-        self.source.ensure_members_unchanged(&self.source.members)?;
-        let candidates = candidate_members(&self.source.members, &self.summary, filters);
-        self.bind_members(connection, candidates)
-    }
-
     pub(crate) fn bind_window_members(
         &self,
         connection: &Connection,
         ordinals: &[u64],
     ) -> Result<usize, DatasetSetupError> {
+        self.bind_window_members_while(connection, ordinals, || true)
+    }
+
+    pub(crate) fn bind_window_members_while(
+        &self,
+        connection: &Connection,
+        ordinals: &[u64],
+        keep_going: impl FnMut() -> bool,
+    ) -> Result<usize, DatasetSetupError> {
         self.source.require_active()?;
-        self.source.ensure_members_unchanged(&self.source.members)?;
+        self.source.ensure_all_members_unchanged_while(keep_going)?;
         let members = self.members_for_ordinals(ordinals)?;
         let count = members.len();
-        self.bind_members(connection, members)?;
+        self.bind_members(connection, &members)?;
+        Ok(count)
+    }
+
+    /// Binds exact ordinals between the export-wide preflight and final validation.
+    pub(crate) fn bind_export_members_while(
+        &self,
+        connection: &Connection,
+        ordinals: &[u64],
+        mut keep_going: impl FnMut() -> bool,
+    ) -> Result<usize, DatasetSetupError> {
+        self.source.require_active()?;
+        let mut ordinals = ordinals.to_vec();
+        ordinals.sort_unstable();
+        ordinals.dedup();
+        let mut members = Vec::with_capacity(ordinals.len());
+        for ordinal in ordinals {
+            if !keep_going() {
+                return Err(DatasetError::Cancelled.into());
+            }
+            members.push(self.source.member(ordinal)?);
+        }
+        if !keep_going() {
+            return Err(DatasetError::Cancelled.into());
+        }
+        let count = members.len();
+        self.bind_members(connection, &members)?;
         Ok(count)
     }
 
     fn bind_members(
         &self,
         connection: &Connection,
-        candidates: Vec<&DatasetMember>,
+        candidates: &[DatasetMember],
     ) -> Result<(), DatasetSetupError> {
-        bind_candidate_members(connection, &candidates, Some(self.schema_seed.path()))?;
+        bind_candidate_members(
+            connection,
+            &self.source,
+            &self.summary,
+            candidates,
+            Some(self.schema_seed.path()),
+        )?;
         install_candidate_offsets(connection)?;
+        *self
+            .bound_members
+            .lock()
+            .map_err(|_| DatasetError::Unsupported)? = candidates.to_vec();
         Ok(())
     }
 
@@ -1003,7 +1297,15 @@ impl DatasetQuerySource {
 
     pub(crate) fn validate(&self) -> Result<(), DatasetError> {
         self.source.require_active()?;
-        self.source.ensure_members_unchanged(&self.source.members)
+        self.source.ensure_all_members_unchanged()
+    }
+
+    pub(crate) fn validate_while(
+        &self,
+        keep_going: impl FnMut() -> bool,
+    ) -> Result<(), DatasetError> {
+        self.source.require_active()?;
+        self.source.ensure_all_members_unchanged_while(keep_going)
     }
 
     pub(crate) fn classify_query_failure(
@@ -1012,8 +1314,16 @@ impl DatasetQuerySource {
         filters: &[DataFilter],
         filters_applied: bool,
     ) -> DatasetError {
-        let candidates = candidate_members(&self.source.members, &self.summary, filters);
-        diagnose_query_failure(&self.source, &candidates, error, filters_applied)
+        let _ = filters;
+        if let Err(changed) = self.source.ensure_all_members_unchanged() {
+            return changed;
+        }
+        match self.bound_members.lock() {
+            Ok(candidates) => {
+                diagnose_query_failure(&self.source, &candidates, error, filters_applied)
+            }
+            Err(_) => DatasetError::Unsupported,
+        }
     }
 
     pub(crate) fn classify_window_query_failure(
@@ -1039,91 +1349,123 @@ impl DatasetQuerySource {
     }
 
     pub(crate) fn classify_lazy_query_failure(&self, panic: &(dyn Any + Send)) -> DatasetError {
-        let candidates = self.source.members.iter().collect::<Vec<_>>();
-        diagnose_lazy_query_failure(&self.source, &candidates, panic, false)
+        if let Err(changed) = self.source.ensure_all_members_unchanged() {
+            return changed;
+        }
+        match self.bound_members.lock() {
+            Ok(candidates) => diagnose_lazy_query_failure(&self.source, &candidates, panic, false),
+            Err(_) => DatasetError::Unsupported,
+        }
     }
 
-    fn members_for_ordinals(&self, ordinals: &[u64]) -> Result<Vec<&DatasetMember>, DatasetError> {
+    fn members_for_ordinals(&self, ordinals: &[u64]) -> Result<Vec<DatasetMember>, DatasetError> {
         let mut ordinals = ordinals.to_vec();
         ordinals.sort_unstable();
         ordinals.dedup();
         ordinals
             .iter()
-            .map(|ordinal| {
-                let index = usize::try_from(*ordinal).map_err(|_| DatasetError::Unsupported)?;
-                self.source
-                    .members
-                    .get(index)
-                    .filter(|member| member.ordinal == *ordinal)
-                    .ok_or(DatasetError::Unsupported)
-            })
+            .map(|ordinal| self.source.member(*ordinal))
             .collect()
     }
 }
 
 impl DatasetWindowReader {
+    fn ensure_query_members_unchanged_while(
+        &self,
+        keep_going: impl FnMut() -> bool,
+    ) -> Result<(), DatasetError> {
+        match self.member_limit {
+            Some(limit) => self
+                .source
+                .ensure_member_prefix_unchanged_while(limit as u64, keep_going),
+            None => self.source.ensure_all_members_unchanged_while(keep_going),
+        }
+    }
+
+    /// Returns a handle that stops an active direct query without locking the reader.
+    pub fn interrupt_handle(&self) -> DatasetWindowInterruptHandle {
+        DatasetWindowInterruptHandle {
+            interrupt: Arc::clone(&self.interrupt),
+            interrupted: Arc::clone(&self.interrupted),
+        }
+    }
+
     /// Returns the selected member's first row in frozen dataset order.
     ///
     /// The whole fixed composition is revalidated before and after calculating
     /// the checked prefix so callers cannot navigate through stale member data.
     pub fn member_row_offset(&self, ordinal: u64) -> Result<u64, DatasetError> {
-        let index = usize::try_from(ordinal).map_err(|_| DatasetError::Unsupported)?;
-        if self
-            .source
-            .members
-            .get(index)
-            .is_none_or(|member| member.ordinal != ordinal)
-        {
-            return Err(DatasetError::Unsupported);
-        }
-        self.source.ensure_members_unchanged(&self.source.members)?;
-        let offset = self.member_row_counts[..index]
-            .iter()
-            .try_fold(0_u64, |offset, row_count| offset.checked_add(*row_count))
-            .ok_or(DatasetError::Unsupported)?;
-        self.source.ensure_members_unchanged(&self.source.members)?;
+        self.member_row_offset_while(ordinal, || true)
+    }
+
+    /// Returns a member offset while the caller still wants the work.
+    pub fn member_row_offset_while(
+        &self,
+        ordinal: u64,
+        mut keep_going: impl FnMut() -> bool,
+    ) -> Result<u64, DatasetError> {
+        self.source.member(ordinal)?;
+        self.source
+            .ensure_all_members_unchanged_while(&mut keep_going)?;
+        let offset = self.source.catalog.row_offset(ordinal)?;
+        self.source
+            .ensure_all_members_unchanged_while(&mut keep_going)?;
         Ok(offset)
     }
 
     /// Opens one selected fixed member without exposing its absolute path.
     pub fn member_snapshot(&self, ordinal: u64) -> Result<DatasetMemberSnapshot, DatasetError> {
-        self.member_snapshot_checked(ordinal, || {})
+        self.member_snapshot_while(ordinal, || true)
+    }
+
+    /// Opens one selected member while the caller still wants the work.
+    pub fn member_snapshot_while(
+        &self,
+        ordinal: u64,
+        keep_going: impl FnMut() -> bool,
+    ) -> Result<DatasetMemberSnapshot, DatasetError> {
+        self.member_snapshot_checked(ordinal, keep_going, || {})
     }
 
     fn member_snapshot_checked(
         &self,
         ordinal: u64,
+        mut keep_going: impl FnMut() -> bool,
         after_open: impl FnOnce(),
     ) -> Result<DatasetMemberSnapshot, DatasetError> {
-        let index = usize::try_from(ordinal).map_err(|_| DatasetError::Unsupported)?;
-        let member = self
-            .source
-            .members
-            .get(index)
-            .filter(|member| member.ordinal == ordinal)
-            .ok_or(DatasetError::Unsupported)?;
-        self.source.ensure_members_unchanged(&self.source.members)?;
+        let member = self.source.member(ordinal)?;
+        self.source
+            .ensure_all_members_unchanged_while(&mut keep_going)?;
         let snapshot = SourceSnapshot::open(&member.path)
-            .map_err(|error| self.source.latch_member_error(error, member))?;
+            .map_err(|error| self.source.latch_member_error(error, &member))?;
         after_open();
-        self.source.ensure_members_unchanged(&self.source.members)?;
+        self.source
+            .ensure_all_members_unchanged_while(&mut keep_going)?;
         snapshot
             .validate_for_install(&member.path)
-            .map_err(|error| self.source.latch_member_error(error, member))?;
+            .map_err(|error| self.source.latch_member_error(error, &member))?;
         Ok(DatasetMemberSnapshot {
             snapshot,
             source: self.source.clone(),
-            member: member.clone(),
+            member,
         })
     }
 
     /// Captures the completed fixed relation for an isolated prepared view.
+    #[cfg(test)]
     pub(crate) fn query_source(&self) -> Result<DatasetQuerySource, DatasetError> {
+        self.query_source_while(|| true)
+    }
+
+    pub(crate) fn query_source_while(
+        &self,
+        keep_going: impl FnMut() -> bool,
+    ) -> Result<DatasetQuerySource, DatasetError> {
         if self.member_limit.is_some() {
             return Err(DatasetError::Unsupported);
         }
         self.source.require_active()?;
-        self.source.ensure_members_unchanged(&self.source.members)?;
+        self.source.ensure_all_members_unchanged_while(keep_going)?;
         let filename_column = unique_internal_column(&self.summary.schema, "__viewda_filename");
         let row_column = unique_internal_column(&self.summary.schema, "__viewda_native_row");
         let ordinal_column =
@@ -1136,21 +1478,33 @@ impl DatasetWindowReader {
             ordinal_column,
             physical_column_count: self.physical_column_count,
             schema_seed: write_schema_seed(&self.arrow_schema)?,
-            member_row_counts: self.member_row_counts.clone(),
+            bound_members: Mutex::new(Vec::new()),
         })
     }
     fn from_parts(
         source: DatasetSource,
         summary: DatasetSummary,
         member_limit: Option<usize>,
-        deviating_members: Vec<usize>,
-        member_row_counts: Vec<u64>,
+        cancelled: Option<&AtomicBool>,
     ) -> Result<Self, DatasetError> {
+        let temporary_directory = tempfile::Builder::new()
+            .prefix("viewda-dataset-query-")
+            .tempdir_in(source.catalog.temporary_directory_hint())
+            .map_err(|_| DataWindowError::ResourceExhausted)?;
+        let temporary_directory_path = temporary_directory
+            .path()
+            .to_str()
+            .ok_or(DataWindowError::QueryEngineUnavailable)?;
         let config = Config::default()
             .enable_object_cache(false)
+            .and_then(|config| config.max_memory(DATASET_QUERY_MEMORY_LIMIT))
+            .and_then(|config| config.with("temp_directory", temporary_directory_path))
+            .and_then(|config| config.with("threads", "1"))
             .map_err(|_| DataWindowError::QueryEngineUnavailable)?;
         let connection = Connection::open_in_memory_with_flags(config)
             .map_err(|_| DataWindowError::QueryEngineUnavailable)?;
+        let interrupt = connection.interrupt_handle();
+        let interrupted = Arc::new(AtomicBool::new(false));
         set_utc_session_timezone(&connection)?;
         connection
             .execute_batch(
@@ -1164,36 +1518,26 @@ impl DatasetWindowReader {
             .unwrap_or(summary.provenance_column_index)
             as usize;
         let filename_column = unique_internal_column(&summary.schema, "__viewda_filename");
-        let active_member_count = member_limit
-            .unwrap_or(source.members.len())
-            .min(source.members.len());
-        initialize_member_tables(
-            &connection,
-            &source.members[..active_member_count],
-            &summary,
-            &member_row_counts,
-        )
-        .map_err(DatasetSetupError::into_dataset)?;
-        install_member_maps(&connection, &summary).map_err(DatasetSetupError::into_dataset)?;
+        initialize_member_tables(&connection, &summary).map_err(DatasetSetupError::into_dataset)?;
         let mut reader = Self {
+            interrupt,
+            interrupted,
             source,
             summary,
             connection,
             member_limit,
-            deviating_members,
             arrow_schema: Arc::new(Schema::empty()),
             filename_column,
             physical_column_count,
-            initialized_member_count: active_member_count,
             schema_seed: None,
-            member_row_counts,
+            _temporary_directory: Some(temporary_directory),
         };
-        let members = reader.active_members();
-        let candidates = members.iter().collect::<Vec<_>>();
-        reader.bind_candidate_paths(&candidates)?;
-        // The completed reader pays one schema-only DuckDB bind after the background footer pass.
-        // Preview uses the same path with an active member table limited to its first member.
-        reader.arrow_schema = reader.query_schema_checked(&candidates, || {})?;
+        reader.refresh_arrow_schema(cancelled)?;
+        if reader.member_limit.is_none() {
+            reader.source.ensure_all_members_unchanged_while(|| {
+                !cancelled.is_some_and(|cancelled| cancelled.load(Ordering::Acquire))
+            })?;
+        }
         reader.install_schema_seed()?;
         Ok(reader)
     }
@@ -1201,23 +1545,10 @@ impl DatasetWindowReader {
     fn upgrade(
         mut self,
         summary: DatasetSummary,
-        deviating_members: Vec<usize>,
-        member_row_counts: Vec<u64>,
+        cancelled: &AtomicBool,
     ) -> Result<Self, DatasetError> {
-        self.source.ensure_members_unchanged(&self.source.members)?;
-        append_member_metadata(
-            &self.connection,
-            &self.source.members[self.initialized_member_count..],
-            &summary,
-            &member_row_counts[self.initialized_member_count..],
-        )
-        .map_err(DatasetSetupError::into_dataset)?;
-        install_member_maps(&self.connection, &summary).map_err(DatasetSetupError::into_dataset)?;
-        self.initialized_member_count = self.source.members.len();
         self.summary = summary;
         self.member_limit = None;
-        self.deviating_members = deviating_members;
-        self.member_row_counts = member_row_counts;
         self.physical_column_count =
             self.summary
                 .partition_column_indices
@@ -1226,11 +1557,77 @@ impl DatasetWindowReader {
                 .unwrap_or(self.summary.provenance_column_index) as usize;
         self.filename_column = unique_internal_column(&self.summary.schema, "__viewda_filename");
         self.schema_seed = None;
-        let candidates = self.source.members.iter().collect::<Vec<_>>();
-        self.bind_candidate_paths(&candidates)?;
-        self.arrow_schema = self.query_schema_checked(&candidates, || {})?;
+        self.refresh_arrow_schema(Some(cancelled))?;
+        self.source
+            .ensure_all_members_unchanged_while(|| !cancelled.load(Ordering::Acquire))?;
         self.install_schema_seed()?;
         Ok(self)
+    }
+
+    fn refresh_arrow_schema(&mut self, cancelled: Option<&AtomicBool>) -> Result<(), DatasetError> {
+        let limit = self
+            .member_limit
+            .map_or(self.source.member_count(), |limit| limit as u64)
+            .min(self.source.member_count());
+        let mut after = None;
+        let mut previous_identity = None;
+        let mut merged_schema: Option<Schema> = None;
+        loop {
+            if cancelled.is_some_and(|cancelled| cancelled.load(Ordering::Acquire)) {
+                return Err(DatasetError::Cancelled);
+            }
+            let mut page = self.source.catalog.page(after, CATALOG_PAGE_MEMBERS)?;
+            let next = page.next_ordinal.filter(|next| *next < limit);
+            page.members.retain(|member| member.ordinal < limit);
+            page.members.retain(|member| {
+                let duplicate = previous_identity.as_ref() == Some(&member.identity);
+                previous_identity = Some(member.identity);
+                !duplicate
+            });
+            if !page.members.is_empty() {
+                bind_paths_variable(&self.connection, &page.members, None)
+                    .map_err(DatasetSetupError::into_dataset)?;
+                let batch_schema = self.query_physical_schema(&page.members)?;
+                merged_schema = Some(match merged_schema {
+                    Some(schema) => merge_arrow_schemas(schema, batch_schema)?,
+                    None => batch_schema,
+                });
+            }
+            let Some(next) = next else {
+                break;
+            };
+            after = Some(next);
+        }
+        let schema = merged_schema.ok_or(DatasetError::Unsupported)?;
+        let mut fields = schema.fields.iter().cloned().collect::<Vec<_>>();
+        for index in &self.summary.partition_column_indices {
+            fields.push(Arc::new(Field::new(
+                &self.summary.schema[*index as usize].name,
+                DataType::Utf8,
+                true,
+            )));
+        }
+        fields.push(Arc::new(Field::new(
+            &self.summary.schema[self.summary.provenance_column_index as usize].name,
+            DataType::Utf8,
+            false,
+        )));
+        self.arrow_schema = Arc::new(Schema::new_with_metadata(fields, schema.metadata));
+        Ok(())
+    }
+
+    fn query_physical_schema(&self, candidates: &[DatasetMember]) -> Result<Schema, DatasetError> {
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT * FROM read_parquet(getvariable('__viewda_paths'), \
+                 union_by_name = true, hive_partitioning = false) LIMIT 0",
+            )
+            .map_err(|error| diagnose_query_failure(&self.source, candidates, error, false))?;
+        let batches = statement
+            .stream_arrow([])
+            .map_err(|error| diagnose_query_failure(&self.source, candidates, error, false))?;
+        Ok(batches.get_schema().as_ref().clone())
     }
 
     /// Returns the inspected union schema and aggregate footer facts.
@@ -1249,7 +1646,18 @@ impl DatasetWindowReader {
         offset: u64,
         limit: u32,
     ) -> Result<DatasetMemberPage, DatasetError> {
-        drift_page(&self.source.members, &self.deviating_members, offset, limit)
+        let (total, members) = self.source.catalog.drift_page(offset, limit)?;
+        Ok(DatasetMemberPage {
+            offset,
+            total,
+            members: members
+                .into_iter()
+                .map(|member| DatasetMemberSummary {
+                    relative_path: member.relative_path,
+                    partitions: member.partitions,
+                })
+                .collect(),
+        })
     }
 
     /// Reads a stable global window and applies typed filters over all members.
@@ -1259,7 +1667,18 @@ impl DatasetWindowReader {
         row_count: u32,
         filters: &[DataFilter],
     ) -> Result<Vec<u8>, DatasetError> {
-        self.fetch_projection(row_offset, row_count, filters, None)
+        self.fetch_while(row_offset, row_count, filters, || true)
+    }
+
+    /// Reads a stable window while the caller still wants the work.
+    pub fn fetch_while(
+        &mut self,
+        row_offset: u64,
+        row_count: u32,
+        filters: &[DataFilter],
+        keep_going: impl FnMut() -> bool,
+    ) -> Result<Vec<u8>, DatasetError> {
+        self.fetch_projection(row_offset, row_count, filters, None, keep_going)
     }
 
     /// Reads selected union-schema columns in the requested order.
@@ -1270,8 +1689,26 @@ impl DatasetWindowReader {
         filters: &[DataFilter],
         source_indices: &[u32],
     ) -> Result<Vec<u8>, DatasetError> {
+        self.fetch_columns_while(row_offset, row_count, filters, source_indices, || true)
+    }
+
+    /// Reads projected columns while the caller still wants the work.
+    pub fn fetch_columns_while(
+        &mut self,
+        row_offset: u64,
+        row_count: u32,
+        filters: &[DataFilter],
+        source_indices: &[u32],
+        keep_going: impl FnMut() -> bool,
+    ) -> Result<Vec<u8>, DatasetError> {
         let projection = validate_projection(&self.summary.schema, source_indices)?;
-        self.fetch_projection(row_offset, row_count, filters, Some(&projection))
+        self.fetch_projection(
+            row_offset,
+            row_count,
+            filters,
+            Some(&projection),
+            keep_going,
+        )
     }
 
     fn fetch_projection(
@@ -1280,56 +1717,25 @@ impl DatasetWindowReader {
         row_count: u32,
         filters: &[DataFilter],
         source_indices: Option<&[usize]>,
+        mut keep_going: impl FnMut() -> bool,
     ) -> Result<Vec<u8>, DatasetError> {
+        let interrupted = Arc::clone(&self.interrupted);
+        let mut wants_work = || !interrupted.load(Ordering::Acquire) && keep_going();
         if row_count > MAX_WINDOW_ROWS {
             return Err(DataWindowError::WindowTooLarge.into());
         }
         self.source.require_active()?;
         let predicate = build_filter_predicate(&self.summary.schema, filters)
             .map_err(|_| DataWindowError::InvalidFilter)?;
-        let members = self.active_members();
-        self.source.ensure_members_unchanged(members)?;
-        let candidates = candidate_members(members, &self.summary, filters);
+        self.ensure_query_members_unchanged_while(&mut wants_work)?;
         let projected_schema = source_indices
             .map(|indices| self.arrow_schema.project(indices).map(Arc::new))
             .transpose()
             .map_err(|_| DataWindowError::Unsupported)?;
-        if candidates.is_empty() {
-            return encode_empty_ipc(projected_schema.as_ref().unwrap_or(&self.arrow_schema));
-        }
-        self.bind_candidate_paths(&candidates)?;
         let where_clause = if filters.is_empty() {
             String::new()
         } else {
             format!(" WHERE {}", predicate.sql)
-        };
-        let query = self.query_sql(&where_clause, source_indices);
-        let mut parameters = predicate.parameters;
-        parameters.push(Value::BigInt(i64::from(row_count)));
-        parameters.push(Value::BigInt(
-            i64::try_from(row_offset).map_err(|_| DataWindowError::Unsupported)?,
-        ));
-        let mut statement = match self.connection.prepare(&query) {
-            Ok(statement) => statement,
-            Err(error) => {
-                return Err(diagnose_query_failure(
-                    &self.source,
-                    &candidates,
-                    error,
-                    !filters.is_empty(),
-                ));
-            }
-        };
-        let batches = match statement.stream_arrow(params_from_iter(parameters.iter())) {
-            Ok(batches) => batches,
-            Err(error) => {
-                return Err(diagnose_query_failure(
-                    &self.source,
-                    &candidates,
-                    error,
-                    !filters.is_empty(),
-                ));
-            }
         };
         let mut writer = StreamWriter::try_new(
             Vec::new(),
@@ -1339,52 +1745,189 @@ impl DatasetWindowReader {
                 .as_ref(),
         )
         .map_err(|_| DataWindowError::EncodingFailed)?;
-        let encoded = match catch_unwind(AssertUnwindSafe(|| {
-            for batch in batches {
-                writer
-                    .write(&batch)
-                    .map_err(|_| DataWindowError::EncodingFailed)?;
+        let active_limit = self
+            .member_limit
+            .map_or(self.source.member_count(), |limit| limit as u64)
+            .min(self.source.member_count());
+        let mut after = None;
+        let mut remaining_offset = row_offset;
+        let mut remaining_count = u64::from(row_count);
+        while remaining_count > 0 {
+            if !wants_work() {
+                return Err(DatasetError::Cancelled);
             }
-            writer
-                .finish()
-                .map_err(|_| DataWindowError::EncodingFailed)?;
-            writer
-                .into_inner()
-                .map_err(|_| DataWindowError::EncodingFailed)
-        })) {
-            Ok(result) => result?,
-            Err(panic) => {
-                return Err(diagnose_lazy_query_failure(
-                    &self.source,
-                    &candidates,
-                    panic.as_ref(),
-                    !filters.is_empty(),
-                ));
+            if filters.is_empty() {
+                let (page_rows, next) = self
+                    .source
+                    .catalog
+                    .row_count_page(after, CATALOG_PAGE_MEMBERS)?;
+                if remaining_offset >= page_rows {
+                    remaining_offset -= page_rows;
+                    let Some(next) = next.filter(|next| *next < active_limit) else {
+                        break;
+                    };
+                    after = Some(next);
+                    continue;
+                }
             }
-        };
-        for member in &candidates {
-            self.source.ensure_member_unchanged(member)?;
+            let page = self.source.catalog.page(after, CATALOG_PAGE_MEMBERS)?;
+            let candidates = page
+                .members
+                .into_iter()
+                .filter(|member| member.ordinal < active_limit)
+                .filter(|member| member_matches_prunable_filters(member, &self.summary, filters))
+                .collect::<Vec<_>>();
+            if !candidates.is_empty() {
+                self.bind_candidate_paths(&candidates)?;
+                let batch_rows = if filters.is_empty() {
+                    Some(candidates.iter().try_fold(0_u64, |total, member| {
+                        total
+                            .checked_add(member.row_count.ok_or(DatasetError::Unsupported)?)
+                            .ok_or(DatasetError::Unsupported)
+                    })?)
+                } else if remaining_offset > 0 {
+                    Some(self.count_candidate_rows(
+                        &candidates,
+                        &where_clause,
+                        &predicate.parameters,
+                    )?)
+                } else {
+                    None
+                };
+                if batch_rows.is_some_and(|batch_rows| remaining_offset >= batch_rows) {
+                    let batch_rows = batch_rows.expect("checked above");
+                    remaining_offset -= batch_rows;
+                } else {
+                    if !wants_work() {
+                        return Err(DatasetError::Cancelled);
+                    }
+                    let batches = self.query_candidate_rows(
+                        &candidates,
+                        &where_clause,
+                        &predicate.parameters,
+                        remaining_offset,
+                        remaining_count,
+                        source_indices,
+                    )?;
+                    remaining_offset = 0;
+                    for batch in batches {
+                        remaining_count = remaining_count.saturating_sub(batch.num_rows() as u64);
+                        writer
+                            .write(&batch)
+                            .map_err(|_| DataWindowError::EncodingFailed)?;
+                    }
+                }
+            }
+            let Some(next) = page.next_ordinal.filter(|next| *next < active_limit) else {
+                break;
+            };
+            after = Some(next);
         }
+        writer
+            .finish()
+            .map_err(|_| DataWindowError::EncodingFailed)?;
+        let encoded = writer
+            .into_inner()
+            .map_err(|_| DataWindowError::EncodingFailed)?;
+        self.ensure_query_members_unchanged_while(&mut wants_work)?;
         Ok(encoded)
     }
 
-    fn active_members(&self) -> &[DatasetMember] {
-        self.member_limit.map_or_else(
-            || self.source.members.as_ref(),
-            |limit| &self.source.members[..limit.min(self.source.members.len())],
-        )
+    fn count_candidate_rows(
+        &self,
+        candidates: &[DatasetMember],
+        where_clause: &str,
+        parameters: &[Value],
+    ) -> Result<u64, DatasetError> {
+        let relation = dataset_relation_sql(
+            &self.summary,
+            self.physical_column_count,
+            &self.filename_column,
+            None,
+            self.schema_seed.is_some(),
+        );
+        let query = format!("SELECT count(*)::UBIGINT FROM {relation}{where_clause}");
+        self.connection
+            .query_row(&query, params_from_iter(parameters.iter()), |row| {
+                row.get(0)
+            })
+            .map_err(|error| {
+                if self.interrupted.load(Ordering::Acquire) {
+                    DatasetError::Cancelled
+                } else {
+                    diagnose_query_failure(&self.source, candidates, error, !parameters.is_empty())
+                }
+            })
     }
 
-    fn bind_candidate_paths(&self, candidates: &[&DatasetMember]) -> Result<(), DatasetError> {
+    fn query_candidate_rows(
+        &self,
+        candidates: &[DatasetMember],
+        where_clause: &str,
+        predicate_parameters: &[Value],
+        row_offset: u64,
+        row_count: u64,
+        source_indices: Option<&[usize]>,
+    ) -> Result<Vec<RecordBatch>, DatasetError> {
+        let query = self.query_sql(where_clause, source_indices);
+        let mut parameters = predicate_parameters.to_vec();
+        parameters.push(Value::BigInt(
+            i64::try_from(row_count).map_err(|_| DataWindowError::Unsupported)?,
+        ));
+        parameters.push(Value::BigInt(
+            i64::try_from(row_offset).map_err(|_| DataWindowError::Unsupported)?,
+        ));
+        let mut statement = self.connection.prepare(&query).map_err(|error| {
+            if self.interrupted.load(Ordering::Acquire) {
+                DatasetError::Cancelled
+            } else {
+                diagnose_query_failure(
+                    &self.source,
+                    candidates,
+                    error,
+                    !predicate_parameters.is_empty(),
+                )
+            }
+        })?;
+        let batches = statement
+            .stream_arrow(params_from_iter(parameters.iter()))
+            .map_err(|error| {
+                if self.interrupted.load(Ordering::Acquire) {
+                    DatasetError::Cancelled
+                } else {
+                    diagnose_query_failure(
+                        &self.source,
+                        candidates,
+                        error,
+                        !predicate_parameters.is_empty(),
+                    )
+                }
+            })?;
+        match catch_unwind(AssertUnwindSafe(|| batches.collect::<Vec<_>>())) {
+            Ok(batches) => Ok(batches),
+            Err(_) if self.interrupted.load(Ordering::Acquire) => Err(DatasetError::Cancelled),
+            Err(panic) => Err(diagnose_lazy_query_failure(
+                &self.source,
+                candidates,
+                panic.as_ref(),
+                !predicate_parameters.is_empty(),
+            )),
+        }
+    }
+
+    fn bind_candidate_paths(&self, candidates: &[DatasetMember]) -> Result<(), DatasetError> {
         bind_candidate_members(
             &self.connection,
+            &self.source,
+            &self.summary,
             candidates,
             self.schema_seed.as_ref().map(NamedTempFile::path),
         )
         .map_err(DatasetSetupError::into_dataset)
     }
 
-    fn query_schema(&self, candidates: &[&DatasetMember]) -> Result<SchemaRef, DatasetError> {
+    #[cfg(test)]
+    fn query_schema(&self, candidates: &[DatasetMember]) -> Result<SchemaRef, DatasetError> {
         let query = self.query_sql("", None);
         let mut statement = self
             .connection
@@ -1397,15 +1940,15 @@ impl DatasetWindowReader {
         Ok(batches.get_schema())
     }
 
+    #[cfg(test)]
     fn query_schema_checked(
         &self,
-        candidates: &[&DatasetMember],
+        candidates: &[DatasetMember],
         after_query: impl FnOnce(),
     ) -> Result<SchemaRef, DatasetError> {
         let schema = self.query_schema(candidates)?;
         after_query();
-        self.source
-            .ensure_members_unchanged(self.active_members())?;
+        self.source.ensure_all_members_unchanged()?;
         Ok(schema)
     }
 
@@ -1530,9 +2073,7 @@ fn dataset_relation_sql(
 
 fn initialize_member_tables(
     connection: &Connection,
-    members: &[DatasetMember],
     summary: &DatasetSummary,
-    row_counts: &[u64],
 ) -> Result<(), DatasetSetupError> {
     let partition_columns = summary
         .partition_column_indices
@@ -1548,7 +2089,7 @@ fn initialize_member_tables(
              CREATE TEMP TABLE __viewda_candidates (__ordinal UBIGINT PRIMARY KEY)"
         ))
         .map_err(DatasetSetupError::Query)?;
-    append_member_metadata(connection, members, summary, row_counts)
+    Ok(())
 }
 
 fn append_member_metadata(
@@ -1644,12 +2185,36 @@ fn install_candidate_offsets(connection: &Connection) -> Result<(), DatasetSetup
 
 fn bind_candidate_members(
     connection: &Connection,
-    candidates: &[&DatasetMember],
+    source: &DatasetSource,
+    summary: &DatasetSummary,
+    candidates: &[DatasetMember],
     schema_seed: Option<&Path>,
 ) -> Result<(), DatasetSetupError> {
     connection
-        .execute_batch("DELETE FROM __viewda_candidates")
+        .execute_batch("DELETE FROM __viewda_candidates; DELETE FROM __viewda_members")
         .map_err(DatasetSetupError::Query)?;
+    let missing_ordinals = candidates
+        .iter()
+        .filter(|member| member.row_count.is_none())
+        .map(|member| member.ordinal)
+        .collect::<Vec<_>>();
+    let catalog_row_counts = source
+        .catalog
+        .row_counts(&missing_ordinals)?
+        .into_iter()
+        .collect::<HashMap<_, _>>();
+    let row_counts = candidates
+        .iter()
+        .map(|member| {
+            member
+                .row_count
+                .or_else(|| catalog_row_counts.get(&member.ordinal).copied())
+                .ok_or(DatasetError::Unsupported)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    append_member_metadata(connection, candidates, summary, &row_counts)?;
+    install_member_maps(connection, summary)?;
+    install_ordinal_map(connection)?;
     let mut appender = connection
         .appender("__viewda_candidates")
         .map_err(DatasetSetupError::Query)?;
@@ -1661,6 +2226,15 @@ fn bind_candidate_members(
     appender.flush().map_err(DatasetSetupError::Query)?;
     drop(appender);
 
+    bind_paths_variable(connection, candidates, schema_seed)?;
+    Ok(())
+}
+
+fn bind_paths_variable(
+    connection: &Connection,
+    candidates: &[DatasetMember],
+    schema_seed: Option<&Path>,
+) -> Result<(), DatasetSetupError> {
     let mut paths = candidates
         .iter()
         .map(|member| member.path.to_str().ok_or(DatasetError::Unsupported))
@@ -1716,30 +2290,26 @@ fn escape_glob_path(path: &str) -> String {
     escaped
 }
 
-fn encode_empty_ipc(schema: &SchemaRef) -> Result<Vec<u8>, DatasetError> {
-    let mut writer = StreamWriter::try_new(Vec::new(), schema.as_ref())
-        .map_err(|_| DataWindowError::EncodingFailed)?;
-    writer
-        .finish()
-        .map_err(|_| DataWindowError::EncodingFailed)?;
-    writer
-        .into_inner()
-        .map_err(|_| DataWindowError::EncodingFailed.into())
-}
-
 fn discover_members(
     root: &Path,
     directory: &Path,
-    members: &mut Vec<DatasetMember>,
+    catalog: &mut MemberCatalogBuilder,
     ignored_file_count: &mut u64,
+    keep_going: &mut dyn FnMut() -> bool,
 ) -> Result<(), DatasetError> {
+    if !keep_going() {
+        return Err(DatasetError::Cancelled);
+    }
     let entries = fs::read_dir(directory).map_err(map_discovery_error)?;
     for entry in entries {
+        if !keep_going() {
+            return Err(DatasetError::Cancelled);
+        }
         let entry = entry.map_err(map_discovery_error)?;
         let file_type = entry.file_type().map_err(map_discovery_error)?;
         let path = entry.path();
         if file_type.is_dir() {
-            discover_members(root, &path, members, ignored_file_count)?;
+            discover_members(root, &path, catalog, ignored_file_count, keep_going)?;
         } else if file_type.is_file() && is_visible_parquet_path(root, &path) {
             let metadata = entry.metadata().map_err(map_discovery_error)?;
             let relative = path
@@ -1748,13 +2318,14 @@ fn discover_members(
             let relative_path = slash_path(relative)?;
             let partitions = parse_partitions(relative)?;
             let identity = member_identity(&path, &metadata).map_err(map_discovery_error)?;
-            members.push(DatasetMember {
+            catalog.push(DatasetMember {
                 ordinal: 0,
                 path,
                 relative_path,
                 partitions,
                 identity,
-            });
+                row_count: None,
+            })?;
         } else if file_type.is_file() {
             *ignored_file_count = ignored_file_count
                 .checked_add(1)
@@ -1793,11 +2364,34 @@ fn slash_path(path: &Path) -> Result<String, DatasetError> {
         .map(|components| components.join("/"))
 }
 
-fn common_parent(paths: &[PathBuf]) -> Option<PathBuf> {
-    let mut common = paths.first()?.parent()?.to_path_buf();
-    while paths.iter().any(|path| !path.starts_with(&common)) {
-        if !common.pop() {
-            return None;
+fn explicit_common_parent(
+    paths: &[PathBuf],
+    keep_going: &mut dyn FnMut() -> bool,
+) -> Result<PathBuf, DatasetError> {
+    if !keep_going() {
+        return Err(DatasetError::Cancelled);
+    }
+    let first = std::path::absolute(paths.first().ok_or(DatasetError::NoParquetFiles)?)
+        .map_err(map_discovery_error)?;
+    if !has_parquet_extension(&first) {
+        return Err(DatasetError::Unsupported);
+    }
+    let mut common = first
+        .parent()
+        .ok_or(DatasetError::Unsupported)?
+        .to_path_buf();
+    for path in &paths[1..] {
+        if !keep_going() {
+            return Err(DatasetError::Cancelled);
+        }
+        if !has_parquet_extension(path) {
+            return Err(DatasetError::Unsupported);
+        }
+        let path = std::path::absolute(path).map_err(map_discovery_error)?;
+        while !path.starts_with(&common) {
+            if !common.pop() {
+                return Err(DatasetError::Unsupported);
+            }
         }
     }
     while common
@@ -1806,10 +2400,10 @@ fn common_parent(paths: &[PathBuf]) -> Option<PathBuf> {
         .is_some_and(is_hive_partition_component)
     {
         if !common.pop() {
-            return None;
+            return Err(DatasetError::Unsupported);
         }
     }
-    Some(common)
+    Ok(common)
 }
 
 // Windows canonicalization returns verbatim paths, while DuckDB file functions
@@ -1900,23 +2494,128 @@ fn parse_partitions(relative_path: &Path) -> Result<Vec<PartitionValue>, Dataset
     Ok(partitions)
 }
 
-fn partition_prefix_matches(partitions: &[PartitionValue], parent: &[PartitionValue]) -> bool {
-    partitions.len() >= parent.len()
-        && partitions.iter().zip(parent).all(|(member, expected)| {
-            member.key.eq_ignore_ascii_case(&expected.key) && member.value == expected.value
-        })
-}
-
-fn partition_order_key(partition: &PartitionValue) -> (String, String) {
-    (partition.key.to_ascii_lowercase(), partition.value.clone())
-}
-
 fn merge_schema(
     union: &mut Vec<SchemaField>,
     member_schema: Vec<SchemaField>,
     member: &str,
 ) -> Result<(), DatasetError> {
     merge_schema_at(union, member_schema, member, "")
+}
+
+fn validate_dataset_schema_bounds(
+    schema: &[SchemaField],
+    partition_names: &[String],
+    first_column_members: &HashMap<String, String>,
+) -> Result<(), DatasetError> {
+    fn field_size(field: &SchemaField) -> (usize, usize) {
+        field.children.iter().fold(
+            (
+                1,
+                field.name.len()
+                    + field.physical_type.len()
+                    + field.logical_type.as_ref().map_or(0, String::len),
+            ),
+            |(nodes, bytes), child| {
+                let (child_nodes, child_bytes) = field_size(child);
+                (
+                    nodes.saturating_add(child_nodes),
+                    bytes.saturating_add(child_bytes),
+                )
+            },
+        )
+    }
+
+    let (nodes, schema_bytes) = schema.iter().fold((1_usize, 0_usize), |total, field| {
+        let field = field_size(field);
+        (
+            total.0.saturating_add(field.0),
+            total.1.saturating_add(field.1),
+        )
+    });
+    let nodes = nodes.saturating_add(partition_names.len());
+    let bytes = schema_bytes
+        .saturating_add(partition_names.iter().map(String::len).sum::<usize>())
+        .saturating_add(
+            first_column_members
+                .iter()
+                .map(|(column, member)| column.len().saturating_add(member.len()))
+                .sum::<usize>(),
+        );
+    if nodes > MAX_DATASET_SCHEMA_NODES || bytes > MAX_DATASET_SCHEMA_BYTES {
+        Err(DatasetError::Unsupported)
+    } else {
+        Ok(())
+    }
+}
+
+fn merge_arrow_schemas(left: Schema, right: Schema) -> Result<Schema, DatasetError> {
+    let mut fields = left
+        .fields
+        .iter()
+        .map(|field| {
+            if right
+                .fields
+                .iter()
+                .any(|incoming| incoming.name().eq_ignore_ascii_case(field.name()))
+            {
+                Arc::clone(field)
+            } else {
+                Arc::new(field.as_ref().clone().with_nullable(true))
+            }
+        })
+        .collect::<Vec<_>>();
+    for incoming in right.fields.iter() {
+        if let Some(index) = fields
+            .iter()
+            .position(|field| field.name().eq_ignore_ascii_case(incoming.name()))
+        {
+            fields[index] = merge_arrow_fields(&fields[index], incoming)?;
+        } else {
+            fields.push(Arc::new(incoming.as_ref().clone().with_nullable(true)));
+        }
+    }
+    Ok(Schema::new_with_metadata(fields, left.metadata))
+}
+
+fn merge_arrow_fields(left: &Arc<Field>, right: &Arc<Field>) -> Result<Arc<Field>, DatasetError> {
+    let data_type = match (left.data_type(), right.data_type()) {
+        (left, right) if left == right => left.clone(),
+        (DataType::Int32, DataType::Int64) | (DataType::Int64, DataType::Int32) => DataType::Int64,
+        (DataType::Float32, DataType::Float64) | (DataType::Float64, DataType::Float32) => {
+            DataType::Float64
+        }
+        (DataType::Struct(left_fields), DataType::Struct(right_fields)) => {
+            let nested = merge_arrow_schemas(
+                Schema::new(left_fields.clone()),
+                Schema::new(right_fields.clone()),
+            )?;
+            DataType::Struct(nested.fields)
+        }
+        (DataType::List(left_field), DataType::List(right_field)) => {
+            DataType::List(merge_arrow_fields(left_field, right_field)?)
+        }
+        (DataType::LargeList(left_field), DataType::LargeList(right_field)) => {
+            DataType::LargeList(merge_arrow_fields(left_field, right_field)?)
+        }
+        (
+            DataType::FixedSizeList(left_field, left_size),
+            DataType::FixedSizeList(right_field, right_size),
+        ) if left_size == right_size => {
+            DataType::FixedSizeList(merge_arrow_fields(left_field, right_field)?, *left_size)
+        }
+        (DataType::Map(left_field, left_sorted), DataType::Map(right_field, right_sorted))
+            if left_sorted == right_sorted =>
+        {
+            DataType::Map(merge_arrow_fields(left_field, right_field)?, *left_sorted)
+        }
+        _ => return Err(DatasetError::Unsupported),
+    };
+    Ok(Arc::new(
+        left.as_ref()
+            .clone()
+            .with_data_type(data_type)
+            .with_nullable(left.is_nullable() || right.is_nullable()),
+    ))
 }
 
 fn validate_member_schema(
@@ -1969,7 +2668,6 @@ fn visible_schema(
     union_schema: &[SchemaField],
     partition_names: &[String],
     first_column_members: &HashMap<String, String>,
-    members: &[DatasetMember],
 ) -> Result<(Vec<SchemaField>, Vec<u32>, u32), DatasetError> {
     let mut schema = union_schema.to_vec();
     let mut partition_column_indices = Vec::with_capacity(partition_names.len());
@@ -1980,7 +2678,7 @@ fn visible_schema(
         {
             return Err(DatasetError::SchemaConflict {
                 column: name.clone(),
-                member: first_member_with_partition(members, name),
+                member: String::new(),
             });
         }
         partition_column_indices
@@ -1999,7 +2697,7 @@ fn visible_schema(
                     .find(|(name, _)| name.eq_ignore_ascii_case(reserved))
                     .map(|(_, member)| member)
                     .cloned()
-                    .unwrap_or_else(|| first_member_with_partition(members, reserved)),
+                    .unwrap_or_default(),
             });
         }
     }
@@ -2065,19 +2763,7 @@ fn text_field(name: &str) -> SchemaField {
     }
 }
 
-fn first_member_with_partition(members: &[DatasetMember], key: &str) -> String {
-    members
-        .iter()
-        .find(|member| {
-            member
-                .partitions
-                .iter()
-                .any(|partition| partition.key.eq_ignore_ascii_case(key))
-        })
-        .map(|member| member.relative_path.clone())
-        .unwrap_or_default()
-}
-
+#[cfg(test)]
 fn drift_page(
     members: &[DatasetMember],
     deviating_members: &[usize],
@@ -2136,6 +2822,7 @@ fn member_matches_prunable_filters(
     })
 }
 
+#[cfg(test)]
 fn candidate_members<'a>(
     members: &'a [DatasetMember],
     summary: &DatasetSummary,
@@ -2149,7 +2836,7 @@ fn candidate_members<'a>(
 
 fn diagnose_query_failure(
     source: &DatasetSource,
-    candidates: &[&DatasetMember],
+    candidates: &[DatasetMember],
     error: DuckDbError,
     has_filters: bool,
 ) -> DatasetError {
@@ -2168,7 +2855,7 @@ fn diagnose_query_failure(
 
 fn diagnose_lazy_query_failure(
     source: &DatasetSource,
-    candidates: &[&DatasetMember],
+    candidates: &[DatasetMember],
     panic: &(dyn Any + Send),
     has_filters: bool,
 ) -> DatasetError {
@@ -2203,7 +2890,7 @@ fn panic_message(panic: &(dyn Any + Send)) -> Option<&str> {
 
 fn diagnose_candidate_members(
     source: &DatasetSource,
-    candidates: &[&DatasetMember],
+    candidates: &[DatasetMember],
 ) -> Result<(), DatasetError> {
     let mut connection = None;
     for member in candidates {
@@ -2366,17 +3053,8 @@ fn platform_file_identity(
     _metadata: &fs::Metadata,
 ) -> Result<PlatformFileIdentity, std::io::Error> {
     let file = fs::File::open(path)?;
-    let mut information = BY_HANDLE_FILE_INFORMATION::default();
-    // SAFETY: `file` keeps the handle valid and `information` is writable for the call.
-    let succeeded = unsafe { GetFileInformationByHandle(file.as_raw_handle(), &mut information) };
-    if succeeded == 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-    Ok(PlatformFileIdentity::Windows {
-        volume: information.dwVolumeSerialNumber,
-        file_index: (u64::from(information.nFileIndexHigh) << 32)
-            | u64::from(information.nFileIndexLow),
-    })
+    let (volume, file_index) = windows_file_identity(&file)?;
+    Ok(PlatformFileIdentity::Windows { volume, file_index })
 }
 
 #[cfg(not(any(unix, windows)))]
@@ -2427,6 +3105,14 @@ mod tests {
         inspector.advance(2).expect("footer pass");
         let reader = inspector.into_window_reader().expect("dataset reader");
         let query_source = reader.query_source().expect("query source");
+        let connection = Connection::open_in_memory().expect("query connection");
+        query_source.install(&connection).expect("dataset install");
+        let mut cursor = query_source.candidate_batches(&[]);
+        assert!(
+            query_source
+                .bind_next_candidate_batch(&connection, &mut cursor, || true)
+                .expect("member bind")
+        );
         let first_escaped = escape_glob_path(first.to_string_lossy().as_ref());
         let seed_escaped =
             escape_glob_path(query_source.schema_seed.path().to_string_lossy().as_ref());
@@ -2443,8 +3129,42 @@ mod tests {
 
         assert_eq!(
             redacted,
-            "failed to read <source>, <source>, <source>, <temporary file>, and <temporary file>"
+            "failed to read <source member>, <source member>, <source member>, <temporary file>, and <temporary file>"
         );
+    }
+
+    #[test]
+    fn root_dataset_resource_diagnostics_never_echo_member_paths() {
+        let source = test_source(vec![member("a.parquet", "2025")], &[1]);
+        let query_source = DatasetQuerySource {
+            source: DatasetSource {
+                root: PathBuf::from(std::path::MAIN_SEPARATOR.to_string()),
+                ..source
+            },
+            summary: DatasetSummary {
+                display_name: "/".to_owned(),
+                member_count: 1,
+                ignored_file_count: 0,
+                size_bytes: 0,
+                row_count: 1,
+                row_group_count: 1,
+                schema: vec![text_field("value"), text_field("file")],
+                schema_drift_member_count: 0,
+                partition_column_indices: vec![],
+                provenance_column_index: 1,
+            },
+            filename_column: "file".to_owned(),
+            row_column: "row".to_owned(),
+            ordinal_column: "ordinal".to_owned(),
+            physical_column_count: 1,
+            schema_seed: write_schema_seed(&Arc::new(Schema::empty())).expect("schema seed"),
+            bound_members: Mutex::new(Vec::new()),
+        };
+
+        let secret = "/private/unbound.parquet";
+        let redacted = query_source.redact_paths(secret);
+        assert_eq!(redacted, "dataset query resource exhausted");
+        assert!(!redacted.contains(secret));
     }
 
     #[test]
@@ -2459,11 +3179,15 @@ mod tests {
         inspector.advance(2).expect("footer pass");
         let reader = inspector.into_window_reader().expect("dataset reader");
 
-        let error = match reader.member_snapshot_checked(0, || {
-            let replacement = directory.path().join("replacement.parquet");
-            write_test_member(&replacement, 3);
-            fs::rename(replacement, &unrelated).expect("replace unrelated member");
-        }) {
+        let error = match reader.member_snapshot_checked(
+            0,
+            || true,
+            || {
+                let replacement = directory.path().join("replacement.parquet");
+                write_test_member(&replacement, 3);
+                fs::rename(replacement, &unrelated).expect("replace unrelated member");
+            },
+        ) {
             Ok(_) => panic!("replacement during snapshot open must fail"),
             Err(error) => error,
         };
@@ -2586,6 +3310,21 @@ mod tests {
     }
 
     #[test]
+    fn preview_stops_when_the_owning_open_request_is_cancelled() {
+        let directory = tempdir().expect("dataset directory");
+        write_test_member(&directory.path().join("a.parquet"), 1);
+        let source = DatasetSource::open_folder(directory.path()).expect("dataset source");
+        let mut inspector = source.inspector();
+
+        assert_eq!(
+            inspector.preview_while(1, || false),
+            Err(DatasetError::Cancelled)
+        );
+        assert_eq!(inspector.next_member, 0);
+        assert!(inspector.preview_reader.is_none());
+    }
+
+    #[test]
     fn query_schema_postflight_rejects_a_change_after_the_query_finishes() {
         let directory = tempdir().expect("dataset directory");
         let path = directory.path().join("part.parquet");
@@ -2594,7 +3333,12 @@ mod tests {
         let mut inspector = source.inspector();
         inspector.advance(1).expect("footer pass");
         let reader = inspector.into_window_reader().expect("dataset reader");
-        let candidates = reader.source.members.iter().collect::<Vec<_>>();
+        let candidates = reader
+            .source
+            .catalog
+            .page(None, 1)
+            .expect("member page")
+            .members;
 
         let result = reader.query_schema_checked(&candidates, || {
             fs::remove_file(&path).expect("remove after query")
@@ -2680,12 +3424,7 @@ mod tests {
         ];
         for (source_error, expected) in cases {
             let member = member("part.parquet", "2026");
-            let source = DatasetSource {
-                display_name: "dataset/".to_owned(),
-                ignored_file_count: 0,
-                members: vec![member.clone()].into(),
-                changed_member: Arc::new(Mutex::new(None)),
-            };
+            let source = test_source(vec![member.clone()], &[0]);
 
             assert_eq!(source.latch_member_error(source_error, &member), expected);
             assert_eq!(
@@ -2728,27 +3467,23 @@ mod tests {
         assert_eq!(candidates[0].relative_path, "year=2026/b.parquet");
         assert_eq!(candidates[0].path, PathBuf::from("year=2026/b.parquet"));
         let connection = Connection::open_in_memory().expect("DuckDB connection");
-        initialize_member_tables(&connection, &members, &summary, &[0, 0])
-            .expect("member metadata");
-        let source = DatasetSource {
-            display_name: "dataset/".to_owned(),
-            ignored_file_count: 0,
-            members: members.clone().into(),
-            changed_member: Arc::new(Mutex::new(None)),
-        };
+        let interrupt = connection.interrupt_handle();
+        initialize_member_tables(&connection, &summary).expect("member metadata");
+        let source = test_source(members.clone(), &[0, 0]);
         let reader = DatasetWindowReader {
             source,
             summary,
             connection,
             member_limit: None,
-            deviating_members: Vec::new(),
             arrow_schema: Arc::new(Schema::empty()),
             filename_column: "__viewda_filename".to_owned(),
             physical_column_count: 0,
-            initialized_member_count: 2,
             schema_seed: None,
-            member_row_counts: vec![0, 0],
+            _temporary_directory: None,
+            interrupt,
+            interrupted: Arc::new(AtomicBool::new(false)),
         };
+        let candidates = candidates.into_iter().cloned().collect::<Vec<_>>();
         reader
             .bind_candidate_paths(&candidates)
             .expect("candidate boundary");
@@ -2784,27 +3519,22 @@ mod tests {
             provenance_column_index: 2,
         };
         let connection = Connection::open_in_memory().expect("DuckDB connection");
+        let interrupt = connection.interrupt_handle();
         let row_counts = vec![0; members.len()];
-        initialize_member_tables(&connection, &members, &summary, &row_counts)
-            .expect("static metadata");
-        let source = DatasetSource {
-            display_name: "dataset/".to_owned(),
-            ignored_file_count: 0,
-            members: members.clone().into(),
-            changed_member: Arc::new(Mutex::new(None)),
-        };
+        initialize_member_tables(&connection, &summary).expect("static metadata");
+        let source = test_source(members.clone(), &row_counts);
         let reader = DatasetWindowReader {
             source,
             summary,
             connection,
             member_limit: None,
-            deviating_members: Vec::new(),
             arrow_schema: Arc::new(Schema::empty()),
             filename_column: "__viewda_filename".to_owned(),
             physical_column_count: 1,
-            initialized_member_count: 1_000,
             schema_seed: None,
-            member_row_counts: row_counts,
+            _temporary_directory: None,
+            interrupt,
+            interrupted: Arc::new(AtomicBool::new(false)),
         };
 
         let query = reader.query_sql("", None);
@@ -2813,7 +3543,11 @@ mod tests {
         assert!(!query.contains("part-0000.parquet"));
         assert!(!query.contains("part-0999.parquet"));
         reader
-            .bind_candidate_paths(&[&members[0], &members[500], &members[999]])
+            .bind_candidate_paths(&[
+                members[0].clone(),
+                members[500].clone(),
+                members[999].clone(),
+            ])
             .expect("bounded candidate bind");
         let (bound_paths, bound_candidates, static_members) = reader
             .connection
@@ -2831,10 +3565,54 @@ mod tests {
                 },
             )
             .expect("bounded per-fetch metadata");
-        assert_eq!(
-            (bound_paths, bound_candidates, static_members),
-            (3, 3, 1_000)
-        );
+        assert_eq!((bound_paths, bound_candidates, static_members), (3, 3, 3));
+    }
+
+    #[test]
+    fn validated_export_binding_polls_only_the_requested_member_batch() {
+        let members = (0..1_000)
+            .map(|ordinal| {
+                let mut member = member(&format!("part-{ordinal:04}.parquet"), "2026");
+                member.ordinal = ordinal;
+                member
+            })
+            .collect::<Vec<_>>();
+        let summary = DatasetSummary {
+            display_name: "dataset/".to_owned(),
+            member_count: members.len() as u64,
+            ignored_file_count: 0,
+            size_bytes: 0,
+            row_count: 0,
+            row_group_count: 0,
+            schema: vec![text_field("year"), text_field("file")],
+            schema_drift_member_count: 0,
+            partition_column_indices: vec![0],
+            provenance_column_index: 1,
+        };
+        let connection = Connection::open_in_memory().expect("DuckDB connection");
+        initialize_member_tables(&connection, &summary).expect("static metadata");
+        let row_counts = vec![0; 1_000];
+        let query_source = DatasetQuerySource {
+            source: test_source(members, &row_counts),
+            summary,
+            filename_column: "file".to_owned(),
+            row_column: "row".to_owned(),
+            ordinal_column: "ordinal".to_owned(),
+            physical_column_count: 0,
+            schema_seed: write_schema_seed(&Arc::new(Schema::empty())).expect("schema seed"),
+            bound_members: Mutex::new(Vec::new()),
+        };
+        let mut polls = 0;
+
+        let count = query_source
+            .bind_export_members_while(&connection, &[0, 999], || {
+                polls += 1;
+                true
+            })
+            .expect("bounded export member binding");
+
+        assert_eq!(count, 2);
+        assert_eq!(polls, 3);
     }
 
     #[test]
@@ -2943,6 +3721,23 @@ mod tests {
     }
 
     #[test]
+    fn logical_dataset_schema_has_a_fixed_metadata_boundary() {
+        let fields = (0..MAX_DATASET_SCHEMA_NODES - 1)
+            .map(|index| text_field(&format!("column_{index}")))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            validate_dataset_schema_bounds(&fields, &[], &HashMap::new()),
+            Ok(())
+        );
+        let mut over_limit = fields;
+        over_limit.push(text_field("one_too_many"));
+        assert_eq!(
+            validate_dataset_schema_bounds(&over_limit, &[], &HashMap::new()),
+            Err(DatasetError::Unsupported)
+        );
+    }
+
+    #[test]
     fn drift_pages_stay_bounded_past_the_protocol_boundary() {
         let members = (0..300)
             .map(|ordinal| {
@@ -2978,6 +3773,34 @@ mod tests {
                 modified: None,
                 platform: test_platform_identity(),
             },
+            row_count: None,
+        }
+    }
+
+    fn test_source(members: Vec<DatasetMember>, row_counts: &[u64]) -> DatasetSource {
+        let mut builder = MemberCatalogBuilder::new().expect("member catalog");
+        for member in members {
+            builder.push(member).expect("catalog member");
+        }
+        let catalog = builder
+            .finish_while(|| true)
+            .expect("completed member catalog");
+        let facts = row_counts
+            .iter()
+            .enumerate()
+            .map(|(ordinal, row_count)| (ordinal as u64, *row_count, None))
+            .collect::<Vec<_>>();
+        for facts in facts.chunks(CATALOG_PAGE_MEMBERS as usize) {
+            catalog
+                .record_inspection_batch(facts)
+                .expect("inspection facts");
+        }
+        DatasetSource {
+            display_name: "dataset/".to_owned(),
+            ignored_file_count: 0,
+            root: PathBuf::new(),
+            catalog: Arc::new(catalog),
+            changed_member: Arc::new(Mutex::new(None)),
         }
     }
 

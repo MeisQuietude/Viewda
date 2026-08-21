@@ -10,7 +10,7 @@ rust-version.workspace = true
 [features]
 # Metadata-only examples disable DuckDB so they keep rustup as their sole tool prerequisite.
 default = ["query-engine"]
-query-engine = ["dep:arrow-select", "dep:duckdb", "dep:tempfile", "dep:windows-sys"]
+query-engine = ["dep:arrow-select", "dep:duckdb", "dep:tempfile"]
 
 [dependencies]
 # TODO(Arrow 59): Upgrade all Arrow and Parquet pins together when duckdb-rs supports it.
@@ -29,7 +29,7 @@ thiserror.workspace = true
 thrift = { version = "=0.17.0", default-features = false }
 
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "=0.61.2", features = ["Win32_Foundation", "Win32_Storage_FileSystem"], optional = true }
+windows-sys = { version = "=0.61.2", features = ["Win32_Foundation", "Win32_Storage_FileSystem"] }
 
 [dev-dependencies]
 half = "=2.7.1"

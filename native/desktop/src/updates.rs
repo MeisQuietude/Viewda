@@ -21,6 +21,7 @@ use crate::{
 };
 
 const UPDATE_STATE_FILE: &str = "updates.json";
+const RESTART_MANIFEST_DIRECTORY: &str = "restart-manifests";
 const STABLE_ENDPOINT: &str = "https://meisquietude.github.io/Viewda/updates/stable.json";
 const LATEST_ENDPOINT: &str = "https://meisquietude.github.io/Viewda/updates/latest.json";
 const AUTOMATIC_CHECK_INTERVAL_SECONDS: u64 = 24 * 60 * 60;
@@ -116,7 +117,7 @@ struct StoredUpdateState {
     pending_restart: Option<PendingRestart>,
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct PendingRestart {
     version: String,
@@ -148,6 +149,35 @@ impl PendingRestart {
             source_paths,
             source_descriptors,
             version,
+        }
+    }
+
+    fn persisted(
+        version: String,
+        source_descriptors: Vec<SourceDescriptor>,
+        manifest_directory: &Path,
+    ) -> Result<Self, OpenSourceError> {
+        let source_descriptors = source_descriptors
+            .iter()
+            .map(|descriptor| descriptor.restart_copy(manifest_directory))
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(Self::new(version, source_descriptors))
+    }
+
+    fn adopt_restart_manifests(mut self, directory: &Path) -> Result<Self, OpenSourceError> {
+        self.source_descriptors = self
+            .source_descriptors
+            .iter()
+            .map(|descriptor| descriptor.adopt_restart_manifest(directory))
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(self)
+    }
+
+    fn preserve_restart_manifests(&self) {
+        for descriptor in &self.source_descriptors {
+            if let SourceDescriptor::ExplicitFiles { manifest, .. } = descriptor {
+                manifest.preserve_restart_copy();
+            }
         }
     }
 
@@ -404,8 +434,17 @@ pub(crate) async fn install_pending_update(
     let source_descriptors = opened_source
         .open_descriptors()
         .map_err(|_| UpdateError::Storage)?;
-    let restart = PendingRestart::new(update.version.clone(), source_descriptors);
-    store.mutate(&app, |stored| stored.pending_restart = Some(restart))?;
+    let manifest_directory = restart_manifest_directory(&app)?;
+    let restart = PendingRestart::persisted(
+        update.version.clone(),
+        source_descriptors,
+        &manifest_directory,
+    )
+    .map_err(|_| UpdateError::Storage)?;
+    store.mutate(&app, |stored| {
+        stored.pending_restart = Some(restart.clone())
+    })?;
+    restart.preserve_restart_manifests();
 
     let progress = Mutex::new(UpdateProgressTracker::default());
     let chunk_progress = on_progress.clone();
@@ -435,6 +474,7 @@ pub(crate) async fn install_pending_update(
     {
         *pending.0.lock().map_err(|_| UpdateError::Unavailable)? = Some(update);
         store.mutate(&app, |stored| stored.pending_restart = None)?;
+        cleanup_restart_manifests(&manifest_directory);
         return Err(UpdateError::Unavailable);
     }
 
@@ -450,12 +490,20 @@ pub async fn take_post_update_state(
     let restart = store.mutate(&app, |stored| {
         stored
             .pending_restart
-            .as_ref()
-            .filter(|restart| restart.version == env!("CARGO_PKG_VERSION"))?;
-        stored.pending_restart.take()
+            .take()
+            .filter(|restart| restart.version == env!("CARGO_PKG_VERSION"))
     })?;
     let Some(restart) = restart else {
+        cleanup_restart_manifests(&restart_manifest_directory(&app)?);
         return Ok(None);
+    };
+    let manifest_directory = restart_manifest_directory(&app)?;
+    let restart = match restart.adopt_restart_manifests(&manifest_directory) {
+        Ok(restart) => restart,
+        Err(_) => {
+            cleanup_restart_manifests(&manifest_directory);
+            return Err(UpdateError::Storage);
+        }
     };
     let version = restart.version.clone();
     let descriptors = restart.restored_descriptors();
@@ -557,6 +605,32 @@ fn state_path(app: &AppHandle) -> Result<PathBuf, UpdateError> {
         .app_config_dir()
         .map(|directory| directory.join(UPDATE_STATE_FILE))
         .map_err(|_| UpdateError::Storage)
+}
+
+fn restart_manifest_directory(app: &AppHandle) -> Result<PathBuf, UpdateError> {
+    app.path()
+        .app_config_dir()
+        .map(|directory| directory.join(RESTART_MANIFEST_DIRECTORY))
+        .map_err(|_| UpdateError::Storage)
+}
+
+fn cleanup_restart_manifests(directory: &Path) {
+    let Ok(entries) = fs::read_dir(directory) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let owned_name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| {
+                name.starts_with("viewda-selection-restart-") && name.ends_with(".manifest")
+            });
+        if owned_name && entry.file_type().is_ok_and(|kind| kind.is_file()) {
+            let _ = fs::remove_file(path);
+        }
+    }
+    let _ = fs::remove_dir(directory);
 }
 
 fn read_state_file(path: &Path) -> Result<StoredUpdateState, UpdateError> {
@@ -826,13 +900,11 @@ mod tests {
     fn restart_marker_retains_folder_and_explicit_dataset_composition() {
         let descriptors = vec![
             SourceDescriptor::Folder(PathBuf::from("/data/folder")),
-            SourceDescriptor::ExplicitFiles {
-                root: PathBuf::from("/data"),
-                paths: vec![
-                    PathBuf::from("/data/a.parquet"),
-                    PathBuf::from("/data/nested/b.parquet"),
-                ],
-            },
+            SourceDescriptor::explicit_files(vec![
+                PathBuf::from("/data/a.parquet"),
+                PathBuf::from("/data/nested/b.parquet"),
+            ])
+            .expect("explicit manifest"),
         ];
         let marker = PendingRestart::new("0.1.0".to_owned(), descriptors.clone());
         let serialized = serde_json::to_value(&marker).expect("restart marker JSON");
@@ -840,6 +912,42 @@ mod tests {
             serde_json::from_value(serialized).expect("restart marker parses");
 
         assert_eq!(restored.restored_descriptors(), descriptors);
+    }
+
+    #[test]
+    fn unpersisted_restart_manifest_is_removed_when_its_owner_drops() {
+        let directory = tempfile::tempdir().expect("restart directory");
+        let descriptor = SourceDescriptor::explicit_files(vec![PathBuf::from("/data/a.parquet")])
+            .expect("explicit manifest");
+        let restart =
+            PendingRestart::persisted("0.1.0".to_owned(), vec![descriptor], directory.path())
+                .expect("restart marker");
+        let SourceDescriptor::ExplicitFiles { manifest, .. } = &restart.source_descriptors[0]
+        else {
+            unreachable!("explicit descriptor retains its manifest");
+        };
+        let manifest_path = manifest.0.storage.path().to_path_buf();
+        assert!(manifest_path.exists());
+
+        drop(restart);
+
+        assert!(!manifest_path.exists());
+    }
+
+    #[test]
+    fn restart_manifest_cleanup_ignores_unowned_files() {
+        let directory = tempfile::tempdir().expect("restart directory");
+        let owned = directory
+            .path()
+            .join("viewda-selection-restart-1-1.manifest");
+        let unrelated = directory.path().join("notes.txt");
+        fs::write(&owned, b"owned").expect("owned manifest");
+        fs::write(&unrelated, b"unrelated").expect("unrelated file");
+
+        cleanup_restart_manifests(directory.path());
+
+        assert!(!owned.exists());
+        assert!(unrelated.exists());
     }
 
     #[test]

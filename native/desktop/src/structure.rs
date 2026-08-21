@@ -293,6 +293,7 @@ pub(crate) async fn get_structure_summary(
     };
     let progress = job.progress.clone();
     let cancellation = job.cancellation.clone();
+    let lifecycle = Arc::clone(&session.lifecycle);
     let result = tauri::async_runtime::spawn_blocking(move || match snapshot_plan {
         StructureSnapshotPlan::File(snapshot) => {
             let snapshot = snapshot.ok_or(StructureCommandError::Unsupported)?;
@@ -306,7 +307,9 @@ pub(crate) async fn get_structure_summary(
             let snapshot = reader
                 .lock()
                 .map_err(|_| StructureCommandError::Unsupported)?
-                .member_snapshot(ordinal)
+                .member_snapshot_while(ordinal, || {
+                    !cancellation.is_cancelled() && lifecycle.wants_work()
+                })
                 .map_err(map_dataset_error)?;
             if cancellation.is_cancelled() {
                 return Err(StructureCommandError::Cancelled);
@@ -314,7 +317,9 @@ pub(crate) async fn get_structure_summary(
             let reader =
                 StructureReader::from_snapshot(snapshot.snapshot(), &progress, &cancellation)
                     .map_err(StructureCommandError::from)?;
-            snapshot.validate().map_err(map_dataset_error)?;
+            snapshot
+                .validate_while(|| !cancellation.is_cancelled() && lifecycle.wants_work())
+                .map_err(map_dataset_error)?;
             Ok(reader)
         }
     })
@@ -533,7 +538,7 @@ pub(crate) fn get_structure_row_offset(
     let member_offset = reader
         .lock()
         .map_err(|_| StructureCommandError::Unsupported)?
-        .member_row_offset(ordinal)
+        .member_row_offset_while(ordinal, || session.lifecycle.wants_work())
         .map_err(map_dataset_error)?;
     let offset = member_offset
         .checked_add(local_offset)

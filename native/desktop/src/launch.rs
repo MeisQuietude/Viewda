@@ -15,7 +15,7 @@ use viewda_data_engine::SourceError;
 
 use crate::{
     OpenSourceError, OpenedSource, OpenedSourceInfo, SourceDescriptor, SourceOpenIntent,
-    inspect_selected_source, open_dataset_descriptor_from_native,
+    inspect_selected_source, open_dataset_descriptor_from_native, open_explicit_files_from_native,
 };
 
 pub const OPENED_SOURCE_AVAILABLE_EVENT: &str = "opened-source-available";
@@ -98,9 +98,9 @@ pub fn open_recent(app: &tauri::AppHandle, id: &str) {
 pub fn open_dropped_paths(app: &tauri::AppHandle, paths: Vec<PathBuf>) {
     let group_files = platform_alt_modifier_active();
     match classify_dropped_paths(paths, group_files) {
-        Ok(DroppedSource::Folder(path)) => publish_dataset(app, SourceDescriptor::Folder(path)),
+        Ok(DroppedSource::Folder(path)) => publish_dataset(app, DatasetDrop::Folder(path)),
         Ok(DroppedSource::FileDataset(paths)) => {
-            publish_dataset(app, SourceDescriptor::explicit_files(paths));
+            publish_dataset(app, DatasetDrop::ExplicitFiles(paths));
         }
         Ok(DroppedSource::Files(paths)) => {
             for path in paths {
@@ -171,22 +171,46 @@ fn classify_dropped_paths(
     }
 }
 
-fn publish_dataset(app: &tauri::AppHandle, descriptor: SourceDescriptor) {
-    let activation = match open_dataset_descriptor_from_native(app, descriptor) {
-        Ok(source) => OpenedSourceActivation {
-            source: Some(source),
-            source_error: None,
-        },
-        Err(OpenSourceError::Recent(_)) => OpenedSourceActivation {
+enum DatasetDrop {
+    Folder(PathBuf),
+    ExplicitFiles(Vec<PathBuf>),
+}
+
+fn publish_dataset(app: &tauri::AppHandle, dropped: DatasetDrop) {
+    let app = app.clone();
+    tauri::async_runtime::spawn(async move {
+        let worker_app = app.clone();
+        let activation = tauri::async_runtime::spawn_blocking(move || {
+            let opened = match dropped {
+                DatasetDrop::Folder(path) => {
+                    open_dataset_descriptor_from_native(&worker_app, SourceDescriptor::Folder(path))
+                }
+                DatasetDrop::ExplicitFiles(paths) => {
+                    open_explicit_files_from_native(&worker_app, paths)
+                }
+            };
+            match opened {
+                Ok(source) => OpenedSourceActivation {
+                    source: Some(source),
+                    source_error: None,
+                },
+                Err(OpenSourceError::Recent(_)) => OpenedSourceActivation {
+                    source: None,
+                    source_error: Some(SourceError::Unsupported.into()),
+                },
+                Err(error) => OpenedSourceActivation {
+                    source: None,
+                    source_error: Some(error),
+                },
+            }
+        })
+        .await
+        .unwrap_or_else(|_| OpenedSourceActivation {
             source: None,
             source_error: Some(SourceError::Unsupported.into()),
-        },
-        Err(error) => OpenedSourceActivation {
-            source: None,
-            source_error: Some(error),
-        },
-    };
-    publish(app, activation);
+        });
+        publish(&app, activation);
+    });
 }
 
 fn is_parquet(path: &Path) -> bool {

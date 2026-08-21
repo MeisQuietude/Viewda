@@ -104,11 +104,26 @@ impl ColumnStatisticsReader {
 
     /// Creates a statistics reader for one completed fixed dataset.
     pub fn for_dataset(reader: &DatasetWindowReader) -> Result<Self, ColumnStatisticsError> {
-        let source = reader.query_source().map_err(dataset_statistics_error)?;
-        Self::with_source(ColumnStatisticsSource::Dataset(Box::new(source)))
+        Self::for_dataset_while(reader, || true)
+    }
+
+    /// Creates a dataset statistics reader while its source session remains active.
+    pub fn for_dataset_while(
+        reader: &DatasetWindowReader,
+        mut keep_going: impl FnMut() -> bool,
+    ) -> Result<Self, ColumnStatisticsError> {
+        let source = reader
+            .query_source_while(&mut keep_going)
+            .map_err(dataset_statistics_error)?;
+        let statistics = Self::with_source(ColumnStatisticsSource::Dataset(Box::new(source)))?;
+        if !keep_going() {
+            return Err(ColumnStatisticsError::QueryFailed);
+        }
+        Ok(statistics)
     }
 
     fn with_source(source: ColumnStatisticsSource) -> Result<Self, ColumnStatisticsError> {
+        let is_dataset = matches!(source, ColumnStatisticsSource::Dataset(_));
         let temporary_directory = tempfile::Builder::new()
             .prefix("viewda-statistics-")
             .tempdir()
@@ -118,11 +133,18 @@ impl ColumnStatisticsReader {
             .to_str()
             .ok_or(ColumnStatisticsError::QueryEngineUnavailable)?;
         let config = Config::default()
-            .enable_object_cache(true)
+            .enable_object_cache(!is_dataset)
             .and_then(|config| config.max_memory(QUERY_MEMORY_LIMIT))
             .and_then(|config| config.with("temp_directory", temporary_directory_path))
             .map_err(|_| ColumnStatisticsError::QueryEngineUnavailable)?;
         let connection = Connection::open_in_memory_with_flags(config)
+            .map_err(|_| ColumnStatisticsError::QueryEngineUnavailable)?;
+        connection
+            .execute_batch(if is_dataset {
+                "SET parquet_metadata_cache = false"
+            } else {
+                "SET parquet_metadata_cache = true"
+            })
             .map_err(|_| ColumnStatisticsError::QueryEngineUnavailable)?;
         Ok(Self {
             source,
@@ -178,12 +200,19 @@ impl ColumnStatisticsReader {
                     return Err(ColumnStatisticsError::Unsupported);
                 }
                 dataset
-                    .install(&self.connection)
+                    .install_while(&self.connection, || !self.cancelled.load(Ordering::Acquire))
                     .map_err(|error| self.classify_setup_error(error))?;
                 dataset
-                    .bind_candidates(&self.connection, &[])
+                    .stage_candidate_batches(
+                        &self.connection,
+                        &[],
+                        "__viewda_statistics_source",
+                        (&quote_identifier(column_name), ""),
+                        &[],
+                        || !self.cancelled.load(Ordering::Acquire),
+                    )
                     .map_err(|error| self.classify_setup_error(error))?;
-                (dataset.relation_sql(), Vec::new())
+                (quote_identifier("__viewda_statistics_source"), Vec::new())
             }
         };
         after_setup();
@@ -221,7 +250,9 @@ impl ColumnStatisticsReader {
             .map_err(|error| self.classify_scan_error(error))?;
         self.require_active()?;
         if let ColumnStatisticsSource::Dataset(dataset) = &self.source {
-            dataset.validate().map_err(dataset_statistics_error)?;
+            dataset
+                .validate_while(|| !self.cancelled.load(Ordering::Acquire))
+                .map_err(dataset_statistics_error)?;
         }
         self.require_active()?;
         let null_count =
