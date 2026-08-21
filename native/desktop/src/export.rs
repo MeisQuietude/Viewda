@@ -31,6 +31,7 @@ pub(crate) enum DataExportScope {
 pub(crate) enum DataExportFailureCode {
     NotFound,
     PermissionDenied,
+    SourceChanged,
     NotParquet,
     CorruptSource,
     InvalidRequest,
@@ -46,6 +47,7 @@ impl DataExportFailureCode {
         Some(match error {
             DataExportError::NotFound => Self::NotFound,
             DataExportError::PermissionDenied => Self::PermissionDenied,
+            DataExportError::SourceChanged => Self::SourceChanged,
             DataExportError::NotParquet => Self::NotParquet,
             DataExportError::CorruptSource => Self::CorruptSource,
             DataExportError::InvalidRequest => Self::InvalidRequest,
@@ -615,7 +617,12 @@ impl OpenedSource {
             .state
             .lock()
             .map_err(|_| DataExportCommandError::Unsupported)?;
-        Ok(export_session(&state, generation)?.path.clone())
+        let session = export_session(&state, generation)?;
+        drop(state);
+        session
+            .validate_source_identity()
+            .map_err(|_| DataExportCommandError::SourceChanged)?;
+        Ok(session.path.clone())
     }
 
     fn export_source(
@@ -636,6 +643,9 @@ impl OpenedSource {
         if session_state.view_revision != view_revision {
             return Err(DataExportCommandError::ViewChanged);
         }
+        session
+            .validate_source_identity()
+            .map_err(|_| DataExportCommandError::SourceChanged)?;
         Ok((
             session.path.clone(),
             session_state
@@ -679,6 +689,9 @@ impl OpenedSource {
         {
             return Err(DataExportCommandError::ViewChanged);
         }
+        session
+            .validate_source_identity()
+            .map_err(|_| DataExportCommandError::SourceChanged)?;
         self.data_exports.install(reservation, job)
     }
 }
