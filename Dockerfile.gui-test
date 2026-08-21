@@ -67,7 +67,7 @@ ARG TAURI_DRIVER_VERSION=2.0.6
 
 # Compile tauri-driver in its own stable layer. The source builder below reuses
 # this pinned Rust base, and runtime package changes do not trigger recompilation.
-FROM rust:1.97.1-slim-trixie@sha256:3b2879047d42784ca9403ad20c51ed3df361a50f1df96f5777d39b4e33aa65cd AS tauri-driver-builder
+FROM rust:1.98.0-slim-trixie@sha256:77abfb641e6ca03336ad986a7f875e4203f67441aa92337efe1f86c2891ca642 AS tauri-driver-builder
 
 ARG TAURI_DRIVER_VERSION
 
@@ -296,7 +296,7 @@ FROM gui-runtime AS artifact-runtime
 # official Rust image matches native/rust-toolchain.toml; its manifest is pinned.
 # BuildKit caches downloads and compilation across source edits, while only the
 # resulting AppImage crosses into the small runtime image.
-FROM rust:1.97.1-slim-trixie@sha256:3b2879047d42784ca9403ad20c51ed3df361a50f1df96f5777d39b4e33aa65cd AS viewda-builder
+FROM rust:1.98.0-slim-trixie@sha256:77abfb641e6ca03336ad986a7f875e4203f67441aa92337efe1f86c2891ca642 AS viewda-builder
 
 WORKDIR /source
 

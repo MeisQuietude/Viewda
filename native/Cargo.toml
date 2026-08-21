@@ -9,7 +9,7 @@ edition = "2024"
 homepage = "https://github.com/MeisQuietude/Viewda"
 license = "Apache-2.0"
 repository = "https://github.com/MeisQuietude/Viewda"
-rust-version = "1.97.1"
+rust-version = "1.98.0"
 version = "0.1.0"
 
 [workspace.dependencies]
@@ -17,4 +17,4 @@ semver = { version = "=1.0.28", features = ["serde"] }
 serde = { version = "=1.0.229", features = ["derive"] }
 serde_json = "=1.0.151"
 tauri = { version = "=2.11.5" }
-thiserror = "=2.0.19"
+thiserror = "=2.0.20"

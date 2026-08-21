@@ -32,7 +32,7 @@ jobs:
       CARGO_SYSTEM_LAYER: ubuntu-22.04
     steps:
       - name: Check out the tested commit
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
 
       - name: Install Tauri system dependencies
         run: |
@@ -44,7 +44,7 @@ jobs:
         working-directory: native
 
       - name: Restore reusable Cargo outputs
-        uses: actions/cache@v5
+        uses: actions/cache@v6
         with:
           path: |
             ~/.cargo/git/db
@@ -58,7 +58,7 @@ jobs:
             cargo-${{ env.CARGO_CACHE_EPOCH }}-${{ env.CARGO_SYSTEM_LAYER }}-${{ runner.arch }}-${{ hashFiles('native/rust-toolchain.toml') }}-
 
       - name: Restore provisioned dependencies
-        uses: actions/cache@v5
+        uses: actions/cache@v6
         with:
           path: |
             native/.toolchain/node
@@ -102,7 +102,7 @@ jobs:
         shell: bash
     steps:
       - name: Check out the tested commit
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
 
       - name: Verify runner platform
         run: |
@@ -125,7 +125,7 @@ jobs:
         working-directory: native
 
       - name: Restore reusable Cargo outputs
-        uses: actions/cache@v5
+        uses: actions/cache@v6
         with:
           path: |
             ~/.cargo/git/db
@@ -139,7 +139,7 @@ jobs:
             cargo-${{ env.CARGO_CACHE_EPOCH }}-${{ env.CARGO_SYSTEM_LAYER }}-${{ runner.arch }}-${{ hashFiles('native/rust-toolchain.toml') }}-
 
       - name: Restore provisioned dependencies
-        uses: actions/cache@v5
+        uses: actions/cache@v6
         with:
           path: |
             native/.toolchain/node

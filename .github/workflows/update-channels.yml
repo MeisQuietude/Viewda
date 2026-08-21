@@ -25,7 +25,7 @@ jobs:
       GH_TOKEN: ${{ github.token }}
     steps:
       - name: Check out the release tooling
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
 
       - name: Install the pinned Node.js
         run: scripts/install-node.sh
@@ -34,13 +34,13 @@ jobs:
         run: scripts/publish-update-channels.sh "$RUNNER_TEMP/site"
 
       - name: Configure GitHub Pages
-        uses: actions/configure-pages@v5
+        uses: actions/configure-pages@v6
 
       - name: Upload the Pages artifact
-        uses: actions/upload-pages-artifact@v4
+        uses: actions/upload-pages-artifact@v5
         with:
           path: ${{ runner.temp }}/site
 
       - name: Deploy the channel endpoints
         id: deployment
-        uses: actions/deploy-pages@v4
+        uses: actions/deploy-pages@v5

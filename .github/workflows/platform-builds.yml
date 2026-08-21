@@ -50,7 +50,7 @@ jobs:
       sha: ${{ steps.source.outputs.sha }}
     steps:
       - name: Check out the tested source
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
 
       - name: Record the exact source commit
         id: source
@@ -117,7 +117,7 @@ jobs:
       TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ""
     steps:
       - name: Check out the tested commit
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
         with:
           ref: ${{ needs.source.outputs.sha }}
 
@@ -142,7 +142,7 @@ jobs:
           version: v0.17.0
 
       - name: Restore Cargo sources
-        uses: actions/cache@v5
+        uses: actions/cache@v6
         with:
           path: |
             ~/.cargo/git/db
@@ -155,7 +155,7 @@ jobs:
       # These directories come from checksum/lockfile-verified installers.
       # Their guards still run inside scripts/run.sh setup after restoration.
       - name: Restore provisioned dependencies
-        uses: actions/cache@v5
+        uses: actions/cache@v6
         with:
           path: |
             native/.toolchain/node
@@ -338,7 +338,7 @@ jobs:
       TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ""
     steps:
       - name: Check out the tested commit
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
         with:
           ref: ${{ needs.source.outputs.sha }}
 
@@ -356,7 +356,7 @@ jobs:
           version: v0.17.0
 
       - name: Restore Cargo sources
-        uses: actions/cache@v5
+        uses: actions/cache@v6
         with:
           path: |
             ~/.cargo/git/db
@@ -367,7 +367,7 @@ jobs:
             cargo-sources-${{ env.CARGO_CACHE_EPOCH }}-${{ env.CARGO_SYSTEM_LAYER }}-${{ runner.arch }}-${{ hashFiles('native/rust-toolchain.toml') }}-
 
       - name: Restore provisioned dependencies
-        uses: actions/cache@v5
+        uses: actions/cache@v6
         with:
           path: |
             native/.toolchain/node
@@ -553,7 +553,7 @@ jobs:
     runs-on: macos-26
     steps:
       - name: Check out the tested commit
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
         with:
           ref: ${{ needs.source.outputs.sha }}
 
@@ -752,7 +752,7 @@ jobs:
         shell: bash
     steps:
       - name: Check out the tested commit
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
         with:
           ref: ${{ needs.source.outputs.sha }}
 
@@ -778,7 +778,7 @@ jobs:
           version: v0.17.0
 
       - name: Restore Cargo sources
-        uses: actions/cache@v5
+        uses: actions/cache@v6
         with:
           path: |
             ~/.cargo/git/db
@@ -789,7 +789,7 @@ jobs:
             cargo-sources-${{ env.CARGO_CACHE_EPOCH }}-${{ env.CARGO_SYSTEM_LAYER }}-${{ runner.arch }}-${{ hashFiles('native/rust-toolchain.toml') }}-
 
       - name: Restore provisioned dependencies
-        uses: actions/cache@v5
+        uses: actions/cache@v6
         with:
           path: |
             native/.toolchain/node
@@ -942,7 +942,7 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - name: Check out the tested commit
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
         with:
           ref: ${{ needs.source.outputs.sha }}
 
@@ -956,7 +956,7 @@ jobs:
         working-directory: native
 
       - name: Restore tauri-driver
-        uses: actions/cache@v5
+        uses: actions/cache@v6
         with:
           path: ~/.cargo/bin/tauri-driver
           key: tauri-driver-${{ runner.os }}-${{ runner.arch }}-${{ env.TAURI_DRIVER_VERSION }}
@@ -1035,7 +1035,7 @@ jobs:
       GH_TOKEN: ${{ github.token }}
     steps:
       - name: Check out the tagged commit
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
         with:
           fetch-depth: 0
 

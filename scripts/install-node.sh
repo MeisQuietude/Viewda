@@ -38,17 +38,17 @@ case "${system}:${machine}" in
 esac
 
 case "${version}:${platform}" in
-  26.5.0:linux-x64)
-    expected_sha256="22b5f47ad6ae78837e4c2b846019965ce1a06ba143de176102294a1bf44fc677"
+  26.7.0:linux-x64)
+    expected_sha256="bd6b6c31e377bad9ad579bed72e5bc11f4c879ac9452ad51d30e646ea3d828df"
     ;;
-  26.5.0:darwin-arm64)
-    expected_sha256="ee920559aaa2391569cff4d737e3b83963430e3a14dedd91bfe0ff53171b5af9"
+  26.7.0:darwin-arm64)
+    expected_sha256="7ee659a7768e641bbfd5360940660b8e8fd0052f77488f365562bac522fc15d4"
     ;;
-  26.5.0:darwin-x64)
-    expected_sha256="98293394c945a24e64e00b4177bf075ec963ea70b34d1d2e24bd4a71716d334f"
+  26.7.0:darwin-x64)
+    expected_sha256="f279d1ed28ce57f7788bf23435d2ad7fdd7438904ad5c4d8a1081a7cde3d4b96"
     ;;
-  26.5.0:win-x64)
-    expected_sha256="d3b2277dbcccfdf24ef6302928f64f484cff1d77a6d3caa3a28f4d20ce9158f6"
+  26.7.0:win-x64)
+    expected_sha256="d3bd72755141ed32bbcd841228ee81897c8a98d50dfa7dae2179399a0a7c90f8"
     ;;
   *)
     echo "No SHA-256 is pinned for Node.js ${version} on ${platform}." >&2
