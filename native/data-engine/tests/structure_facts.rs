@@ -389,6 +389,87 @@ fn ranks_columns_by_stored_bytes_and_reports_their_share() {
 }
 
 #[test]
+fn keeps_cumulative_share_tied_to_the_files_own_ranking() {
+    let source = write_wide_parquet(4);
+    let reader = open_structure(source.path());
+
+    let ranked = reader.column_page(
+        StructureByteUnit::Compressed,
+        StructureColumnSort::Bytes,
+        StructureSortDirection::Descending,
+        0,
+        16,
+    );
+    let cumulative = ranked
+        .columns
+        .iter()
+        .map(|column| column.cumulative_share)
+        .collect::<Vec<_>>();
+    assert!(
+        cumulative.windows(2).all(|pair| pair[0] <= pair[1]),
+        "the running total never decreases down the ranking: {cumulative:?}"
+    );
+    assert!((cumulative[0] - ranked.columns[0].share).abs() < 1e-9);
+    assert!((cumulative[3] - 1.0).abs() < 1e-9);
+
+    let by_name = reader.column_page(
+        StructureByteUnit::Compressed,
+        StructureColumnSort::Name,
+        StructureSortDirection::Ascending,
+        0,
+        16,
+    );
+    for column in &by_name.columns {
+        let ranked_column = ranked
+            .columns
+            .iter()
+            .find(|candidate| candidate.index == column.index)
+            .expect("every column appears in both orderings");
+        assert_eq!(
+            column.cumulative_share, ranked_column.cumulative_share,
+            "sorting the view never changes a column's cumulative share"
+        );
+    }
+
+    let uncompressed = reader.column_page(
+        StructureByteUnit::Uncompressed,
+        StructureColumnSort::Bytes,
+        StructureSortDirection::Descending,
+        0,
+        16,
+    );
+    assert!(
+        (uncompressed
+            .columns
+            .last()
+            .expect("the file has columns")
+            .cumulative_share
+            - 1.0)
+            .abs()
+            < 1e-9
+    );
+}
+
+#[test]
+fn reports_no_cumulative_share_for_a_file_without_bytes() {
+    let source = write_empty_parquet();
+
+    let page = open_structure(source.path()).column_page(
+        StructureByteUnit::Compressed,
+        StructureColumnSort::Bytes,
+        StructureSortDirection::Descending,
+        0,
+        16,
+    );
+
+    assert!(
+        page.columns
+            .iter()
+            .all(|column| column.cumulative_share == 0.0)
+    );
+}
+
+#[test]
 fn lists_key_value_metadata_keys_and_sizes_without_their_values() {
     let source = write_parquet(
         WriterProperties::builder()

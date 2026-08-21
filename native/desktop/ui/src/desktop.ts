@@ -291,6 +291,9 @@ export interface StructureColumnSummary {
   compressionRatio: number | null;
   encodings: string[];
   share: number;
+  // The running total follows the file's own bytes-descending ranking, so a
+  // column keeps the same value under any visible sort.
+  cumulativeShare: number;
 }
 
 export interface StructureColumnPage {

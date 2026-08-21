@@ -725,6 +725,7 @@ mod tests {
                 compression_ratio: Some(3.0),
                 encodings: vec!["PLAIN".to_owned()],
                 share: 1.0,
+                cumulative_share: 1.0,
             }],
         };
 
@@ -761,7 +762,8 @@ mod tests {
                     "uncompressedBytes": 1_500,
                     "compressionRatio": 3.0,
                     "encodings": ["PLAIN"],
-                    "share": 1.0
+                    "share": 1.0,
+                    "cumulativeShare": 1.0
                 }]
             })
         );

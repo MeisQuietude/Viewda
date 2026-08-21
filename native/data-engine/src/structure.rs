@@ -463,6 +463,11 @@ pub struct StructureColumnSummary {
     pub encodings: Vec<String>,
     /// Fraction of the file's bytes in the requested unit.
     pub share: f64,
+    /// Share of this column plus every larger column in the requested unit.
+    ///
+    /// The running total follows the file's own bytes-descending ranking, not the
+    /// caller's ordering, so a row keeps the same value under any visible sort.
+    pub cumulative_share: f64,
 }
 
 /// A bounded window of the columns table.
@@ -592,6 +597,8 @@ struct ColumnFacts {
     compressed_bytes: u64,
     uncompressed_bytes: u64,
     encodings: u16,
+    cumulative_share_compressed: f64,
+    cumulative_share_uncompressed: f64,
 }
 
 /// The parsed footer of one source, shared by every structure query.
@@ -667,6 +674,8 @@ impl StructureReader {
                 compressed_bytes: 0,
                 uncompressed_bytes: 0,
                 encodings: 0,
+                cumulative_share_compressed: 0.0,
+                cumulative_share_uncompressed: 0.0,
             })
             .collect::<Vec<_>>();
         let mut row_groups = Vec::with_capacity(row_group_count);
@@ -735,6 +744,17 @@ impl StructureReader {
                 Ordering::Release,
             );
         }
+
+        assign_cumulative_shares(
+            &mut columns,
+            compressed_bytes,
+            StructureByteUnit::Compressed,
+        );
+        assign_cumulative_shares(
+            &mut columns,
+            uncompressed_bytes,
+            StructureByteUnit::Uncompressed,
+        );
 
         let key_value_metadata = file_metadata.key_value_metadata();
         let key_value_count = key_value_metadata.map_or(0, Vec::len);
@@ -1083,6 +1103,10 @@ impl StructureReader {
             } else {
                 bytes as f64 / total as f64
             },
+            cumulative_share: match unit {
+                StructureByteUnit::Compressed => facts.cumulative_share_compressed,
+                StructureByteUnit::Uncompressed => facts.cumulative_share_uncompressed,
+            },
         }
     }
 
@@ -1345,6 +1369,38 @@ impl LensAccumulator {
             unrated_chunk_count: self.unrated_chunk_count,
             statistics: self.statistics.finish(),
             bloom_filters: self.bloom_filters.finish(),
+        }
+    }
+}
+
+/// Records, per column, the share of the file covered by that column and every
+/// larger one.
+///
+/// Ranking is the file's own fact, so the running total is computed once against
+/// the bytes-descending order and stays valid under any ordering a caller asks for.
+fn assign_cumulative_shares(columns: &mut [ColumnFacts], total: u64, unit: StructureByteUnit) {
+    let bytes = |facts: &ColumnFacts| match unit {
+        StructureByteUnit::Compressed => facts.compressed_bytes,
+        StructureByteUnit::Uncompressed => facts.uncompressed_bytes,
+    };
+    let mut order = (0..columns.len()).collect::<Vec<_>>();
+    order.sort_unstable_by(|left, right| {
+        bytes(&columns[*right])
+            .cmp(&bytes(&columns[*left]))
+            .then_with(|| left.cmp(right))
+    });
+
+    let mut running = 0_u64;
+    for index in order {
+        running += bytes(&columns[index]);
+        let share = if total == 0 {
+            0.0
+        } else {
+            running as f64 / total as f64
+        };
+        match unit {
+            StructureByteUnit::Compressed => columns[index].cumulative_share_compressed = share,
+            StructureByteUnit::Uncompressed => columns[index].cumulative_share_uncompressed = share,
         }
     }
 }
