@@ -47,6 +47,269 @@ fn discovers_visible_parquet_members_in_lexicographic_order_and_counts_other_fil
 }
 
 #[test]
+fn explicit_files_use_common_root_hive_paths_and_lexicographic_order() {
+    let directory = TempDir::new().expect("dataset directory");
+    let later = directory.path().join("year=2026/part.parquet");
+    let earlier = directory.path().join("year=2025/part.parquet");
+    write_ints(&later, "value", &[20]);
+    write_ints(&earlier, "value", &[10]);
+
+    let source = DatasetSource::open_files(&[later, earlier]).expect("explicit dataset");
+    let page = source.member_page(0, 8).expect("member page");
+
+    assert_eq!(
+        source.display_name(),
+        format!(
+            "{}/",
+            directory
+                .path()
+                .file_name()
+                .expect("temporary folder name")
+                .to_string_lossy()
+        )
+    );
+    assert_eq!(source.ignored_file_count(), 0);
+    assert_eq!(
+        page.members
+            .iter()
+            .map(|member| member.relative_path.as_str())
+            .collect::<Vec<_>>(),
+        ["year=2025/part.parquet", "year=2026/part.parquet"]
+    );
+    assert_eq!(
+        page.members
+            .iter()
+            .map(|member| member.partitions.as_slice())
+            .collect::<Vec<_>>(),
+        [
+            &[viewda_data_engine::PartitionValue {
+                key: "year".to_owned(),
+                value: "2025".to_owned(),
+            }][..],
+            &[viewda_data_engine::PartitionValue {
+                key: "year".to_owned(),
+                value: "2026".to_owned(),
+            }][..],
+        ]
+    );
+    let mut reader = complete_reader(source);
+    let batch = decode_one(&reader.fetch(0, 8, &[]).expect("explicit window"));
+    assert_eq!(int64_values(&batch, 0), [10, 20]);
+    assert_eq!(
+        string_values(&batch, 2),
+        [
+            Some("year=2025/part.parquet"),
+            Some("year=2026/part.parquet"),
+        ]
+    );
+}
+
+#[test]
+fn explicit_files_preserve_constant_trailing_hive_partitions() {
+    let directory = TempDir::new().expect("dataset directory");
+    let trips = directory.path().join("trips");
+    let first = trips.join("year=2026/month=07/a.parquet");
+    let second = trips.join("year=2026/month=07/b.parquet");
+    write_ints(&first, "value", &[10]);
+    write_ints(&second, "value", &[20]);
+
+    let source = DatasetSource::open_files(&[second, first]).expect("explicit dataset");
+    let page = source.member_page(0, 8).expect("member page");
+
+    assert_eq!(source.display_name(), "trips/");
+    assert_eq!(
+        page.members
+            .iter()
+            .map(|member| member.relative_path.as_str())
+            .collect::<Vec<_>>(),
+        [
+            "year=2026/month=07/a.parquet",
+            "year=2026/month=07/b.parquet",
+        ]
+    );
+    for member in &page.members {
+        assert_eq!(
+            member
+                .partitions
+                .iter()
+                .map(|partition| (partition.key.as_str(), partition.value.as_str()))
+                .collect::<Vec<_>>(),
+            [("year", "2026"), ("month", "07")]
+        );
+    }
+
+    let mut reader = complete_reader(source);
+    let batch = decode_one(&reader.fetch(0, 8, &[]).expect("explicit window"));
+    assert_eq!(int64_values(&batch, 0), [10, 20]);
+    assert_eq!(string_values(&batch, 1), [Some("2026"), Some("2026")]);
+    assert_eq!(string_values(&batch, 2), [Some("07"), Some("07")]);
+    assert_eq!(
+        string_values(&batch, 3),
+        [
+            Some("year=2026/month=07/a.parquet"),
+            Some("year=2026/month=07/b.parquet"),
+        ]
+    );
+}
+
+#[test]
+fn explicit_file_validation_is_eager_but_footer_reads_remain_lazy() {
+    let directory = TempDir::new().expect("dataset directory");
+    let damaged = directory.path().join("damaged.parquet");
+    let uppercase = directory.path().join("ignored.PARQUET");
+    fs::write(&damaged, b"not parquet").expect("damaged member");
+    fs::write(&uppercase, b"not parquet").expect("uppercase extension");
+
+    assert!(matches!(
+        DatasetSource::open_files(&[]),
+        Err(DatasetError::NoParquetFiles)
+    ));
+    assert!(matches!(
+        DatasetSource::open_files(&[damaged.clone(), uppercase]),
+        Err(DatasetError::Unsupported)
+    ));
+    let source =
+        DatasetSource::open_files(std::slice::from_ref(&damaged)).expect("lazy explicit source");
+    assert_eq!(source.member_count(), 1);
+    assert_eq!(
+        source.inspector().advance(1),
+        Err(DatasetError::InvalidMember {
+            member: "damaged.parquet".to_owned(),
+        })
+    );
+
+    let directory_member = directory.path().join("folder.parquet");
+    fs::create_dir(&directory_member).expect("directory member");
+    assert!(matches!(
+        DatasetSource::open_files(&[directory_member]),
+        Err(DatasetError::Unsupported)
+    ));
+}
+
+#[cfg(unix)]
+#[test]
+fn explicit_files_reject_two_aliases_of_the_same_canonical_member() {
+    let directory = TempDir::new().expect("dataset directory");
+    let member = directory.path().join("part.parquet");
+    let alias = directory.path().join("alias.parquet");
+    write_ints(&member, "value", &[1]);
+    std::os::unix::fs::symlink(&member, &alias).expect("member alias");
+
+    assert!(matches!(
+        DatasetSource::open_files(&[member, alias]),
+        Err(DatasetError::Unsupported)
+    ));
+}
+
+#[cfg(unix)]
+#[test]
+fn explicit_file_aliases_preserve_logical_hive_paths_and_root() {
+    let directory = TempDir::new().expect("dataset directory");
+    let physical = directory.path().join("physical");
+    let logical = directory.path().join("logical");
+    let earlier_target = physical.join("earlier.parquet");
+    let later_target = physical.join("later.parquet");
+    let earlier_alias = logical.join("year=2025/part.parquet");
+    let later_alias = logical.join("year=2026/part.parquet");
+    write_ints(&earlier_target, "value", &[10]);
+    write_ints(&later_target, "value", &[20]);
+    fs::create_dir_all(earlier_alias.parent().expect("earlier alias parent"))
+        .expect("earlier alias parent");
+    fs::create_dir_all(later_alias.parent().expect("later alias parent"))
+        .expect("later alias parent");
+    std::os::unix::fs::symlink(&earlier_target, &earlier_alias).expect("earlier alias");
+    std::os::unix::fs::symlink(&later_target, &later_alias).expect("later alias");
+
+    let source = DatasetSource::open_files(&[later_alias, earlier_alias]).expect("alias dataset");
+    let page = source.member_page(0, 8).expect("member page");
+
+    assert_eq!(source.display_name(), "logical/");
+    assert_eq!(
+        page.members
+            .iter()
+            .map(|member| member.relative_path.as_str())
+            .collect::<Vec<_>>(),
+        ["year=2025/part.parquet", "year=2026/part.parquet"]
+    );
+    assert_eq!(page.members[0].partitions[0].value, "2025");
+    assert_eq!(page.members[1].partitions[0].value, "2026");
+
+    let mut reader = complete_reader(source);
+    let batch = decode_one(&reader.fetch(0, 8, &[]).expect("alias window"));
+    assert_eq!(int64_values(&batch, 0), [10, 20]);
+    assert_eq!(
+        string_values(&batch, 2),
+        [
+            Some("year=2025/part.parquet"),
+            Some("year=2026/part.parquet"),
+        ]
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn non_utf8_member_paths_are_rejected_before_footer_inspection() {
+    use std::{ffi::OsString, os::unix::ffi::OsStringExt as _};
+
+    let explicit_directory = TempDir::new().expect("explicit directory");
+    let explicit_member = explicit_directory
+        .path()
+        .join(OsString::from_vec(b"bad-\xff.parquet".to_vec()));
+    fs::write(&explicit_member, b"not parquet").expect("non-UTF-8 explicit member");
+    assert!(matches!(
+        DatasetSource::open_files(&[explicit_member]),
+        Err(DatasetError::Unsupported)
+    ));
+
+    let folder = TempDir::new().expect("folder directory");
+    let folder_member_directory = folder.path().join(OsString::from_vec(b"bad-\xff".to_vec()));
+    fs::create_dir(&folder_member_directory).expect("non-UTF-8 member directory");
+    write_ints(&folder_member_directory.join("part.parquet"), "value", &[1]);
+    assert!(matches!(
+        DatasetSource::open_folder(folder.path()),
+        Err(DatasetError::Unsupported)
+    ));
+}
+
+#[cfg(unix)]
+#[test]
+fn folder_discovery_counts_non_utf8_files_that_are_not_visible_members() {
+    use std::{ffi::OsString, os::unix::ffi::OsStringExt as _};
+
+    let folder = TempDir::new().expect("folder directory");
+    write_ints(&folder.path().join("part.parquet"), "value", &[1]);
+    fs::write(
+        folder
+            .path()
+            .join(OsString::from_vec(b"ignored-\xff.txt".to_vec())),
+        b"ignored",
+    )
+    .expect("non-UTF-8 unrelated file");
+    fs::write(
+        folder
+            .path()
+            .join(OsString::from_vec(b".hidden-\xff.parquet".to_vec())),
+        b"ignored",
+    )
+    .expect("non-UTF-8 hidden file");
+    let unrelated_directory = folder
+        .path()
+        .join(OsString::from_vec(b"directory-\xff".to_vec()));
+    fs::create_dir(&unrelated_directory).expect("non-UTF-8 directory");
+    fs::write(unrelated_directory.join("ignored.txt"), b"ignored")
+        .expect("file below non-UTF-8 directory");
+
+    let source = DatasetSource::open_folder(folder.path()).expect("folder dataset");
+
+    assert_eq!(source.member_count(), 1);
+    assert_eq!(source.ignored_file_count(), 3);
+    assert_eq!(
+        source.member_page(0, 8).expect("member page").members[0].relative_path,
+        "part.parquet"
+    );
+}
+
+#[test]
 fn rejects_empty_folders_and_bounds_member_pages() {
     let directory = TempDir::new().expect("dataset directory");
     fs::write(directory.path().join("_SUCCESS"), b"").expect("success marker");

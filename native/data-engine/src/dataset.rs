@@ -1,8 +1,8 @@
-//! Folder-backed Parquet datasets with fixed membership and bounded windows.
+//! Parquet datasets with fixed membership and bounded windows.
 
 use std::{
     any::Any,
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     fs,
     panic::{AssertUnwindSafe, catch_unwind},
     path::{Path, PathBuf},
@@ -86,7 +86,7 @@ enum PlatformFileIdentity {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DatasetMemberSummary {
-    /// Stable slash-separated path relative to the opened folder.
+    /// Stable slash-separated path relative to the dataset's logical root.
     pub relative_path: String,
     /// Hive values derived from the member's parent directories.
     pub partitions: Vec<PartitionValue>,
@@ -108,7 +108,7 @@ pub struct DatasetMemberPage {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DatasetSummary {
-    /// Folder name with the dataset marker expected by source switchers.
+    /// Dataset label with the marker expected by source switchers.
     pub display_name: String,
     /// Files in the fixed dataset composition.
     pub member_count: u64,
@@ -134,14 +134,14 @@ pub struct DatasetSummary {
 #[derive(Debug, Clone, PartialEq, Eq, Error, Serialize)]
 #[serde(tag = "code", rename_all = "camelCase")]
 pub enum DatasetError {
-    /// The folder cannot be found.
-    #[error("The selected folder no longer exists.")]
+    /// The dataset source cannot be found.
+    #[error("The selected dataset source no longer exists.")]
     NotFound,
-    /// The operating system denied folder or member access.
-    #[error("Viewda does not have permission to read the selected folder.")]
+    /// The operating system denied source or member access.
+    #[error("Viewda does not have permission to read the selected dataset source.")]
     PermissionDenied,
     /// Discovery found no supported member.
-    #[error("The selected folder does not contain any Parquet files.")]
+    #[error("The selected source does not contain any Parquet files.")]
     NoParquetFiles,
     /// A requested member page exceeds the bounded protocol limit.
     #[error("The requested dataset member page is too large.")]
@@ -164,8 +164,8 @@ pub enum DatasetError {
     /// A bounded query failed under the existing data-window contract.
     #[error("{error}")]
     Window { error: DataWindowError },
-    /// The folder shape or its paths cannot be represented safely.
-    #[error("This folder dataset is not supported.")]
+    /// The source shape or its paths cannot be represented safely.
+    #[error("This dataset source is not supported.")]
     Unsupported,
 }
 
@@ -175,7 +175,7 @@ impl From<DataWindowError> for DatasetError {
     }
 }
 
-/// One folder snapshot. Membership changes only when the caller opens it again.
+/// One fixed dataset snapshot. Membership changes only when the caller opens it again.
 #[derive(Debug, Clone)]
 pub struct DatasetSource {
     display_name: String,
@@ -187,18 +187,21 @@ pub struct DatasetSource {
 impl DatasetSource {
     /// Discovers supported members without reading any Parquet footer.
     pub fn open_folder(root: &Path) -> Result<Self, DatasetError> {
-        let metadata = fs::metadata(root).map_err(map_discovery_error)?;
+        let root = std::path::absolute(root).map_err(map_discovery_error)?;
+        root.to_str().ok_or(DatasetError::Unsupported)?;
+        let metadata = fs::metadata(&root).map_err(map_discovery_error)?;
         if !metadata.is_dir() {
             return Err(DatasetError::Unsupported);
         }
         let folder_name = root
             .file_name()
-            .map(|name| name.to_string_lossy().into_owned())
+            .and_then(|name| name.to_str())
+            .map(str::to_owned)
             .filter(|name| !name.is_empty())
             .ok_or(DatasetError::Unsupported)?;
         let mut discovered = Vec::new();
         let mut ignored_file_count = 0_u64;
-        discover_members(root, root, &mut discovered, &mut ignored_file_count)?;
+        discover_members(&root, &root, &mut discovered, &mut ignored_file_count)?;
         if discovered.is_empty() {
             return Err(DatasetError::NoParquetFiles);
         }
@@ -215,7 +218,81 @@ impl DatasetSource {
         })
     }
 
-    /// Folder name with a trailing slash.
+    /// Opens an explicit fixed set after deriving one common logical root.
+    ///
+    /// Logical absolute paths determine provenance, Hive values, and lexicographic
+    /// order. Canonical targets determine reads, identities, and duplicate rejection.
+    pub fn open_files(paths: &[PathBuf]) -> Result<Self, DatasetError> {
+        if paths.is_empty() {
+            return Err(DatasetError::NoParquetFiles);
+        }
+        if paths.iter().any(|path| {
+            path.extension()
+                .is_none_or(|extension| extension != "parquet")
+        }) {
+            return Err(DatasetError::Unsupported);
+        }
+
+        let mut canonical_targets = HashSet::with_capacity(paths.len());
+        let mut resolved_paths = Vec::with_capacity(paths.len());
+        for path in paths {
+            let logical = std::path::absolute(path).map_err(map_discovery_error)?;
+            logical.to_str().ok_or(DatasetError::Unsupported)?;
+            let path = query_compatible_canonical_path(
+                fs::canonicalize(&logical).map_err(map_discovery_error)?,
+            )?;
+            path.to_str().ok_or(DatasetError::Unsupported)?;
+            let metadata = fs::metadata(&path).map_err(map_discovery_error)?;
+            if !metadata.is_file() || !canonical_targets.insert(path.clone()) {
+                return Err(DatasetError::Unsupported);
+            }
+            resolved_paths.push((logical, path));
+        }
+        let logical_paths = resolved_paths
+            .iter()
+            .map(|(logical, _)| logical.clone())
+            .collect::<Vec<_>>();
+        let root = common_parent(&logical_paths).ok_or(DatasetError::Unsupported)?;
+        let mut members = Vec::with_capacity(resolved_paths.len());
+        for (logical, path) in resolved_paths {
+            let metadata = fs::metadata(&path).map_err(map_discovery_error)?;
+            let relative = logical
+                .strip_prefix(&root)
+                .map_err(|_| DatasetError::Unsupported)?;
+            let relative_path = slash_path(relative)?;
+            let partitions = parse_partitions(relative)?;
+            let identity = member_identity(&path, &metadata).map_err(map_discovery_error)?;
+            members.push(DatasetMember {
+                ordinal: 0,
+                path,
+                relative_path,
+                partitions,
+                identity,
+            });
+        }
+        members.sort_by(|left, right| left.relative_path.cmp(&right.relative_path));
+        for (ordinal, member) in members.iter_mut().enumerate() {
+            member.ordinal = ordinal as u64;
+        }
+        let display_name = root
+            .file_name()
+            .and_then(|name| name.to_str())
+            .map(str::to_owned)
+            .filter(|name| !name.is_empty())
+            .map_or_else(
+                || format!("{} files/", members.len()),
+                |name| format!("{name}/"),
+            );
+
+        Ok(Self {
+            display_name,
+            ignored_file_count: 0,
+            members: members.into(),
+            changed_member: Arc::new(Mutex::new(None)),
+        })
+    }
+
+    /// Dataset label with a trailing slash.
     pub fn display_name(&self) -> &str {
         &self.display_name
     }
@@ -579,7 +656,7 @@ pub struct DatasetPreview {
     pub arrow_ipc: Vec<u8>,
 }
 
-/// Reuses one DuckDB connection for windows from one fixed folder snapshot.
+/// Reuses one DuckDB connection for windows from one fixed dataset snapshot.
 pub struct DatasetWindowReader {
     source: DatasetSource,
     summary: DatasetSummary,
@@ -1055,7 +1132,7 @@ fn discover_members(
             let relative = path
                 .strip_prefix(root)
                 .map_err(|_| DatasetError::Unsupported)?;
-            let relative_path = slash_path(relative);
+            let relative_path = slash_path(relative)?;
             let partitions = parse_partitions(relative)?;
             let identity = member_identity(&path, &metadata).map_err(map_discovery_error)?;
             members.push(DatasetMember {
@@ -1075,7 +1152,7 @@ fn discover_members(
 }
 
 fn is_visible_parquet_path(root: &Path, path: &Path) -> bool {
-    let Ok(relative) = path.strip_prefix(root) else {
+    let Some(relative) = path.strip_prefix(root).ok() else {
         return false;
     };
     relative
@@ -1086,11 +1163,79 @@ fn is_visible_parquet_path(root: &Path, path: &Path) -> bool {
             .is_some_and(|extension| extension == "parquet")
 }
 
-fn slash_path(path: &Path) -> String {
+fn slash_path(path: &Path) -> Result<String, DatasetError> {
     path.components()
-        .map(|component| component.as_os_str().to_string_lossy())
-        .collect::<Vec<_>>()
-        .join("/")
+        .map(|component| {
+            component
+                .as_os_str()
+                .to_str()
+                .map(str::to_owned)
+                .ok_or(DatasetError::Unsupported)
+        })
+        .collect::<Result<Vec<_>, _>>()
+        .map(|components| components.join("/"))
+}
+
+fn common_parent(paths: &[PathBuf]) -> Option<PathBuf> {
+    let mut common = paths.first()?.parent()?.to_path_buf();
+    while paths.iter().any(|path| !path.starts_with(&common)) {
+        if !common.pop() {
+            return None;
+        }
+    }
+    while common
+        .file_name()
+        .and_then(|component| component.to_str())
+        .is_some_and(is_hive_partition_component)
+    {
+        if !common.pop() {
+            return None;
+        }
+    }
+    Some(common)
+}
+
+// Windows canonicalization returns verbatim paths, while DuckDB file functions
+// accept the equivalent drive or UNC spelling used by ordinary discovered members.
+// The round trip proves that Win32 normalization of trailing dots, spaces, or
+// device-like components cannot redirect the ordinary spelling to another target.
+#[cfg(windows)]
+fn query_compatible_canonical_path(path: PathBuf) -> Result<PathBuf, DatasetError> {
+    let value = path.to_str().ok_or(DatasetError::Unsupported)?;
+    let Some(candidate) = windows_path_without_verbatim_prefix(value).map(PathBuf::from) else {
+        return (!value.starts_with(r"\\?\"))
+            .then_some(path)
+            .ok_or(DatasetError::Unsupported);
+    };
+    let target = fs::canonicalize(&candidate).map_err(|_| DatasetError::Unsupported)?;
+    (target == path)
+        .then_some(candidate)
+        .ok_or(DatasetError::Unsupported)
+}
+
+#[cfg(not(windows))]
+fn query_compatible_canonical_path(path: PathBuf) -> Result<PathBuf, DatasetError> {
+    Ok(path)
+}
+
+#[cfg(any(windows, test))]
+fn windows_path_without_verbatim_prefix(path: &str) -> Option<String> {
+    path.strip_prefix(r"\\?\UNC\")
+        .map(|path| format!(r"\\{path}"))
+        .or_else(|| {
+            let path = path.strip_prefix(r"\\?\")?;
+            let prefix = path.as_bytes().get(..3)?;
+            (prefix[0].is_ascii_alphabetic()
+                && prefix[1] == b':'
+                && matches!(prefix[2], b'\\' | b'/'))
+            .then(|| path.to_owned())
+        })
+}
+
+fn is_hive_partition_component(component: &str) -> bool {
+    component
+        .split_once('=')
+        .is_some_and(|(key, _)| !key.is_empty())
 }
 
 fn quote_string_literal(value: &str) -> String {
@@ -1116,7 +1261,10 @@ fn parse_partitions(relative_path: &Path) -> Result<Vec<PartitionValue>, Dataset
         return Ok(partitions);
     };
     for component in parent.components() {
-        let component = component.as_os_str().to_string_lossy();
+        let component = component
+            .as_os_str()
+            .to_str()
+            .ok_or(DatasetError::Unsupported)?;
         let Some((key, value)) = component.split_once('=') else {
             continue;
         };
@@ -1879,6 +2027,43 @@ mod tests {
         assert_eq!(
             escape_glob_path(r#"C:\data\a[1]*?'"данные.parquet"#),
             r#"C:\data\a[[]1[]][*][?]'"данные.parquet"#
+        );
+    }
+
+    #[test]
+    fn removes_windows_verbatim_prefixes_before_query_binding() {
+        assert_eq!(
+            windows_path_without_verbatim_prefix(r"\\?\C:\data\part.parquet"),
+            Some(r"C:\data\part.parquet".to_owned())
+        );
+        assert_eq!(
+            windows_path_without_verbatim_prefix(r"\\?\UNC\server\share\part.parquet"),
+            Some(r"\\server\share\part.parquet".to_owned())
+        );
+        assert_eq!(
+            windows_path_without_verbatim_prefix(r"C:\data\part.parquet"),
+            None
+        );
+        assert_eq!(
+            windows_path_without_verbatim_prefix(r"\\?\Volume{01234567}\part.parquet"),
+            None
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn rejects_verbatim_paths_that_win32_would_normalize_to_another_target() {
+        let directory = tempdir().expect("dataset directory");
+        let canonical_directory = fs::canonicalize(directory.path()).expect("canonical directory");
+        let lossy_directory = canonical_directory.join("folder.");
+        fs::create_dir(&lossy_directory).expect("verbatim trailing-dot directory");
+        let member = lossy_directory.join("part.parquet");
+        fs::write(&member, b"member").expect("verbatim member");
+        let canonical_member = fs::canonicalize(member).expect("canonical member");
+
+        assert_eq!(
+            query_compatible_canonical_path(canonical_member),
+            Err(DatasetError::Unsupported)
         );
     }
 
