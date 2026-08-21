@@ -306,6 +306,28 @@ describe("row-stepped wheel gestures", () => {
     expect(advanceWheelGesture(null, 0, 84, 0, 28).rowSteps).toBe(3);
   });
 
+  it.each([
+    { delta: 10, rowSteps: 1, remainder: 2 },
+    { delta: -10, rowSteps: -1, remainder: -2 },
+  ])(
+    "resolves a sustained signed diagonal tie vertically after one row ($delta)",
+    ({ delta, rowSteps, remainder }) => {
+      const first = advanceWheelGesture(null, delta, delta, 0, 28);
+      const second = advanceWheelGesture(first.state, delta, delta, 10, 28);
+      const third = advanceWheelGesture(second.state, delta, delta, 20, 28);
+
+      expect(first.state.axis).toBeNull();
+      expect(second.state.axis).toBeNull();
+      expect(third).toMatchObject({ rowSteps });
+      expect(third.state).toMatchObject({
+        axis: "vertical",
+        pendingX: 0,
+        pendingY: 0,
+        verticalRemainder: remainder,
+      });
+    },
+  );
+
   it("waits for dominance and lets strong opposing input take over", () => {
     const undecided = advanceWheelGesture(null, 10, 9, 0, 28);
     expect(undecided).toMatchObject({ horizontalDelta: 0, rowSteps: 0 });

@@ -28,13 +28,18 @@ function file(
     active,
     busy: false,
     mode: "data",
+    dataTargetRow: null,
     summary: {
       generation,
       displayName: name,
       sizeBytes: 8,
       rowCount: 1,
       rowGroupCount: 1,
+      columnCount: 0,
       schema: [],
+      schemaNodeCount: 0,
+      schemaIsTruncated: false,
+      stringsTruncated: false,
     },
   };
 }

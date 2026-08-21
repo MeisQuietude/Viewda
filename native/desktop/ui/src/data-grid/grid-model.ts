@@ -126,6 +126,8 @@ export interface GridColumn {
   monospace: boolean;
   pinned: boolean;
   pending: boolean;
+  sortable: boolean;
+  filterable: boolean;
   sort: {
     direction: "neutral" | "ascending" | "descending";
     priority?: number;

@@ -15,7 +15,11 @@ function summary(generation: number, displayName: string): SourceSummary {
     sizeBytes: 1_024,
     rowCount: 10,
     rowGroupCount: 1,
+    columnCount: 0,
     schema: [],
+    schemaNodeCount: 0,
+    schemaIsTruncated: false,
+    stringsTruncated: false,
   };
 }
 
@@ -41,6 +45,7 @@ function file(generation: number, path: string, active = false): OpenFile {
     summary: summary(generation, listed.name),
     mode: "data",
     busy: false,
+    dataTargetRow: null,
   };
 }
 
@@ -49,6 +54,7 @@ describe("open files", () => {
     const first = {
       ...file(1, "/data/first.parquet"),
       mode: "structure" as const,
+      dataTargetRow: { row: 42, request: 3 },
     };
     const summaries = new Map([
       [1, first.summary],
@@ -66,6 +72,9 @@ describe("open files", () => {
       [1, "structure"],
     ]);
     expect(activeOpenFile(merged)?.generation).toBe(2);
+    expect(merged.find((open) => open.generation === 1)?.dataTargetRow).toEqual(
+      { row: 42, request: 3 },
+    );
   });
 
   it("keeps state identity when a native listing changes nothing", () => {
