@@ -5200,24 +5200,31 @@ dependencies = [
  "arrow-ipc",
  "arrow-schema",
  "arrow-select",
+ "bytes",
  "duckdb",
  "half",
  "parquet",
  "serde",
+ "serde_json",
  "tempfile",
  "thiserror 2.0.20",
+ "thrift",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
 name = "viewda-desktop"
 version = "0.2.0"
 dependencies = [
+ "arrow-array",
+ "arrow-schema",
  "block2",
  "gtk",
  "objc2",
  "objc2-app-kit",
  "objc2-foundation",
  "objc2-uniform-type-identifiers",
+ "parquet",
  "semver",
  "serde",
  "serde_json",
@@ -5230,6 +5237,7 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.20",
  "viewda-data-engine",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

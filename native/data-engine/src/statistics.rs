@@ -1,22 +1,35 @@
-use std::{path::PathBuf, sync::Arc};
+use std::{
+    path::PathBuf,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+};
 
-use duckdb::{Config, Connection, InterruptHandle, params};
+use duckdb::{Config, Connection, InterruptHandle, params_from_iter, types::Value};
 use serde::Serialize;
 use tempfile::TempDir;
 use thiserror::Error;
 
-use crate::source::{SourceError, open_local_source};
+use crate::{
+    dataset::{DatasetError, DatasetQuerySource, DatasetSetupError, DatasetWindowReader},
+    source::{SourceError, open_local_source},
+};
 
 const QUERY_MEMORY_LIMIT: &str = "384MB";
 
 /// A handle for cancelling an in-flight statistics scan.
 pub struct StatisticsInterruptHandle {
     inner: Arc<InterruptHandle>,
+    cancelled: Arc<AtomicBool>,
 }
 
 impl StatisticsInterruptHandle {
     /// Interrupts the active scan, or does nothing after its reader is dropped.
+    /// Statistics keep their existing error surface, so an interrupted scan
+    /// returns [`ColumnStatisticsError::QueryFailed`].
     pub fn interrupt(&self) {
+        self.cancelled.store(true, Ordering::Release);
         self.inner.interrupt();
     }
 }
@@ -47,6 +60,9 @@ pub enum ColumnStatisticsError {
     /// The operating system denied access to the selected source.
     #[error("Viewda does not have permission to read the selected file.")]
     PermissionDenied,
+    /// The source path no longer identifies the opened file.
+    #[error("The selected file changed after it was opened.")]
+    SourceChanged,
     /// The selected source does not have Parquet file markers.
     #[error("The selected file is not a Parquet file.")]
     NotParquet,
@@ -69,14 +85,45 @@ pub enum ColumnStatisticsError {
 
 /// Owns the isolated DuckDB connection used by one statistics scan.
 pub struct ColumnStatisticsReader {
-    source_path: PathBuf,
+    source: ColumnStatisticsSource,
     connection: Connection,
     _temporary_directory: TempDir,
+    cancelled: Arc<AtomicBool>,
+}
+
+enum ColumnStatisticsSource {
+    File(PathBuf),
+    Dataset(Box<DatasetQuerySource>),
 }
 
 impl ColumnStatisticsReader {
     /// Creates a statistics reader that cannot block the grid's connection.
     pub fn new(source_path: PathBuf) -> Result<Self, ColumnStatisticsError> {
+        Self::with_source(ColumnStatisticsSource::File(source_path))
+    }
+
+    /// Creates a statistics reader for one completed fixed dataset.
+    pub fn for_dataset(reader: &DatasetWindowReader) -> Result<Self, ColumnStatisticsError> {
+        Self::for_dataset_while(reader, || true)
+    }
+
+    /// Creates a dataset statistics reader while its source session remains active.
+    pub fn for_dataset_while(
+        reader: &DatasetWindowReader,
+        mut keep_going: impl FnMut() -> bool,
+    ) -> Result<Self, ColumnStatisticsError> {
+        let source = reader
+            .query_source_while(&mut keep_going)
+            .map_err(dataset_statistics_error)?;
+        let statistics = Self::with_source(ColumnStatisticsSource::Dataset(Box::new(source)))?;
+        if !keep_going() {
+            return Err(ColumnStatisticsError::QueryFailed);
+        }
+        Ok(statistics)
+    }
+
+    fn with_source(source: ColumnStatisticsSource) -> Result<Self, ColumnStatisticsError> {
+        let is_dataset = matches!(source, ColumnStatisticsSource::Dataset(_));
         let temporary_directory = tempfile::Builder::new()
             .prefix("viewda-statistics-")
             .tempdir()
@@ -86,16 +133,24 @@ impl ColumnStatisticsReader {
             .to_str()
             .ok_or(ColumnStatisticsError::QueryEngineUnavailable)?;
         let config = Config::default()
-            .enable_object_cache(true)
+            .enable_object_cache(!is_dataset)
             .and_then(|config| config.max_memory(QUERY_MEMORY_LIMIT))
             .and_then(|config| config.with("temp_directory", temporary_directory_path))
             .map_err(|_| ColumnStatisticsError::QueryEngineUnavailable)?;
         let connection = Connection::open_in_memory_with_flags(config)
             .map_err(|_| ColumnStatisticsError::QueryEngineUnavailable)?;
+        connection
+            .execute_batch(if is_dataset {
+                "SET parquet_metadata_cache = false"
+            } else {
+                "SET parquet_metadata_cache = true"
+            })
+            .map_err(|_| ColumnStatisticsError::QueryEngineUnavailable)?;
         Ok(Self {
-            source_path,
+            source,
             connection,
             _temporary_directory: temporary_directory,
+            cancelled: Arc::new(AtomicBool::new(false)),
         })
     }
 
@@ -103,6 +158,7 @@ impl ColumnStatisticsReader {
     pub fn interrupt_handle(&self) -> StatisticsInterruptHandle {
         StatisticsInterruptHandle {
             inner: self.connection.interrupt_handle(),
+            cancelled: Arc::clone(&self.cancelled),
         }
     }
 
@@ -112,14 +168,55 @@ impl ColumnStatisticsReader {
         column_name: &str,
         include_min_max: bool,
     ) -> Result<ColumnStatistics, ColumnStatisticsError> {
-        let (source, _) =
-            open_local_source(&self.source_path).map_err(ColumnStatisticsError::from)?;
-        drop(source);
+        self.fetch_checked(column_name, include_min_max, || {})
+    }
 
-        let path = self
-            .source_path
-            .to_str()
-            .ok_or(ColumnStatisticsError::Unsupported)?;
+    fn fetch_checked(
+        self,
+        column_name: &str,
+        include_min_max: bool,
+        after_setup: impl FnOnce(),
+    ) -> Result<ColumnStatistics, ColumnStatisticsError> {
+        self.require_active()?;
+        let (relation, parameters) = match &self.source {
+            ColumnStatisticsSource::File(source_path) => {
+                let (source, _) =
+                    open_local_source(source_path).map_err(ColumnStatisticsError::from)?;
+                drop(source);
+                let path = source_path
+                    .to_str()
+                    .ok_or(ColumnStatisticsError::Unsupported)?;
+                (
+                    "read_parquet(?)".to_owned(),
+                    vec![Value::Text(path.to_owned())],
+                )
+            }
+            ColumnStatisticsSource::Dataset(dataset) => {
+                if !dataset
+                    .schema()
+                    .iter()
+                    .any(|field| field.name == column_name)
+                {
+                    return Err(ColumnStatisticsError::Unsupported);
+                }
+                dataset
+                    .install_while(&self.connection, || !self.cancelled.load(Ordering::Acquire))
+                    .map_err(|error| self.classify_setup_error(error))?;
+                dataset
+                    .stage_candidate_batches(
+                        &self.connection,
+                        &[],
+                        "__viewda_statistics_source",
+                        (&quote_identifier(column_name), ""),
+                        &[],
+                        || !self.cancelled.load(Ordering::Acquire),
+                    )
+                    .map_err(|error| self.classify_setup_error(error))?;
+                (quote_identifier("__viewda_statistics_source"), Vec::new())
+            }
+        };
+        after_setup();
+        self.require_active()?;
         let identifier = quote_identifier(column_name);
         let (minimum, maximum) = if include_min_max {
             (
@@ -133,14 +230,15 @@ impl ColumnStatisticsReader {
             "SELECT {minimum}, {maximum}, \
              count(*) - count({identifier}), \
              approx_count_distinct({identifier}), count(*) \
-             FROM read_parquet(?)"
+             FROM {relation}"
         );
         let mut statement = self
             .connection
             .prepare(&query)
-            .map_err(classify_query_error)?;
+            .map_err(|error| self.classify_scan_error(error))?;
+        self.require_active()?;
         let (minimum, maximum, null_count, approximate_distinct_count, row_count) = statement
-            .query_row(params![path], |row| {
+            .query_row(params_from_iter(parameters.iter()), |row| {
                 Ok((
                     row.get::<_, Option<String>>(0)?,
                     row.get::<_, Option<String>>(1)?,
@@ -149,7 +247,14 @@ impl ColumnStatisticsReader {
                     row.get::<_, i64>(4)?,
                 ))
             })
-            .map_err(classify_query_error)?;
+            .map_err(|error| self.classify_scan_error(error))?;
+        self.require_active()?;
+        if let ColumnStatisticsSource::Dataset(dataset) = &self.source {
+            dataset
+                .validate_while(|| !self.cancelled.load(Ordering::Acquire))
+                .map_err(dataset_statistics_error)?;
+        }
+        self.require_active()?;
         let null_count =
             u64::try_from(null_count).map_err(|_| ColumnStatisticsError::Unsupported)?;
         let approximate_distinct_count = u64::try_from(approximate_distinct_count)
@@ -168,6 +273,57 @@ impl ColumnStatisticsReader {
             approximate_distinct_count,
         })
     }
+
+    fn require_active(&self) -> Result<(), ColumnStatisticsError> {
+        if self.cancelled.load(Ordering::Acquire) {
+            Err(ColumnStatisticsError::QueryFailed)
+        } else {
+            Ok(())
+        }
+    }
+
+    fn classify_setup_error(&self, error: DatasetSetupError) -> ColumnStatisticsError {
+        if self.cancelled.load(Ordering::Acquire) {
+            ColumnStatisticsError::QueryFailed
+        } else {
+            dataset_setup_statistics_error(error)
+        }
+    }
+
+    fn classify_scan_error(&self, error: duckdb::Error) -> ColumnStatisticsError {
+        classify_statistics_scan_error(&self.source, error, &self.cancelled)
+    }
+}
+
+fn dataset_setup_statistics_error(error: DatasetSetupError) -> ColumnStatisticsError {
+    match error {
+        DatasetSetupError::Dataset(error) => dataset_statistics_error(error),
+        DatasetSetupError::Query(error) => classify_query_error(error),
+    }
+}
+
+fn dataset_statistics_error(error: DatasetError) -> ColumnStatisticsError {
+    match error {
+        DatasetError::NotFound => ColumnStatisticsError::NotFound,
+        DatasetError::PermissionDenied => ColumnStatisticsError::PermissionDenied,
+        DatasetError::SourceChanged { .. } => ColumnStatisticsError::SourceChanged,
+        DatasetError::InvalidMember { .. } => ColumnStatisticsError::CorruptSource,
+        DatasetError::Window { error } => match error {
+            crate::DataWindowError::NotFound => ColumnStatisticsError::NotFound,
+            crate::DataWindowError::PermissionDenied => ColumnStatisticsError::PermissionDenied,
+            crate::DataWindowError::SourceChanged => ColumnStatisticsError::SourceChanged,
+            crate::DataWindowError::NotParquet | crate::DataWindowError::CorruptSource => {
+                ColumnStatisticsError::CorruptSource
+            }
+            crate::DataWindowError::ResourceExhausted => ColumnStatisticsError::ResourceExhausted,
+            crate::DataWindowError::QueryEngineUnavailable => {
+                ColumnStatisticsError::QueryEngineUnavailable
+            }
+            crate::DataWindowError::QueryFailed => ColumnStatisticsError::QueryFailed,
+            _ => ColumnStatisticsError::Unsupported,
+        },
+        _ => ColumnStatisticsError::Unsupported,
+    }
 }
 
 impl From<SourceError> for ColumnStatisticsError {
@@ -175,6 +331,7 @@ impl From<SourceError> for ColumnStatisticsError {
         match error {
             SourceError::NotFound => Self::NotFound,
             SourceError::PermissionDenied => Self::PermissionDenied,
+            SourceError::SourceChanged => Self::SourceChanged,
             SourceError::NotParquet => Self::NotParquet,
             SourceError::CorruptFooter => Self::CorruptSource,
             SourceError::Unsupported => Self::Unsupported,
@@ -187,21 +344,44 @@ fn quote_identifier(identifier: &str) -> String {
 }
 
 fn classify_query_error(error: duckdb::Error) -> ColumnStatisticsError {
+    classify_query_error_category(&error).unwrap_or(ColumnStatisticsError::QueryFailed)
+}
+
+fn classify_query_error_category(error: &duckdb::Error) -> Option<ColumnStatisticsError> {
     let duckdb::Error::DuckDBFailure(_, Some(message)) = error else {
-        return ColumnStatisticsError::QueryFailed;
+        return None;
     };
 
     // duckdb 1.10505 collapses execution categories into one error variant;
     // its message prefix is the only category exposed by this pinned binding.
     if message.starts_with("Out of Memory Error:") {
-        ColumnStatisticsError::ResourceExhausted
+        Some(ColumnStatisticsError::ResourceExhausted)
     } else if message.starts_with("Binder Error:")
         || message.starts_with("Invalid type Error:")
         || message.starts_with("Not implemented Error:")
     {
-        ColumnStatisticsError::Unsupported
+        Some(ColumnStatisticsError::Unsupported)
     } else {
-        ColumnStatisticsError::QueryFailed
+        None
+    }
+}
+
+fn classify_statistics_scan_error(
+    source: &ColumnStatisticsSource,
+    error: duckdb::Error,
+    cancelled: &AtomicBool,
+) -> ColumnStatisticsError {
+    if cancelled.load(Ordering::Acquire) {
+        return ColumnStatisticsError::QueryFailed;
+    }
+    if let Some(error) = classify_query_error_category(&error) {
+        return error;
+    }
+    match source {
+        ColumnStatisticsSource::File(_) => ColumnStatisticsError::QueryFailed,
+        ColumnStatisticsSource::Dataset(dataset) => {
+            dataset_statistics_error(dataset.classify_query_failure(error, &[], false))
+        }
     }
 }
 
@@ -212,9 +392,10 @@ mod tests {
     use arrow_array::{ArrayRef, Int64Array, RecordBatch, StringArray};
     use arrow_schema::{DataType, Field, Schema};
     use parquet::arrow::ArrowWriter;
-    use tempfile::NamedTempFile;
+    use tempfile::{NamedTempFile, tempdir};
 
     use super::*;
+    use crate::DatasetSource;
 
     #[test]
     fn computes_requested_statistics_in_one_column_scan() {
@@ -319,6 +500,25 @@ mod tests {
         );
     }
 
+    #[test]
+    fn dataset_cancellation_after_setup_stops_before_query_preparation() {
+        let directory = tempdir().expect("dataset directory");
+        write_statistics_parquet_to(&directory.path().join("part.parquet"));
+        let source = DatasetSource::open_folder(directory.path()).expect("dataset source");
+        let mut inspector = source.inspector();
+        inspector.advance(1).expect("dataset inspection");
+        let dataset = inspector.into_window_reader().expect("dataset reader");
+        let statistics =
+            ColumnStatisticsReader::for_dataset(&dataset).expect("dataset statistics reader");
+        let interrupt = statistics.interrupt_handle();
+
+        assert_eq!(
+            statistics.fetch_checked("value", true, || interrupt.interrupt()),
+            Err(ColumnStatisticsError::QueryFailed)
+        );
+        assert!(dataset.member_snapshot(0).is_ok());
+    }
+
     fn memory_size_in_bytes(value: &str) -> Option<f64> {
         let amount_end = value
             .char_indices()
@@ -342,6 +542,11 @@ mod tests {
 
     fn write_statistics_parquet() -> NamedTempFile {
         let source = NamedTempFile::new().expect("temporary file can be created");
+        write_statistics_parquet_to(source.path());
+        source
+    }
+
+    fn write_statistics_parquet_to(path: &std::path::Path) {
         let schema = Arc::new(Schema::new(vec![
             Field::new("value", DataType::Int64, true),
             Field::new("odd\"name", DataType::Utf8, false),
@@ -354,11 +559,10 @@ mod tests {
             ],
         )
         .expect("statistics record batch is valid");
-        let file = File::create(source.path()).expect("temporary file can be opened");
+        let file = File::create(path).expect("temporary file can be opened");
         let mut writer =
             ArrowWriter::try_new(file, schema, None).expect("Parquet writer can be created");
         writer.write(&batch).expect("record batch can be written");
         writer.close().expect("Parquet footer can be written");
-        source
     }
 }

@@ -66,7 +66,6 @@ pub(crate) enum ColumnFilterKind {
     NullOnly,
 }
 
-#[cfg(test)]
 pub(crate) fn build_filter_predicate(
     schema: &[SchemaField],
     filters: &[DataFilter],

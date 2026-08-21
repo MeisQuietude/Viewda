@@ -17,7 +17,9 @@ use viewda_data_engine::{
     DataExportRequest, PreparedDataViewExport,
 };
 
-use crate::{OpenedSource, OpenedSourceSession, OpenedSourceState};
+use crate::{
+    DatasetSessionPhase, OpenedSource, OpenedSourceSession, OpenedSourceState, SessionWindowReader,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -31,6 +33,7 @@ pub(crate) enum DataExportScope {
 pub(crate) enum DataExportFailureCode {
     NotFound,
     PermissionDenied,
+    SourceChanged,
     NotParquet,
     CorruptSource,
     InvalidRequest,
@@ -46,6 +49,7 @@ impl DataExportFailureCode {
         Some(match error {
             DataExportError::NotFound => Self::NotFound,
             DataExportError::PermissionDenied => Self::PermissionDenied,
+            DataExportError::SourceChanged => Self::SourceChanged,
             DataExportError::NotParquet => Self::NotParquet,
             DataExportError::CorruptSource => Self::CorruptSource,
             DataExportError::InvalidRequest => Self::InvalidRequest,
@@ -65,6 +69,7 @@ pub(crate) enum DataExportCommandError {
     NoSourceOpen,
     SourceChanged,
     ViewChanged,
+    NotReady,
     AlreadyRunning,
     NotFound,
     PermissionDenied,
@@ -477,7 +482,7 @@ impl DataExportJobs {
         ))
     }
 
-    fn cancel_source_and_wait(&self, generation: u64) {
+    pub(crate) fn cancel_source_and_wait(&self, generation: u64) {
         let Ok(mut state) = self.state.lock() else {
             return;
         };
@@ -615,14 +620,19 @@ impl OpenedSource {
             .state
             .lock()
             .map_err(|_| DataExportCommandError::Unsupported)?;
-        Ok(export_session(&state, generation)?.path.clone())
+        let session = export_session(&state, generation)?;
+        session
+            .validate_source_identity()
+            .map_err(|_| DataExportCommandError::SourceChanged)?;
+        Ok(session.path.clone())
     }
 
     fn export_source(
         &self,
         generation: u64,
         view_revision: u64,
-    ) -> Result<(PathBuf, Option<PreparedDataViewExport>), DataExportCommandError> {
+    ) -> Result<(Arc<OpenedSourceSession>, Option<PreparedDataViewExport>), DataExportCommandError>
+    {
         let state = self
             .state
             .lock()
@@ -636,13 +646,31 @@ impl OpenedSource {
         if session_state.view_revision != view_revision {
             return Err(DataExportCommandError::ViewChanged);
         }
-        Ok((
-            session.path.clone(),
-            session_state
-                .view
-                .as_ref()
-                .map(|view| view.export_snapshot()),
-        ))
+        match &session_state.reader {
+            SessionWindowReader::File(_) => {}
+            SessionWindowReader::Dataset(dataset) => match &dataset.phase {
+                DatasetSessionPhase::Ready { .. } => {}
+                DatasetSessionPhase::Inspecting { .. } => {
+                    return Err(DataExportCommandError::NotReady);
+                }
+                DatasetSessionPhase::Failed(_) => {
+                    return Err(DataExportCommandError::SourceChanged);
+                }
+            },
+        }
+        session
+            .validate_source_identity()
+            .map_err(|_| DataExportCommandError::SourceChanged)?;
+        let view = session_state.view.as_ref().map(Arc::clone);
+        drop(session_state);
+        let view = view
+            .map(|view| {
+                view.lock()
+                    .map_err(|_| DataExportCommandError::Unsupported)
+                    .map(|view| view.export_snapshot())
+            })
+            .transpose()?;
+        Ok((session, view))
     }
 
     fn reserve_export_start(
@@ -679,6 +707,9 @@ impl OpenedSource {
         {
             return Err(DataExportCommandError::ViewChanged);
         }
+        session
+            .validate_source_identity()
+            .map_err(|_| DataExportCommandError::SourceChanged)?;
         self.data_exports.install(reservation, job)
     }
 }
@@ -727,15 +758,41 @@ pub(crate) async fn start_data_export(
         Err(_) => return Err(DataExportCommandError::Unsupported),
     };
     let reservation = opened_source.reserve_export_start(generation)?;
-    let (source_path, view) = opened_source.export_source(generation, view_revision)?;
+    let (session, view) = opened_source.export_source(generation, view_revision)?;
     let file_name = target_path.file_name().map_or_else(
         || "export.csv".to_owned(),
         |name| name.to_string_lossy().into_owned(),
     );
     let id = jobs.next_id();
+    let start_cancelled = Arc::clone(&reservation.cancelled);
     let reader = match tauri::async_runtime::spawn_blocking({
         let target_path = target_path.clone();
-        move || DataExportReader::new(source_path, target_path, request, view)
+        move || {
+            let state = session
+                .state
+                .lock()
+                .map_err(|_| DataExportError::QueryFailed)?;
+            let dataset_reader = match &state.reader {
+                SessionWindowReader::File(_) => None,
+                SessionWindowReader::Dataset(dataset) => match &dataset.phase {
+                    DatasetSessionPhase::Ready { reader, .. } => Some(Arc::clone(reader)),
+                    DatasetSessionPhase::Inspecting { .. } => {
+                        return Err(DataExportError::Cancelled);
+                    }
+                    DatasetSessionPhase::Failed(_) => return Err(DataExportError::SourceChanged),
+                },
+            };
+            drop(state);
+            match dataset_reader {
+                None => DataExportReader::new(session.path.clone(), target_path, request, view),
+                Some(reader) => {
+                    let reader = reader.lock().map_err(|_| DataExportError::QueryFailed)?;
+                    DataExportReader::for_dataset_while(&reader, target_path, request, view, || {
+                        !start_cancelled.load(Ordering::Acquire)
+                    })
+                }
+            }
+        }
     })
     .await
     {

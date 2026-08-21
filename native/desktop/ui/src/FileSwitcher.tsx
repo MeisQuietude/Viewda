@@ -16,6 +16,8 @@ export function FileSwitcher({
   onDismiss,
   onContextMenu,
   onOpenFile,
+  onOpenFolder,
+  onCancelOpen,
   onOpenRecent,
   onRemoveRecent,
 }: {
@@ -27,6 +29,8 @@ export function FileSwitcher({
   onDismiss: () => void;
   onContextMenu: (generation: number, x: number, y: number) => void;
   onOpenFile: () => Promise<void>;
+  onOpenFolder: () => Promise<void>;
+  onCancelOpen: () => void;
   onOpenRecent: (id: string) => Promise<void>;
   onRemoveRecent: (id: string) => Promise<void>;
 }) {
@@ -147,7 +151,11 @@ export function FileSwitcher({
                   active={file.active}
                   highlighted={index === selectedIndex}
                   name={file.name}
-                  directory={directoryLabels[index] ?? file.directory}
+                  directory={
+                    file.kind === "file"
+                      ? (directoryLabels[index] ?? file.directory)
+                      : `${file.datasetMemberCount?.toLocaleString("en-US") ?? "…"} files${file.datasetIgnoredFileCount ? ` · ${file.datasetIgnoredFileCount.toLocaleString("en-US")} ignored` : ""} · ${middleTruncate(file.path)}`
+                  }
                   path={file.path}
                   busy={file.busy}
                   onChoose={() =>
@@ -181,14 +189,29 @@ export function FileSwitcher({
             <p className="file-switcher-empty">No matching files</p>
           )}
         </div>
-        <button
-          className="file-switcher-footer"
-          type="button"
-          disabled={opening}
-          onClick={() => void onOpenFile()}
-        >
-          Open File… <kbd>{shortcutModifier}O</kbd>
-        </button>
+        <div className="file-switcher-actions">
+          <button
+            className="file-switcher-footer"
+            type="button"
+            onClick={() => (opening ? onCancelOpen() : void onOpenFile())}
+          >
+            {opening ? (
+              "Cancel opening"
+            ) : (
+              <>
+                Open File… <kbd>{shortcutModifier}O</kbd>
+              </>
+            )}
+          </button>
+          <button
+            className="file-switcher-footer"
+            type="button"
+            disabled={opening}
+            onClick={() => void onOpenFolder()}
+          >
+            Open Folder… <kbd>⇧{shortcutModifier}O</kbd>
+          </button>
+        </div>
       </section>
     </div>
   );
@@ -241,7 +264,7 @@ function Row({
         id={id}
         type="button"
         role="option"
-        aria-label={`${name} — ${path ?? directory}`}
+        aria-label={`${name} — ${directory}${path === undefined ? "" : ` — ${path}`}`}
         aria-selected={highlighted}
         onClick={onChoose}
       >
@@ -475,6 +498,7 @@ export function FileContextMenu({
   onClose,
   onDismiss,
   onCloseOthers,
+  onReload,
 }: {
   file: OpenFile | null;
   x: number;
@@ -482,6 +506,7 @@ export function FileContextMenu({
   onClose: () => void;
   onDismiss: () => void;
   onCloseOthers: () => void;
+  onReload?: () => void;
 }) {
   useEffect(() => {
     window.addEventListener("pointerdown", onDismiss, { once: true });
@@ -503,6 +528,11 @@ export function FileContextMenu({
       }}
       onPointerDown={(event) => event.stopPropagation()}
     >
+      {file.kind !== "file" && onReload !== undefined && (
+        <button type="button" role="menuitem" onClick={onReload}>
+          Reload dataset
+        </button>
+      )}
       <button type="button" role="menuitem" onClick={onClose}>
         Close
       </button>

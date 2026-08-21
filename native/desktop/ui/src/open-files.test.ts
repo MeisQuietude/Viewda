@@ -15,7 +15,11 @@ function summary(generation: number, displayName: string): SourceSummary {
     sizeBytes: 1_024,
     rowCount: 10,
     rowGroupCount: 1,
+    columnCount: 0,
     schema: [],
+    schemaNodeCount: 0,
+    schemaIsTruncated: false,
+    stringsTruncated: false,
   };
 }
 
@@ -27,6 +31,9 @@ function entry(
   const name = path.split("/").at(-1) ?? path;
   return {
     generation,
+    kind: "file",
+    datasetMemberCount: null,
+    datasetIgnoredFileCount: null,
     name,
     directory: "~/data",
     path,
@@ -77,6 +84,21 @@ describe("open files", () => {
     );
 
     expect(merged).toBe(previous);
+  });
+
+  it("replaces the stale row when a path receives a new generation", () => {
+    const previous = [file(1, "/data/source.parquet", true)];
+    const replacement = summary(2, "source.parquet");
+    replacement.rowCount = 20;
+
+    const merged = mergeOpenFiles(
+      [entry(2, "/data/source.parquet", true)],
+      new Map([[2, replacement]]),
+      previous,
+    );
+
+    expect(merged).toHaveLength(1);
+    expect(merged[0]).toMatchObject({ generation: 2, summary: replacement });
   });
 
   it("leaves out a file whose summary never reached the window", () => {

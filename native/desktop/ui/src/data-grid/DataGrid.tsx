@@ -9,6 +9,7 @@ import {
   getDataExportStatus,
   getDataWindow,
   getDataViewStatus,
+  getSourceSchemaPage,
   prepareDataView,
   revealDataExport,
   shortcutModifier,
@@ -108,6 +109,7 @@ const PROJECTION_REQUEST_IDLE_MS = 120;
 // profiles if workloads eventually need different defaults.
 const SUPPLEMENT_WINDOW_MULTIPLIER = 2;
 const DEFAULT_DATA_VIEW_SETTINGS: DataViewSettings = { memoryLimit: "mb384" };
+const EMPTY_SOURCE_INDICES: ReadonlySet<number> = new Set();
 
 // Detect clipboard support once per webview so copy format stays consistent.
 // There is no user choice here.
@@ -457,17 +459,28 @@ function ViewErrorAlert({
 
 export function DataGrid({
   source,
+  requestedRow = null,
   viewSettings = DEFAULT_DATA_VIEW_SETTINGS,
   diagnostics = gridDiagnosticsNoopSink,
   active = true,
+  defaultHiddenSourceIndices = EMPTY_SOURCE_INDICES,
   onOperationChange,
 }: {
   source: SourceSummary;
+  requestedRow?: { row: number; request: number } | null;
   viewSettings?: DataViewSettings;
   diagnostics?: GridDiagnosticsSink;
   active?: boolean;
+  defaultHiddenSourceIndices?: ReadonlySet<number>;
   onOperationChange?: (running: boolean) => void;
 }) {
+  const [schema, setSchema] = useState(() => source.schema);
+  const [schemaTotal, setSchemaTotal] = useState<number | null>(null);
+  const [schemaPageLoading, setSchemaPageLoading] = useState(false);
+  const [schemaPageError, setSchemaPageError] = useState(false);
+  const schemaPageRequest = useRef(0);
+  const schemaPageActive = useRef(false);
+  const schemaSource = useMemo(() => ({ ...source, schema }), [schema, source]);
   const [columnStates, setColumnStates] = useState<ColumnState[]>(() =>
     source.schema.map((field, sourceIndex) => ({
       sourceIndex,
@@ -477,7 +490,7 @@ export function DataGrid({
         Math.max(MIN_COLUMN_WIDTH, field.name.length * 8 + 48),
       ),
       pinned: false,
-      hidden: false,
+      hidden: defaultHiddenSourceIndices.has(sourceIndex),
     })),
   );
   const [monospaceColumns, setMonospaceColumns] = useState<ReadonlySet<number>>(
@@ -524,6 +537,17 @@ export function DataGrid({
   >(null);
   const [schemaFocusRequest, setSchemaFocusRequest] = useState(0);
   const gridRef = useRef<ViewdaGridHandle>(null);
+  const appliedRequestedRow = useRef<number | null>(null);
+  useEffect(() => {
+    if (
+      requestedRow === null ||
+      appliedRequestedRow.current === requestedRow.request
+    ) {
+      return;
+    }
+    appliedRequestedRow.current = requestedRow.request;
+    gridRef.current?.scrollToRow(requestedRow.row);
+  }, [requestedRow]);
   const schemaFocusColumnRef = useRef<number | null>(null);
   const visibleColumnStatesRef = useRef<readonly ColumnState[]>([]);
   // The display cache holds one row window and one column supplement. The row
@@ -585,6 +609,57 @@ export function DataGrid({
   const hiddenCount = columnStates.length - visibleColumnStates.length;
   activeViewRef.current = activeView;
 
+  const loadMoreSchema = useCallback(async () => {
+    if (schemaPageActive.current) {
+      return;
+    }
+    schemaPageActive.current = true;
+    const request = ++schemaPageRequest.current;
+    const offset = schema.length;
+    setSchemaPageLoading(true);
+    setSchemaPageError(false);
+    try {
+      const page = await getSourceSchemaPage(source.generation, offset, 256);
+      if (schemaPageRequest.current === request && page.offset === offset) {
+        setSchemaTotal(page.totalCount);
+        setSchema((current) =>
+          current.length === page.offset
+            ? [...current, ...page.columns]
+            : current,
+        );
+        setColumnStates((current) =>
+          current.length === page.offset
+            ? [
+                ...current,
+                ...page.columns.map((field, pageIndex) => {
+                  const sourceIndex = page.offset + pageIndex;
+                  return {
+                    sourceIndex,
+                    title: field.name,
+                    width: Math.min(
+                      280,
+                      Math.max(MIN_COLUMN_WIDTH, field.name.length * 8 + 48),
+                    ),
+                    pinned: false,
+                    hidden: defaultHiddenSourceIndices.has(sourceIndex),
+                  };
+                }),
+              ]
+            : current,
+        );
+      }
+    } catch {
+      if (schemaPageRequest.current === request) {
+        setSchemaPageError(true);
+      }
+    } finally {
+      if (schemaPageRequest.current === request) {
+        schemaPageActive.current = false;
+        setSchemaPageLoading(false);
+      }
+    }
+  }, [defaultHiddenSourceIndices, schema.length, source.generation]);
+
   const nextSuggestionRevision = useCallback(() => {
     nextSuggestionRevisionRef.current += 1;
     return nextSuggestionRevisionRef.current;
@@ -605,12 +680,12 @@ export function DataGrid({
     if (visibleSourceIndices.length > SELECT_TOOLTIP_COLUMN_LIMIT) {
       return `${visibleSourceIndices.length.toLocaleString("en-US")} of ${columnStates.length.toLocaleString("en-US")} columns visible`;
     }
-    return formatSelectClause(visibleSourceIndices, source.schema);
-  }, [columnStates.length, hiddenCount, source.schema, visibleSourceIndices]);
+    return formatSelectClause(visibleSourceIndices, schema);
+  }, [columnStates.length, hiddenCount, schema, visibleSourceIndices]);
   const pickerColumns = useMemo(
     () =>
       columnStates.map((column) => {
-        const field = source.schema[column.sourceIndex];
+        const field = schema[column.sourceIndex];
         return {
           sourceIndex: column.sourceIndex,
           name: column.title,
@@ -619,19 +694,19 @@ export function DataGrid({
           pinned: column.pinned,
         };
       }),
-    [columnStates, source.schema],
+    [columnStates, schema],
   );
   const selectedExport = useMemo(
     () => exportSelectionShape(selection, visibleSourceIndices, gridRowCount),
     [gridRowCount, selection, visibleSourceIndices],
   );
   const whereClause = useMemo(
-    () => formatWhereClause(filters, source.schema),
-    [filters, source.schema],
+    () => formatWhereClause(filters, schema),
+    [filters, schema],
   );
   const orderByClause = useMemo(
-    () => formatOrderByClause(sort, source.schema),
-    [sort, source.schema],
+    () => formatOrderByClause(sort, schema),
+    [sort, schema],
   );
 
   useEffect(() => {
@@ -2195,7 +2270,7 @@ export function DataGrid({
 
   const openFilterForCell = useCallback(
     (sourceIndex: number, row: number, bounds: Rectangle) => {
-      const field = source.schema[sourceIndex];
+      const field = schema[sourceIndex];
       const supplement = supplementWindowRef.current;
       const base = baseWindowRef.current;
       const current =
@@ -2236,7 +2311,7 @@ export function DataGrid({
         gridAnchor: { kind: "cell", row },
       });
     },
-    [source.schema],
+    [schema],
   );
 
   const menuColumn =
@@ -2246,7 +2321,7 @@ export function DataGrid({
           (column) => column.sourceIndex === headerMenu.sourceIndex,
         );
   const filterEditorField =
-    filterEditor === null ? undefined : source.schema[filterEditor.sourceIndex];
+    filterEditor === null ? undefined : schema[filterEditor.sourceIndex];
   const exportBusy = exportStarting || exportStatus?.state === "running";
   const runningExportLabel =
     exportStatus?.state === "running"
@@ -2303,6 +2378,22 @@ export function DataGrid({
         >
           Schema
         </button>
+        {source.schemaIsTruncated &&
+          (schemaTotal === null || schema.length < schemaTotal) && (
+            <button
+              className="schema-sidebar-toggle"
+              type="button"
+              disabled={schemaPageLoading}
+              onClick={() => void loadMoreSchema()}
+            >
+              {schemaPageLoading ? "Loading columns…" : "Load more columns"}
+            </button>
+          )}
+        {schemaPageError && (
+          <span className="status-error" role="alert">
+            More columns could not be loaded.
+          </span>
+        )}
         <div className="query-expression">
           <span className="query-keyword">SELECT</span>
           <div ref={selectPopupRef} className="query-select-wrap">
@@ -2377,9 +2468,9 @@ export function DataGrid({
                   <ol>
                     {sortDraft.map((column, index) => (
                       <li key={column.sourceIndex}>
-                        <code>{source.schema[column.sourceIndex]?.name}</code>
+                        <code>{schema[column.sourceIndex]?.name}</code>
                         <select
-                          aria-label={`Direction for ${source.schema[column.sourceIndex]?.name}`}
+                          aria-label={`Direction for ${schema[column.sourceIndex]?.name}`}
                           value={column.direction}
                           onChange={(event) =>
                             setSortDraft((current) =>
@@ -2400,7 +2491,7 @@ export function DataGrid({
                         </select>
                         <button
                           type="button"
-                          aria-label={`Move ${source.schema[column.sourceIndex]?.name} earlier`}
+                          aria-label={`Move ${schema[column.sourceIndex]?.name} earlier`}
                           disabled={index === 0}
                           onClick={() =>
                             setSortDraft((current) =>
@@ -2412,7 +2503,7 @@ export function DataGrid({
                         </button>
                         <button
                           type="button"
-                          aria-label={`Move ${source.schema[column.sourceIndex]?.name} later`}
+                          aria-label={`Move ${schema[column.sourceIndex]?.name} later`}
                           disabled={index === sortDraft.length - 1}
                           onClick={() =>
                             setSortDraft((current) =>
@@ -2424,7 +2515,7 @@ export function DataGrid({
                         </button>
                         <button
                           type="button"
-                          aria-label={`Remove sort ${source.schema[column.sourceIndex]?.name}`}
+                          aria-label={`Remove sort ${schema[column.sourceIndex]?.name}`}
                           onClick={() =>
                             setSortDraft((current) =>
                               current.filter(
@@ -2456,7 +2547,7 @@ export function DataGrid({
                     <option value="" disabled>
                       Select…
                     </option>
-                    {source.schema.map((field, sourceIndex) => (
+                    {schema.map((field, sourceIndex) => (
                       <option
                         key={sourceIndex}
                         value={sourceIndex}
@@ -2574,7 +2665,7 @@ export function DataGrid({
         <SchemaSidebar
           open={sidebarOpen}
           selectedColumn={selectedSchemaColumn}
-          source={source}
+          source={schemaSource}
           onSelectColumn={selectSchemaColumn}
         />
         {visibleColumnStates.length === 0 ? (
@@ -2748,7 +2839,7 @@ export function DataGrid({
           ) : (
             <ol>
               {filters.map((filter, index) => {
-                const field = source.schema[filter.columnIndex];
+                const field = schema[filter.columnIndex];
                 if (field === undefined) {
                   return null;
                 }
@@ -3251,7 +3342,9 @@ function copySelectionShape(
 function dataWindowErrorMessage(error: unknown): string {
   if (error instanceof DataWindowCommandError) {
     if (error.code === "sourceChanged") {
-      return "The open file changed before this window finished loading.";
+      return error.detail?.member === undefined
+        ? "The open file changed before this window finished loading."
+        : `Dataset member ${error.detail.member} changed. Reload the dataset.`;
     }
     if (error.code === "notFound" || error.code === "noSourceOpen") {
       return "The open file is no longer available.";
@@ -3261,6 +3354,11 @@ function dataWindowErrorMessage(error: unknown): string {
     }
     if (error.code === "corruptSource" || error.code === "notParquet") {
       return "The open Parquet file is damaged or incomplete.";
+    }
+    if (error.code === "invalidMember") {
+      return error.detail?.member === undefined
+        ? "A dataset member is damaged or unsupported. Reload the dataset."
+        : `Dataset member ${error.detail.member} is damaged or unsupported. Reload the dataset.`;
     }
     if (error.code === "invalidFilter") {
       return "This condition does not match its column type or exceeds the limits of 32 conditions, 100 list values, and 4 KB per value.";

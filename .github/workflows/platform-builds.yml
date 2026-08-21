@@ -220,16 +220,23 @@ jobs:
             "$extracted/usr/share/mime/packages/viewda.xml"
           # Resolution is checked with the dev environment stripped: the
           # installed package must stand on its own RUNPATH.
+          readelf -d "$extracted/usr/bin/viewda" \
+            | grep -F '$ORIGIN/../lib/viewda'
+          ldd_output=$(env -u LD_LIBRARY_PATH ldd "$extracted/usr/bin/viewda")
+          printf '%s\n' "$ldd_output"
           resolved_library=$(
-            env -u LD_LIBRARY_PATH ldd "$extracted/usr/bin/viewda" \
+            printf '%s\n' "$ldd_output" \
               | awk '$1 == "libduckdb.so" { print $3 }'
           )
+          test -n "$resolved_library"
           test "$(realpath "$resolved_library")" \
             = "$(realpath "$extracted/usr/lib/viewda/libduckdb.so")"
           package_size=$(stat --format='%s' "$package")
-          test "$package_size" -lt "$((30 * 1000 * 1000))"
           stat --format='release binary: %s bytes' native/target/release/viewda
           stat --format='deb package: %s bytes' "$package"
+          # The package includes the offline DuckDB runtime. Keep a bounded
+          # download while allowing application code to grow within a release.
+          test "$package_size" -lt "$((32 * 1000 * 1000))"
 
           mapfile -d '' -t appimages < <(
             find native/target/release/bundle/appimage \
@@ -665,10 +672,10 @@ jobs:
             "$artifact"
 
           artifact_size=$(stat -f '%z' "$artifact")
-          # The convenience installer contains both native slices; the 30 MB
-          # single-architecture budget does not apply to it.
-          test "$artifact_size" -lt "$((50 * 1000 * 1000))"
           echo "macOS Universal DMG: ${artifact_size} bytes"
+          # The convenience installer contains both native slices. Keep a
+          # bounded download with room for application code in each slice.
+          test "$artifact_size" -lt "$((55 * 1000 * 1000))"
 
           mount_point=
           pid=

@@ -7,13 +7,36 @@ import {
   waitFor,
   within,
 } from "@testing-library/react";
+import { useEffect as useReactEffect, useRef as useReactRef } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-import { App, formatFileSize } from "./App";
+import { App } from "./App";
 import * as desktop from "./desktop";
 
+const dataGridProps = vi.hoisted(() => vi.fn());
+const decodePreview = vi.hoisted(() => vi.fn());
+const structureGridProps = vi.hoisted(() => vi.fn());
 vi.mock("./data-grid/DataGrid", () => ({
-  DataGrid: () => <section aria-label="Data">Grid data</section>,
+  DataGrid: (props: unknown) => {
+    dataGridProps(props);
+    return <section aria-label="Data">Grid data</section>;
+  },
+}));
+vi.mock("./data-grid/arrow-window", async (importOriginal) => {
+  const actual =
+    await importOriginal<typeof import("./data-grid/arrow-window")>();
+  return { ...actual, decodeArrowWindow: decodePreview };
+});
+vi.mock("./structure/StructureGrid", () => ({
+  StructureGrid: (props: {
+    label: string;
+    onViewportChange?: (start: number, count: number) => void;
+  }) => {
+    structureGridProps(props);
+    const initialViewport = useReactRef(props.onViewportChange);
+    useReactEffect(() => initialViewport.current?.(0, 20), []);
+    return <section aria-label={props.label} />;
+  },
 }));
 
 let requestSettings: (() => void) | undefined;
@@ -23,6 +46,26 @@ let reportUpdate: ((update: desktop.UpdateInfo) => void) | undefined;
 let reportOpenedSource: (() => void) | undefined;
 let requestDataExportClose:
   ((dialog: desktop.DataExportCloseDialog) => void) | undefined;
+const structureSummary: desktop.StructureSummary = {
+  compressedBytes: 1_200_000,
+  uncompressedBytes: 3_600_000,
+  compressionRatio: 3,
+  formatVersion: 2,
+  createdBy: "parquet-mr version 1.13.1",
+  rowCount: 1_234_567,
+  rowGroupCount: 12,
+  columnCount: 2,
+  rowsPerRowGroup: 102_880.58,
+  footerBytes: 4_096,
+  codecs: ["snappy", "zstd"],
+  chunkCount: 24,
+  chunksWithStatistics: 24,
+  chunksWithBloomFilter: 0,
+  unreadableRowGroupCount: 0,
+  keyValueCount: 0,
+  keyValueMetadata: [],
+};
+
 let systemDark = false;
 let themeChangeListeners = new Set<EventListener>();
 let listedSources: desktop.OpenedSourceEntry[] = [];
@@ -34,11 +77,31 @@ function listedSource(
 ): desktop.OpenedSourceEntry {
   return {
     generation,
+    kind: "file",
+    datasetMemberCount: null,
+    datasetIgnoredFileCount: null,
     name,
     directory: "~/Data",
     path: `/home/test/Data/${name}`,
     active,
   };
+}
+
+function mockLocalSource(source: desktop.SourceSummary) {
+  return vi.spyOn(desktop, "openLocalSource").mockImplementation(async () => {
+    listedSources = [listedSource(source.generation, source.displayName)];
+    return {
+      sources: [
+        {
+          ...source,
+          kind: "file",
+          datasetMemberCount: null,
+          datasetIgnoredFileCount: null,
+        },
+      ],
+      sourceError: null,
+    };
+  });
 }
 
 afterEach(() => {
@@ -56,6 +119,16 @@ beforeEach(() => {
   reportUpdate = undefined;
   reportOpenedSource = undefined;
   requestDataExportClose = undefined;
+  dataGridProps.mockClear();
+  structureGridProps.mockClear();
+  decodePreview.mockReset();
+  decodePreview.mockReturnValue({
+    rowOffset: 0,
+    rowCount: 1,
+    sourceIndices: [0],
+    sourceColumnOffsets: new Map([[0, 0]]),
+    table: { getChildAt: () => ({ at: () => 42 }) },
+  });
   systemDark = false;
   themeChangeListeners = new Set();
   listedSources = [];
@@ -77,6 +150,51 @@ beforeEach(() => {
     queryEngineVersion: "v1.5.5",
   });
   vi.spyOn(desktop, "getRecentSources").mockResolvedValue([]);
+  vi.spyOn(desktop, "getStructureSummary").mockResolvedValue(structureSummary);
+  vi.spyOn(desktop, "getStructureLoadProgress").mockResolvedValue(null);
+  vi.spyOn(desktop, "cancelStructureLoad").mockResolvedValue();
+  vi.spyOn(desktop, "cancelSourceOpen").mockResolvedValue("cancelled");
+  vi.spyOn(desktop, "getSourceOpenProgress").mockResolvedValue(null);
+  vi.spyOn(desktop, "getStructureLensTotals").mockResolvedValue({
+    codecs: [],
+    ratioSteps: [],
+    unrated: { chunkCount: 0, compressedBytes: 0, uncompressedBytes: 0 },
+    statistics: {
+      present: { chunkCount: 0, compressedBytes: 0, uncompressedBytes: 0 },
+      absent: { chunkCount: 0, compressedBytes: 0, uncompressedBytes: 0 },
+    },
+    bloomFilters: {
+      present: { chunkCount: 0, compressedBytes: 0, uncompressedBytes: 0 },
+      absent: { chunkCount: 0, compressedBytes: 0, uncompressedBytes: 0 },
+    },
+  });
+  vi.spyOn(desktop, "getStructureLayout").mockResolvedValue({
+    offset: 0,
+    totalCount: 0,
+    maxCompressedBytes: 0,
+    maxUncompressedBytes: 0,
+    overview: [],
+    rows: [],
+  });
+  vi.spyOn(desktop, "getStructureRowOffset").mockResolvedValue(0);
+  vi.spyOn(desktop, "getStructureReport").mockResolvedValue("# report");
+  vi.spyOn(desktop, "getStructureRowGroups").mockResolvedValue({
+    offset: 0,
+    totalCount: 0,
+    rowGroups: [],
+  });
+  vi.spyOn(desktop, "getStructureColumns").mockResolvedValue({
+    offset: 0,
+    totalCount: 0,
+    totalCompressedBytes: 0,
+    totalUncompressedBytes: 0,
+    columns: [],
+  });
+  vi.spyOn(desktop, "getSourceSchemaNodePage").mockResolvedValue({
+    nodes: [],
+    nextCursor: null,
+    totalCount: 0,
+  });
   vi.spyOn(desktop, "openRecentSource").mockRejectedValue(
     new desktop.OpenSourceError("unsupported"),
   );
@@ -84,6 +202,8 @@ beforeEach(() => {
     requestOpenSource = handler;
     return Promise.resolve(() => {});
   });
+  vi.spyOn(desktop, "onOpenFolderRequested").mockResolvedValue(() => {});
+  vi.spyOn(desktop, "openLocalFolder").mockResolvedValue(null);
   vi.spyOn(desktop, "onSettingsRequested").mockImplementation((handler) => {
     requestSettings = handler;
     return Promise.resolve(() => {});
@@ -168,7 +288,11 @@ function renderWithOpenSources(...sources: desktop.OpenedSourceEntry[]) {
       sizeBytes: 8,
       rowCount: 1,
       rowGroupCount: 1,
+      columnCount: 0,
       schema: [],
+      schemaNodeCount: 0,
+      schemaIsTruncated: false,
+      stringsTruncated: false,
     })),
   });
   render(<App />);
@@ -264,7 +388,11 @@ describe("App", () => {
       sizeBytes: 2048,
       rowCount: 4,
       rowGroupCount: 1,
+      columnCount: 0,
       schema: [],
+      schemaNodeCount: 0,
+      schemaIsTruncated: false,
+      stringsTruncated: false,
     });
 
     render(<App />);
@@ -285,7 +413,10 @@ describe("App", () => {
     fireEvent.keyDown(secondEntry, { key: "Enter" });
 
     await waitFor(() =>
-      expect(desktop.openRecentSource).toHaveBeenCalledWith("recent-7"),
+      expect(desktop.openRecentSource).toHaveBeenCalledWith(
+        "recent-7",
+        expect.any(String),
+      ),
     );
     expect(
       (await screen.findAllByText("events.parquet")).some((element) =>
@@ -349,39 +480,48 @@ describe("App", () => {
   it("opens a local source and renders its path-free summary", async () => {
     listedSources = [listedSource(1, "people.parquet")];
     const openSource = vi.spyOn(desktop, "openLocalSource").mockResolvedValue({
-      generation: 1,
-      displayName: "people.parquet",
-      sizeBytes: 1_300_000,
-      rowCount: 1_234_567,
-      rowGroupCount: 12,
-      schema: [
+      sources: [
         {
-          name: "created_on",
-          physicalType: "INT32",
-          logicalType: "Date",
-          children: [],
-        },
-        {
-          name: "related_urls",
-          physicalType: "GROUP",
-          logicalType: "List",
-          children: [
+          generation: 1,
+          displayName: "people.parquet",
+          sizeBytes: 1_300_000,
+          rowCount: 1_234_567,
+          rowGroupCount: 12,
+          columnCount: 2,
+          schema: [
             {
-              name: "list",
+              name: "created_on",
+              physicalType: "INT32",
+              logicalType: "Date",
+              children: [],
+            },
+            {
+              name: "related_urls",
               physicalType: "GROUP",
-              logicalType: null,
+              logicalType: "List",
               children: [
                 {
-                  name: "element",
-                  physicalType: "BYTE_ARRAY",
-                  logicalType: "String",
-                  children: [],
+                  name: "list",
+                  physicalType: "GROUP",
+                  logicalType: null,
+                  children: [
+                    {
+                      name: "element",
+                      physicalType: "BYTE_ARRAY",
+                      logicalType: "String",
+                      children: [],
+                    },
+                  ],
                 },
               ],
             },
           ],
+          schemaNodeCount: 4,
+          schemaIsTruncated: false,
+          stringsTruncated: false,
         },
       ],
+      sourceError: null,
     });
 
     const { container } = render(<App />);
@@ -404,26 +544,42 @@ describe("App", () => {
     );
 
     const facts = screen.getByLabelText("File facts");
+    expect(factLabels(facts)).toEqual([
+      "Rows",
+      "Row groups",
+      "Columns",
+      "Rows per group",
+      "File size",
+    ]);
     expect(
       Array.from(
-        facts.querySelectorAll("dt"),
+        facts.querySelectorAll(".fact-value"),
         ({ textContent }) => textContent,
       ),
-    ).toEqual(["Rows", "Row groups", "Fields", "Size"]);
-    const factValues = Array.from(facts.querySelectorAll("dd"));
-    expect(factValues.map(({ textContent }) => textContent)).toEqual([
-      "1,234,567",
-      "12",
-      "2",
-      "1.3 MB",
-    ]);
-    for (const value of factValues) {
-      expect(value).toHaveClass("fact-value");
-    }
+    ).toEqual(["1,234,567", "12", "2", "—", "1.3 MB"]);
     expect(within(facts).getByText("1.3 MB")).toHaveAttribute(
       "title",
       "1,300,000 bytes",
     );
+    await waitFor(() =>
+      expect(factLabels(facts)).toEqual([
+        "Rows",
+        "Row groups",
+        "Columns",
+        "Rows per group",
+        "File size",
+        "Stored chunks",
+        "Uncompressed chunks",
+        "Format",
+        "Footer",
+        "Codec",
+        "Statistics",
+        "Bloom filters",
+      ]),
+    );
+    expect(within(facts).getByText("≈ 102,881")).toHaveClass("fact-value");
+    expect(within(facts).getByText("snappy + zstd")).toHaveClass("fact-value");
+    expect(within(facts).getByText("24 of 24 chunks")).toBeInTheDocument();
 
     const schema = screen.getByRole("heading", {
       name: "Schema",
@@ -472,6 +628,511 @@ describe("App", () => {
     );
   });
 
+  it("shows the bounded dataset preview until one ready result installs the grid", async () => {
+    const provisional = datasetProvisionalSummary();
+    listedSources = [listedDataset(7)];
+    vi.mocked(desktop.openLocalFolder).mockResolvedValue(provisional);
+    vi.spyOn(desktop, "getDatasetPreview").mockResolvedValue(
+      new ArrayBuffer(1),
+    );
+    let resolveStatus: ((status: desktop.DatasetStatus) => void) | undefined;
+    vi.spyOn(desktop, "getDatasetStatus").mockReturnValue(
+      new Promise((resolve) => {
+        resolveStatus = resolve;
+      }),
+    );
+
+    render(<App />);
+    fireEvent.click(
+      await screen.findByRole("button", { name: "Open Folder…" }),
+    );
+
+    expect(await screen.findByLabelText("Dataset preview")).toHaveTextContent(
+      "42",
+    );
+    expect(
+      screen.getByRole("region", { name: "Scrollable dataset preview" }),
+    ).toHaveAttribute("tabindex", "0");
+    expect(decodePreview).toHaveBeenCalledWith(expect.any(ArrayBuffer), 0, [0]);
+    expect(dataGridProps).not.toHaveBeenCalled();
+
+    const ready = datasetReadyStatus();
+    if (ready.state === "ready") ready.summary.columnCount = 3;
+    await act(async () => resolveStatus?.(ready));
+    await waitFor(() => expect(dataGridProps).toHaveBeenCalled());
+    const props = dataGridProps.mock.lastCall?.[0] as {
+      source: desktop.SourceSummary;
+      defaultHiddenSourceIndices: ReadonlySet<number>;
+    };
+    expect(props.source).toMatchObject({ generation: 7, columnCount: 3 });
+    expect(props.defaultHiddenSourceIndices.has(1)).toBe(true);
+    expect(desktop.getDatasetStatus).toHaveBeenCalledTimes(1);
+  });
+
+  it("ignores a late dataset-ready result after the generation closes", async () => {
+    listedSources = [listedDataset(7)];
+    vi.mocked(desktop.openLocalFolder).mockResolvedValue(
+      datasetProvisionalSummary(),
+    );
+    vi.spyOn(desktop, "getDatasetPreview").mockResolvedValue(
+      new ArrayBuffer(1),
+    );
+    let resolveStatus: ((status: desktop.DatasetStatus) => void) | undefined;
+    vi.spyOn(desktop, "getDatasetStatus").mockReturnValue(
+      new Promise((resolve) => {
+        resolveStatus = resolve;
+      }),
+    );
+    vi.mocked(desktop.closeOpenedSource).mockImplementation(async () => {
+      listedSources = [];
+      return true;
+    });
+
+    render(<App />);
+    fireEvent.click(
+      await screen.findByRole("button", { name: "Open Folder…" }),
+    );
+    await screen.findByLabelText("Dataset preview");
+    await act(async () => requestCloseSource?.(7));
+    await waitFor(() =>
+      expect(screen.queryByText("dataset/")).not.toBeInTheDocument(),
+    );
+    await act(async () => resolveStatus?.(datasetReadyStatus()));
+
+    expect(dataGridProps).not.toHaveBeenCalled();
+    expect(desktop.getDatasetStatus).toHaveBeenCalledTimes(1);
+  });
+
+  it("coalesces overlapping dataset reloads into one native replacement", async () => {
+    let resolveReload: ((source: desktop.SourceSummary) => void) | undefined;
+    vi.spyOn(desktop, "reloadOpenedSource").mockReturnValue(
+      new Promise((resolve) => {
+        resolveReload = resolve;
+      }),
+    );
+    await renderReadyDataset();
+
+    openDatasetContextMenu();
+    fireEvent.click(screen.getByRole("menuitem", { name: "Reload dataset" }));
+    openDatasetContextMenu();
+    fireEvent.click(screen.getByRole("menuitem", { name: "Reload dataset" }));
+    expect(desktop.reloadOpenedSource).toHaveBeenCalledTimes(1);
+
+    const replacement = { ...datasetProvisionalSummary(), generation: 8 };
+    listedSources = [listedDataset(8)];
+    await act(async () => resolveReload?.(replacement));
+    await waitFor(() => {
+      const props = dataGridProps.mock.lastCall?.[0] as
+        { source: desktop.SourceSummary } | undefined;
+      expect(props?.source.generation).toBe(8);
+    });
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+  });
+
+  it("closes a replacement published before the reload response", async () => {
+    let resolveReload: ((source: desktop.SourceSummary) => void) | undefined;
+    vi.spyOn(desktop, "reloadOpenedSource").mockReturnValue(
+      new Promise((resolve) => {
+        resolveReload = resolve;
+      }),
+    );
+    vi.mocked(desktop.closeOpenedSource).mockImplementation(async () => {
+      listedSources = [];
+      return true;
+    });
+    await renderReadyDataset();
+    vi.mocked(desktop.listOpenedSources).mockRejectedValueOnce(
+      new Error("listing unavailable"),
+    );
+
+    openDatasetContextMenu();
+    fireEvent.click(screen.getByRole("menuitem", { name: "Reload dataset" }));
+    openDatasetContextMenu();
+    fireEvent.click(screen.getByRole("menuitem", { name: "Close" }));
+    listedSources = [listedDataset(8)];
+    await act(async () =>
+      resolveReload?.({ ...datasetProvisionalSummary(), generation: 8 }),
+    );
+
+    await waitFor(() =>
+      expect(desktop.closeOpenedSource).toHaveBeenCalledWith(8),
+    );
+    await waitFor(() =>
+      expect(screen.queryByText("dataset/")).not.toBeInTheDocument(),
+    );
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+  });
+
+  it("does not publish a reload error after close", async () => {
+    let rejectReload: ((error: unknown) => void) | undefined;
+    vi.spyOn(desktop, "reloadOpenedSource").mockReturnValue(
+      new Promise((_resolve, reject) => {
+        rejectReload = reject;
+      }),
+    );
+    vi.mocked(desktop.closeOpenedSource).mockImplementation(async () => {
+      listedSources = [];
+      return true;
+    });
+    await renderReadyDataset();
+
+    openDatasetContextMenu();
+    fireEvent.click(screen.getByRole("menuitem", { name: "Reload dataset" }));
+    openDatasetContextMenu();
+    fireEvent.click(screen.getByRole("menuitem", { name: "Close" }));
+    await act(async () =>
+      rejectReload?.(new desktop.OpenSourceError("sourceChanged")),
+    );
+
+    await waitFor(() =>
+      expect(screen.queryByText("dataset/")).not.toBeInTheDocument(),
+    );
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+  });
+
+  it("waits for the dataset poll interval and keeps only one request in flight", async () => {
+    vi.useFakeTimers();
+    listedSources = [listedDataset(7)];
+    vi.mocked(desktop.openLocalFolder).mockResolvedValue(
+      datasetProvisionalSummary(),
+    );
+    vi.spyOn(desktop, "getDatasetPreview").mockResolvedValue(
+      new ArrayBuffer(1),
+    );
+    let resolveSecond: ((status: desktop.DatasetStatus) => void) | undefined;
+    vi.spyOn(desktop, "getDatasetStatus")
+      .mockResolvedValueOnce({
+        state: "inspecting",
+        progress: {
+          completedMemberCount: 1,
+          totalMemberCount: 2,
+          rowCount: 1,
+          rowGroupCount: 1,
+          schema: datasetProvisionalSummary().schema,
+          schemaNodeCount: 1,
+          schemaIsTruncated: false,
+          stringsTruncated: false,
+          schemaComplete: false,
+        },
+      })
+      .mockReturnValueOnce(
+        new Promise((resolve) => {
+          resolveSecond = resolve;
+        }),
+      );
+
+    render(<App />);
+    await act(async () => {});
+    fireEvent.click(screen.getByRole("button", { name: "Open Folder…" }));
+    await act(async () => {});
+    expect(desktop.getDatasetStatus).toHaveBeenCalledTimes(1);
+
+    await act(async () => vi.advanceTimersByTimeAsync(249));
+    expect(desktop.getDatasetStatus).toHaveBeenCalledTimes(1);
+    await act(async () => vi.advanceTimersByTimeAsync(1));
+    expect(desktop.getDatasetStatus).toHaveBeenCalledTimes(2);
+    await act(async () => vi.advanceTimersByTimeAsync(1_000));
+    expect(desktop.getDatasetStatus).toHaveBeenCalledTimes(2);
+
+    await act(async () => resolveSecond?.(datasetReadyStatus()));
+    expect(dataGridProps).toHaveBeenCalled();
+  });
+
+  it("shows one path-free alert when background inspection fails", async () => {
+    listedSources = [listedDataset(7)];
+    vi.mocked(desktop.openLocalFolder).mockResolvedValue(
+      datasetProvisionalSummary(),
+    );
+    vi.spyOn(desktop, "getDatasetPreview").mockResolvedValue(
+      new ArrayBuffer(1),
+    );
+    vi.spyOn(desktop, "getDatasetStatus").mockResolvedValue({
+      state: "failed",
+      error: {
+        code: "invalidMember",
+        member: "year=2026/broken.parquet",
+      },
+    });
+    render(<App />);
+
+    fireEvent.click(
+      await screen.findByRole("button", { name: "Open Folder…" }),
+    );
+
+    const alerts = await screen.findAllByRole("alert");
+    expect(alerts).toHaveLength(1);
+    expect(alerts[0]).toHaveTextContent("year=2026/broken.parquet");
+  });
+
+  it("pages members, keeps latest selection intent, and expands partition children", async () => {
+    listedSources = [listedDataset(7)];
+    vi.mocked(desktop.openLocalFolder).mockResolvedValue(
+      datasetProvisionalSummary(),
+    );
+    vi.spyOn(desktop, "getDatasetPreview").mockResolvedValue(
+      new ArrayBuffer(1),
+    );
+    const readyStatus = datasetReadyStatus();
+    if (readyStatus.state === "ready") {
+      readyStatus.summary.memberCount = 600;
+      readyStatus.summary.schemaDriftMemberCount = 2;
+      readyStatus.summary.partitionColumnIndices = [0, 1];
+    }
+    vi.spyOn(desktop, "getDatasetStatus").mockResolvedValue(readyStatus);
+    vi.spyOn(desktop, "getDatasetMembers").mockImplementation(
+      async (_generation, offset) => ({
+        offset,
+        total: 600,
+        members: [{ relativePath: `part-${offset}.parquet`, partitions: [] }],
+      }),
+    );
+    vi.spyOn(desktop, "getDatasetSchemaDriftMembers").mockResolvedValue({
+      offset: 0,
+      total: 2,
+      members: [],
+    });
+    const partition = { key: "year", value: "2026" };
+    const month = { key: "month", value: "08" };
+    const after = { key: "year", value: "2027" };
+    vi.spyOn(desktop, "getDatasetPartitions").mockImplementation(
+      async (_generation, parent, cursor) =>
+        parent.length === 0 && cursor === null
+          ? {
+              nodes: [
+                { partition, memberCount: 2 },
+                { partition, memberCount: 1 },
+              ],
+              nextAfter: after,
+            }
+          : parent.length === 1 && cursor === null
+            ? { nodes: [{ partition: month, memberCount: 2 }], nextAfter: null }
+            : { nodes: [], nextAfter: null },
+    );
+    let resolveFirstSelection:
+      ((member: desktop.DatasetMemberSummary) => void) | undefined;
+    vi.spyOn(desktop, "selectDatasetStructureMember")
+      .mockImplementationOnce(
+        () =>
+          new Promise((resolve) => {
+            resolveFirstSelection = resolve;
+          }),
+      )
+      .mockResolvedValue({ relativePath: "part-0.parquet", partitions: [] });
+
+    render(<App />);
+    fireEvent.click(
+      await screen.findByRole("button", { name: "Open Folder…" }),
+    );
+    await waitFor(() => expect(dataGridProps).toHaveBeenCalled());
+    fireEvent.click(screen.getByRole("button", { name: "Structure" }));
+
+    await waitFor(() =>
+      expect(screen.getAllByRole("button", { name: /year=2026/ })).toHaveLength(
+        2,
+      ),
+    );
+    const memberGrid = structureGridProps.mock.calls
+      .map(
+        ([props]) =>
+          props as {
+            label: string;
+            onViewportChange: (start: number, count: number) => void;
+            onSelectRow: (row: number) => void;
+            getCell: (row: number, column: string) => unknown;
+          },
+      )
+      .find((props) => props.label === "Dataset members");
+    act(() => memberGrid?.onViewportChange(450, 20));
+    await waitFor(() =>
+      expect(desktop.getDatasetMembers).toHaveBeenCalledWith(7, 400, 256),
+    );
+    const updatedMemberGrid = structureGridProps.mock.calls
+      .map(([props]) => props as typeof memberGrid)
+      .findLast((props) => props?.label === "Dataset members");
+    expect(updatedMemberGrid?.getCell(400, "path")).toMatchObject({
+      text: "part-400.parquet",
+    });
+    const unit = screen.getByRole("group", { name: "Byte unit" });
+    fireEvent.click(within(unit).getByRole("button", { name: "Uncompressed" }));
+    act(() => updatedMemberGrid?.onSelectRow(400));
+    await waitFor(() =>
+      expect(desktop.selectDatasetStructureMember).toHaveBeenCalledWith(7, 400),
+    );
+    const summariesBeforeReturn = vi.mocked(desktop.getStructureSummary).mock
+      .calls.length;
+    act(() => updatedMemberGrid?.onSelectRow(0));
+    act(() =>
+      resolveFirstSelection?.({
+        relativePath: "part-400.parquet",
+        partitions: [],
+      }),
+    );
+    await waitFor(() =>
+      expect(desktop.selectDatasetStructureMember).toHaveBeenLastCalledWith(
+        7,
+        0,
+      ),
+    );
+    await waitFor(() =>
+      expect(desktop.getStructureSummary).toHaveBeenCalledTimes(
+        summariesBeforeReturn + 1,
+      ),
+    );
+    expect(
+      within(unit).getByRole("button", { name: "Uncompressed" }),
+    ).toHaveAttribute("aria-pressed", "true");
+
+    fireEvent.click(screen.getAllByRole("button", { name: /year=2026/ })[0]!);
+    await waitFor(() =>
+      expect(desktop.getDatasetPartitions).toHaveBeenCalledWith(
+        7,
+        [partition],
+        null,
+        100,
+      ),
+    );
+    expect(screen.getByText("month=08").closest("button")).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "Next partitions" }));
+    await waitFor(() =>
+      expect(desktop.getDatasetPartitions).toHaveBeenCalledWith(
+        7,
+        [],
+        after,
+        100,
+      ),
+    );
+  });
+
+  it("drops a late virtual member page after its dataset generation closes", async () => {
+    listedSources = [listedDataset(7)];
+    vi.mocked(desktop.openLocalFolder).mockResolvedValue(
+      datasetProvisionalSummary(),
+    );
+    vi.spyOn(desktop, "getDatasetPreview").mockResolvedValue(
+      new ArrayBuffer(1),
+    );
+    const readyStatus = datasetReadyStatus();
+    if (readyStatus.state === "ready") readyStatus.summary.memberCount = 600;
+    vi.spyOn(desktop, "getDatasetStatus").mockResolvedValue(readyStatus);
+    let resolvePage: ((page: desktop.DatasetMemberPage) => void) | undefined;
+    vi.spyOn(desktop, "getDatasetMembers").mockImplementation(
+      async (_generation, offset) =>
+        offset === 0
+          ? { offset: 0, total: 600, members: [] }
+          : new Promise((resolve) => {
+              resolvePage = resolve;
+            }),
+    );
+    vi.mocked(desktop.closeOpenedSource).mockImplementation(async () => {
+      listedSources = [];
+      return true;
+    });
+
+    render(<App />);
+    fireEvent.click(
+      await screen.findByRole("button", { name: "Open Folder…" }),
+    );
+    await waitFor(() => expect(dataGridProps).toHaveBeenCalled());
+    fireEvent.click(screen.getByRole("button", { name: "Structure" }));
+    const memberGrid = await waitFor(() => {
+      const props = structureGridProps.mock.calls
+        .map(
+          ([candidate]) =>
+            candidate as {
+              label: string;
+              onViewportChange: (start: number, count: number) => void;
+            },
+        )
+        .findLast((candidate) => candidate.label === "Dataset members");
+      expect(props).toBeDefined();
+      return props!;
+    });
+    act(() => memberGrid.onViewportChange(450, 20));
+    await waitFor(() =>
+      expect(desktop.getDatasetMembers).toHaveBeenCalledTimes(2),
+    );
+    await act(async () => requestCloseSource?.(7));
+    const rendersAfterClose = structureGridProps.mock.calls.length;
+    await act(async () =>
+      resolvePage?.({
+        offset: 400,
+        total: 600,
+        members: [{ relativePath: "late.parquet", partitions: [] }],
+      }),
+    );
+
+    expect(structureGridProps).toHaveBeenCalledTimes(rendersAfterClose);
+    expect(screen.queryByText("dataset/")).not.toBeInTheDocument();
+  });
+
+  it("detaches a cancelled source open and ignores its stale result", async () => {
+    let resolveOpen:
+      ((source: desktop.OpenedSourceBatch | null) => void) | undefined;
+    vi.spyOn(desktop, "openLocalSource").mockReturnValue(
+      new Promise((resolve) => {
+        resolveOpen = resolve;
+      }),
+    );
+    vi.mocked(desktop.getSourceOpenProgress).mockResolvedValue("readingFooter");
+
+    render(<App />);
+    fireEvent.click(await readyOpenButton());
+    expect(
+      await screen.findByText("Reading the Parquet footer…"),
+    ).toHaveAttribute("role", "status");
+    fireEvent.click(
+      await screen.findByRole("button", { name: "Cancel opening" }),
+    );
+
+    expect(desktop.cancelSourceOpen).toHaveBeenCalledOnce();
+    expect(
+      await screen.findByRole("button", { name: "Open Parquet file…" }),
+    ).toBeEnabled();
+    await act(async () =>
+      resolveOpen?.({ sources: [sourceSummary()], sourceError: null }),
+    );
+    expect(screen.queryByText("people.parquet")).not.toBeInTheDocument();
+    expect(dataGridProps).not.toHaveBeenCalled();
+  });
+
+  it("accepts a published recent open after its cancel response wins the IPC race", async () => {
+    vi.spyOn(desktop, "getRecentSources").mockResolvedValue([
+      {
+        id: "recent-1",
+        name: "people.parquet",
+        directory: "~/Data",
+        path: "/home/test/Data/people.parquet",
+      },
+    ]);
+    let resolveOpen: ((source: desktop.SourceSummary) => void) | undefined;
+    vi.spyOn(desktop, "openRecentSource").mockReturnValue(
+      new Promise((resolve) => {
+        resolveOpen = resolve;
+      }),
+    );
+    vi.mocked(desktop.cancelSourceOpen).mockResolvedValue("published");
+    vi.mocked(desktop.getSourceOpenProgress).mockResolvedValue("summarizing");
+
+    render(<App />);
+    fireEvent.click(
+      await screen.findByRole("button", { name: /people\.parquet/ }),
+    );
+    fireEvent.click(
+      await screen.findByRole("button", { name: "Cancel opening" }),
+    );
+    const attempt = vi.mocked(desktop.openRecentSource).mock.calls[0]?.[1];
+    await waitFor(() =>
+      expect(desktop.cancelSourceOpen).toHaveBeenCalledWith(attempt),
+    );
+
+    listedSources = [listedSource(1, "people.parquet")];
+    await act(async () => resolveOpen?.(sourceSummary()));
+    expect(await screen.findByText("people.parquet")).toBeInTheDocument();
+    expect(screen.queryByRole("status")).not.toBeInTheDocument();
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+    expect(dataGridProps).toHaveBeenCalled();
+  });
+
   it("treats dialog cancellation as an unchanged empty state", async () => {
     vi.spyOn(desktop, "openLocalSource").mockResolvedValue(null);
 
@@ -482,6 +1143,47 @@ describe("App", () => {
       await screen.findByRole("button", { name: "Open Parquet file…" }),
     ).toBeEnabled();
     expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+  });
+
+  it("groups a multi-file dialog only while Alt is held and resets on blur", async () => {
+    vi.spyOn(desktop, "openLocalSource").mockResolvedValue(null);
+    render(<App />);
+
+    fireEvent.keyDown(window, { key: "Alt", altKey: true });
+    fireEvent.click(await readyOpenButton());
+    await waitFor(() =>
+      expect(desktop.openLocalSource).toHaveBeenCalledWith(
+        expect.any(String),
+        true,
+      ),
+    );
+    fireEvent.blur(window);
+    fireEvent.click(await readyOpenButton());
+    await waitFor(() =>
+      expect(desktop.openLocalSource).toHaveBeenLastCalledWith(
+        expect.any(String),
+        false,
+      ),
+    );
+  });
+
+  it("keeps published batch sources visible beside a path-free partial error", async () => {
+    listedSources = [listedSource(1, "people.parquet")];
+    vi.spyOn(desktop, "openLocalSource").mockResolvedValue({
+      sources: [sourceSummary()],
+      sourceError: {
+        code: "invalidMember",
+        member: "year=2026/broken.parquet",
+      },
+    });
+    render(<App />);
+
+    fireEvent.click(await readyOpenButton());
+
+    expect(await screen.findByText("people.parquet")).toBeInTheDocument();
+    expect(screen.getByRole("alert")).toHaveTextContent(
+      "year=2026/broken.parquet",
+    );
   });
 
   it("renders a recoverable source error from the stable taxonomy", async () => {
@@ -511,7 +1213,11 @@ describe("App", () => {
           sizeBytes: 128,
           rowCount: 3,
           rowGroupCount: 1,
+          columnCount: 0,
           schema: [],
+          schemaNodeCount: 0,
+          schemaIsTruncated: false,
+          stringsTruncated: false,
         },
         sourceError: null,
       });
@@ -543,7 +1249,11 @@ describe("App", () => {
           sizeBytes: 128,
           rowCount: 3,
           rowGroupCount: 1,
+          columnCount: 0,
           schema: [],
+          schemaNodeCount: 0,
+          schemaIsTruncated: false,
+          stringsTruncated: false,
         },
         sourceError: null,
       })
@@ -565,7 +1275,11 @@ describe("App", () => {
             sizeBytes: 256,
             rowCount: 6,
             rowGroupCount: 1,
+            columnCount: 0,
             schema: [],
+            schemaNodeCount: 0,
+            schemaIsTruncated: false,
+            stringsTruncated: false,
           },
         ],
         sourceError: null,
@@ -602,7 +1316,11 @@ describe("App", () => {
           sizeBytes: 16,
           rowCount: 2,
           rowGroupCount: 1,
+          columnCount: 0,
           schema: [],
+          schemaNodeCount: 0,
+          schemaIsTruncated: false,
+          stringsTruncated: false,
         },
         {
           generation: 1,
@@ -610,7 +1328,11 @@ describe("App", () => {
           sizeBytes: 8,
           rowCount: 1,
           rowGroupCount: 1,
+          columnCount: 0,
           schema: [],
+          schemaNodeCount: 0,
+          schemaIsTruncated: false,
+          stringsTruncated: false,
         },
       ],
     });
@@ -808,7 +1530,11 @@ describe("App", () => {
           sizeBytes: 8,
           rowCount: 1,
           rowGroupCount: 1,
+          columnCount: 0,
           schema: [],
+          schemaNodeCount: 0,
+          schemaIsTruncated: false,
+          stringsTruncated: false,
         },
         sourceError: null,
       })
@@ -843,7 +1569,11 @@ describe("App", () => {
           sizeBytes: 8,
           rowCount: 1,
           rowGroupCount: 1,
+          columnCount: 0,
           schema: [],
+          schemaNodeCount: 0,
+          schemaIsTruncated: false,
+          stringsTruncated: false,
         },
         sourceError: null,
       })
@@ -880,7 +1610,10 @@ describe("App", () => {
   it("shows a recoverable error for a missing native file activation", async () => {
     vi.spyOn(desktop, "takeOpenedSource")
       .mockResolvedValueOnce(null)
-      .mockResolvedValueOnce({ source: null, sourceError: "notFound" });
+      .mockResolvedValueOnce({
+        source: null,
+        sourceError: { code: "notFound" },
+      });
     render(<App />);
 
     await waitFor(() => expect(reportOpenedSource).toBeTypeOf("function"));
@@ -1289,7 +2022,11 @@ describe("App", () => {
           sizeBytes: 4096,
           rowCount: 12,
           rowGroupCount: 2,
+          columnCount: 0,
           schema: [],
+          schemaNodeCount: 0,
+          schemaIsTruncated: false,
+          stringsTruncated: false,
         },
       ],
     });
@@ -1555,6 +2292,327 @@ describe("App", () => {
     ).toHaveAttribute("aria-valuenow", "63");
   });
 
+  it("reads the structure only once the mode is first opened", async () => {
+    const summary = vi.mocked(desktop.getStructureSummary);
+    mockLocalSource(sourceSummary());
+
+    render(<App />);
+    fireEvent.click(await readyOpenButton());
+    await screen.findByText("people.parquet");
+
+    expect(summary).not.toHaveBeenCalled();
+
+    fireEvent.click(screen.getByRole("button", { name: "Structure" }));
+    await waitFor(() => expect(summary).toHaveBeenCalledWith(1));
+
+    fireEvent.keyDown(window, { key: "1", ctrlKey: true });
+    fireEvent.keyDown(window, { key: "2", ctrlKey: true });
+    await waitFor(() =>
+      expect(
+        screen.getByRole("group", { name: "Byte unit" }),
+      ).toBeInTheDocument(),
+    );
+    expect(summary).toHaveBeenCalledTimes(1);
+  });
+
+  it("opens Data and continues a capped nested schema in the same tree", async () => {
+    mockLocalSource({
+      ...sourceSummary(),
+      columnCount: 301,
+      schemaNodeCount: 302,
+      schemaIsTruncated: true,
+      schema: [
+        {
+          name: "prefix",
+          physicalType: "INT64",
+          logicalType: null,
+          children: [],
+        },
+        {
+          name: "wrapper",
+          physicalType: "GROUP",
+          logicalType: null,
+          children: [],
+        },
+      ],
+    });
+    vi.mocked(desktop.getStructureSummary).mockResolvedValue({
+      ...structureSummary,
+      columnCount: 301,
+    });
+    vi.mocked(desktop.getSourceSchemaNodePage).mockImplementation(
+      async (_generation, cursor, limit) => {
+        expect(limit).toBe(256);
+        const start = cursor?.path[1] ?? 0;
+        const childCount = cursor === null ? 254 : 46;
+        return {
+          nodes: [
+            ...(cursor === null
+              ? [
+                  {
+                    path: [0],
+                    name: "prefix",
+                    physicalType: "INT64",
+                    logicalType: null,
+                    hasChildren: false,
+                    leafIndex: 0,
+                  },
+                  {
+                    path: [1],
+                    name: "wrapper",
+                    physicalType: "GROUP",
+                    logicalType: null,
+                    hasChildren: true,
+                    leafIndex: null,
+                  },
+                ]
+              : []),
+            ...Array.from({ length: childCount }, (_, pageIndex) => {
+              const index = start + pageIndex;
+              return {
+                path: [1, index],
+                name: `nested_${index}`,
+                physicalType: "INT64",
+                logicalType: null,
+                hasChildren: false,
+                leafIndex: index + 1,
+              };
+            }),
+          ],
+          nextCursor:
+            cursor === null ? { path: [1, 254], leafIndex: 255 } : null,
+          totalCount: 302,
+        };
+      },
+    );
+
+    render(<App />);
+    fireEvent.click(await readyOpenButton());
+
+    await waitFor(() => expect(dataGridProps).toHaveBeenCalled());
+    expect(screen.getByRole("button", { name: "Data" })).toBeEnabled();
+    expect(dataGridProps).toHaveBeenLastCalledWith(
+      expect.objectContaining({
+        source: expect.objectContaining({
+          columnCount: 301,
+          schemaIsTruncated: true,
+        }),
+      }),
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Structure" }));
+    expect(await screen.findByText("nested_0")).toBeInTheDocument();
+    expect(
+      screen.getByText("More nested fields are not loaded yet."),
+    ).toBeInTheDocument();
+    const loadMore = screen.getByRole("button", { name: "Load more columns" });
+    fireEvent.click(loadMore);
+    fireEvent.click(loadMore);
+    expect(
+      await screen.findByRole("button", { name: /nested_299/ }),
+    ).toBeInTheDocument();
+    expect(desktop.getSourceSchemaNodePage).toHaveBeenLastCalledWith(
+      1,
+      { path: [1, 254], leafIndex: 255 },
+      256,
+    );
+    expect(desktop.getSourceSchemaNodePage).toHaveBeenCalledTimes(2);
+  });
+
+  it("offers a retry after the structure read is cancelled", async () => {
+    mockLocalSource(sourceSummary());
+    const summary = vi
+      .mocked(desktop.getStructureSummary)
+      .mockRejectedValueOnce(new desktop.StructureCommandError("cancelled"))
+      .mockResolvedValueOnce(structureSummary);
+
+    render(<App />);
+    fireEvent.click(await readyOpenButton());
+    await screen.findByText("people.parquet");
+    fireEvent.click(screen.getByRole("button", { name: "Structure" }));
+
+    const retry = await screen.findByRole("button", { name: "Read again" });
+    expect(
+      screen.getByText("Reading the structure was cancelled."),
+    ).toBeInTheDocument();
+
+    fireEvent.click(retry);
+
+    await waitFor(() =>
+      expect(
+        screen.getByRole("group", { name: "Byte unit" }),
+      ).toBeInTheDocument(),
+    );
+    expect(summary).toHaveBeenCalledTimes(2);
+  });
+
+  it("cancels a running structure read for the open source", async () => {
+    mockLocalSource(sourceSummary());
+    vi.mocked(desktop.getStructureSummary).mockReturnValue(
+      new Promise(() => {}),
+    );
+
+    render(<App />);
+    fireEvent.click(await readyOpenButton());
+    await screen.findByText("people.parquet");
+    fireEvent.click(screen.getByRole("button", { name: "Structure" }));
+
+    fireEvent.click(await screen.findByRole("button", { name: "Cancel" }));
+
+    expect(desktop.cancelStructureLoad).toHaveBeenCalledWith(1);
+  });
+
+  it("applies the unit toggle to every table in the mode", async () => {
+    mockLocalSource(sourceSummary());
+    vi.mocked(desktop.getStructureRowGroups).mockResolvedValue({
+      offset: 0,
+      totalCount: 1,
+      rowGroups: [
+        {
+          index: 0,
+          rowCount: 10,
+          compressedBytes: 100,
+          uncompressedBytes: 400,
+          compressionRatio: 4,
+          chunkCount: 2,
+          chunksWithBloomFilter: 0,
+          isReadable: true,
+          hasLayoutFacts: true,
+        },
+      ],
+    });
+    vi.mocked(desktop.getStructureColumns).mockResolvedValue({
+      offset: 0,
+      totalCount: 1,
+      totalCompressedBytes: 100,
+      totalUncompressedBytes: 400,
+      columns: [
+        {
+          index: 0,
+          name: "id",
+          physicalType: "INT64",
+          logicalType: null,
+          compressedBytes: 100,
+          uncompressedBytes: 400,
+          compressionRatio: 4,
+          encodings: ["PLAIN"],
+          share: 1,
+          cumulativeShare: 1,
+        },
+      ],
+    });
+
+    render(<App />);
+    fireEvent.click(await readyOpenButton());
+    await screen.findByText("people.parquet");
+    fireEvent.click(screen.getByRole("button", { name: "Structure" }));
+
+    const toggle = await screen.findByRole("group", { name: "Byte unit" });
+    await waitFor(() =>
+      expect(desktop.getStructureRowGroups).toHaveBeenCalledWith(
+        1,
+        "compressed",
+        expect.anything(),
+        expect.anything(),
+        expect.anything(),
+        expect.anything(),
+      ),
+    );
+
+    fireEvent.click(
+      within(toggle).getByRole("button", { name: "Uncompressed" }),
+    );
+
+    await waitFor(() =>
+      expect(desktop.getStructureRowGroups).toHaveBeenLastCalledWith(
+        1,
+        "uncompressed",
+        expect.anything(),
+        expect.anything(),
+        expect.anything(),
+        expect.anything(),
+      ),
+    );
+    expect(desktop.getStructureColumns).toHaveBeenLastCalledWith(
+      1,
+      "uncompressed",
+      expect.anything(),
+      expect.anything(),
+      expect.anything(),
+      expect.anything(),
+    );
+  });
+
+  it("reissues navigation when the same row group opens in Data twice", async () => {
+    mockLocalSource(sourceSummary());
+    vi.mocked(desktop.getStructureLayout).mockResolvedValue({
+      offset: 0,
+      totalCount: 1,
+      rows: [
+        {
+          index: 0,
+          compressedBytes: 100,
+          uncompressedBytes: 200,
+          isReadable: true,
+          segments: [],
+          tail: null,
+        },
+      ],
+      maxCompressedBytes: 100,
+      maxUncompressedBytes: 200,
+      overview: [],
+    });
+
+    render(<App />);
+    fireEvent.click(await readyOpenButton());
+    await screen.findByText("people.parquet");
+    fireEvent.click(screen.getByRole("button", { name: "Structure" }));
+    const row = await screen.findByRole("button", { name: "RG 0" });
+
+    fireEvent.doubleClick(row);
+    await waitFor(() =>
+      expect(dataGridProps).toHaveBeenLastCalledWith(
+        expect.objectContaining({ requestedRow: { row: 0, request: 1 } }),
+      ),
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Structure" }));
+    fireEvent.doubleClick(row);
+    await waitFor(() =>
+      expect(dataGridProps).toHaveBeenLastCalledWith(
+        expect.objectContaining({ requestedRow: { row: 0, request: 2 } }),
+      ),
+    );
+  });
+
+  it("captions a file that holds no row group instead of showing empty tables", async () => {
+    mockLocalSource({
+      ...sourceSummary(),
+      rowCount: 0,
+      rowGroupCount: 0,
+    });
+    vi.mocked(desktop.getStructureSummary).mockResolvedValue({
+      ...structureSummary,
+      rowCount: 0,
+      rowGroupCount: 0,
+      rowsPerRowGroup: null,
+      chunkCount: 0,
+      chunksWithStatistics: 0,
+      chunksWithBloomFilter: 0,
+    });
+
+    render(<App />);
+    fireEvent.click(await readyOpenButton());
+    await screen.findByText("people.parquet");
+    fireEvent.click(screen.getByRole("button", { name: "Structure" }));
+
+    expect(await screen.findByText("No row groups")).toHaveClass(
+      "structure-empty",
+    );
+    expect(screen.queryByLabelText("Row groups")).not.toBeInTheDocument();
+    expect(screen.queryByLabelText("Columns")).not.toBeInTheDocument();
+    expect(screen.getByRole("heading", { name: "Schema" })).toBeInTheDocument();
+    expect(desktop.getStructureRowGroups).not.toHaveBeenCalled();
+  });
+
   it("explains why a Debian package cannot update itself", async () => {
     vi.spyOn(desktop, "getUpdateSettings").mockResolvedValue({
       channel: "stable",
@@ -1584,14 +2642,113 @@ describe("shortcutModifierFor", () => {
   });
 });
 
-describe("formatFileSize", () => {
-  it.each([
-    [999, "999 B"],
-    [1_000, "1.0 kB"],
-    [999_999, "1.0 MB"],
-    [1_300_000, "1.3 MB"],
-    [2_500_000_000, "2.5 GB"],
-  ])("formats %i bytes as %s", (bytes, expected) => {
-    expect(formatFileSize(bytes)).toBe(expected);
+async function renderReadyDataset() {
+  listedSources = [listedDataset(7)];
+  vi.mocked(desktop.openLocalFolder).mockResolvedValue(
+    datasetProvisionalSummary(),
+  );
+  vi.spyOn(desktop, "getDatasetPreview").mockResolvedValue(new ArrayBuffer(1));
+  vi.spyOn(desktop, "getDatasetStatus").mockResolvedValue(datasetReadyStatus());
+  render(<App />);
+  fireEvent.click(await screen.findByRole("button", { name: "Open Folder…" }));
+  await waitFor(() => expect(dataGridProps).toHaveBeenCalled());
+}
+
+function openDatasetContextMenu() {
+  if (screen.queryByRole("option", { name: /dataset/ }) === null) {
+    fireEvent.click(screen.getByRole("button", { name: "Switch files" }));
+  }
+  fireEvent.contextMenu(screen.getByRole("option", { name: /dataset/ }), {
+    clientX: 20,
+    clientY: 20,
   });
-});
+}
+
+function sourceSummary(): desktop.SourceSummary {
+  return {
+    generation: 1,
+    displayName: "people.parquet",
+    sizeBytes: 1_300_000,
+    rowCount: 1_234_567,
+    rowGroupCount: 12,
+    columnCount: 1,
+    schema: [
+      { name: "id", physicalType: "INT64", logicalType: null, children: [] },
+    ],
+    schemaNodeCount: 1,
+    schemaIsTruncated: false,
+    stringsTruncated: false,
+  };
+}
+
+function listedDataset(generation: number): desktop.OpenedSourceEntry {
+  return {
+    generation,
+    kind: "folderDataset",
+    datasetMemberCount: 2,
+    datasetIgnoredFileCount: 1,
+    name: "dataset",
+    directory: "~/Data",
+    path: "/home/test/Data/dataset",
+    active: true,
+  };
+}
+
+function datasetProvisionalSummary(): desktop.SourceSummary {
+  return {
+    generation: 7,
+    displayName: "dataset/",
+    sizeBytes: 100,
+    rowCount: 1,
+    rowGroupCount: 1,
+    columnCount: 1,
+    schema: [
+      { name: "id", physicalType: "INT64", logicalType: null, children: [] },
+    ],
+    schemaNodeCount: 1,
+    schemaIsTruncated: false,
+    stringsTruncated: false,
+  };
+}
+
+function datasetReadyStatus(): desktop.DatasetStatus {
+  return {
+    state: "ready",
+    summary: {
+      displayName: "dataset/",
+      memberCount: 2,
+      ignoredFileCount: 1,
+      sizeBytes: 200,
+      rowCount: 3,
+      rowGroupCount: 2,
+      columnCount: 2,
+      schema: [
+        {
+          name: "id",
+          physicalType: "INT64",
+          logicalType: null,
+          children: [],
+        },
+        {
+          name: "file",
+          physicalType: "BYTE_ARRAY",
+          logicalType: "String",
+          children: [],
+        },
+      ],
+      schemaNodeCount: 2,
+      schemaIsTruncated: false,
+      stringsTruncated: false,
+      schemaDriftMemberCount: 0,
+      partitionColumnIndices: [],
+      provenanceColumnIndex: 1,
+    },
+  };
+}
+
+function factLabels(facts: HTMLElement): string[] {
+  return Array.from(
+    facts.querySelectorAll("dt"),
+    ({ textContent }) => textContent ?? "",
+  );
+}

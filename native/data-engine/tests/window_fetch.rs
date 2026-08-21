@@ -158,6 +158,22 @@ fn projects_five_columns_from_a_ten_thousand_column_source_in_requested_order() 
 }
 
 #[test]
+fn projects_a_column_whose_name_exceeds_the_wire_summary_limit() {
+    let column_name = format!("long_{}", "界".repeat(100));
+    let source = write_named_parquet(&column_name);
+    let mut reader = DataWindowReader::new(source.path().to_owned());
+
+    let batches = decode(
+        reader
+            .fetch_columns(0, 1, &[0])
+            .expect("query schema keeps the complete column name"),
+    );
+
+    assert_eq!(batches[0].schema().field(0).name(), &column_name);
+    assert_eq!(int32_value(&batches[0], 0), 17);
+}
+
+#[test]
 fn projected_direct_windows_preserve_deep_file_order_and_unusual_names() {
     let source = write_basic_parquet();
     let mut reader = DataWindowReader::new(source.path().to_owned());
@@ -1770,6 +1786,25 @@ fn write_wide_parquet(column_count: usize) -> NamedTempFile {
         .collect::<Vec<_>>();
     let batch = RecordBatch::try_new(Arc::clone(&schema), columns).expect("wide record batch");
     write_batch(&source, schema, &batch);
+    source
+}
+
+fn write_named_parquet(column_name: &str) -> NamedTempFile {
+    let source = NamedTempFile::new().expect("temporary file");
+    let schema = Arc::new(Schema::new(vec![Field::new(
+        column_name,
+        DataType::Int32,
+        false,
+    )]));
+    let batch = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![Arc::new(Int32Array::from(vec![17])) as ArrayRef],
+    )
+    .expect("record batch");
+    let mut writer = ArrowWriter::try_new(source.reopen().expect("source file"), schema, None)
+        .expect("Parquet writer");
+    writer.write(&batch).expect("write batch");
+    writer.close().expect("write footer");
     source
 }
 

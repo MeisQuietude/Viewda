@@ -2,7 +2,8 @@
 
 use std::{
     collections::HashSet,
-    fs, io,
+    fs,
+    io::{self, Read, Write},
     path::{Path, PathBuf},
     sync::{
         Arc,
@@ -19,9 +20,10 @@ use tempfile::{TempDir, TempPath};
 use thiserror::Error;
 
 use crate::{
+    dataset::{DatasetError, DatasetQuerySource, DatasetSetupError, DatasetWindowReader},
     filter::{DataFilter, FilterPredicate, build_filter_predicate_with_names},
-    source::{SchemaField, SourceError, inspect_local_source},
-    view::PreparedDataViewExport,
+    source::{SchemaField, SourceError, inspect_local_source_for_query},
+    view::{PreparedDataViewExport, PreparedDataViewExportSource},
 };
 
 const QUERY_MEMORY_LIMIT: &str = "384MB";
@@ -75,6 +77,9 @@ pub enum DataExportError {
     /// The operating system denied source or destination access.
     #[error("Viewda does not have permission to read or write this file.")]
     PermissionDenied,
+    /// The source path no longer identifies the opened file.
+    #[error("The selected file changed after it was opened.")]
+    SourceChanged,
     /// The selected source does not have Parquet file markers.
     #[error("The selected file is not a Parquet file.")]
     NotParquet,
@@ -142,7 +147,7 @@ impl DataExportProgress {
 
 /// Owns the isolated DuckDB connection and adjacent temporary output file.
 pub struct DataExportReader {
-    source_path: PathBuf,
+    source: DataExportSource,
     target_path: PathBuf,
     temporary_path: TempPath,
     connection: Connection,
@@ -154,6 +159,11 @@ pub struct DataExportReader {
     final_bytes: Arc<AtomicU64>,
 }
 
+enum DataExportSource {
+    File(PathBuf),
+    Dataset(Box<DatasetQuerySource>),
+}
+
 impl DataExportReader {
     /// Prepares an export that cannot block the grid connection.
     pub fn new(
@@ -162,14 +172,14 @@ impl DataExportReader {
         mut request: DataExportRequest,
         view: Option<PreparedDataViewExport>,
     ) -> Result<Self, DataExportError> {
-        let summary = inspect_local_source(&source_path).map_err(DataExportError::from)?;
+        let summary =
+            inspect_local_source_for_query(&source_path).map_err(DataExportError::from)?;
         if paths_match(&source_path, &target_path) {
             return Err(DataExportError::InvalidRequest);
         }
-        if view
-            .as_ref()
-            .is_some_and(|view| view.source_path != source_path)
-        {
+        if view.as_ref().is_some_and(|view| {
+            !matches!(&view.source, PreparedDataViewExportSource::File(path) if path == &source_path)
+        }) {
             return Err(DataExportError::InvalidRequest);
         }
         let filters = view
@@ -182,6 +192,77 @@ impl DataExportReader {
         validate_request(&summary.schema, &request, filters, view_row_count)?;
         request.row_ranges = normalize_ranges(&request.row_ranges)?;
 
+        Self::with_source(
+            DataExportSource::File(source_path),
+            target_path,
+            request,
+            view,
+            summary.schema,
+        )
+    }
+
+    /// Prepares an export from one completed fixed dataset.
+    pub fn for_dataset(
+        reader: &DatasetWindowReader,
+        target_path: PathBuf,
+        request: DataExportRequest,
+        view: Option<PreparedDataViewExport>,
+    ) -> Result<Self, DataExportError> {
+        Self::for_dataset_while(reader, target_path, request, view, || true)
+    }
+
+    /// Prepares a dataset export while its start reservation remains active.
+    pub fn for_dataset_while(
+        reader: &DatasetWindowReader,
+        target_path: PathBuf,
+        mut request: DataExportRequest,
+        view: Option<PreparedDataViewExport>,
+        mut keep_going: impl FnMut() -> bool,
+    ) -> Result<Self, DataExportError> {
+        let source = reader
+            .query_source_while(&mut keep_going)
+            .map_err(dataset_export_error)?;
+        if source.target_matches_member(&target_path) {
+            return Err(DataExportError::InvalidRequest);
+        }
+        if view.as_ref().is_some_and(|view| {
+            !matches!(&view.source, PreparedDataViewExportSource::Dataset(token)
+                if source.matches_session(token))
+        }) {
+            return Err(DataExportError::InvalidRequest);
+        }
+        let filters = view
+            .as_ref()
+            .map(|view| view.filters.as_slice())
+            .unwrap_or_default();
+        let view_row_count = view
+            .as_ref()
+            .map_or(source.row_count(), |view| view.row_count);
+        validate_request(source.schema(), &request, filters, view_row_count)?;
+        request.row_ranges = normalize_ranges(&request.row_ranges)?;
+        let schema = source.schema().to_vec();
+        let export = Self::with_source(
+            DataExportSource::Dataset(Box::new(source)),
+            target_path,
+            request,
+            view,
+            schema,
+        )?;
+        if !keep_going() {
+            export.cancellation().cancel();
+            return Err(DataExportError::Cancelled);
+        }
+        Ok(export)
+    }
+
+    fn with_source(
+        source: DataExportSource,
+        target_path: PathBuf,
+        request: DataExportRequest,
+        view: Option<PreparedDataViewExport>,
+        schema: Vec<SchemaField>,
+    ) -> Result<Self, DataExportError> {
+        let is_dataset = matches!(source, DataExportSource::Dataset(_));
         let target_directory = target_path.parent().ok_or(DataExportError::Unsupported)?;
         let temporary_file = tempfile::Builder::new()
             .prefix(".viewda-export-")
@@ -200,7 +281,7 @@ impl DataExportReader {
             .to_str()
             .ok_or(DataExportError::QueryEngineUnavailable)?;
         let config = Config::default()
-            .enable_object_cache(true)
+            .enable_object_cache(!is_dataset)
             .and_then(|config| config.max_memory(QUERY_MEMORY_LIMIT))
             .and_then(|config| config.with("temp_directory", spill_directory_path))
             .and_then(|config| config.with("preserve_insertion_order", "true"))
@@ -208,18 +289,22 @@ impl DataExportReader {
         let connection = Connection::open_in_memory_with_flags(config)
             .map_err(|_| DataExportError::QueryEngineUnavailable)?;
         connection
-            .execute_batch("SET TimeZone = 'UTC'")
+            .execute_batch(if is_dataset {
+                "SET TimeZone = 'UTC'; SET parquet_metadata_cache = false"
+            } else {
+                "SET TimeZone = 'UTC'; SET parquet_metadata_cache = true"
+            })
             .map_err(|_| DataExportError::QueryEngineUnavailable)?;
 
         Ok(Self {
-            source_path,
+            source,
             target_path,
             temporary_path,
             connection,
             _spill_directory: spill_directory,
             request,
             view,
-            schema: summary.schema,
+            schema,
             cancelled: Arc::new(AtomicBool::new(false)),
             final_bytes: Arc::new(AtomicU64::new(0)),
         })
@@ -243,28 +328,48 @@ impl DataExportReader {
 
     /// Streams the requested query to a temporary file and atomically replaces the target.
     pub fn export(self) -> Result<u64, DataExportError> {
+        self.export_checked(|| {})
+    }
+
+    fn export_checked(self, before_copy: impl FnOnce()) -> Result<u64, DataExportError> {
         self.require_active()?;
-        let source_path = self
-            .source_path
-            .to_str()
-            .ok_or(DataExportError::Unsupported)?;
         let temporary_path = self
             .temporary_path
             .to_str()
             .ok_or(DataExportError::Unsupported)?;
-        self.connection
-            .execute(
-                "SET VARIABLE __viewda_source_path = ?",
-                params![source_path],
-            )
-            .map_err(classify_query_error)?;
+        let filters = self
+            .view
+            .as_ref()
+            .map(|view| view.filters.as_slice())
+            .unwrap_or_default();
+        match &self.source {
+            DataExportSource::File(source_path) => {
+                let source_path = source_path.to_str().ok_or(DataExportError::Unsupported)?;
+                self.connection
+                    .execute(
+                        "SET VARIABLE __viewda_source_path = ?",
+                        params![source_path],
+                    )
+                    .map_err(|error| self.classify_setup_query_error(error, true))?;
+            }
+            DataExportSource::Dataset(dataset) => {
+                dataset
+                    .install_while(&self.connection, || !self.cancelled.load(Ordering::Acquire))
+                    .map_err(|error| self.classify_dataset_setup_error(error))?;
+            }
+        }
+        let conversion_is_request = matches!(&self.source, DataExportSource::File(_));
         self.connection
             .execute(
                 "SET VARIABLE __viewda_export_path = ?",
                 params![temporary_path],
             )
-            .map_err(classify_query_error)?;
-        if let Some(view) = self.view.as_ref().filter(|view| view.sorted) {
+            .map_err(|error| self.classify_setup_query_error(error, conversion_is_request))?;
+        if let Some(view) = self
+            .view
+            .as_ref()
+            .filter(|view| view.sorted || matches!(&self.source, DataExportSource::Dataset(_)))
+        {
             let position_index = view
                 .position_index
                 .to_str()
@@ -274,31 +379,46 @@ impl DataExportReader {
                     "SET VARIABLE __viewda_position_index_path = ?",
                     params![position_index],
                 )
-                .map_err(classify_query_error)?;
+                .map_err(|error| self.classify_setup_query_error(error, conversion_is_request))?;
         }
-        let (query, parameters) =
-            build_export_query(&self.schema, &self.request, self.view.as_ref())?;
-        let copy = match &self.request.output {
-            DataExportFormat::Csv { .. } => format!(
-                "COPY ({query}) TO (getvariable('__viewda_export_path')) \
-                 (FORMAT CSV, HEADER true, DELIMITER ',', \
-                 QUOTE '\"', ESCAPE '\"', NULLSTR '', NEW_LINE E'\\r\\n', \
-                 DATEFORMAT '%Y-%m-%d', TIMESTAMPFORMAT '%Y-%m-%dT%H:%M:%S.%n')"
-            ),
+        before_copy();
+        self.require_active()?;
+        let result = match &self.source {
+            DataExportSource::File(_) => {
+                let (query, parameters) =
+                    build_export_query(&self.schema, &self.request, self.view.as_ref())?;
+                self.connection.execute(
+                    &build_csv_copy(&query, true),
+                    params_from_iter(parameters.iter()),
+                )
+            }
+            DataExportSource::Dataset(dataset) => {
+                self.export_dataset_batches(dataset)?;
+                Ok(0)
+            }
         };
-        let result = self
-            .connection
-            .execute(&copy, params_from_iter(parameters.iter()));
         if self.cancelled.load(Ordering::Acquire) {
             return Err(DataExportError::Cancelled);
         }
-        result.map_err(classify_query_error)?;
+        result.map_err(|error| match &self.source {
+            DataExportSource::File(_) => classify_query_error(error),
+            DataExportSource::Dataset(dataset) => {
+                classify_dataset_export_query_error(dataset, error, filters)
+            }
+        })?;
+        self.require_active()?;
+        if let DataExportSource::Dataset(dataset) = &self.source {
+            dataset
+                .validate_while(|| !self.cancelled.load(Ordering::Acquire))
+                .map_err(dataset_export_error)?;
+        }
         self.require_active()?;
 
         let bytes = fs::metadata(&self.temporary_path)
             .map_err(classify_io_error)?
             .len();
         self.final_bytes.store(bytes, Ordering::Release);
+        self.require_active()?;
         self.temporary_path
             .persist(&self.target_path)
             .map_err(|error| classify_io_error(error.error))?;
@@ -312,6 +432,308 @@ impl DataExportReader {
             Ok(())
         }
     }
+
+    fn export_dataset_batches(&self, dataset: &DatasetQuerySource) -> Result<(), DataExportError> {
+        const EXPORT_POSITION_BATCH_ROWS: u64 = 8_192;
+        const EXPORT_POSITION_BATCH_MEMBERS: usize = 256;
+        let selected_columns = self
+            .request
+            .column_indices
+            .iter()
+            .map(|index| {
+                let field = self
+                    .schema
+                    .get(*index as usize)
+                    .ok_or(DataExportError::InvalidRequest)?;
+                Ok(export_column_expression_from(
+                    field,
+                    &format!("source.{}", quote_identifier(&field.name)),
+                ))
+            })
+            .collect::<Result<Vec<_>, DataExportError>>()?
+            .join(", ");
+        let mut wrote_rows = false;
+        if let Some(view) = &self.view {
+            let ranges = if self.request.row_ranges.is_empty() {
+                vec![ExportRowRange {
+                    start: 0,
+                    end: view.row_count,
+                }]
+            } else {
+                self.request.row_ranges.clone()
+            };
+            for range in ranges {
+                let mut offset = range.start;
+                while offset < range.end {
+                    self.require_active()?;
+                    let requested_rows = (range.end - offset).min(EXPORT_POSITION_BATCH_ROWS);
+                    let (ordinals, row_count) = dataset_export_member_batch(
+                        &self.connection,
+                        dataset,
+                        offset,
+                        requested_rows,
+                        EXPORT_POSITION_BATCH_MEMBERS,
+                    )?;
+                    dataset
+                        .bind_export_members_while(&self.connection, &ordinals, || {
+                            !self.cancelled.load(Ordering::Acquire)
+                        })
+                        .map_err(|error| self.classify_dataset_setup_error(error))?;
+                    let requested = quote_identifier("__viewda_requested");
+                    let member_ordinal = quote_identifier(dataset.ordinal_column());
+                    let member_row = quote_identifier(dataset.row_column());
+                    let requested_order = quote_identifier("__viewda_requested_order");
+                    let relation = dataset.relation_sql();
+                    let query = format!(
+                        "WITH {requested} AS (SELECT {member_ordinal}, {member_row}, \
+                         {requested_order} FROM read_parquet(\
+                         getvariable('__viewda_position_index_path'), file_row_number = true, \
+                         hive_partitioning = false) AS {requested}(\
+                         {member_ordinal}, {member_row}, {requested_order}) \
+                         WHERE {requested_order} >= ? AND {requested_order} < ?) \
+                         SELECT {selected_columns} FROM {requested} \
+                         JOIN {relation} source ON source.{member_ordinal} = \
+                         {requested}.{member_ordinal} AND source.{member_row} = \
+                         {requested}.{member_row} ORDER BY {requested}.{requested_order}"
+                    );
+                    self.execute_dataset_copy(
+                        dataset,
+                        &query,
+                        &[
+                            Value::BigInt(
+                                i64::try_from(offset)
+                                    .map_err(|_| DataExportError::InvalidRequest)?,
+                            ),
+                            Value::BigInt(
+                                i64::try_from(offset + row_count)
+                                    .map_err(|_| DataExportError::InvalidRequest)?,
+                            ),
+                        ],
+                        !wrote_rows,
+                    )?;
+                    wrote_rows = true;
+                    offset += row_count;
+                }
+            }
+        } else {
+            let mut cursor = dataset.candidate_batches(&[]);
+            let ranges = if self.request.row_ranges.is_empty() {
+                vec![ExportRowRange {
+                    start: 0,
+                    end: dataset.row_count(),
+                }]
+            } else {
+                self.request.row_ranges.clone()
+            };
+            let mut batch_start = 0_u64;
+            while dataset
+                .bind_next_candidate_batch(&self.connection, &mut cursor, || {
+                    !self.cancelled.load(Ordering::Acquire)
+                })
+                .map_err(|error| self.classify_dataset_setup_error(error))?
+            {
+                let batch_rows = dataset
+                    .bound_row_count(&self.connection)
+                    .map_err(|error| self.classify_dataset_setup_error(error))?;
+                let batch_end = batch_start
+                    .checked_add(batch_rows)
+                    .ok_or(DataExportError::Unsupported)?;
+                for range in &ranges {
+                    let start = range.start.max(batch_start);
+                    let end = range.end.min(batch_end);
+                    if start >= end {
+                        continue;
+                    }
+                    let relation = dataset.relation_sql();
+                    let ordinal = quote_identifier(dataset.ordinal_column());
+                    let native_row = quote_identifier(dataset.row_column());
+                    let query = format!(
+                        "SELECT {selected_columns} FROM {relation} source \
+                         ORDER BY source.{ordinal}, source.{native_row} LIMIT ? OFFSET ?"
+                    );
+                    self.execute_dataset_copy(
+                        dataset,
+                        &query,
+                        &[
+                            Value::BigInt((end - start) as i64),
+                            Value::BigInt((start - batch_start) as i64),
+                        ],
+                        !wrote_rows,
+                    )?;
+                    wrote_rows = true;
+                }
+                batch_start = batch_end;
+            }
+        }
+        if !wrote_rows {
+            dataset
+                .bind_export_members_while(&self.connection, &[], || {
+                    !self.cancelled.load(Ordering::Acquire)
+                })
+                .map_err(|error| self.classify_dataset_setup_error(error))?;
+            let query = format!(
+                "SELECT {selected_columns} FROM {} source LIMIT 0",
+                dataset.relation_sql()
+            );
+            self.execute_dataset_copy(dataset, &query, &[], true)?;
+        }
+        Ok(())
+    }
+
+    fn execute_dataset_copy(
+        &self,
+        dataset: &DatasetQuerySource,
+        query: &str,
+        parameters: &[Value],
+        header: bool,
+    ) -> Result<(), DataExportError> {
+        self.require_active()?;
+        if header {
+            let output_path = self
+                .temporary_path
+                .to_str()
+                .ok_or(DataExportError::Unsupported)?;
+            self.connection
+                .execute(
+                    "SET VARIABLE __viewda_export_path = ?",
+                    params![output_path],
+                )
+                .map_err(|error| self.classify_setup_query_error(error, false))?;
+            let result = self.connection.execute(
+                &build_csv_copy(query, true),
+                params_from_iter(parameters.iter()),
+            );
+            if self.cancelled.load(Ordering::Acquire) {
+                return Err(DataExportError::Cancelled);
+            }
+            result.map_err(|error| classify_dataset_export_query_error(dataset, error, &[]))?;
+            return self.require_active();
+        }
+        let directory = self
+            .temporary_path
+            .parent()
+            .ok_or(DataExportError::Unsupported)?;
+        let chunk = tempfile::Builder::new()
+            .prefix(".viewda-export-chunk-")
+            .tempfile_in(directory)
+            .map_err(classify_io_error)?;
+        let chunk = chunk.into_temp_path();
+        fs::remove_file(&chunk).map_err(classify_io_error)?;
+        let chunk_path = chunk.to_str().ok_or(DataExportError::Unsupported)?;
+        self.connection
+            .execute("SET VARIABLE __viewda_export_path = ?", params![chunk_path])
+            .map_err(|error| self.classify_setup_query_error(error, false))?;
+        let result = self.connection.execute(
+            &build_csv_copy(query, header),
+            params_from_iter(parameters.iter()),
+        );
+        if self.cancelled.load(Ordering::Acquire) {
+            return Err(DataExportError::Cancelled);
+        }
+        result.map_err(|error| classify_dataset_export_query_error(dataset, error, &[]))?;
+        let mut chunk_file = fs::File::open(&chunk).map_err(classify_io_error)?;
+        let mut output = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.temporary_path)
+            .map_err(classify_io_error)?;
+        let mut buffer = [0_u8; 64 * 1024];
+        loop {
+            self.require_active()?;
+            let read = chunk_file.read(&mut buffer).map_err(classify_io_error)?;
+            if read == 0 {
+                break;
+            }
+            output
+                .write_all(&buffer[..read])
+                .map_err(classify_io_error)?;
+        }
+        self.require_active()
+    }
+
+    fn classify_setup_query_error(
+        &self,
+        error: DuckDbError,
+        conversion_is_request: bool,
+    ) -> DataExportError {
+        if self.cancelled.load(Ordering::Acquire) {
+            DataExportError::Cancelled
+        } else {
+            classify_query_error_category(&error, conversion_is_request)
+                .unwrap_or(DataExportError::QueryFailed)
+        }
+    }
+
+    fn classify_dataset_setup_error(&self, error: DatasetSetupError) -> DataExportError {
+        if self.cancelled.load(Ordering::Acquire) {
+            return DataExportError::Cancelled;
+        }
+        match error {
+            DatasetSetupError::Dataset(error) => dataset_export_error(error),
+            DatasetSetupError::Query(error) => {
+                classify_query_error_category(&error, false).unwrap_or(DataExportError::QueryFailed)
+            }
+        }
+    }
+}
+
+fn build_csv_copy(query: &str, header: bool) -> String {
+    format!(
+        "COPY ({query}) TO (getvariable('__viewda_export_path')) \
+         (FORMAT CSV, HEADER {header}, DELIMITER ',', \
+         QUOTE '\"', ESCAPE '\"', NULLSTR '', NEW_LINE E'\\r\\n', \
+         DATEFORMAT '%Y-%m-%d', TIMESTAMPFORMAT '%Y-%m-%dT%H:%M:%S.%n')"
+    )
+}
+
+fn dataset_export_member_batch(
+    connection: &Connection,
+    dataset: &DatasetQuerySource,
+    offset: u64,
+    row_count: u64,
+    member_limit: usize,
+) -> Result<(Vec<u64>, u64), DataExportError> {
+    let ordinal = quote_identifier(dataset.ordinal_column());
+    let native_row = quote_identifier(dataset.row_column());
+    let requested_order = quote_identifier("__viewda_requested_order");
+    let mut statement = connection
+        .prepare(&format!(
+            "SELECT {ordinal} FROM read_parquet(\
+             getvariable('__viewda_position_index_path'), file_row_number = true, \
+             hive_partitioning = false) AS requested(\
+             {ordinal}, {native_row}, {requested_order}) \
+             WHERE {requested_order} >= ? AND {requested_order} < ? \
+             ORDER BY {requested_order}"
+        ))
+        .map_err(|error| classify_dataset_export_query_error(dataset, error, &[]))?;
+    let start = i64::try_from(offset).map_err(|_| DataExportError::InvalidRequest)?;
+    let end = i64::try_from(
+        offset
+            .checked_add(row_count)
+            .ok_or(DataExportError::InvalidRequest)?,
+    )
+    .map_err(|_| DataExportError::InvalidRequest)?;
+    let rows = statement
+        .query_map([Value::BigInt(start), Value::BigInt(end)], |row| row.get(0))
+        .map_err(|error| classify_dataset_export_query_error(dataset, error, &[]))?;
+    let mut ordinals = Vec::new();
+    let mut seen = HashSet::new();
+    let mut exported_rows = 0_u64;
+    for row in rows {
+        let ordinal =
+            row.map_err(|error| classify_dataset_export_query_error(dataset, error, &[]))?;
+        if !seen.contains(&ordinal) && seen.len() == member_limit {
+            break;
+        }
+        if seen.insert(ordinal) {
+            ordinals.push(ordinal);
+        }
+        exported_rows += 1;
+    }
+    if exported_rows == 0 {
+        return Err(DataExportError::QueryFailed);
+    }
+    Ok((ordinals, exported_rows))
 }
 
 fn paths_match(source_path: &Path, target_path: &Path) -> bool {
@@ -647,28 +1069,79 @@ fn quote_identifier(identifier: &str) -> String {
 }
 
 fn classify_query_error(error: DuckDbError) -> DataExportError {
-    let message = match error {
-        DuckDbError::DuckDBFailure(_, Some(message)) => message,
-        _ => return DataExportError::QueryFailed,
+    classify_query_error_category(&error, true).unwrap_or(DataExportError::QueryFailed)
+}
+
+fn classify_query_error_category(
+    error: &DuckDbError,
+    conversion_is_request: bool,
+) -> Option<DataExportError> {
+    let DuckDbError::DuckDBFailure(_, Some(message)) = error else {
+        return None;
     };
     let lowercase = message.to_lowercase();
     if lowercase.contains("no space left")
         || lowercase.contains("not enough space")
         || lowercase.contains("disk full")
     {
-        DataExportError::DiskFull
+        Some(DataExportError::DiskFull)
     } else if lowercase.contains("permission denied") || lowercase.contains("access is denied") {
-        DataExportError::PermissionDenied
+        Some(DataExportError::PermissionDenied)
     } else if message.starts_with("Out of Memory Error:") {
-        DataExportError::ResourceExhausted
-    } else if message.starts_with("Conversion Error:")
+        Some(DataExportError::ResourceExhausted)
+    } else if (conversion_is_request && message.starts_with("Conversion Error:"))
         || message.starts_with("Binder Error:")
         || message.starts_with("Invalid type Error:")
         || message.starts_with("Not implemented Error:")
     {
-        DataExportError::InvalidRequest
+        Some(DataExportError::InvalidRequest)
     } else {
-        DataExportError::QueryFailed
+        None
+    }
+}
+
+fn classify_dataset_export_query_error(
+    dataset: &DatasetQuerySource,
+    error: DuckDbError,
+    filters: &[DataFilter],
+) -> DataExportError {
+    classify_query_error_category(&error, false).unwrap_or_else(|| {
+        dataset_export_error(dataset.classify_query_failure(error, filters, false))
+    })
+}
+
+fn dataset_export_error(error: DatasetError) -> DataExportError {
+    match error {
+        DatasetError::NotFound => DataExportError::NotFound,
+        DatasetError::PermissionDenied => DataExportError::PermissionDenied,
+        DatasetError::SourceChanged { .. } => DataExportError::SourceChanged,
+        DatasetError::InvalidMember { .. } => DataExportError::CorruptSource,
+        DatasetError::Cancelled => DataExportError::Cancelled,
+        DatasetError::Window { error } => match error {
+            crate::DataWindowError::NotFound => DataExportError::NotFound,
+            crate::DataWindowError::PermissionDenied => DataExportError::PermissionDenied,
+            crate::DataWindowError::SourceChanged => DataExportError::SourceChanged,
+            crate::DataWindowError::NotParquet | crate::DataWindowError::CorruptSource => {
+                DataExportError::CorruptSource
+            }
+            crate::DataWindowError::InvalidFilter | crate::DataWindowError::InvalidSort => {
+                DataExportError::InvalidRequest
+            }
+            crate::DataWindowError::Cancelled => DataExportError::Cancelled,
+            crate::DataWindowError::ResourceExhausted => DataExportError::ResourceExhausted,
+            crate::DataWindowError::QueryEngineUnavailable => {
+                DataExportError::QueryEngineUnavailable
+            }
+            crate::DataWindowError::Unsupported
+            | crate::DataWindowError::WindowTooLarge
+            | crate::DataWindowError::EncodingFailed => DataExportError::Unsupported,
+            crate::DataWindowError::QueryFailed => DataExportError::QueryFailed,
+        },
+        DatasetError::NoParquetFiles
+        | DatasetError::PageTooLarge
+        | DatasetError::InspectionStepTooLarge
+        | DatasetError::SchemaConflict { .. }
+        | DatasetError::Unsupported => DataExportError::Unsupported,
     }
 }
 
@@ -685,6 +1158,7 @@ impl From<SourceError> for DataExportError {
         match error {
             SourceError::NotFound => Self::NotFound,
             SourceError::PermissionDenied => Self::PermissionDenied,
+            SourceError::SourceChanged => Self::SourceChanged,
             SourceError::NotParquet => Self::NotParquet,
             SourceError::CorruptFooter => Self::CorruptSource,
             SourceError::Unsupported => Self::Unsupported,
@@ -878,7 +1352,7 @@ mod tests {
     }
 
     #[test]
-    fn cancellation_preserves_an_existing_target_and_removes_the_temporary_file() {
+    fn cancellation_after_setup_preserves_the_target_and_skips_copy() {
         let source = write_export_parquet();
         let output_directory = tempdir().expect("output directory");
         let target = output_directory.path().join("view.csv");
@@ -893,9 +1367,10 @@ mod tests {
         let progress = reader.progress();
         let cancellation = reader.cancellation();
 
-        cancellation.cancel();
-
-        assert_eq!(reader.export(), Err(DataExportError::Cancelled));
+        assert_eq!(
+            reader.export_checked(|| cancellation.cancel()),
+            Err(DataExportError::Cancelled)
+        );
         assert_eq!(
             fs::read_to_string(target).expect("existing target"),
             "existing"

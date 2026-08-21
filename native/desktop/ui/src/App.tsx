@@ -21,21 +21,31 @@ import {
   getPendingDataExportCloseDialog,
   getDefaultApplicationStatus,
   getDataViewSettings,
+  getDatasetPreview,
+  getDatasetStatus,
   getEngineStatus,
   getRecentSources,
+  getSourceOpenProgress,
+  getSourceSchemaNodePage,
+  getStructureRowOffset,
   getUpdateSettings,
   installPendingUpdate,
   listOpenedSources,
   onCloseSourceRequested,
   onOpenSourceRequested,
+  onOpenFolderRequested,
   onOpenedSourceAvailable,
   onRecentSourcesChanged,
   onDataExportCloseRequested,
   onSettingsRequested,
   onUpdateAvailable,
   openLocalSource,
+  openLocalFolder,
+  cancelDatasetInspection,
+  cancelSourceOpen,
   openRecentSource,
   openReleasesPage,
+  reloadOpenedSource,
   OpenSourceError,
   removeRecentSource,
   resolveDataExportCloseDialog,
@@ -54,7 +64,13 @@ import {
   type EngineStatus,
   type OpenedSourceEntry,
   type RecentSource,
-  type SourceErrorCode,
+  type DatasetErrorDetail,
+  type DatasetReadySummary,
+  type DatasetStatus,
+  type SourceOpenProgressPhase,
+  type StructureByteUnit,
+  type SourceSchemaNode,
+  type SourceSchemaNodeCursor,
   type SourceSummary,
   type UpdateChannel,
   type UpdateInfo,
@@ -62,16 +78,36 @@ import {
   UpdateCommandError,
 } from "./desktop";
 import {
+  decodeArrowWindow,
+  type ArrowDataWindow,
+} from "./data-grid/arrow-window";
+import {
   activeOpenFile,
   distinguishingTail,
   mergeOpenFiles,
   type OpenFile,
   type SourceMode,
 } from "./open-files";
-import { SchemaTreeNode } from "./SchemaTree";
+import { SchemaTreeNode, type RenderedSchemaField } from "./SchemaTree";
 import { FileContextMenu, FileSwitcher } from "./FileSwitcher";
 import { GridPerformanceDebug } from "./data-grid/GridPerformanceDebug";
+import {
+  DatasetInspection,
+  DatasetStructureNavigator,
+} from "./dataset/DatasetViews";
+import { SourceErrorMessage } from "./SourceErrorMessage";
 import type { GridDiagnosticsSink } from "./data-grid/diagnostics/session";
+import {
+  StructureCard,
+  StructureLoadStatus,
+  StructureUnitToggle,
+} from "./structure/StructureCard";
+import { KeyValueMetadata } from "./structure/KeyValueMetadata";
+import { CopyStructureReport } from "./structure/CopyStructureReport";
+import { ColumnTable, RowGroupTable } from "./structure/StructureTables";
+import { StructureLayoutView } from "./structure/StructureLayout";
+import { formatNumber } from "./structure/format";
+import { useStructureSummary } from "./structure/use-structure-summary";
 import {
   applyDocumentTheme,
   SYSTEM_THEME_QUERY,
@@ -116,7 +152,9 @@ export function App({
 }) {
   const [readiness, setReadiness] = useState<Readiness>({ kind: "loading" });
   const [openFiles, setOpenFiles] = useState<OpenFile[]>([]);
-  const [sourceError, setSourceError] = useState<SourceErrorCode | null>(null);
+  const [sourceError, setSourceError] = useState<DatasetErrorDetail | null>(
+    null,
+  );
   const [opening, setOpening] = useState(false);
   const [recentSources, setRecentSources] = useState<RecentSource[]>([]);
   const [switcherOpen, setSwitcherOpen] = useState(false);
@@ -164,8 +202,16 @@ export function App({
   const cycleFilesTail = useRef<Promise<void>>(Promise.resolve());
   const previousOpenFileCount = useRef(0);
   const openFilesSyncSequence = useRef(0);
+  const sourceOpenRequest = useRef(0);
+  const sourceOpenAttempt = useRef<string | null>(null);
+  const sourceOpenCancellation = useRef<string | null>(null);
+  const datasetGroupingModifier = useRef(false);
+  const reloadRequests = useRef(
+    new Map<number, { token: symbol; promise: Promise<number> }>(),
+  );
+  const closingSources = useRef(new Set<number>());
   // Native listings carry no schema, so the window keeps the summary of every
-  // file it opened for as long as that file stays open.
+  // source it opened for as long as that source stays open.
   const summaries = useRef(new Map<number, SourceSummary>());
   const activeFile = activeOpenFile(openFiles);
   const activeGeneration = activeFile?.generation ?? null;
@@ -206,7 +252,7 @@ export function App({
     return () => systemTheme.removeEventListener("change", applyTheme);
   }, [themePreference]);
 
-  /// Mirrors the native open set, adding the summaries of files opened just now.
+  /// Mirrors the native open set, adding the summaries of sources opened just now.
   const syncOpenFiles = useCallback(async (opened: SourceSummary[] = []) => {
     const sequence = ++openFilesSyncSequence.current;
     for (const summary of opened) {
@@ -229,54 +275,159 @@ export function App({
   }, []);
 
   const openSource = useCallback(async () => {
+    if (sourceOpenAttempt.current !== null) {
+      return;
+    }
+    const request = ++sourceOpenRequest.current;
+    const attempt = crypto.randomUUID();
+    sourceOpenAttempt.current = attempt;
     setOpening(true);
     setSourceError(null);
 
     try {
-      const selected = await openLocalSource();
-      if (selected !== null) {
-        await syncOpenFiles([selected]);
+      const selected = await openLocalSource(
+        attempt,
+        datasetGroupingModifier.current,
+      );
+      if (sourceOpenRequest.current === request && selected !== null) {
+        if (selected.sources.length > 0) {
+          await syncOpenFiles(selected.sources);
+          setSwitcherOpen(false);
+        }
+        setSourceError(selected.sourceError);
       }
     } catch (error) {
-      setSourceError(
-        error instanceof OpenSourceError ? error.code : "unsupported",
-      );
+      if (
+        sourceOpenRequest.current === request &&
+        sourceOpenCancellation.current !== attempt
+      ) {
+        setSourceError(
+          error instanceof OpenSourceError
+            ? error.detail
+            : { code: "unsupported" },
+        );
+      }
     } finally {
-      setOpening(false);
+      if (sourceOpenRequest.current === request) {
+        sourceOpenAttempt.current = null;
+        setOpening(false);
+      }
+    }
+  }, [syncOpenFiles]);
+
+  const openFolder = useCallback(async () => {
+    if (sourceOpenAttempt.current !== null) {
+      return;
+    }
+    const request = ++sourceOpenRequest.current;
+    const attempt = crypto.randomUUID();
+    sourceOpenAttempt.current = attempt;
+    setOpening(true);
+    setSourceError(null);
+    try {
+      const selected = await openLocalFolder(attempt);
+      if (sourceOpenRequest.current === request && selected !== null) {
+        await syncOpenFiles([selected]);
+        setSwitcherOpen(false);
+      }
+    } catch (error) {
+      if (
+        sourceOpenRequest.current === request &&
+        sourceOpenCancellation.current !== attempt
+      ) {
+        setSourceError(
+          error instanceof OpenSourceError
+            ? error.detail
+            : { code: "unsupported" },
+        );
+      }
+    } finally {
+      if (sourceOpenRequest.current === request) {
+        sourceOpenAttempt.current = null;
+        setOpening(false);
+      }
     }
   }, [syncOpenFiles]);
 
   const openRecent = useCallback(
     async (id: string) => {
+      if (sourceOpenAttempt.current !== null) {
+        return;
+      }
+      const request = ++sourceOpenRequest.current;
+      const attempt = crypto.randomUUID();
+      sourceOpenAttempt.current = attempt;
       setOpening(true);
       setSourceError(null);
 
       try {
-        await syncOpenFiles([await openRecentSource(id)]);
+        const selected = await openRecentSource(id, attempt);
+        if (sourceOpenRequest.current !== request) {
+          return;
+        }
+        await syncOpenFiles([selected]);
         await refreshRecentSources();
         setSwitcherOpen(false);
       } catch (error) {
-        const code =
-          error instanceof OpenSourceError ? error.code : "unsupported";
-        setSourceError(code);
-        if (code === "notFound") {
+        const detail =
+          error instanceof OpenSourceError
+            ? error.detail
+            : { code: "unsupported" as const };
+        if (
+          sourceOpenRequest.current !== request ||
+          sourceOpenCancellation.current === attempt
+        ) {
+          return;
+        }
+        setSourceError(detail);
+        if (detail.code === "notFound") {
           setRecentSources((entries) =>
             entries.filter((entry) => entry.id !== id),
           );
         }
       } finally {
-        setOpening(false);
+        if (sourceOpenRequest.current === request) {
+          sourceOpenAttempt.current = null;
+          setOpening(false);
+        }
       }
     },
     [refreshRecentSources, syncOpenFiles],
   );
+
+  const cancelOpenSource = useCallback(() => {
+    const request = sourceOpenRequest.current;
+    const attempt = sourceOpenAttempt.current;
+    if (attempt === null) {
+      return;
+    }
+    sourceOpenCancellation.current = attempt;
+    void cancelSourceOpen(attempt)
+      .then((outcome) => {
+        if (sourceOpenRequest.current !== request) {
+          return;
+        }
+        sourceOpenCancellation.current = null;
+        if (outcome === "cancelled") {
+          sourceOpenAttempt.current = null;
+          sourceOpenRequest.current += 1;
+          setOpening(false);
+        }
+      })
+      .catch(() => {
+        if (sourceOpenRequest.current === request) {
+          sourceOpenCancellation.current = null;
+          setSourceError({ code: "unsupported" });
+        }
+      });
+  }, []);
 
   const receiveOpenedSource = useCallback(async () => {
     try {
       // One drag and drop can queue several activations; each of them opened a file.
       const opened: SourceSummary[] = [];
       let received = false;
-      let failure: SourceErrorCode | null = null;
+      let failure: DatasetErrorDetail | null = null;
       for (;;) {
         const activation = await takeOpenedSource();
         if (activation === null) {
@@ -296,7 +447,7 @@ export function App({
         await syncOpenFiles(opened);
       }
     } catch {
-      setSourceError("unsupported");
+      setSourceError({ code: "unsupported" });
     }
   }, [syncOpenFiles]);
 
@@ -314,24 +465,31 @@ export function App({
 
   const closeFile = useCallback(
     async (generation: number) => {
+      closingSources.current.add(generation);
       try {
-        if (!(await closeOpenedSource(generation))) {
+        const target = await (reloadRequests.current.get(generation)?.promise ??
+          Promise.resolve(generation));
+        try {
+          if (!(await closeOpenedSource(target))) {
+            return false;
+          }
+        } catch {
+          // A rejected request can still mean native state changed; verify it below.
+        }
+        let entries: OpenedSourceEntry[];
+        try {
+          entries = await syncOpenFiles();
+        } catch {
           return false;
         }
-      } catch {
-        // A rejected request can still mean native state changed; verify it below.
+        if (entries.some((entry) => entry.generation === target)) {
+          return false;
+        }
+        await refreshRecentSources();
+        return true;
+      } finally {
+        closingSources.current.delete(generation);
       }
-      let entries: OpenedSourceEntry[];
-      try {
-        entries = await syncOpenFiles();
-      } catch {
-        return false;
-      }
-      if (entries.some((entry) => entry.generation === generation)) {
-        return false;
-      }
-      await refreshRecentSources();
-      return true;
     },
     [refreshRecentSources, syncOpenFiles],
   );
@@ -348,6 +506,44 @@ export function App({
       }
     },
     [closeFile, openFiles],
+  );
+
+  const reloadFile = useCallback(
+    (generation: number) => {
+      const running = reloadRequests.current.get(generation);
+      if (running !== undefined) return running.promise;
+      setSourceError(null);
+      const token = Symbol();
+      const request = (async () => {
+        let target = generation;
+        try {
+          const source = await reloadOpenedSource(generation);
+          target = source.generation;
+          if (reloadRequests.current.get(generation)?.token === token) {
+            await syncOpenFiles([source]);
+          }
+          return target;
+        } catch (error) {
+          if (reloadRequests.current.get(generation)?.token === token) {
+            if (!closingSources.current.has(generation)) {
+              setSourceError(
+                error instanceof OpenSourceError
+                  ? error.detail
+                  : { code: "unsupported" },
+              );
+            }
+          }
+          return target;
+        } finally {
+          if (reloadRequests.current.get(generation)?.token === token) {
+            reloadRequests.current.delete(generation);
+          }
+        }
+      })();
+      reloadRequests.current.set(generation, { token, promise: request });
+      return request;
+    },
+    [syncOpenFiles],
   );
 
   const setFileBusy = useCallback((generation: number, busy: boolean) => {
@@ -371,6 +567,23 @@ export function App({
   const setActiveMode = useCallback((mode: SourceMode) => {
     setOpenFiles((files) =>
       files.map((file) => (file.active ? { ...file, mode } : file)),
+    );
+  }, []);
+
+  const openDataForFile = useCallback((generation: number, row: number) => {
+    setOpenFiles((files) =>
+      files.map((file) =>
+        file.generation === generation
+          ? {
+              ...file,
+              mode: "data",
+              dataTargetRow: {
+                row,
+                request: (file.dataTargetRow?.request ?? 0) + 1,
+              },
+            }
+          : file,
+      ),
     );
   }, []);
 
@@ -448,6 +661,41 @@ export function App({
       unlisten();
     };
   }, [openSource]);
+
+  useEffect(() => {
+    let active = true;
+    let unlisten = () => {};
+    onOpenFolderRequested(() => void openFolder())
+      .then((stopListening) => {
+        if (active) {
+          unlisten = stopListening;
+        } else {
+          stopListening();
+        }
+      })
+      .catch(() => {});
+    return () => {
+      active = false;
+      unlisten();
+    };
+  }, [openFolder]);
+
+  useEffect(() => {
+    const update = (active: boolean) => {
+      datasetGroupingModifier.current = active;
+    };
+    const onKey = (event: globalThis.KeyboardEvent) => update(event.altKey);
+    const reset = () => update(false);
+    window.addEventListener("keydown", onKey);
+    window.addEventListener("keyup", onKey);
+    window.addEventListener("blur", reset);
+    return () => {
+      window.removeEventListener("keydown", onKey);
+      window.removeEventListener("keyup", onKey);
+      window.removeEventListener("blur", reset);
+      datasetGroupingModifier.current = false;
+    };
+  }, []);
 
   useEffect(() => {
     let active = true;
@@ -1018,6 +1266,26 @@ export function App({
     [openFiles],
   );
 
+  const installDatasetSummary = useCallback(
+    async (generation: number, ready: DatasetReadySummary) => {
+      await syncOpenFiles([
+        {
+          generation,
+          displayName: ready.displayName,
+          sizeBytes: ready.sizeBytes,
+          rowCount: ready.rowCount,
+          rowGroupCount: ready.rowGroupCount,
+          columnCount: ready.columnCount,
+          schema: ready.schema,
+          schemaNodeCount: ready.schemaNodeCount,
+          schemaIsTruncated: ready.schemaIsTruncated,
+          stringsTruncated: ready.stringsTruncated,
+        },
+      ]);
+    },
+    [syncOpenFiles],
+  );
+
   const makeDefaultApplication = useCallback(async () => {
     setChangingDefaultApplication(true);
     setDefaultApplicationMessage(null);
@@ -1071,6 +1339,8 @@ export function App({
                 setFileContextMenu({ generation, x, y });
               }}
               onOpenFile={openSource}
+              onOpenFolder={openFolder}
+              onCancelOpen={cancelOpenSource}
               onOpenRecent={openRecent}
               onRemoveRecent={removeRecent}
             />
@@ -1094,6 +1364,11 @@ export function App({
                 setFileContextMenu(null);
                 void closeOtherFiles(fileContextMenu.generation);
               }}
+              onReload={() => {
+                const generation = fileContextMenu.generation;
+                setFileContextMenu(null);
+                void reloadFile(generation);
+              }}
             />
           )}
 
@@ -1110,7 +1385,12 @@ export function App({
                 )}
                 {readiness.kind === "ready" && (
                   <>
-                    <OpenButton opening={opening} onOpen={openSource} />
+                    <OpenButton
+                      opening={opening}
+                      onOpen={openSource}
+                      onCancel={cancelOpenSource}
+                    />
+                    <FolderButton disabled={opening} onOpen={openFolder} />
                     <RecentFiles
                       entries={recentSources}
                       opening={opening}
@@ -1129,40 +1409,25 @@ export function App({
                 )}
                 <ShortcutHints modifier={shortcutModifier} />
                 {sourceError !== null && (
-                  <SourceErrorMessage code={sourceError} />
+                  <SourceErrorMessage error={sourceError} />
                 )}
               </section>
             ) : (
               panels.map((file) => (
-                <Fragment key={file.generation}>
-                  <div
-                    className="mode-panel"
-                    hidden={!file.active || file.mode !== "data"}
-                  >
-                    <div className="data-mode">
-                      {file.active && sourceError !== null && (
-                        <SourceErrorMessage code={sourceError} />
-                      )}
-                      <OpenFileDataGrid
-                        file={file}
-                        viewSettings={dataViewSettings}
-                        diagnostics={file.active ? diagnostics : undefined}
-                        onBusyChange={setFileBusy}
-                      />
-                    </div>
-                  </div>
-                  <div
-                    className="mode-panel structure-mode-panel"
-                    hidden={!file.active || file.mode !== "structure"}
-                  >
-                    <SourceDetails
-                      opening={opening}
-                      source={file.summary}
-                      sourceError={file.active ? sourceError : null}
-                      onOpen={openSource}
-                    />
-                  </div>
-                </Fragment>
+                <OpenFilePanels
+                  key={file.generation}
+                  file={file}
+                  opening={opening}
+                  sourceError={file.active ? sourceError : null}
+                  viewSettings={dataViewSettings}
+                  diagnostics={file.active ? diagnostics : undefined}
+                  onBusyChange={setFileBusy}
+                  onOpen={openSource}
+                  onCancelOpen={cancelOpenSource}
+                  onOpenData={(row) => openDataForFile(file.generation, row)}
+                  onDatasetReady={installDatasetSummary}
+                  onDatasetClosed={() => void syncOpenFiles()}
+                />
               ))
             )}
           </div>
@@ -1213,15 +1478,184 @@ export function App({
   );
 }
 
+function OpenFilePanels({
+  file,
+  opening,
+  sourceError,
+  viewSettings,
+  diagnostics,
+  onBusyChange,
+  onOpen,
+  onCancelOpen,
+  onOpenData,
+  onDatasetReady,
+  onDatasetClosed,
+}: {
+  file: OpenFile;
+  opening: boolean;
+  sourceError: DatasetErrorDetail | null;
+  viewSettings: DataViewSettings;
+  diagnostics: GridDiagnosticsSink | undefined;
+  onBusyChange: (generation: number, busy: boolean) => void;
+  onOpen: () => Promise<void>;
+  onCancelOpen: () => void;
+  onOpenData: (row: number) => void;
+  onDatasetReady: (
+    generation: number,
+    summary: DatasetReadySummary,
+  ) => Promise<void>;
+  onDatasetClosed: () => void;
+}) {
+  const isDataset = file.kind !== "file";
+  const [datasetStatus, setDatasetStatus] = useState<DatasetStatus | null>(
+    null,
+  );
+  const [preview, setPreview] = useState<ArrowDataWindow | null>(null);
+  const [previewFailed, setPreviewFailed] = useState(false);
+  const [readyInstalled, setReadyInstalled] = useState(false);
+  const [structureRevision, setStructureRevision] = useState(0);
+  const previewSchema = useRef(file.summary.schema);
+
+  useEffect(() => {
+    if (!isDataset) {
+      return;
+    }
+    let active = true;
+    let timer: number | null = null;
+    const generation = file.generation;
+    const poll = async () => {
+      try {
+        const status = await getDatasetStatus(generation);
+        if (!active) return;
+        setDatasetStatus(status);
+        if (status.state === "ready") {
+          await onDatasetReady(generation, status.summary);
+          if (active) setReadyInstalled(true);
+          return;
+        }
+        if (status.state === "failed") return;
+      } catch {
+        if (active) timer = window.setTimeout(() => void poll(), 500);
+        return;
+      }
+      if (active) timer = window.setTimeout(() => void poll(), 250);
+    };
+    void getDatasetPreview(generation)
+      .then((bytes) => {
+        if (!active) return;
+        const indices = previewSchema.current.map((_, index) => index);
+        setPreview(decodeArrowWindow(bytes, 0, indices));
+      })
+      .catch(() => {
+        if (active) setPreviewFailed(true);
+      });
+    void poll();
+    return () => {
+      active = false;
+      if (timer !== null) window.clearTimeout(timer);
+    };
+  }, [file.generation, isDataset, onDatasetReady]);
+
+  const readySummary =
+    datasetStatus?.state === "ready" ? datasetStatus.summary : null;
+  const provenance = useMemo(
+    () =>
+      readySummary === null
+        ? new Set<number>()
+        : new Set([readySummary.provenanceColumnIndex]),
+    [readySummary],
+  );
+  const ready = !isDataset || (readySummary !== null && readyInstalled);
+  const provisional = isDataset && !ready;
+
+  return (
+    <Fragment>
+      <div className="mode-panel" hidden={!file.active || file.mode !== "data"}>
+        <div className="data-mode">
+          {file.active && sourceError !== null && (
+            <SourceErrorMessage error={sourceError} />
+          )}
+          {ready ? (
+            <OpenFileDataGrid
+              file={file}
+              viewSettings={viewSettings}
+              diagnostics={diagnostics}
+              defaultHiddenSourceIndices={provenance}
+              onBusyChange={onBusyChange}
+            />
+          ) : file.mode === "data" ? (
+            <DatasetInspection
+              status={datasetStatus}
+              preview={preview}
+              previewFailed={previewFailed}
+              source={file.summary}
+              onCancel={() => {
+                void cancelDatasetInspection(file.generation).then(
+                  (closed) => closed && onDatasetClosed(),
+                  () => {},
+                );
+              }}
+            />
+          ) : null}
+        </div>
+      </div>
+      <div
+        className="mode-panel structure-mode-panel"
+        hidden={!file.active || file.mode !== "structure"}
+      >
+        {provisional && file.mode === "structure" ? (
+          <DatasetInspection
+            status={datasetStatus}
+            preview={preview}
+            previewFailed={previewFailed}
+            source={file.summary}
+            onCancel={() => {
+              void cancelDatasetInspection(file.generation).then(
+                (closed) => closed && onDatasetClosed(),
+                () => {},
+              );
+            }}
+          />
+        ) : (
+          <>
+            {isDataset && readySummary !== null && (
+              <DatasetStructureNavigator
+                generation={file.generation}
+                ready={readySummary}
+                active={file.active && file.mode === "structure"}
+                onSelected={() =>
+                  setStructureRevision((revision) => revision + 1)
+                }
+              />
+            )}
+            <SourceDetails
+              active={file.active && file.mode === "structure"}
+              opening={opening}
+              source={file.summary}
+              sourceError={sourceError}
+              structureRevision={structureRevision}
+              onOpen={onOpen}
+              onCancelOpen={onCancelOpen}
+              onOpenData={onOpenData}
+            />
+          </>
+        )}
+      </div>
+    </Fragment>
+  );
+}
+
 function OpenFileDataGrid({
   file,
   viewSettings,
   diagnostics,
+  defaultHiddenSourceIndices = new Set(),
   onBusyChange,
 }: {
   file: OpenFile;
   viewSettings: DataViewSettings;
   diagnostics: GridDiagnosticsSink | undefined;
+  defaultHiddenSourceIndices?: ReadonlySet<number>;
   onBusyChange: (generation: number, busy: boolean) => void;
 }) {
   const reportOperation = useCallback(
@@ -1238,9 +1672,11 @@ function OpenFileDataGrid({
     >
       <DataGrid
         source={file.summary}
+        requestedRow={file.dataTargetRow ?? null}
         viewSettings={viewSettings}
         diagnostics={diagnostics}
         active={file.active}
+        defaultHiddenSourceIndices={defaultHiddenSourceIndices}
         onOperationChange={reportOperation}
       />
     </Suspense>
@@ -1358,7 +1794,11 @@ function FileContext({
       aria-label="Switch files"
       onClick={onOpen}
     >
-      <span className="file-context-name">{file.name}</span>
+      <span className="file-context-name">
+        {file.kind === "folderDataset" && !file.name.endsWith("/")
+          ? `${file.name}/`
+          : file.name}
+      </span>
       {tail !== null && <span className="file-context-tail">— {tail}</span>}
       {count > 1 && <span className="file-context-count">· {count}</span>}
       <span className="file-context-caret" aria-hidden="true">
@@ -1911,19 +2351,83 @@ function OpenButton({
   opening,
   disabled = false,
   onOpen,
+  onCancel,
 }: {
   opening: boolean;
   disabled?: boolean;
   onOpen: () => Promise<void>;
+  onCancel?: () => void;
+}) {
+  const [progress, setProgress] = useState<SourceOpenProgressPhase | null>(
+    null,
+  );
+  useEffect(() => {
+    if (!opening) {
+      setProgress(null);
+      return;
+    }
+    let active = true;
+    const readProgress = async () => {
+      try {
+        const next = await getSourceOpenProgress();
+        if (active) {
+          setProgress(next);
+        }
+      } catch {
+        // The Open action remains cancellable if a status poll fails.
+      }
+    };
+    void readProgress();
+    const interval = window.setInterval(() => void readProgress(), 250);
+    return () => {
+      active = false;
+      window.clearInterval(interval);
+    };
+  }, [opening]);
+  const progressLabel =
+    progress === "waiting"
+      ? "Waiting to inspect the Parquet footer…"
+      : progress === "readingFooter"
+        ? "Reading the Parquet footer…"
+        : progress === "decodingFooter"
+          ? "Decoding the Parquet footer…"
+          : progress === "summarizing"
+            ? "Preparing the source summary…"
+            : null;
+  return (
+    <div className="open-source-control">
+      <button
+        className="open-button"
+        type="button"
+        disabled={disabled}
+        onClick={() => (opening ? onCancel?.() : void onOpen())}
+      >
+        {opening ? "Cancel opening" : "Open Parquet file…"}
+      </button>
+      {progressLabel !== null && (
+        <span role="status" aria-live="polite">
+          {progressLabel}
+        </span>
+      )}
+    </div>
+  );
+}
+
+function FolderButton({
+  disabled,
+  onOpen,
+}: {
+  disabled: boolean;
+  onOpen: () => Promise<void>;
 }) {
   return (
     <button
-      className="open-button"
+      className="open-folder-button"
       type="button"
-      disabled={disabled || opening}
+      disabled={disabled}
       onClick={() => void onOpen()}
     >
-      {opening ? "Opening…" : "Open Parquet file…"}
+      Open Folder…
     </button>
   );
 }
@@ -1943,110 +2447,351 @@ function ShortcutHints({ modifier }: { modifier: string }) {
           <kbd>{modifier},</kbd>
         </dd>
       </div>
+      <div>
+        <dt>Open folder</dt>
+        <dd>
+          <kbd>⇧{modifier}O</kbd>
+        </dd>
+      </div>
     </dl>
   );
 }
 
 function SourceDetails({
+  active,
   opening,
   source,
   sourceError,
+  structureRevision = 0,
   onOpen,
+  onCancelOpen,
+  onOpenData,
 }: {
+  active: boolean;
   opening: boolean;
   source: SourceSummary;
-  sourceError: SourceErrorCode | null;
+  sourceError: DatasetErrorDetail | null;
+  structureRevision?: number;
   onOpen: () => Promise<void>;
+  onCancelOpen: () => void;
+  onOpenData: (row: number) => void;
 }) {
+  const { state, cancel, retry } = useStructureSummary(
+    source.generation,
+    active,
+    structureRevision,
+  );
+  const [unit, setUnit] = useState<StructureByteUnit>("compressed");
+  const [highlightedColumn, setHighlightedColumn] = useState<number | null>(
+    null,
+  );
+  const [dataBridgeError, setDataBridgeError] = useState<string | null>(null);
+  const [selectedRowGroup, setSelectedRowGroup] = useState<{
+    row: number;
+    request: number;
+  } | null>(null);
+  const [schemaNodes, setSchemaNodes] = useState<SourceSchemaNode[]>(() =>
+    schemaNodesFromSummary(source.schema),
+  );
+  const [schemaCursor, setSchemaCursor] =
+    useState<SourceSchemaNodeCursor | null>(null);
+  const [schemaPageStarted, setSchemaPageStarted] = useState(false);
+  const [schemaPageLoading, setSchemaPageLoading] = useState(false);
+  const [schemaPageError, setSchemaPageError] = useState(false);
+  const schemaRequest = useRef(0);
+  const schemaPageInFlight = useRef<string | null>(null);
+  const leafOffsets = schemaLeafOffsets(source.schema);
+  const summary = state.kind === "ready" ? state.summary : null;
+
+  const loadSchemaPage = useCallback(
+    async (cursor: SourceSchemaNodeCursor | null) => {
+      const cursorKey = cursor === null ? "root" : cursor.path.join(".");
+      if (schemaPageInFlight.current === cursorKey) {
+        return;
+      }
+      schemaPageInFlight.current = cursorKey;
+      const request = ++schemaRequest.current;
+      setSchemaPageLoading(true);
+      setSchemaPageError(false);
+      try {
+        const page = await getSourceSchemaNodePage(
+          source.generation,
+          cursor,
+          256,
+        );
+        if (schemaRequest.current === request) {
+          setSchemaNodes((current) => mergeSchemaNodes(current, page.nodes));
+          setSchemaCursor(page.nextCursor);
+          setSchemaPageStarted(true);
+        }
+      } catch {
+        if (schemaRequest.current === request) {
+          setSchemaPageError(true);
+        }
+      } finally {
+        if (schemaPageInFlight.current === cursorKey) {
+          schemaPageInFlight.current = null;
+        }
+        if (schemaRequest.current === request) {
+          setSchemaPageLoading(false);
+        }
+      }
+    },
+    [source.generation],
+  );
+
+  useEffect(() => {
+    schemaRequest.current += 1;
+    schemaPageInFlight.current = null;
+    setSchemaNodes(schemaNodesFromSummary(source.schema));
+    setSchemaCursor(null);
+    setSchemaPageStarted(false);
+    setSchemaPageError(false);
+    if (source.schemaIsTruncated && summary !== null) {
+      void loadSchemaPage(null);
+    }
+  }, [loadSchemaPage, source.schema, source.schemaIsTruncated, summary]);
+  const schemaTree = useMemo(
+    () => materializeSchemaTree(schemaNodes, schemaCursor, schemaPageStarted),
+    [schemaCursor, schemaNodes, schemaPageStarted],
+  );
+
   return (
     <section className="source-view" aria-label="Parquet source">
       <div className="source-heading">
-        <OpenButton opening={opening} onOpen={onOpen} />
+        {summary !== null && (
+          <>
+            <StructureUnitToggle unit={unit} onUnit={setUnit} />
+            <CopyStructureReport generation={source.generation} unit={unit} />
+          </>
+        )}
+        <OpenButton opening={opening} onOpen={onOpen} onCancel={onCancelOpen} />
       </div>
 
-      <dl className="source-facts" aria-label="File facts">
-        <Fact label="Rows" value={formatNumber(source.rowCount)} />
-        <Fact label="Row groups" value={formatNumber(source.rowGroupCount)} />
-        <Fact label="Fields" value={formatNumber(source.schema.length)} />
-        <Fact
-          label="Size"
-          value={formatFileSize(source.sizeBytes)}
-          title={`${formatNumber(source.sizeBytes)} bytes`}
-        />
-      </dl>
+      <StructureCard source={source} summary={summary} />
+      <StructureLoadStatus state={state} onCancel={cancel} onRetry={retry} />
 
-      {sourceError !== null && <SourceErrorMessage code={sourceError} />}
+      {sourceError !== null && <SourceErrorMessage error={sourceError} />}
+
+      {summary !== null && (
+        <>
+          <KeyValueMetadata generation={source.generation} summary={summary} />
+          {summary.rowGroupCount === 0 ? (
+            <p className="structure-empty">No row groups</p>
+          ) : (
+            <>
+              <StructureLayoutView
+                generation={source.generation}
+                unit={unit}
+                rowGroupCount={summary.rowGroupCount}
+                dataAvailable
+                highlightedColumn={highlightedColumn}
+                onHighlightColumn={setHighlightedColumn}
+                selectedRow={selectedRowGroup?.row ?? null}
+                onSelectRow={(row) =>
+                  setSelectedRowGroup((current) => ({
+                    row,
+                    request: (current?.request ?? 0) + 1,
+                  }))
+                }
+                onOpenRow={(rowGroupIndex) => {
+                  setDataBridgeError(null);
+                  void getStructureRowOffset(
+                    source.generation,
+                    rowGroupIndex,
+                  ).then(onOpenData, () => {
+                    setDataBridgeError(
+                      "This row group could not be located in Data.",
+                    );
+                  });
+                }}
+              />
+              {dataBridgeError !== null && (
+                <p className="structure-status-error" role="alert">
+                  {dataBridgeError}
+                </p>
+              )}
+              <RowGroupTable
+                generation={source.generation}
+                unit={unit}
+                rowGroupCount={summary.rowGroupCount}
+                requestedRow={selectedRowGroup}
+              />
+              <ColumnTable
+                generation={source.generation}
+                unit={unit}
+                columnCount={summary.columnCount}
+              />
+            </>
+          )}
+        </>
+      )}
 
       <div className="schema-card">
         <h2>Schema</h2>
+        {source.schemaIsTruncated && (
+          <p className="structure-truncation" role="status">
+            The open summary shows a bounded schema prefix. Load more columns
+            here without sending the complete schema to the UI at once.
+          </p>
+        )}
         <ul className="schema-tree">
-          {source.schema.map((field, fieldIndex) => (
-            <SchemaTreeNode key={fieldIndex} field={field} />
-          ))}
+          {(source.schemaIsTruncated ? schemaTree : source.schema).map(
+            (field, fieldIndex) => (
+              <SchemaTreeNode
+                key={fieldIndex}
+                field={field}
+                leafOffset={leafOffsets[fieldIndex] ?? 0}
+                selectedLeaf={highlightedColumn}
+                onSelectLeaf={setHighlightedColumn}
+              />
+            ),
+          )}
         </ul>
+        {source.schemaIsTruncated &&
+          (!schemaPageStarted || schemaCursor !== null) && (
+            <button
+              className="tonal-button"
+              type="button"
+              disabled={schemaPageLoading || summary === null}
+              onClick={() => void loadSchemaPage(schemaCursor)}
+            >
+              {schemaPageLoading ? "Loading schema…" : "Load more columns"}
+            </button>
+          )}
+        {schemaPageError && (
+          <p className="structure-status-error" role="alert">
+            More schema columns could not be loaded.
+          </p>
+        )}
+        {!source.schemaIsTruncated &&
+          summary !== null &&
+          summary.columnCount > schemaLeafCountForFields(source.schema) && (
+            <p className="structure-truncation">
+              {formatNumber(
+                summary.columnCount - schemaLeafCountForFields(source.schema),
+              )}{" "}
+              further columns are not rendered in the schema tree.
+            </p>
+          )}
+        {(source.stringsTruncated || summary?.stringsTruncated) && (
+          <p className="structure-truncation">
+            Long footer labels are shortened in this view.
+          </p>
+        )}
       </div>
     </section>
   );
 }
 
-function Fact({
-  label,
-  value,
-  title,
-}: {
-  label: string;
-  value: string;
-  title?: string;
-}) {
-  return (
-    <div>
-      <dt>{label}</dt>
-      <dd className="fact-value" title={title}>
-        {value}
-      </dd>
-    </div>
-  );
+function schemaLeafCount(field: SourceSummary["schema"][number]): number {
+  return field.children.length === 0
+    ? 1
+    : field.children.reduce(
+        (count, child) => count + schemaLeafCount(child),
+        0,
+      );
 }
 
-function SourceErrorMessage({ code }: { code: SourceErrorCode }) {
-  const messages: Record<SourceErrorCode, string> = {
-    notFound: "That file is no longer available. Choose it again.",
-    permissionDenied:
-      "Viewda cannot read that file. Check its permissions and try again.",
-    notParquet: "That file is not Parquet. Choose a .parquet file.",
-    corruptFooter:
-      "The Parquet footer is damaged or incomplete. Choose another file.",
-    unsupported: "Viewda cannot inspect that source yet. Choose another file.",
+function schemaNodesFromSummary(
+  schema: SourceSummary["schema"],
+): SourceSchemaNode[] {
+  const nodes: SourceSchemaNode[] = [];
+  let leafIndex = 0;
+  const visit = (fields: SourceSummary["schema"], parent: number[]) => {
+    fields.forEach((field, index) => {
+      const path = [...parent, index];
+      const hasChildren =
+        field.children.length > 0 || field.physicalType === "GROUP";
+      nodes.push({
+        path,
+        name: field.name,
+        physicalType: field.physicalType,
+        logicalType: field.logicalType,
+        hasChildren,
+        leafIndex: hasChildren ? null : leafIndex++,
+      });
+      visit(field.children, path);
+    });
   };
+  visit(schema, []);
+  return nodes;
+}
 
-  return (
-    <p className="source-error" role="alert">
-      {messages[code]}
-    </p>
+function mergeSchemaNodes(
+  current: SourceSchemaNode[],
+  incoming: SourceSchemaNode[],
+): SourceSchemaNode[] {
+  const merged = new Map(current.map((node) => [node.path.join("."), node]));
+  incoming.forEach((node) => merged.set(node.path.join("."), node));
+  return [...merged.values()].sort((left, right) =>
+    compareSchemaPaths(left.path, right.path),
   );
 }
 
-function formatNumber(value: number): string {
-  return new Intl.NumberFormat("en-US").format(value);
+function materializeSchemaTree(
+  nodes: SourceSchemaNode[],
+  nextCursor: SourceSchemaNodeCursor | null,
+  pageStarted: boolean,
+): RenderedSchemaField[] {
+  const roots: RenderedSchemaField[] = [];
+  const fields = new Map<string, RenderedSchemaField>();
+  for (const node of nodes) {
+    const field: RenderedSchemaField = {
+      name: node.name,
+      physicalType: node.physicalType,
+      logicalType: node.logicalType,
+      children: [],
+      leafIndex: node.leafIndex,
+      hasUnloadedChildren:
+        node.hasChildren &&
+        (!pageStarted ||
+          (nextCursor !== null &&
+            isSchemaPathPrefix(node.path, nextCursor.path))),
+    };
+    fields.set(node.path.join("."), field);
+    const parent = fields.get(node.path.slice(0, -1).join("."));
+    if (parent === undefined) {
+      roots.push(field);
+    } else {
+      parent.children.push(field);
+      if (
+        pageStarted &&
+        (nextCursor === null ||
+          !isSchemaPathPrefix(node.path.slice(0, -1), nextCursor.path))
+      ) {
+        parent.hasUnloadedChildren = false;
+      }
+    }
+  }
+  return roots;
 }
 
-export function formatFileSize(bytes: number): string {
-  const units = ["B", "kB", "MB", "GB", "TB"];
-  if (bytes < 1_000) {
-    return `${bytes} B`;
+function compareSchemaPaths(left: number[], right: number[]): number {
+  for (let index = 0; index < Math.min(left.length, right.length); index += 1) {
+    if (left[index] !== right[index]) {
+      return (left[index] ?? 0) - (right[index] ?? 0);
+    }
   }
+  return left.length - right.length;
+}
 
-  let value = bytes;
-  let unit = 0;
-  while (value >= 1_000 && unit < units.length - 1) {
-    value /= 1_000;
-    unit += 1;
-  }
+function isSchemaPathPrefix(prefix: number[], path: number[]): boolean {
+  return (
+    prefix.length < path.length &&
+    prefix.every((component, index) => component === path[index])
+  );
+}
 
-  if (value >= 999.95 && unit < units.length - 1) {
-    value /= 1_000;
-    unit += 1;
-  }
+function schemaLeafOffsets(schema: SourceSummary["schema"]): number[] {
+  let offset = 0;
+  return schema.map((field) => {
+    const current = offset;
+    offset += schemaLeafCount(field);
+    return current;
+  });
+}
 
-  return `${value.toFixed(1)} ${units[unit]}`;
+function schemaLeafCountForFields(schema: SourceSummary["schema"]): number {
+  return schema.reduce((count, field) => count + schemaLeafCount(field), 0);
 }

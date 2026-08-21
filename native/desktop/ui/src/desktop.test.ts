@@ -2,7 +2,9 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import {
   activateOpenedSource,
+  cancelSourceOpen,
   cancelDataView,
+  cancelStructureBloomProbe,
   cancelTextValueSuggestions,
   ColumnStatisticsCommandError,
   DataExportCommandError,
@@ -13,9 +15,24 @@ import {
   getDataViewSettings,
   getDataWindow,
   getDataViewStatus,
+  getDatasetMembers,
+  getDatasetPartitions,
+  getDatasetPreview,
+  getDatasetStatus,
+  DatasetCommandError,
+  getStructureColumns,
+  getSourceSchemaNodePage,
+  getSourceOpenProgress,
+  getStructureLoadProgress,
+  getStructureSummary,
   getTextValueSuggestions,
+  probeStructureBloomFilter,
+  StructureCommandError,
   installPendingUpdate,
   listOpenedSources,
+  openLocalSource,
+  openLocalFolder,
+  openRecentSource,
   prepareDataView,
   revealDataExport,
   revealOpenedSource,
@@ -118,6 +135,230 @@ describe("desktop seam", () => {
     ]);
   });
 
+  it("passes structure paging and probe arguments through the desktop seam", async () => {
+    invokeMock
+      .mockResolvedValueOnce({
+        offset: 0,
+        totalCount: 1,
+        totalCompressedBytes: 10,
+        totalUncompressedBytes: 30,
+        columns: [],
+      })
+      .mockResolvedValueOnce({
+        columnIndex: 1,
+        offset: 0,
+        totalCount: 1,
+        rowGroups: [{ index: 0, outcome: "definitelyAbsent" }],
+      })
+      .mockResolvedValueOnce(undefined);
+
+    await getStructureColumns(7, "uncompressed", "bytes", "descending", 20, 50);
+    await probeStructureBloomFilter(7, 1, "north", 0, 64);
+    await cancelStructureBloomProbe(7);
+
+    expect(invokeMock).toHaveBeenNthCalledWith(1, "get_structure_columns", {
+      generation: 7,
+      unit: "uncompressed",
+      sort: "bytes",
+      direction: "descending",
+      offset: 20,
+      limit: 50,
+    });
+    expect(invokeMock).toHaveBeenNthCalledWith(
+      2,
+      "probe_structure_bloom_filter",
+      { generation: 7, columnIndex: 1, value: "north", offset: 0, limit: 64 },
+    );
+    expect(invokeMock).toHaveBeenNthCalledWith(
+      3,
+      "cancel_structure_bloom_probe",
+      { generation: 7 },
+    );
+  });
+
+  it("passes the stable nested schema cursor through the desktop seam", async () => {
+    invokeMock.mockResolvedValue({
+      nodes: [],
+      nextCursor: null,
+      totalCount: 0,
+    });
+
+    await getSourceSchemaNodePage(7, { path: [1, 254], leafIndex: 255 }, 256);
+
+    expect(invokeMock).toHaveBeenCalledWith("get_source_schema_node_page", {
+      generation: 7,
+      cursor: { path: [1, 254], leafIndex: 255 },
+      limit: 256,
+    });
+  });
+
+  it("reads the coarse source-open phase without exposing a path", async () => {
+    invokeMock.mockResolvedValue("decodingFooter");
+
+    await expect(getSourceOpenProgress()).resolves.toBe("decodingFooter");
+
+    expect(invokeMock).toHaveBeenCalledWith(
+      "get_source_open_progress",
+      undefined,
+    );
+  });
+
+  it("keeps source-open cancellation scoped to the client attempt", async () => {
+    invokeMock
+      .mockResolvedValueOnce(null)
+      .mockResolvedValueOnce("cancelled")
+      .mockResolvedValueOnce({ generation: 2 });
+
+    await openLocalSource("attempt-local");
+    await expect(cancelSourceOpen("attempt-local")).resolves.toBe("cancelled");
+    await openRecentSource("recent-1", "attempt-recent");
+
+    expect(invokeMock.mock.calls).toEqual([
+      [
+        "open_local_source",
+        { attempt: "attempt-local", groupAsDataset: false },
+      ],
+      ["cancel_source_open", { attempt: "attempt-local" }],
+      ["open_recent_source", { id: "recent-1", attempt: "attempt-recent" }],
+    ]);
+  });
+
+  it("keeps dataset paging and grouping arguments path-free", async () => {
+    invokeMock
+      .mockResolvedValueOnce(null)
+      .mockResolvedValueOnce(null)
+      .mockResolvedValueOnce({ state: "inspecting" })
+      .mockResolvedValueOnce({ members: [], offset: 100, total: 100 })
+      .mockResolvedValueOnce({ nodes: [], nextAfter: null });
+
+    await openLocalSource("files", true);
+    await openLocalFolder("folder");
+    await getDatasetStatus(9);
+    await getDatasetMembers(9, 100, 50);
+    await getDatasetPartitions(
+      9,
+      [{ key: "year", value: "2026" }],
+      { key: "month", value: "08" },
+      50,
+    );
+
+    expect(invokeMock.mock.calls).toEqual([
+      ["open_local_source", { attempt: "files", groupAsDataset: true }],
+      ["open_local_folder", { attempt: "folder" }],
+      ["get_dataset_status", { generation: 9 }],
+      ["get_dataset_members", { generation: 9, offset: 100, limit: 50 }],
+      [
+        "get_dataset_partitions",
+        {
+          generation: 9,
+          parent: [{ key: "year", value: "2026" }],
+          after: { key: "month", value: "08" },
+          limit: 50,
+        },
+      ],
+    ]);
+  });
+
+  it("preserves the relative dataset member in typed errors", async () => {
+    invokeMock.mockRejectedValue({
+      code: "sourceChanged",
+      member: "year=2026/part-01.parquet",
+    });
+
+    const error = await getDatasetStatus(3).catch((caught) => caught);
+
+    expect(error).toBeInstanceOf(DatasetCommandError);
+    expect(error).toMatchObject({
+      detail: {
+        code: "sourceChanged",
+        member: "year=2026/part-01.parquet",
+      },
+    });
+  });
+
+  it("preserves session and nested dataset window errors", async () => {
+    invokeMock
+      .mockRejectedValueOnce({ code: "noSourceOpen" })
+      .mockRejectedValueOnce({
+        code: "window",
+        error: { code: "resourceExhausted" },
+      })
+      .mockRejectedValueOnce({
+        code: "window",
+        error: { code: "queryFailed" },
+      });
+
+    await expect(getDatasetStatus(3)).rejects.toMatchObject({
+      detail: { code: "noSourceOpen" },
+    });
+    await expect(getDatasetPreview(3)).rejects.toMatchObject({
+      detail: {
+        code: "window",
+        error: { code: "resourceExhausted" },
+      },
+    });
+    await expect(getDataWindow(3, 0, 0, 10, [0])).rejects.toMatchObject({
+      code: "queryFailed",
+    });
+  });
+
+  it("preserves relative members from direct and prepared data errors", async () => {
+    invokeMock
+      .mockRejectedValueOnce({
+        code: "sourceChanged",
+        member: "year=2026/changed.parquet",
+      })
+      .mockRejectedValueOnce({
+        code: "invalidMember",
+        member: "year=2026/broken.parquet",
+      });
+
+    const direct = await getDataWindow(3, 0, 0, 10, [0]).catch(
+      (error) => error,
+    );
+    const prepared = await prepareDataView(3, 1, [], [], {
+      memoryLimit: "mb384",
+    }).catch((error) => error);
+
+    expect(direct).toMatchObject({
+      code: "sourceChanged",
+      detail: {
+        code: "sourceChanged",
+        member: "year=2026/changed.parquet",
+      },
+    });
+    expect(prepared).toMatchObject({
+      code: "invalidMember",
+      detail: {
+        code: "invalidMember",
+        member: "year=2026/broken.parquet",
+      },
+    });
+  });
+
+  it("narrows structure failures to their closed code set", async () => {
+    invokeMock
+      .mockRejectedValueOnce({ code: "notLoaded" })
+      .mockRejectedValueOnce({ code: "a code this build does not know" });
+
+    const known = await getStructureSummary(1).catch((error: unknown) => error);
+    expect(known).toBeInstanceOf(StructureCommandError);
+    expect(known).toMatchObject({ code: "notLoaded" });
+
+    await expect(getStructureSummary(1)).rejects.toMatchObject({
+      code: "unsupported",
+    });
+  });
+
+  it("reports an absent structure load as no progress", async () => {
+    invokeMock.mockResolvedValueOnce(null);
+
+    await expect(getStructureLoadProgress(3)).resolves.toBeNull();
+    expect(invokeMock).toHaveBeenCalledWith("get_structure_load_progress", {
+      generation: 3,
+    });
+  });
+
   it("passes text suggestion revisions through the desktop seam", async () => {
     invokeMock
       .mockResolvedValueOnce({
@@ -165,7 +406,7 @@ describe("desktop seam", () => {
     await expect(takePostUpdateState()).resolves.toEqual({
       version: "0.1.0",
       sources: [],
-      sourceError: "notFound",
+      sourceError: { code: "notFound" },
     });
     expect(invokeMock).toHaveBeenCalledWith("take_post_update_state");
   });

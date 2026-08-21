@@ -14,7 +14,8 @@ use tauri::{Emitter, Manager};
 use viewda_data_engine::SourceError;
 
 use crate::{
-    OpenSourceError, OpenedSource, OpenedSourceInfo, SourceOpenIntent, inspect_selected_source,
+    OpenSourceError, OpenedSource, OpenedSourceInfo, SourceDescriptor, SourceOpenIntent,
+    inspect_selected_source, open_dataset_descriptor_from_native, open_explicit_files_from_native,
 };
 
 pub const OPENED_SOURCE_AVAILABLE_EVENT: &str = "opened-source-available";
@@ -31,7 +32,7 @@ pub struct PendingOpenedSource(Mutex<VecDeque<OpenedSourceActivation>>);
 #[serde(rename_all = "camelCase")]
 pub struct OpenedSourceActivation {
     source: Option<OpenedSourceInfo>,
-    source_error: Option<SourceError>,
+    source_error: Option<OpenSourceError>,
 }
 
 #[tauri::command]
@@ -52,11 +53,15 @@ pub fn open_path(app: &tauri::AppHandle, path: PathBuf) {
         },
         Err(OpenSourceError::Source(error)) => OpenedSourceActivation {
             source: None,
-            source_error: Some(error),
+            source_error: Some(error.into()),
         },
         Err(OpenSourceError::Recent(_)) => OpenedSourceActivation {
             source: None,
-            source_error: Some(SourceError::Unsupported),
+            source_error: Some(SourceError::Unsupported.into()),
+        },
+        Err(error @ OpenSourceError::Dataset(_)) => OpenedSourceActivation {
+            source: None,
+            source_error: Some(error),
         },
     };
 
@@ -72,11 +77,15 @@ pub fn open_recent(app: &tauri::AppHandle, id: &str) {
         },
         Err(OpenSourceError::Source(error)) => OpenedSourceActivation {
             source: None,
-            source_error: Some(error),
+            source_error: Some(error.into()),
         },
         Err(OpenSourceError::Recent(_)) => OpenedSourceActivation {
             source: None,
-            source_error: Some(SourceError::Unsupported),
+            source_error: Some(SourceError::Unsupported.into()),
+        },
+        Err(error @ OpenSourceError::Dataset(_)) => OpenedSourceActivation {
+            source: None,
+            source_error: Some(error),
         },
     };
     publish(app, activation);
@@ -87,8 +96,13 @@ pub fn open_recent(app: &tauri::AppHandle, id: &str) {
 ///
 /// Files open in drop order, so the last one dropped becomes the active source.
 pub fn open_dropped_paths(app: &tauri::AppHandle, paths: Vec<PathBuf>) {
-    match dropped_parquet_paths(paths) {
-        Ok(paths) => {
+    let group_files = platform_alt_modifier_active();
+    match classify_dropped_paths(paths, group_files) {
+        Ok(DroppedSource::Folder(path)) => publish_dataset(app, DatasetDrop::Folder(path)),
+        Ok(DroppedSource::FileDataset(paths)) => {
+            publish_dataset(app, DatasetDrop::ExplicitFiles(paths));
+        }
+        Ok(DroppedSource::Files(paths)) => {
             for path in paths {
                 open_path(app, path);
             }
@@ -97,12 +111,106 @@ pub fn open_dropped_paths(app: &tauri::AppHandle, paths: Vec<PathBuf>) {
     }
 }
 
-fn dropped_parquet_paths(paths: Vec<PathBuf>) -> Result<Vec<PathBuf>, SourceError> {
-    let paths: Vec<PathBuf> = paths.into_iter().filter(|path| is_parquet(path)).collect();
+// WRY's cross-platform drop event omits keyboard modifiers, so the native
+// callback samples the platform state at Drop instead of trusting webview focus.
+#[cfg(target_os = "linux")]
+fn platform_alt_modifier_active() -> bool {
+    use gtk::gdk::{Display, Keymap, ModifierType};
+
+    Display::default()
+        .and_then(|display| Keymap::for_display(&display))
+        .is_some_and(|keymap| keymap.modifier_state() & ModifierType::MOD1_MASK.bits() != 0)
+}
+
+#[cfg(target_os = "windows")]
+fn platform_alt_modifier_active() -> bool {
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, VK_MENU};
+
+    // The high bit is the key's current state; the low bit is historical.
+    unsafe { GetAsyncKeyState(VK_MENU.into()) as u16 & 0x8000 != 0 }
+}
+
+#[cfg(target_os = "macos")]
+fn platform_alt_modifier_active() -> bool {
+    use objc2_app_kit::{NSEvent, NSEventModifierFlags};
+
+    NSEvent::modifierFlags_class().contains(NSEventModifierFlags::Option)
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "macos")))]
+fn platform_alt_modifier_active() -> bool {
+    false
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum DroppedSource {
+    Folder(PathBuf),
+    Files(Vec<PathBuf>),
+    FileDataset(Vec<PathBuf>),
+}
+
+fn classify_dropped_paths(
+    paths: Vec<PathBuf>,
+    group_files: bool,
+) -> Result<DroppedSource, SourceError> {
     if paths.is_empty() {
         return Err(SourceError::NotParquet);
     }
-    Ok(paths)
+    if paths.len() == 1 && paths[0].is_dir() {
+        return Ok(DroppedSource::Folder(
+            paths.into_iter().next().expect("one path"),
+        ));
+    }
+    if paths.iter().any(|path| path.is_dir() || !is_parquet(path)) {
+        return Err(SourceError::NotParquet);
+    }
+    if group_files && paths.len() > 1 {
+        Ok(DroppedSource::FileDataset(paths))
+    } else {
+        Ok(DroppedSource::Files(paths))
+    }
+}
+
+enum DatasetDrop {
+    Folder(PathBuf),
+    ExplicitFiles(Vec<PathBuf>),
+}
+
+fn publish_dataset(app: &tauri::AppHandle, dropped: DatasetDrop) {
+    let app = app.clone();
+    tauri::async_runtime::spawn(async move {
+        let worker_app = app.clone();
+        let activation = tauri::async_runtime::spawn_blocking(move || {
+            let opened = match dropped {
+                DatasetDrop::Folder(path) => {
+                    open_dataset_descriptor_from_native(&worker_app, SourceDescriptor::Folder(path))
+                }
+                DatasetDrop::ExplicitFiles(paths) => {
+                    open_explicit_files_from_native(&worker_app, paths)
+                }
+            };
+            match opened {
+                Ok(source) => OpenedSourceActivation {
+                    source: Some(source),
+                    source_error: None,
+                },
+                Err(OpenSourceError::Recent(_)) => OpenedSourceActivation {
+                    source: None,
+                    source_error: Some(SourceError::Unsupported.into()),
+                },
+                Err(error) => OpenedSourceActivation {
+                    source: None,
+                    source_error: Some(error),
+                },
+            }
+        })
+        .await
+        .unwrap_or_else(|_| OpenedSourceActivation {
+            source: None,
+            source_error: Some(SourceError::Unsupported.into()),
+        });
+        publish(&app, activation);
+    });
 }
 
 fn is_parquet(path: &Path) -> bool {
@@ -117,7 +225,7 @@ fn report_source_error(app: &tauri::AppHandle, error: SourceError) {
         app,
         OpenedSourceActivation {
             source: None,
-            source_error: Some(error),
+            source_error: Some(error.into()),
         },
     );
 }
@@ -229,27 +337,94 @@ mod tests {
     }
 
     #[test]
-    fn a_drop_opens_its_parquet_files_in_drop_order() {
+    fn a_plain_drop_keeps_parquet_files_in_drop_order() {
+        let dropped = classify_dropped_paths(
+            vec![
+                PathBuf::from("/data/first.parquet"),
+                PathBuf::from("/data/second.PARQUET"),
+            ],
+            false,
+        )
+        .expect("plain Parquet drop");
+        let DroppedSource::Files(paths) = dropped else {
+            panic!("plain drop must keep separate files");
+        };
         assert_eq!(
-            dropped_parquet_paths(vec![
-                PathBuf::from("/data/notes.txt"),
+            paths,
+            [
                 PathBuf::from("/data/first.parquet"),
                 PathBuf::from("/data/second.PARQUET"),
-            ]),
-            Ok(vec![
-                PathBuf::from("/data/first.parquet"),
-                PathBuf::from("/data/second.PARQUET"),
-            ])
+            ]
         );
     }
 
     #[test]
     fn a_drop_without_parquet_files_reports_one_source_error() {
         assert_eq!(
-            dropped_parquet_paths(vec![
-                PathBuf::from("/data/notes.txt"),
-                PathBuf::from("/data/table.csv"),
-            ]),
+            classify_dropped_paths(
+                vec![
+                    PathBuf::from("/data/notes.txt"),
+                    PathBuf::from("/data/table.csv"),
+                ],
+                false,
+            ),
+            Err(SourceError::NotParquet)
+        );
+    }
+
+    #[test]
+    fn dataset_activation_keeps_the_path_free_dataset_error_shape() {
+        let activation = OpenedSourceActivation {
+            source: None,
+            source_error: Some(
+                viewda_data_engine::DatasetError::InvalidMember {
+                    member: "partition/broken.parquet".to_owned(),
+                }
+                .into(),
+            ),
+        };
+
+        assert_eq!(
+            serde_json::to_value(activation).expect("activation JSON"),
+            serde_json::json!({
+                "source": null,
+                "sourceError": {
+                    "code": "invalidMember",
+                    "member": "partition/broken.parquet",
+                },
+            })
+        );
+    }
+
+    #[test]
+    fn modifier_groups_only_multiple_parquet_files() {
+        let dropped = classify_dropped_paths(
+            vec![PathBuf::from("a.parquet"), PathBuf::from("b.parquet")],
+            true,
+        )
+        .expect("grouped Parquet drop");
+        assert!(matches!(dropped, DroppedSource::FileDataset(paths) if paths.len() == 2));
+    }
+
+    #[test]
+    fn one_folder_drop_is_always_a_folder_dataset() {
+        let directory = tempdir().expect("drop folder");
+        let dropped = classify_dropped_paths(vec![directory.path().to_path_buf()], false)
+            .expect("folder drop");
+        assert!(matches!(dropped, DroppedSource::Folder(path) if path == directory.path()));
+    }
+
+    #[test]
+    fn mixed_folder_and_file_drop_is_rejected() {
+        let directory = tempdir().expect("drop folder");
+        assert_eq!(
+            classify_dropped_paths(
+                vec![
+                    directory.path().to_path_buf(),
+                    PathBuf::from("part.parquet")
+                ],
+                true,
+            ),
             Err(SourceError::NotParquet)
         );
     }

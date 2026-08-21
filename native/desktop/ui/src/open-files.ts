@@ -1,4 +1,4 @@
-// The window's model of the files that are open. Rust owns the set, the
+// The window's model of the sources that are open. Rust owns the set, the
 // most-recently-used order and the display metadata; the window adds what only
 // it knows: the summary it received when the file opened and the view mode.
 
@@ -10,12 +10,13 @@ export interface OpenFile extends OpenedSourceEntry {
   summary: SourceSummary;
   mode: SourceMode;
   busy: boolean;
+  dataTargetRow?: { row: number; request: number };
 }
 
 /**
- * Rebuilds the open files from a native listing, keeping per-file window state.
+ * Rebuilds the open sources from a native listing, keeping per-source window state.
  *
- * A file whose summary never reached the window cannot be rendered and is left
+ * A source whose summary never reached the window cannot be rendered and is left
  * out; it stays open natively until it is closed.
  */
 export function mergeOpenFiles(
@@ -35,6 +36,7 @@ export function mergeOpenFiles(
         summary,
         mode: kept?.mode ?? "data",
         busy: kept?.busy ?? false,
+        dataTargetRow: kept?.dataTargetRow,
       },
     ];
   });
@@ -52,13 +54,17 @@ function sameOpenFiles(
       return (
         other !== undefined &&
         file.generation === other.generation &&
+        file.kind === other.kind &&
+        file.datasetMemberCount === other.datasetMemberCount &&
+        file.datasetIgnoredFileCount === other.datasetIgnoredFileCount &&
         file.name === other.name &&
         file.directory === other.directory &&
         file.path === other.path &&
         file.active === other.active &&
         file.summary === other.summary &&
         file.mode === other.mode &&
-        file.busy === other.busy
+        file.busy === other.busy &&
+        file.dataTargetRow === other.dataTargetRow
       );
     })
   );

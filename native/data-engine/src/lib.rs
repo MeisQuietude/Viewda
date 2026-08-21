@@ -1,12 +1,15 @@
 //! Shell-independent data inspection and query operations for Viewda.
 
 #[cfg(feature = "query-engine")]
+mod dataset;
+#[cfg(feature = "query-engine")]
 mod export;
 #[cfg(feature = "query-engine")]
 mod filter;
 mod source;
 #[cfg(feature = "query-engine")]
 mod statistics;
+mod structure;
 #[cfg(feature = "query-engine")]
 mod suggestions;
 #[cfg(feature = "query-engine")]
@@ -22,16 +25,36 @@ use serde::Serialize;
 use thiserror::Error;
 
 #[cfg(feature = "query-engine")]
+pub use dataset::{
+    DatasetError, DatasetInspectionInterruptHandle, DatasetInspectionProgress, DatasetInspector,
+    DatasetMemberPage, DatasetMemberSnapshot, DatasetMemberSummary, DatasetPartitionNode,
+    DatasetPartitionPage, DatasetPreview, DatasetSource, DatasetSummary,
+    DatasetWindowInterruptHandle, DatasetWindowReader, PartitionValue,
+};
+#[cfg(feature = "query-engine")]
 pub use export::{
     CsvExportOptions, DataExportCancellation, DataExportError, DataExportFormat,
     DataExportProgress, DataExportReader, DataExportRequest, ExportRowRange,
 };
 #[cfg(feature = "query-engine")]
 pub use filter::{DataFilter, DataFilterOperator};
-pub use source::{SchemaField, SourceError, SourceSummary, inspect_local_source};
+pub use source::{
+    SchemaField, SourceError, SourceIdentity, SourceOpenPhase, SourceSnapshot, SourceSummary,
+    inspect_local_source, inspect_local_source_snapshot, inspect_local_source_snapshot_cancellable,
+};
 #[cfg(feature = "query-engine")]
 pub use statistics::{
     ColumnStatistics, ColumnStatisticsError, ColumnStatisticsReader, StatisticsInterruptHandle,
+};
+pub use structure::{
+    StructureBloomProbe, StructureBloomProbeOutcome, StructureBloomProbeResult, StructureByteUnit,
+    StructureCancellation, StructureChunkDetails, StructureChunkStatistics, StructureCodecTotal,
+    StructureColumnPage, StructureColumnSort, StructureColumnSummary, StructureError,
+    StructureKeyValue, StructureKeyValueEntry, StructureLayout, StructureLayoutOverviewBucket,
+    StructureLayoutRow, StructureLayoutSegment, StructureLayoutTail, StructureLensTotal,
+    StructureLensTotals, StructureLoadProgress, StructureLoadSnapshot, StructurePresenceTotals,
+    StructureRatioStep, StructureReader, StructureRowGroupPage, StructureRowGroupSort,
+    StructureRowGroupSummary, StructureSortDirection, StructureSummary,
 };
 #[cfg(feature = "query-engine")]
 pub use suggestions::{
