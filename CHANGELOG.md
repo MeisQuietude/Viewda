@@ -8,6 +8,8 @@ Backward-incompatible entries start with **Breaking:**.
 
 ## Unreleased
 
+## 0.2.0 — 2026-08-21
+
 ### Added
 
 - Keep several Parquet files open with independent reading state and background
