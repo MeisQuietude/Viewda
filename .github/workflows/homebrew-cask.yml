@@ -22,7 +22,7 @@ jobs:
       # The deploy key bypasses the pull-request ruleset on main, and unlike
       # GITHUB_TOKEN its pushes still trigger CI on the bumped commit.
       - name: Check out main with the push deploy key
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
         with:
           ref: main
           ssh-key: ${{ secrets.CASK_BUMP_DEPLOY_KEY }}
