@@ -50,6 +50,7 @@ function rowGroup(
     chunkCount: 4,
     chunksWithBloomFilter: 1,
     isReadable: true,
+    hasLayoutFacts: true,
     ...overrides,
   };
 }
@@ -206,6 +207,68 @@ describe("RowGroupTable", () => {
     );
   });
 
+  it("returns to file order and highlights a row selected in the layout", async () => {
+    const targetRow = 1_000;
+    const fetchPage = vi
+      .spyOn(desktop, "getStructureRowGroups")
+      .mockImplementation(
+        async (_generation, _unit, _sort, _direction, offset, limit) => ({
+          offset,
+          totalCount: 2_000,
+          rowGroups: Array.from(
+            { length: Math.min(limit, 2_000 - offset) },
+            (_, index) => rowGroup(offset + index),
+          ),
+        }),
+      );
+    const view = render(
+      <RowGroupTable
+        generation={1}
+        unit="compressed"
+        rowGroupCount={2_000}
+        measurementPort={measurementPort}
+      />,
+    );
+    await waitFor(() => expect(fetchPage).toHaveBeenCalledTimes(1));
+    fireEvent.click(screen.getByRole("button", { name: "Sort Bytes" }));
+    await waitFor(() =>
+      expect(fetchPage).toHaveBeenLastCalledWith(
+        1,
+        "compressed",
+        "bytes",
+        "descending",
+        0,
+        STRUCTURE_PAGE_LIMIT,
+      ),
+    );
+
+    view.rerender(
+      <RowGroupTable
+        generation={1}
+        unit="compressed"
+        rowGroupCount={2_000}
+        requestedRow={{ row: targetRow, request: 1 }}
+        measurementPort={measurementPort}
+      />,
+    );
+
+    await waitFor(() =>
+      expect(
+        fetchPage.mock.calls.some(
+          ([, , sort, direction, offset, limit]) =>
+            sort === "index" &&
+            direction === "ascending" &&
+            offset <= targetRow &&
+            offset + limit > targetRow,
+        ),
+      ).toBe(true),
+    );
+    expect(screen.getByRole("rowheader", { name: "1001" })).toHaveAttribute(
+      "aria-selected",
+      "true",
+    );
+  });
+
   it("marks a row group whose footer entry is inconsistent", async () => {
     vi.spyOn(desktop, "getStructureRowGroups").mockResolvedValue({
       offset: 0,
@@ -214,6 +277,7 @@ describe("RowGroupTable", () => {
         rowGroup(0),
         rowGroup(1, {
           isReadable: false,
+          hasLayoutFacts: false,
           rowCount: 0,
           compressedBytes: 0,
           uncompressedBytes: 0,
@@ -251,6 +315,39 @@ describe("RowGroupTable", () => {
     );
     expect(cells[5]).toHaveClass("is-faded");
     expect(cells[0]).not.toHaveClass("is-faded");
+  });
+
+  it("keeps footer-recorded facts visible when only data pages are unavailable", async () => {
+    vi.spyOn(desktop, "getStructureRowGroups").mockResolvedValue({
+      offset: 0,
+      totalCount: 1,
+      rowGroups: [rowGroup(0, { isReadable: false, hasLayoutFacts: true })],
+    });
+
+    render(
+      <RowGroupTable
+        generation={1}
+        unit="compressed"
+        rowGroupCount={1}
+        measurementPort={measurementPort}
+      />,
+    );
+
+    await waitFor(() =>
+      expect(cellTexts("Row groups")).toEqual([
+        "0",
+        "1,000",
+        "500.0 kB",
+        "×3.0",
+        "1 of 4",
+      ]),
+    );
+    const cells = within(screen.getByLabelText("Row groups")).getAllByRole(
+      "gridcell",
+    );
+    expect(cells.every((cell) => cell.classList.contains("is-faded"))).toBe(
+      true,
+    );
   });
 
   it("reports a page the engine refused", async () => {

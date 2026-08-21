@@ -39,7 +39,7 @@ export function StructureCard({
       />
       <Fact
         label="Columns"
-        value={formatNumber(summary?.columnCount ?? source.schema.length)}
+        value={formatNumber(summary?.columnCount ?? source.columnCount)}
       />
       <Fact
         label={<StructureHelp term="Rows per group" />}
@@ -178,8 +178,12 @@ export function StructureLoadStatus({
   onRetry: () => void;
 }) {
   if (state.kind === "loading") {
-    const total = state.progress?.totalRowGroups ?? 0;
-    const completed = state.progress?.completedRowGroups ?? 0;
+    const chunkTotal = state.progress?.totalChunks ?? 0;
+    const total = chunkTotal || state.progress?.totalRowGroups || 0;
+    const completed = chunkTotal
+      ? (state.progress?.completedChunks ?? 0)
+      : (state.progress?.completedRowGroups ?? 0);
+    const itemLabel = chunkTotal ? "column chunks" : "row groups";
     return (
       <section className="structure-status" aria-label="Reading file structure">
         <p
@@ -189,13 +193,13 @@ export function StructureLoadStatus({
         >
           {total === 0
             ? "Reading the Parquet footer…"
-            : `Summarizing ${formatNumber(completed)} of ${formatNumber(total)} row groups…`}
+            : `Summarizing ${formatNumber(completed)} of ${formatNumber(total)} ${itemLabel}…`}
         </p>
         {total === 0 ? (
           <progress aria-label="Reading the Parquet footer" />
         ) : (
           <progress
-            aria-label="Summarizing row groups"
+            aria-label={`Summarizing ${itemLabel}`}
             value={completed}
             max={total}
           />

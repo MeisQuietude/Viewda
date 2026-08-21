@@ -2,6 +2,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import {
   activateOpenedSource,
+  cancelSourceOpen,
   cancelDataView,
   cancelStructureBloomProbe,
   cancelTextValueSuggestions,
@@ -15,6 +16,8 @@ import {
   getDataWindow,
   getDataViewStatus,
   getStructureColumns,
+  getSourceSchemaNodePage,
+  getSourceOpenProgress,
   getStructureLoadProgress,
   getStructureSummary,
   getTextValueSuggestions,
@@ -22,6 +25,8 @@ import {
   StructureCommandError,
   installPendingUpdate,
   listOpenedSources,
+  openLocalSource,
+  openRecentSource,
   prepareDataView,
   revealDataExport,
   revealOpenedSource,
@@ -163,6 +168,50 @@ describe("desktop seam", () => {
       "cancel_structure_bloom_probe",
       { generation: 7 },
     );
+  });
+
+  it("passes the stable nested schema cursor through the desktop seam", async () => {
+    invokeMock.mockResolvedValue({
+      nodes: [],
+      nextCursor: null,
+      totalCount: 0,
+    });
+
+    await getSourceSchemaNodePage(7, { path: [1, 254], leafIndex: 255 }, 256);
+
+    expect(invokeMock).toHaveBeenCalledWith("get_source_schema_node_page", {
+      generation: 7,
+      cursor: { path: [1, 254], leafIndex: 255 },
+      limit: 256,
+    });
+  });
+
+  it("reads the coarse source-open phase without exposing a path", async () => {
+    invokeMock.mockResolvedValue("decodingFooter");
+
+    await expect(getSourceOpenProgress()).resolves.toBe("decodingFooter");
+
+    expect(invokeMock).toHaveBeenCalledWith(
+      "get_source_open_progress",
+      undefined,
+    );
+  });
+
+  it("keeps source-open cancellation scoped to the client attempt", async () => {
+    invokeMock
+      .mockResolvedValueOnce(null)
+      .mockResolvedValueOnce("cancelled")
+      .mockResolvedValueOnce({ generation: 2 });
+
+    await openLocalSource("attempt-local");
+    await expect(cancelSourceOpen("attempt-local")).resolves.toBe("cancelled");
+    await openRecentSource("recent-1", "attempt-recent");
+
+    expect(invokeMock.mock.calls).toEqual([
+      ["open_local_source", { attempt: "attempt-local" }],
+      ["cancel_source_open", { attempt: "attempt-local" }],
+      ["open_recent_source", { id: "recent-1", attempt: "attempt-recent" }],
+    ]);
   });
 
   it("narrows structure failures to their closed code set", async () => {

@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 
 import {
   cancelStructureBloomProbe,
@@ -31,6 +31,7 @@ export function ChunkPanel({
   selected: SelectedChunk;
   onClose: () => void;
 }) {
+  const panel = useRef<HTMLElement>(null);
   const [details, setDetails] = useState<StructureChunkDetails | null>(null);
   const [error, setError] = useState<string | null>(null);
 
@@ -51,8 +52,18 @@ export function ChunkPanel({
     };
   }, [generation, selected.columnIndex, selected.rowGroupIndex]);
 
+  useEffect(() => {
+    panel.current?.scrollIntoView?.({ block: "nearest" });
+    panel.current?.focus();
+  }, [selected.columnIndex, selected.rowGroupIndex]);
+
   return (
-    <aside className="chunk-panel" aria-label="Column chunk details">
+    <aside
+      ref={panel}
+      className="chunk-panel"
+      aria-label="Column chunk details"
+      tabIndex={-1}
+    >
       <div className="chunk-panel-heading">
         <div>
           <span>Row group {formatNumber(selected.rowGroupIndex)}</span>
@@ -196,12 +207,18 @@ function BloomProbe({
   const [value, setValue] = useState("");
   const [result, setResult] = useState<StructureBloomProbe | null>(null);
   const [status, setStatus] = useState<"idle" | "loading" | "error">("idle");
+  const request = useRef(0);
 
   useEffect(() => {
+    request.current += 1;
     setValue("");
     setResult(null);
     setStatus("idle");
-  }, [details.columnIndex]);
+    return () => {
+      request.current += 1;
+      void cancelStructureBloomProbe(generation).catch(() => {});
+    };
+  }, [details.columnIndex, generation]);
 
   if (!details.columnHasBloomFilter) {
     return (
@@ -215,21 +232,25 @@ function BloomProbe({
   }
 
   const probe = async (offset = 0) => {
+    const token = ++request.current;
     setStatus("loading");
     setResult(null);
     try {
-      setResult(
-        await probeStructureBloomFilter(
-          generation,
-          details.columnIndex,
-          value,
-          offset,
-          256,
-        ),
+      const next = await probeStructureBloomFilter(
+        generation,
+        details.columnIndex,
+        value,
+        offset,
+        256,
       );
-      setStatus("idle");
+      if (request.current === token) {
+        setResult(next);
+        setStatus("idle");
+      }
     } catch {
-      setStatus("error");
+      if (request.current === token) {
+        setStatus("error");
+      }
     }
   };
 
@@ -248,7 +269,16 @@ function BloomProbe({
         <input
           aria-label="Probe value"
           value={value}
-          onChange={(event) => setValue(event.target.value)}
+          onChange={(event) => {
+            const wasLoading = status === "loading";
+            request.current += 1;
+            setValue(event.target.value);
+            setResult(null);
+            setStatus("idle");
+            if (wasLoading) {
+              void cancelStructureBloomProbe(generation).catch(() => {});
+            }
+          }}
         />
         <button
           type="submit"
@@ -259,7 +289,11 @@ function BloomProbe({
         {status === "loading" && (
           <button
             type="button"
-            onClick={() => void cancelStructureBloomProbe(generation)}
+            onClick={() => {
+              request.current += 1;
+              setStatus("idle");
+              void cancelStructureBloomProbe(generation).catch(() => {});
+            }}
           >
             Cancel
           </button>

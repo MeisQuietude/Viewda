@@ -34,7 +34,11 @@ function file(
       sizeBytes: 8,
       rowCount: 1,
       rowGroupCount: 1,
+      columnCount: 0,
       schema: [],
+      schemaNodeCount: 0,
+      schemaIsTruncated: false,
+      stringsTruncated: false,
     },
   };
 }

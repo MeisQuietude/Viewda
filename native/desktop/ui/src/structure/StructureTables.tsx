@@ -160,16 +160,24 @@ export function RowGroupTable({
   generation,
   unit,
   rowGroupCount,
+  requestedRow,
   measurementPort,
 }: {
   generation: number;
   unit: StructureByteUnit;
   rowGroupCount: number;
+  requestedRow?: { row: number; request: number } | null;
   measurementPort?: GridMeasurementPort;
 }) {
   const [sortColumnId, setSortColumnId] = useState("index");
   const [direction, setDirection] =
     useState<StructureSortDirection>("ascending");
+  useEffect(() => {
+    if (requestedRow !== null && requestedRow !== undefined) {
+      setSortColumnId("index");
+      setDirection("ascending");
+    }
+  }, [requestedRow]);
   const { state, requestViewport } = useStructurePage<StructureRowGroupSummary>(
     rowGroupCount,
     useCallback(
@@ -197,7 +205,7 @@ export function RowGroupTable({
         return null;
       }
       const faded = !group.isReadable;
-      if (!group.isReadable && columnId !== "index") {
+      if (!group.hasLayoutFacts && columnId !== "index") {
         return { text: MISSING_FACT, faded };
       }
       switch (columnId) {
@@ -237,6 +245,7 @@ export function RowGroupTable({
         heldPage={heldPageRange(state.page)}
         getCell={getCell}
         measurementPort={measurementPort}
+        requestedRow={requestedRow}
         onSort={(columnId) =>
           applySort(columnId, sortColumnId, setSortColumnId, setDirection)
         }

@@ -1,4 +1,5 @@
 :root {
+  --layout-outline: #1b1d1e;
   color-scheme: light;
   color: #1b1d1e;
   --font-ui:
@@ -2621,6 +2622,17 @@ button:focus-visible,
   opacity: 0.55;
 }
 
+.open-source-control {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.open-source-control [role="status"] {
+  color: var(--grid-text-muted);
+  font-size: 12px;
+}
+
 .recent-files {
   width: 100%;
   margin: 18px 0 0;
@@ -2967,6 +2979,7 @@ button:focus-visible,
 }
 
 .structure-help {
+  position: relative;
   cursor: help;
   text-decoration: underline dotted;
   text-underline-offset: 3px;
@@ -3021,8 +3034,20 @@ button:focus-visible,
   height: 100%;
 }
 
+.layout-minimap span.has-bloom-filter::after {
+  position: absolute;
+  top: 2px;
+  right: 2px;
+  width: 4px;
+  height: 4px;
+  border-radius: 50%;
+  background: #fff;
+  box-shadow: 0 0 0 1px rgb(27 29 30 / 45%);
+  content: "";
+}
+
 .layout-minimap > i {
-  border: 2px solid #1b1d1e;
+  border: 2px solid var(--layout-outline);
   background: rgb(255 255 252 / 15%);
   pointer-events: none;
 }
@@ -3093,6 +3118,7 @@ button:focus-visible,
 }
 
 .layout-row-track {
+  position: relative;
   display: flex;
   align-items: stretch;
   height: 24px;
@@ -3103,7 +3129,7 @@ button:focus-visible,
 
 .layout-segment {
   position: relative;
-  min-width: 4px;
+  min-width: 0;
   padding: 0 5px;
   overflow: hidden;
   border: 0;
@@ -3118,7 +3144,7 @@ button:focus-visible,
 
 .layout-segment.is-highlighted {
   z-index: 1;
-  outline: 2px solid #1b1d1e;
+  outline: 2px solid var(--layout-outline);
   outline-offset: -2px;
 }
 
@@ -3134,7 +3160,7 @@ button:focus-visible,
 }
 
 .layout-tail {
-  min-width: 70px;
+  min-width: 4px;
   padding: 5px 7px;
   overflow: hidden;
   color: #555a5b;
@@ -3150,20 +3176,32 @@ button:focus-visible,
   white-space: nowrap;
 }
 
-.layout-row.is-unreadable .layout-row-track {
+.layout-row.is-unreadable .layout-row-track::after {
+  position: absolute;
+  z-index: 3;
+  inset: 0;
   background: repeating-linear-gradient(
     135deg,
-    #eadada,
-    #eadada 5px,
-    #d5bcbc 5px,
-    #d5bcbc 10px
+    rgb(234 218 218 / 45%),
+    rgb(234 218 218 / 45%) 5px,
+    rgb(117 72 72 / 40%) 5px,
+    rgb(117 72 72 / 40%) 10px
   );
+  content: "";
+  pointer-events: none;
 }
 
 .layout-unreadable-label {
-  padding: 5px 8px;
+  position: absolute;
+  z-index: 4;
+  top: 3px;
+  left: 6px;
+  padding: 2px 5px;
   color: #744;
   font-size: 10px;
+  background: rgb(255 255 255 / 82%);
+  border-radius: 3px;
+  pointer-events: none;
 }
 
 .layout-row-bytes {
@@ -3192,6 +3230,30 @@ button:focus-visible,
   width: 10px;
   height: 10px;
   border-radius: 3px;
+}
+
+.layout-legend i.is-dot {
+  width: 7px;
+  height: 7px;
+  margin: 0 2px;
+  border-radius: 50%;
+}
+
+.structure-help-card {
+  position: fixed;
+  z-index: 20;
+  display: block;
+  width: min(320px, 70vw);
+  padding: 10px 12px;
+  border: 1px solid rgb(27 29 30 / 16%);
+  border-radius: 7px;
+  color: #35393a;
+  background: #fff;
+  box-shadow: 0 8px 24px rgb(27 29 30 / 16%);
+  font-size: 12px;
+  font-weight: 400;
+  line-height: 1.45;
+  text-align: left;
 }
 
 .chunk-panel {
@@ -3618,4 +3680,47 @@ button:focus-visible,
 :root[data-theme="dark"] .source-error {
   border-color: rgb(241 153 142 / 20%);
   background: rgb(241 153 142 / 7%);
+}
+
+:root[data-theme="dark"] .lens-toggle button,
+:root[data-theme="dark"] .layout-axis button,
+:root[data-theme="dark"] .layout-row-label,
+:root[data-theme="dark"] .layout-row-bytes,
+:root[data-theme="dark"] .layout-legend,
+:root[data-theme="dark"] .chunk-facts dt {
+  color: #b6bbba;
+}
+
+:root[data-theme="dark"] {
+  --layout-outline: #f0f0eb;
+}
+
+:root[data-theme="dark"] .lens-toggle,
+:root[data-theme="dark"] .layout-axis button,
+:root[data-theme="dark"] .chunk-panel {
+  border-color: rgb(240 240 235 / 14%);
+}
+
+:root[data-theme="dark"] .lens-toggle button[aria-pressed="true"],
+:root[data-theme="dark"] .layout-axis button[aria-pressed="true"] {
+  color: #f0f0eb;
+  background: rgb(240 240 235 / 12%);
+}
+
+:root[data-theme="dark"] .layout-tail {
+  color: #d4d7d3;
+  background: repeating-linear-gradient(
+    135deg,
+    #3a3e3e,
+    #3a3e3e 4px,
+    #484d4c 4px,
+    #484d4c 8px
+  );
+}
+
+:root[data-theme="dark"] .structure-help-card {
+  border-color: rgb(240 240 235 / 16%);
+  color: #e7e8e3;
+  background: #242728;
+  box-shadow: 0 8px 24px rgb(0 0 0 / 45%);
 }

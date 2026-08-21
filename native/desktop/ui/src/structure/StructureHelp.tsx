@@ -1,4 +1,11 @@
-import type { ReactNode } from "react";
+import {
+  useId,
+  useLayoutEffect,
+  useRef,
+  useState,
+  type ReactNode,
+} from "react";
+import { createPortal } from "react-dom";
 
 const HELP = {
   "Row groups":
@@ -32,13 +39,86 @@ export type StructureHelpTerm = keyof typeof HELP;
 export function StructureHelp({
   term,
   children,
+  button,
 }: {
   term: StructureHelpTerm;
   children?: ReactNode;
+  button?: { pressed: boolean; onClick: () => void };
 }) {
+  const helpId = useId();
+  const anchor = useRef<HTMLElement>(null);
+  const card = useRef<HTMLSpanElement>(null);
+  const [position, setPosition] = useState<{
+    top: number;
+    left: number;
+  } | null>(null);
+  const show = () => {
+    const bounds = anchor.current?.getBoundingClientRect();
+    if (bounds !== undefined) {
+      setPosition({ top: bounds.bottom + 7, left: bounds.left });
+    }
+  };
+  useLayoutEffect(() => {
+    const bounds = card.current?.getBoundingClientRect();
+    if (position === null || bounds === undefined) {
+      return;
+    }
+    const margin = 8;
+    const left = Math.min(
+      Math.max(margin, position.left),
+      Math.max(margin, window.innerWidth - bounds.width - margin),
+    );
+    const top =
+      bounds.bottom <= window.innerHeight - margin
+        ? position.top
+        : Math.max(
+            margin,
+            (anchor.current?.getBoundingClientRect().top ?? position.top) -
+              bounds.height -
+              7,
+          );
+    if (left !== position.left || top !== position.top) {
+      setPosition({ left, top });
+    }
+  }, [position]);
+  const anchorProps = {
+    className: "structure-help",
+    "aria-describedby": position === null ? undefined : helpId,
+    onFocus: show,
+    onBlur: () => setPosition(null),
+    onMouseEnter: show,
+    onMouseLeave: () => setPosition(null),
+  };
   return (
-    <span className="structure-help" tabIndex={0} title={HELP[term]}>
-      {children ?? term}
-    </span>
+    <>
+      {button === undefined ? (
+        <span ref={anchor} tabIndex={0} {...anchorProps}>
+          {children ?? term}
+        </span>
+      ) : (
+        <button
+          ref={anchor as React.RefObject<HTMLButtonElement>}
+          type="button"
+          aria-pressed={button.pressed}
+          onClick={button.onClick}
+          {...anchorProps}
+        >
+          {children ?? term}
+        </button>
+      )}
+      {position !== null &&
+        createPortal(
+          <span
+            ref={card}
+            id={helpId}
+            className="structure-help-card"
+            role="tooltip"
+            style={position}
+          >
+            {HELP[term]}
+          </span>,
+          document.body,
+        )}
+    </>
   );
 }

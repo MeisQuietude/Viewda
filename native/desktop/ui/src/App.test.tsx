@@ -65,6 +65,13 @@ function listedSource(
   };
 }
 
+function mockLocalSource(source: desktop.SourceSummary) {
+  return vi.spyOn(desktop, "openLocalSource").mockImplementation(async () => {
+    listedSources = [listedSource(source.generation, source.displayName)];
+    return source;
+  });
+}
+
 afterEach(() => {
   cleanup();
   vi.useRealTimers();
@@ -105,10 +112,12 @@ beforeEach(() => {
   vi.spyOn(desktop, "getStructureSummary").mockResolvedValue(structureSummary);
   vi.spyOn(desktop, "getStructureLoadProgress").mockResolvedValue(null);
   vi.spyOn(desktop, "cancelStructureLoad").mockResolvedValue();
+  vi.spyOn(desktop, "cancelSourceOpen").mockResolvedValue("cancelled");
+  vi.spyOn(desktop, "getSourceOpenProgress").mockResolvedValue(null);
   vi.spyOn(desktop, "getStructureLensTotals").mockResolvedValue({
     codecs: [],
     ratioSteps: [],
-    unratedChunkCount: 0,
+    unrated: { chunkCount: 0, compressedBytes: 0, uncompressedBytes: 0 },
     statistics: {
       present: { chunkCount: 0, compressedBytes: 0, uncompressedBytes: 0 },
       absent: { chunkCount: 0, compressedBytes: 0, uncompressedBytes: 0 },
@@ -139,6 +148,11 @@ beforeEach(() => {
     totalCompressedBytes: 0,
     totalUncompressedBytes: 0,
     columns: [],
+  });
+  vi.spyOn(desktop, "getSourceSchemaNodePage").mockResolvedValue({
+    nodes: [],
+    nextCursor: null,
+    totalCount: 0,
   });
   vi.spyOn(desktop, "openRecentSource").mockRejectedValue(
     new desktop.OpenSourceError("unsupported"),
@@ -231,7 +245,11 @@ function renderWithOpenSources(...sources: desktop.OpenedSourceEntry[]) {
       sizeBytes: 8,
       rowCount: 1,
       rowGroupCount: 1,
+      columnCount: 0,
       schema: [],
+      schemaNodeCount: 0,
+      schemaIsTruncated: false,
+      stringsTruncated: false,
     })),
   });
   render(<App />);
@@ -327,7 +345,11 @@ describe("App", () => {
       sizeBytes: 2048,
       rowCount: 4,
       rowGroupCount: 1,
+      columnCount: 0,
       schema: [],
+      schemaNodeCount: 0,
+      schemaIsTruncated: false,
+      stringsTruncated: false,
     });
 
     render(<App />);
@@ -348,7 +370,10 @@ describe("App", () => {
     fireEvent.keyDown(secondEntry, { key: "Enter" });
 
     await waitFor(() =>
-      expect(desktop.openRecentSource).toHaveBeenCalledWith("recent-7"),
+      expect(desktop.openRecentSource).toHaveBeenCalledWith(
+        "recent-7",
+        expect.any(String),
+      ),
     );
     expect(
       (await screen.findAllByText("events.parquet")).some((element) =>
@@ -417,6 +442,7 @@ describe("App", () => {
       sizeBytes: 1_300_000,
       rowCount: 1_234_567,
       rowGroupCount: 12,
+      columnCount: 2,
       schema: [
         {
           name: "created_on",
@@ -445,6 +471,9 @@ describe("App", () => {
           ],
         },
       ],
+      schemaNodeCount: 4,
+      schemaIsTruncated: false,
+      stringsTruncated: false,
     });
 
     const { container } = render(<App />);
@@ -551,6 +580,72 @@ describe("App", () => {
     );
   });
 
+  it("detaches a cancelled source open and ignores its stale result", async () => {
+    let resolveOpen:
+      ((source: desktop.SourceSummary | null) => void) | undefined;
+    vi.spyOn(desktop, "openLocalSource").mockReturnValue(
+      new Promise((resolve) => {
+        resolveOpen = resolve;
+      }),
+    );
+    vi.mocked(desktop.getSourceOpenProgress).mockResolvedValue("readingFooter");
+
+    render(<App />);
+    fireEvent.click(await readyOpenButton());
+    expect(
+      await screen.findByText("Reading the Parquet footer…"),
+    ).toHaveAttribute("role", "status");
+    fireEvent.click(
+      await screen.findByRole("button", { name: "Cancel opening" }),
+    );
+
+    expect(desktop.cancelSourceOpen).toHaveBeenCalledOnce();
+    expect(
+      await screen.findByRole("button", { name: "Open Parquet file…" }),
+    ).toBeEnabled();
+    await act(async () => resolveOpen?.(sourceSummary()));
+    expect(screen.queryByText("people.parquet")).not.toBeInTheDocument();
+    expect(dataGridProps).not.toHaveBeenCalled();
+  });
+
+  it("accepts a published recent open after its cancel response wins the IPC race", async () => {
+    vi.spyOn(desktop, "getRecentSources").mockResolvedValue([
+      {
+        id: "recent-1",
+        name: "people.parquet",
+        directory: "~/Data",
+        path: "/home/test/Data/people.parquet",
+      },
+    ]);
+    let resolveOpen: ((source: desktop.SourceSummary) => void) | undefined;
+    vi.spyOn(desktop, "openRecentSource").mockReturnValue(
+      new Promise((resolve) => {
+        resolveOpen = resolve;
+      }),
+    );
+    vi.mocked(desktop.cancelSourceOpen).mockResolvedValue("published");
+    vi.mocked(desktop.getSourceOpenProgress).mockResolvedValue("summarizing");
+
+    render(<App />);
+    fireEvent.click(
+      await screen.findByRole("button", { name: /people\.parquet/ }),
+    );
+    fireEvent.click(
+      await screen.findByRole("button", { name: "Cancel opening" }),
+    );
+    const attempt = vi.mocked(desktop.openRecentSource).mock.calls[0]?.[1];
+    await waitFor(() =>
+      expect(desktop.cancelSourceOpen).toHaveBeenCalledWith(attempt),
+    );
+
+    listedSources = [listedSource(1, "people.parquet")];
+    await act(async () => resolveOpen?.(sourceSummary()));
+    expect(await screen.findByText("people.parquet")).toBeInTheDocument();
+    expect(screen.queryByRole("status")).not.toBeInTheDocument();
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+    expect(dataGridProps).toHaveBeenCalled();
+  });
+
   it("treats dialog cancellation as an unchanged empty state", async () => {
     vi.spyOn(desktop, "openLocalSource").mockResolvedValue(null);
 
@@ -590,7 +685,11 @@ describe("App", () => {
           sizeBytes: 128,
           rowCount: 3,
           rowGroupCount: 1,
+          columnCount: 0,
           schema: [],
+          schemaNodeCount: 0,
+          schemaIsTruncated: false,
+          stringsTruncated: false,
         },
         sourceError: null,
       });
@@ -622,7 +721,11 @@ describe("App", () => {
           sizeBytes: 128,
           rowCount: 3,
           rowGroupCount: 1,
+          columnCount: 0,
           schema: [],
+          schemaNodeCount: 0,
+          schemaIsTruncated: false,
+          stringsTruncated: false,
         },
         sourceError: null,
       })
@@ -644,7 +747,11 @@ describe("App", () => {
             sizeBytes: 256,
             rowCount: 6,
             rowGroupCount: 1,
+            columnCount: 0,
             schema: [],
+            schemaNodeCount: 0,
+            schemaIsTruncated: false,
+            stringsTruncated: false,
           },
         ],
         sourceError: null,
@@ -681,7 +788,11 @@ describe("App", () => {
           sizeBytes: 16,
           rowCount: 2,
           rowGroupCount: 1,
+          columnCount: 0,
           schema: [],
+          schemaNodeCount: 0,
+          schemaIsTruncated: false,
+          stringsTruncated: false,
         },
         {
           generation: 1,
@@ -689,7 +800,11 @@ describe("App", () => {
           sizeBytes: 8,
           rowCount: 1,
           rowGroupCount: 1,
+          columnCount: 0,
           schema: [],
+          schemaNodeCount: 0,
+          schemaIsTruncated: false,
+          stringsTruncated: false,
         },
       ],
     });
@@ -887,7 +1002,11 @@ describe("App", () => {
           sizeBytes: 8,
           rowCount: 1,
           rowGroupCount: 1,
+          columnCount: 0,
           schema: [],
+          schemaNodeCount: 0,
+          schemaIsTruncated: false,
+          stringsTruncated: false,
         },
         sourceError: null,
       })
@@ -922,7 +1041,11 @@ describe("App", () => {
           sizeBytes: 8,
           rowCount: 1,
           rowGroupCount: 1,
+          columnCount: 0,
           schema: [],
+          schemaNodeCount: 0,
+          schemaIsTruncated: false,
+          stringsTruncated: false,
         },
         sourceError: null,
       })
@@ -1368,7 +1491,11 @@ describe("App", () => {
           sizeBytes: 4096,
           rowCount: 12,
           rowGroupCount: 2,
+          columnCount: 0,
           schema: [],
+          schemaNodeCount: 0,
+          schemaIsTruncated: false,
+          stringsTruncated: false,
         },
       ],
     });
@@ -1636,7 +1763,7 @@ describe("App", () => {
 
   it("reads the structure only once the mode is first opened", async () => {
     const summary = vi.mocked(desktop.getStructureSummary);
-    vi.spyOn(desktop, "openLocalSource").mockResolvedValue(sourceSummary());
+    mockLocalSource(sourceSummary());
 
     render(<App />);
     fireEvent.click(await readyOpenButton());
@@ -1657,8 +1784,111 @@ describe("App", () => {
     expect(summary).toHaveBeenCalledTimes(1);
   });
 
+  it("opens Data and continues a capped nested schema in the same tree", async () => {
+    mockLocalSource({
+      ...sourceSummary(),
+      columnCount: 301,
+      schemaNodeCount: 302,
+      schemaIsTruncated: true,
+      schema: [
+        {
+          name: "prefix",
+          physicalType: "INT64",
+          logicalType: null,
+          children: [],
+        },
+        {
+          name: "wrapper",
+          physicalType: "GROUP",
+          logicalType: null,
+          children: [],
+        },
+      ],
+    });
+    vi.mocked(desktop.getStructureSummary).mockResolvedValue({
+      ...structureSummary,
+      columnCount: 301,
+    });
+    vi.mocked(desktop.getSourceSchemaNodePage).mockImplementation(
+      async (_generation, cursor, limit) => {
+        expect(limit).toBe(256);
+        const start = cursor?.path[1] ?? 0;
+        const childCount = cursor === null ? 254 : 46;
+        return {
+          nodes: [
+            ...(cursor === null
+              ? [
+                  {
+                    path: [0],
+                    name: "prefix",
+                    physicalType: "INT64",
+                    logicalType: null,
+                    hasChildren: false,
+                    leafIndex: 0,
+                  },
+                  {
+                    path: [1],
+                    name: "wrapper",
+                    physicalType: "GROUP",
+                    logicalType: null,
+                    hasChildren: true,
+                    leafIndex: null,
+                  },
+                ]
+              : []),
+            ...Array.from({ length: childCount }, (_, pageIndex) => {
+              const index = start + pageIndex;
+              return {
+                path: [1, index],
+                name: `nested_${index}`,
+                physicalType: "INT64",
+                logicalType: null,
+                hasChildren: false,
+                leafIndex: index + 1,
+              };
+            }),
+          ],
+          nextCursor:
+            cursor === null ? { path: [1, 254], leafIndex: 255 } : null,
+          totalCount: 302,
+        };
+      },
+    );
+
+    render(<App />);
+    fireEvent.click(await readyOpenButton());
+
+    await waitFor(() => expect(dataGridProps).toHaveBeenCalled());
+    expect(screen.getByRole("button", { name: "Data" })).toBeEnabled();
+    expect(dataGridProps).toHaveBeenLastCalledWith(
+      expect.objectContaining({
+        source: expect.objectContaining({
+          columnCount: 301,
+          schemaIsTruncated: true,
+        }),
+      }),
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Structure" }));
+    expect(await screen.findByText("nested_0")).toBeInTheDocument();
+    expect(
+      screen.getByText("More nested fields are not loaded yet."),
+    ).toBeInTheDocument();
+    const loadMore = screen.getByRole("button", { name: "Load more columns" });
+    fireEvent.click(loadMore);
+    fireEvent.click(loadMore);
+    expect(
+      await screen.findByRole("button", { name: /nested_299/ }),
+    ).toBeInTheDocument();
+    expect(desktop.getSourceSchemaNodePage).toHaveBeenLastCalledWith(
+      1,
+      { path: [1, 254], leafIndex: 255 },
+      256,
+    );
+    expect(desktop.getSourceSchemaNodePage).toHaveBeenCalledTimes(2);
+  });
+
   it("offers a retry after the structure read is cancelled", async () => {
-    vi.spyOn(desktop, "openLocalSource").mockResolvedValue(sourceSummary());
+    mockLocalSource(sourceSummary());
     const summary = vi
       .mocked(desktop.getStructureSummary)
       .mockRejectedValueOnce(new desktop.StructureCommandError("cancelled"))
@@ -1685,7 +1915,7 @@ describe("App", () => {
   });
 
   it("cancels a running structure read for the open source", async () => {
-    vi.spyOn(desktop, "openLocalSource").mockResolvedValue(sourceSummary());
+    mockLocalSource(sourceSummary());
     vi.mocked(desktop.getStructureSummary).mockReturnValue(
       new Promise(() => {}),
     );
@@ -1701,7 +1931,7 @@ describe("App", () => {
   });
 
   it("applies the unit toggle to every table in the mode", async () => {
-    vi.spyOn(desktop, "openLocalSource").mockResolvedValue(sourceSummary());
+    mockLocalSource(sourceSummary());
     vi.mocked(desktop.getStructureRowGroups).mockResolvedValue({
       offset: 0,
       totalCount: 1,
@@ -1715,6 +1945,7 @@ describe("App", () => {
           chunkCount: 2,
           chunksWithBloomFilter: 0,
           isReadable: true,
+          hasLayoutFacts: true,
         },
       ],
     });
@@ -1781,7 +2012,7 @@ describe("App", () => {
   });
 
   it("reissues navigation when the same row group opens in Data twice", async () => {
-    vi.spyOn(desktop, "openLocalSource").mockResolvedValue(sourceSummary());
+    mockLocalSource(sourceSummary());
     vi.mocked(desktop.getStructureLayout).mockResolvedValue({
       offset: 0,
       totalCount: 1,
@@ -1822,7 +2053,7 @@ describe("App", () => {
   });
 
   it("captions a file that holds no row group instead of showing empty tables", async () => {
-    vi.spyOn(desktop, "openLocalSource").mockResolvedValue({
+    mockLocalSource({
       ...sourceSummary(),
       rowCount: 0,
       rowGroupCount: 0,
@@ -1887,9 +2118,13 @@ function sourceSummary(): desktop.SourceSummary {
     sizeBytes: 1_300_000,
     rowCount: 1_234_567,
     rowGroupCount: 12,
+    columnCount: 1,
     schema: [
       { name: "id", physicalType: "INT64", logicalType: null, children: [] },
     ],
+    schemaNodeCount: 1,
+    schemaIsTruncated: false,
+    stringsTruncated: false,
   };
 }
 

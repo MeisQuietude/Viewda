@@ -1,5 +1,11 @@
 import type { SchemaField } from "./desktop";
 
+export interface RenderedSchemaField extends SchemaField {
+  hasUnloadedChildren?: boolean;
+  leafIndex?: number | null;
+  children: RenderedSchemaField[];
+}
+
 // Physical wrapper nodes are part of the inspected Parquet schema. Keep them
 // visible instead of collapsing the tree into a lossy notation such as List<T>.
 export function SchemaTreeNode({
@@ -10,18 +16,19 @@ export function SchemaTreeNode({
   selectedLeaf,
   onSelectLeaf,
 }: {
-  field: SchemaField;
+  field: RenderedSchemaField;
   selected?: boolean;
   onSelect?: () => void;
   leafOffset?: number;
   selectedLeaf?: number | null;
   onSelectLeaf?: (columnIndex: number) => void;
 }) {
-  const isLeaf = field.children.length === 0;
+  const isLeaf = field.children.length === 0 && !field.hasUnloadedChildren;
+  const leafIndex = field.leafIndex ?? leafOffset;
   const selectable =
     onSelect ??
     (isLeaf && onSelectLeaf !== undefined
-      ? () => onSelectLeaf(leafOffset)
+      ? () => onSelectLeaf(leafIndex)
       : undefined);
   const childOffsets = leafOffsets(field.children, leafOffset);
   const type = schemaType(field);
@@ -42,7 +49,7 @@ export function SchemaTreeNode({
         <button
           className="schema-field"
           type="button"
-          aria-pressed={selected || (isLeaf && selectedLeaf === leafOffset)}
+          aria-pressed={selected || (isLeaf && selectedLeaf === leafIndex)}
           onClick={selectable}
         >
           {content}
@@ -61,17 +68,25 @@ export function SchemaTreeNode({
           ))}
         </ul>
       )}
+      {field.hasUnloadedChildren && (
+        <p className="schema-continuation">
+          More nested fields are not loaded yet.
+        </p>
+      )}
     </li>
   );
 }
 
-function leafCount(field: SchemaField): number {
+function leafCount(field: RenderedSchemaField): number {
   return field.children.length === 0
     ? 1
     : field.children.reduce((count, child) => count + leafCount(child), 0);
 }
 
-function leafOffsets(fields: readonly SchemaField[], start: number): number[] {
+function leafOffsets(
+  fields: readonly RenderedSchemaField[],
+  start: number,
+): number[] {
   let offset = start;
   return fields.map((field) => {
     const current = offset;

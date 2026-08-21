@@ -1,7 +1,10 @@
-import { useCallback, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
-import type { GridMeasurementPort } from "../data-grid/ViewdaGrid";
-import { ViewdaGrid } from "../data-grid/ViewdaGrid";
+import {
+  ViewdaGrid,
+  type GridMeasurementPort,
+  type ViewdaGridHandle,
+} from "../data-grid/ViewdaGrid";
 import {
   copyBufferContents,
   type CellAlignment,
@@ -11,6 +14,7 @@ import {
 import {
   boundedSelectionScope,
   emptyGridSelection,
+  selectRow,
 } from "../data-grid/grid-selection";
 import { copyRowLimit } from "../data-grid/copy-limit";
 
@@ -49,6 +53,7 @@ export function StructureGrid({
   onSort,
   onViewportChange,
   heldPage,
+  requestedRow,
   measurementPort,
 }: {
   label: string;
@@ -61,11 +66,29 @@ export function StructureGrid({
   onSort: (columnId: string) => void;
   onViewportChange: (rowStart: number, rowCount: number) => void;
   heldPage: { offset: number; length: number } | null;
+  requestedRow?: { row: number; request: number } | null;
   measurementPort?: GridMeasurementPort;
 }) {
   const [widths, setWidths] = useState<Record<string, number>>({});
   const [selection, setSelection] = useState(emptyGridSelection);
   const [copyFeedback, setCopyFeedback] = useState<string | null>(null);
+  const gridRef = useRef<ViewdaGridHandle>(null);
+  const appliedRequest = useRef<number | null>(null);
+
+  useEffect(() => {
+    if (
+      requestedRow === null ||
+      requestedRow === undefined ||
+      appliedRequest.current === requestedRow.request
+    ) {
+      return;
+    }
+    appliedRequest.current = requestedRow.request;
+    setSelection((current) =>
+      selectRow(current, requestedRow.row, false, false),
+    );
+    gridRef.current?.scrollToRow(requestedRow.row);
+  }, [requestedRow]);
 
   const gridColumns = useMemo<GridColumn[]>(
     () =>
@@ -166,6 +189,7 @@ export function StructureGrid({
   return (
     <section className="structure-grid" aria-label={label}>
       <ViewdaGrid
+        ref={gridRef}
         columns={gridColumns}
         rowCount={rowCount}
         selection={selection}

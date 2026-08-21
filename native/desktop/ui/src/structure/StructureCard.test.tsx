@@ -16,6 +16,7 @@ const source: SourceSummary = {
   sizeBytes: 1_300_000,
   rowCount: 1_200,
   rowGroupCount: 12,
+  columnCount: 2,
   schema: [
     { name: "id", physicalType: "INT64", logicalType: null, children: [] },
     {
@@ -25,6 +26,9 @@ const source: SourceSummary = {
       children: [],
     },
   ],
+  schemaNodeCount: 2,
+  schemaIsTruncated: false,
+  stringsTruncated: false,
 };
 
 function summaryOf(
@@ -206,12 +210,17 @@ describe("StructureLoadStatus", () => {
     ).not.toHaveAttribute("value");
   });
 
-  it("counts summarized row groups against the total", () => {
+  it("counts summarized column chunks against the total", () => {
     render(
       <StructureLoadStatus
         state={{
           kind: "loading",
-          progress: { completedRowGroups: 40, totalRowGroups: 96 },
+          progress: {
+            completedRowGroups: 40,
+            totalRowGroups: 96,
+            completedChunks: 400,
+            totalChunks: 960,
+          },
         }}
         onCancel={() => {}}
         onRetry={() => {}}
@@ -219,11 +228,11 @@ describe("StructureLoadStatus", () => {
     );
 
     expect(screen.getByRole("status")).toHaveTextContent(
-      "Summarizing 40 of 96 row groups…",
+      "Summarizing 400 of 960 column chunks…",
     );
-    const progress = screen.getByLabelText("Summarizing row groups");
-    expect(progress).toHaveAttribute("value", "40");
-    expect(progress).toHaveAttribute("max", "96");
+    const progress = screen.getByLabelText("Summarizing column chunks");
+    expect(progress).toHaveAttribute("value", "400");
+    expect(progress).toHaveAttribute("max", "960");
   });
 
   it("cancels the running parse", () => {
