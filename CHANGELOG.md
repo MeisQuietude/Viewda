@@ -8,6 +8,13 @@ Backward-incompatible entries start with **Breaking:**.
 
 ## Unreleased
 
+### Added
+
+- Keep several Parquet files open with independent reading state and background
+  operations. Open them from the dialog, recent history, file manager, or drag
+  and drop; use the searchable MRU switcher below the active file name or
+  keyboard shortcuts, and close the active file without losing the others.
+
 ## 0.1.0 — 2026-08-20
 
 Viewda's first stable release: a free, fully offline viewer for local

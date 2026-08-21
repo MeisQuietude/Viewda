@@ -1,6 +1,7 @@
 //! Native save dialog and lifecycle for one active data export.
 
 use std::{
+    collections::HashMap,
     fs, io,
     path::{Path, PathBuf},
     sync::{
@@ -16,7 +17,7 @@ use viewda_data_engine::{
     DataExportRequest, PreparedDataViewExport,
 };
 
-use crate::OpenedSource;
+use crate::{OpenedSource, OpenedSourceSession, OpenedSourceState};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -107,18 +108,79 @@ pub(crate) enum DataExportStatus {
 #[derive(Default)]
 pub(crate) struct DataExportJobs {
     next_id: AtomicU64,
+    next_reservation_id: AtomicU64,
     state: Mutex<DataExportJobsState>,
+    reservation_finished: Condvar,
 }
 
 #[derive(Default)]
 struct DataExportJobsState {
-    starting: bool,
+    starting: Option<StartingDataExport>,
     starts_blocked: bool,
+    temporary_start_blocks: usize,
+    closing_generations: HashMap<u64, usize>,
     active: Option<Arc<ActiveDataExportJob>>,
+}
+
+struct StartingDataExport {
+    id: u64,
+    generation: u64,
+    cancelled: Arc<AtomicBool>,
+}
+
+struct DataExportReservation<'a> {
+    jobs: &'a DataExportJobs,
+    id: u64,
+    generation: u64,
+    cancelled: Arc<AtomicBool>,
+}
+
+pub(crate) struct SourceCloseReservation<'a> {
+    jobs: &'a DataExportJobs,
+    generation: u64,
+}
+
+struct TemporaryDataExportDrain<'a> {
+    jobs: &'a DataExportJobs,
+}
+
+impl Drop for DataExportReservation<'_> {
+    fn drop(&mut self) {
+        self.jobs.release_reservation(self.id);
+    }
+}
+
+impl Drop for SourceCloseReservation<'_> {
+    fn drop(&mut self) {
+        if let Ok(mut state) = self.jobs.state.lock()
+            && let Some(count) = state.closing_generations.get_mut(&self.generation)
+        {
+            *count -= 1;
+            if *count == 0 {
+                state.closing_generations.remove(&self.generation);
+            }
+        }
+    }
+}
+
+impl Drop for TemporaryDataExportDrain<'_> {
+    fn drop(&mut self) {
+        if let Ok(mut state) = self.jobs.state.lock() {
+            state.temporary_start_blocks -= 1;
+        }
+    }
+}
+
+impl SourceCloseReservation<'_> {
+    pub(crate) fn cancel_and_wait(&self) {
+        self.jobs.cancel_source_and_wait(self.generation);
+    }
 }
 
 struct ActiveDataExportJob {
     id: u64,
+    /// Opened source this export reads, so closing that source can cancel it.
+    generation: u64,
     file_name: String,
     target_path: PathBuf,
     progress: Option<DataExportProgress>,
@@ -126,6 +188,33 @@ struct ActiveDataExportJob {
     cancel_requested: AtomicBool,
     state: Mutex<DataExportExecutionState>,
     finished: Condvar,
+}
+
+struct DataExportCompletion {
+    job: Arc<ActiveDataExportJob>,
+    finished: bool,
+}
+
+impl DataExportCompletion {
+    fn new(job: Arc<ActiveDataExportJob>) -> Self {
+        Self {
+            job,
+            finished: false,
+        }
+    }
+
+    fn finish(mut self, result: Result<u64, DataExportError>) {
+        self.job.finish(result);
+        self.finished = true;
+    }
+}
+
+impl Drop for DataExportCompletion {
+    fn drop(&mut self) {
+        if !self.finished {
+            self.job.finish(Err(DataExportError::QueryFailed));
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -139,12 +228,14 @@ enum DataExportExecutionState {
 impl ActiveDataExportJob {
     fn running(
         id: u64,
+        generation: u64,
         file_name: String,
         target_path: PathBuf,
         reader: &DataExportReader,
     ) -> Self {
         Self {
             id,
+            generation,
             file_name,
             target_path,
             progress: Some(reader.progress()),
@@ -157,12 +248,14 @@ impl ActiveDataExportJob {
 
     fn failed(
         id: u64,
+        generation: u64,
         file_name: String,
         target_path: PathBuf,
         error: DataExportFailureCode,
     ) -> Self {
         Self {
             id,
+            generation,
             file_name,
             target_path,
             progress: None,
@@ -251,12 +344,18 @@ impl ActiveDataExportJob {
 }
 
 impl DataExportJobs {
-    fn reserve_start(&self) -> Result<(), DataExportCommandError> {
+    fn reserve_start(
+        &self,
+        generation: u64,
+    ) -> Result<DataExportReservation<'_>, DataExportCommandError> {
         let mut state = self
             .state
             .lock()
             .map_err(|_| DataExportCommandError::QueryFailed)?;
-        if state.starts_blocked {
+        if state.starts_blocked
+            || state.temporary_start_blocks > 0
+            || state.closing_generations.contains_key(&generation)
+        {
             return Err(DataExportCommandError::Cancelled);
         }
         let running = state
@@ -265,25 +364,59 @@ impl DataExportJobs {
             .map(|job| job.is_running())
             .transpose()?
             .unwrap_or(false);
-        if state.starting || running {
+        if state.starting.is_some() || running {
             return Err(DataExportCommandError::AlreadyRunning);
         }
-        state.starting = true;
-        Ok(())
+        let id = self.next_reservation_id.fetch_add(1, Ordering::Relaxed) + 1;
+        let cancelled = Arc::new(AtomicBool::new(false));
+        state.starting = Some(StartingDataExport {
+            id,
+            generation,
+            cancelled: Arc::clone(&cancelled),
+        });
+        Ok(DataExportReservation {
+            jobs: self,
+            id,
+            generation,
+            cancelled,
+        })
     }
 
-    fn release_start(&self) {
-        if let Ok(mut state) = self.state.lock() {
-            state.starting = false;
+    fn release_reservation(&self, id: u64) {
+        if let Ok(mut state) = self.state.lock()
+            && state.starting.as_ref().is_some_and(|start| start.id == id)
+        {
+            state.starting = None;
+            self.reservation_finished.notify_all();
         }
     }
 
-    fn install(&self, job: Arc<ActiveDataExportJob>) -> Result<(), DataExportCommandError> {
+    fn install(
+        &self,
+        reservation: &DataExportReservation<'_>,
+        job: Arc<ActiveDataExportJob>,
+    ) -> Result<(), DataExportCommandError> {
         let mut state = self
             .state
             .lock()
             .map_err(|_| DataExportCommandError::QueryFailed)?;
-        state.starting = false;
+        let owns_start = state.starting.as_ref().is_some_and(|start| {
+            start.id == reservation.id && start.generation == reservation.generation
+        });
+        if !owns_start {
+            job.cancel();
+            return Err(DataExportCommandError::Cancelled);
+        }
+        state.starting = None;
+        self.reservation_finished.notify_all();
+        if state.starts_blocked
+            || state.temporary_start_blocks > 0
+            || state.closing_generations.contains_key(&job.generation)
+            || reservation.cancelled.load(Ordering::Acquire)
+        {
+            job.cancel();
+            return Err(DataExportCommandError::Cancelled);
+        }
         state.active = Some(job);
         Ok(())
     }
@@ -293,6 +426,98 @@ impl DataExportJobs {
     }
 
     pub(crate) fn running_file_names(&self) -> Result<Vec<String>, DataExportCommandError> {
+        Ok(self
+            .running_job()?
+            .map(|job| vec![job.file_name.clone()])
+            .unwrap_or_default())
+    }
+
+    /// Running export targets of one opened source, for its close confirmation.
+    #[cfg(test)]
+    pub(crate) fn running_file_names_for(
+        &self,
+        generation: u64,
+    ) -> Result<Vec<String>, DataExportCommandError> {
+        Ok(self
+            .running_job()?
+            .filter(|job| job.generation == generation)
+            .map(|job| vec![job.file_name.clone()])
+            .unwrap_or_default())
+    }
+
+    pub(crate) fn begin_source_close(
+        &self,
+        generation: u64,
+    ) -> Result<(SourceCloseReservation<'_>, Vec<String>), DataExportCommandError> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| DataExportCommandError::QueryFailed)?;
+        let file_names = match state.active.as_ref() {
+            Some(job) if job.generation == generation && job.is_running()? => {
+                vec![job.file_name.clone()]
+            }
+            _ => Vec::new(),
+        };
+        *state.closing_generations.entry(generation).or_default() += 1;
+        if let Some(start) = state
+            .starting
+            .as_ref()
+            .filter(|start| start.generation == generation)
+        {
+            start.cancelled.store(true, Ordering::Release);
+        }
+        drop(state);
+        Ok((
+            SourceCloseReservation {
+                jobs: self,
+                generation,
+            },
+            file_names,
+        ))
+    }
+
+    fn cancel_source_and_wait(&self, generation: u64) {
+        let Ok(mut state) = self.state.lock() else {
+            return;
+        };
+        if let Some(start) = state
+            .starting
+            .as_ref()
+            .filter(|start| start.generation == generation)
+        {
+            start.cancelled.store(true, Ordering::Release);
+        }
+        let job = state
+            .active
+            .clone()
+            .filter(|job| job.generation == generation);
+        while state
+            .starting
+            .as_ref()
+            .is_some_and(|start| start.generation == generation)
+        {
+            let Ok(next) = self.reservation_finished.wait(state) else {
+                return;
+            };
+            state = next;
+        }
+        drop(state);
+        if let Some(job) = job {
+            job.cancel();
+            job.wait_until_finished();
+            if let Ok(mut state) = self.state.lock()
+                && state
+                    .active
+                    .as_ref()
+                    .is_some_and(|active| Arc::ptr_eq(active, &job))
+            {
+                state.active.take();
+            }
+        }
+    }
+
+    fn running_job(&self) -> Result<Option<Arc<ActiveDataExportJob>>, DataExportCommandError> {
         let job = self
             .state
             .lock()
@@ -300,23 +525,26 @@ impl DataExportJobs {
             .active
             .clone();
         match job {
-            Some(job) if job.is_running()? => Ok(vec![job.file_name.clone()]),
-            _ => Ok(Vec::new()),
-        }
-    }
-
-    pub(crate) fn cancel_all(&self) {
-        let job = self
-            .state
-            .lock()
-            .ok()
-            .and_then(|state| state.active.clone());
-        if let Some(job) = job {
-            job.cancel();
+            Some(job) if job.is_running()? => Ok(Some(job)),
+            _ => Ok(None),
         }
     }
 
     pub(crate) fn cancel_all_and_wait(&self) {
+        let _ = self.block_starts_and_wait();
+        self.cancel_active_and_wait();
+    }
+
+    pub(crate) fn drain_temporarily<T>(
+        &self,
+        cleanup: impl FnOnce() -> T,
+    ) -> Result<T, DataExportCommandError> {
+        let _drain = self.begin_temporary_drain()?;
+        self.cancel_active_and_wait();
+        Ok(cleanup())
+    }
+
+    fn cancel_active_and_wait(&self) {
         let job = self
             .state
             .lock()
@@ -325,14 +553,53 @@ impl DataExportJobs {
         if let Some(job) = job {
             job.cancel();
             job.wait_until_finished();
+            if let Ok(mut state) = self.state.lock()
+                && state
+                    .active
+                    .as_ref()
+                    .is_some_and(|active| Arc::ptr_eq(active, &job))
+            {
+                state.active.take();
+            }
         }
     }
 
-    pub(crate) fn block_starts(&self) -> Result<(), DataExportCommandError> {
-        self.state
+    fn begin_temporary_drain(
+        &self,
+    ) -> Result<TemporaryDataExportDrain<'_>, DataExportCommandError> {
+        let mut state = self
+            .state
             .lock()
-            .map(|mut state| state.starts_blocked = true)
-            .map_err(|_| DataExportCommandError::QueryFailed)
+            .map_err(|_| DataExportCommandError::QueryFailed)?;
+        state.temporary_start_blocks += 1;
+        if let Some(start) = &state.starting {
+            start.cancelled.store(true, Ordering::Release);
+        }
+        while state.starting.is_some() {
+            state = self
+                .reservation_finished
+                .wait(state)
+                .map_err(|_| DataExportCommandError::QueryFailed)?;
+        }
+        Ok(TemporaryDataExportDrain { jobs: self })
+    }
+
+    pub(crate) fn block_starts_and_wait(&self) -> Result<(), DataExportCommandError> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| DataExportCommandError::QueryFailed)?;
+        state.starts_blocked = true;
+        if let Some(start) = &state.starting {
+            start.cancelled.store(true, Ordering::Release);
+        }
+        while state.starting.is_some() {
+            state = self
+                .reservation_finished
+                .wait(state)
+                .map_err(|_| DataExportCommandError::QueryFailed)?;
+        }
+        Ok(())
     }
 
     pub(crate) fn allow_starts(&self) {
@@ -348,14 +615,7 @@ impl OpenedSource {
             .state
             .lock()
             .map_err(|_| DataExportCommandError::Unsupported)?;
-        let session = state
-            .session
-            .as_ref()
-            .ok_or(DataExportCommandError::NoSourceOpen)?;
-        if session.generation != generation {
-            return Err(DataExportCommandError::SourceChanged);
-        }
-        Ok(session.path.clone())
+        Ok(export_session(&state, generation)?.path.clone())
     }
 
     fn export_source(
@@ -367,24 +627,39 @@ impl OpenedSource {
             .state
             .lock()
             .map_err(|_| DataExportCommandError::Unsupported)?;
-        let session = state
-            .session
-            .as_ref()
-            .ok_or(DataExportCommandError::NoSourceOpen)?;
-        if session.generation != generation {
-            return Err(DataExportCommandError::SourceChanged);
-        }
-        if session.view_revision != view_revision {
+        let session = export_session(&state, generation)?;
+        drop(state);
+        let session_state = session
+            .state
+            .lock()
+            .map_err(|_| DataExportCommandError::Unsupported)?;
+        if session_state.view_revision != view_revision {
             return Err(DataExportCommandError::ViewChanged);
         }
         Ok((
             session.path.clone(),
-            session.view.as_ref().map(|view| view.export_snapshot()),
+            session_state
+                .view
+                .as_ref()
+                .map(|view| view.export_snapshot()),
         ))
+    }
+
+    fn reserve_export_start(
+        &self,
+        generation: u64,
+    ) -> Result<DataExportReservation<'_>, DataExportCommandError> {
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| DataExportCommandError::Unsupported)?;
+        export_session(&state, generation)?;
+        self.data_exports.reserve_start(generation)
     }
 
     fn install_export_job(
         &self,
+        reservation: &DataExportReservation<'_>,
         generation: u64,
         view_revision: u64,
         job: Arc<ActiveDataExportJob>,
@@ -393,18 +668,31 @@ impl OpenedSource {
             .state
             .lock()
             .map_err(|_| DataExportCommandError::QueryFailed)?;
-        let session = state
-            .session
-            .as_ref()
-            .ok_or(DataExportCommandError::NoSourceOpen)?;
-        if session.generation != generation {
-            return Err(DataExportCommandError::SourceChanged);
-        }
-        if session.view_revision != view_revision {
+        let session = export_session(&state, generation)?;
+        drop(state);
+        if session
+            .state
+            .lock()
+            .map_err(|_| DataExportCommandError::Unsupported)?
+            .view_revision
+            != view_revision
+        {
             return Err(DataExportCommandError::ViewChanged);
         }
-        self.data_exports.install(job)
+        self.data_exports.install(reservation, job)
     }
+}
+
+fn export_session(
+    state: &OpenedSourceState,
+    generation: u64,
+) -> Result<Arc<OpenedSourceSession>, DataExportCommandError> {
+    state.session(generation).ok_or_else(|| {
+        state.missing_session(
+            DataExportCommandError::NoSourceOpen,
+            DataExportCommandError::SourceChanged,
+        )
+    })
 }
 
 #[tauri::command]
@@ -417,14 +705,7 @@ pub(crate) async fn start_data_export(
     opened_source: tauri::State<'_, OpenedSource>,
 ) -> Result<Option<DataExportStatus>, DataExportCommandError> {
     let jobs = &opened_source.data_exports;
-    jobs.reserve_start()?;
-    let source_path = match opened_source.export_source_path(generation) {
-        Ok(path) => path,
-        Err(error) => {
-            jobs.release_start();
-            return Err(error);
-        }
-    };
+    let source_path = opened_source.export_source_path(generation)?;
     let suggested_name = default_export_name(&source_path, scope);
     let selected = match tauri::async_runtime::spawn_blocking(move || {
         app.dialog()
@@ -436,29 +717,17 @@ pub(crate) async fn start_data_export(
     .await
     {
         Ok(selected) => selected,
-        Err(_) => {
-            jobs.release_start();
-            return Err(DataExportCommandError::Unsupported);
-        }
+        Err(_) => return Err(DataExportCommandError::Unsupported),
     };
     let Some(selected) = selected else {
-        jobs.release_start();
         return Ok(None);
     };
     let target_path = match selected.into_path() {
         Ok(path) => path,
-        Err(_) => {
-            jobs.release_start();
-            return Err(DataExportCommandError::Unsupported);
-        }
+        Err(_) => return Err(DataExportCommandError::Unsupported),
     };
-    let (source_path, view) = match opened_source.export_source(generation, view_revision) {
-        Ok(source) => source,
-        Err(error) => {
-            jobs.release_start();
-            return Err(error);
-        }
-    };
+    let reservation = opened_source.reserve_export_start(generation)?;
+    let (source_path, view) = opened_source.export_source(generation, view_revision)?;
     let file_name = target_path.file_name().map_or_else(
         || "export.csv".to_owned(),
         |name| name.to_string_lossy().into_owned(),
@@ -471,55 +740,50 @@ pub(crate) async fn start_data_export(
     .await
     {
         Ok(reader) => reader,
-        Err(_) => {
-            jobs.release_start();
-            return Err(DataExportCommandError::QueryEngineUnavailable);
-        }
+        Err(_) => return Err(DataExportCommandError::QueryEngineUnavailable),
     };
     let reader = match reader {
         Ok(reader) => reader,
         Err(error) => {
             let Some(failure) = DataExportFailureCode::from_error(error) else {
-                jobs.release_start();
                 return Err(DataExportCommandError::Cancelled);
             };
             let job = Arc::new(ActiveDataExportJob::failed(
                 id,
+                generation,
                 file_name,
                 target_path,
                 failure,
             ));
-            if let Err(error) =
-                opened_source.install_export_job(generation, view_revision, Arc::clone(&job))
-            {
-                jobs.release_start();
-                return Err(error);
-            }
+            opened_source.install_export_job(
+                &reservation,
+                generation,
+                view_revision,
+                Arc::clone(&job),
+            )?;
             return job.status().map(Some);
         }
     };
     let job = Arc::new(ActiveDataExportJob::running(
         id,
+        generation,
         file_name,
         target_path,
         &reader,
     ));
-    if let Err(error) =
-        opened_source.install_export_job(generation, view_revision, Arc::clone(&job))
-    {
-        jobs.release_start();
-        return Err(error);
-    }
+    opened_source.install_export_job(&reservation, generation, view_revision, Arc::clone(&job))?;
+    drop(reservation);
     tauri::async_runtime::spawn_blocking(move || {
-        let result = reader.export();
-        job.finish(result);
+        let completion = DataExportCompletion::new(job);
+        completion.finish(reader.export());
     });
 
-    get_data_export_status(opened_source)
+    get_data_export_status(generation, opened_source)
 }
 
 #[tauri::command]
 pub(crate) fn get_data_export_status(
+    generation: u64,
     opened_source: tauri::State<'_, OpenedSource>,
 ) -> Result<Option<DataExportStatus>, DataExportCommandError> {
     let jobs = &opened_source.data_exports;
@@ -529,7 +793,9 @@ pub(crate) fn get_data_export_status(
         .map_err(|_| DataExportCommandError::QueryFailed)?
         .active
         .clone();
-    job.map(|job| job.status()).transpose()
+    job.filter(|job| job.generation == generation)
+        .map(|job| job.status())
+        .transpose()
 }
 
 #[tauri::command]
@@ -632,8 +898,7 @@ mod tests {
     use std::sync::{Arc, Barrier};
 
     use super::*;
-    use crate::SourceOpenIntent;
-    use viewda_data_engine::SourceSummary;
+    use crate::tests::open_test_source;
 
     #[test]
     fn suggests_scope_specific_csv_names_without_exposing_the_directory() {
@@ -696,15 +961,15 @@ mod tests {
     fn rejects_a_second_command_start_while_the_export_worker_is_running() {
         let jobs = DataExportJobs::default();
 
-        assert_eq!(jobs.reserve_start(), Ok(()));
+        let reservation = jobs.reserve_start(1).expect("reserve export");
         assert!(matches!(
-            jobs.reserve_start(),
+            jobs.reserve_start(1),
             Err(DataExportCommandError::AlreadyRunning)
         ));
-        jobs.release_start();
+        drop(reservation);
 
-        let job = test_running_job();
-        jobs.install(Arc::clone(&job)).expect("install running job");
+        let job = test_running_job(1);
+        install_test_job(&jobs, Arc::clone(&job));
         let worker_ready = Arc::new(Barrier::new(2));
         let worker = {
             let job = Arc::clone(&job);
@@ -719,88 +984,101 @@ mod tests {
         };
         worker_ready.wait();
         assert!(matches!(
-            jobs.reserve_start(),
+            jobs.reserve_start(1),
             Err(DataExportCommandError::AlreadyRunning)
         ));
 
         job.cancel();
         worker.join().expect("export worker");
-        assert_eq!(jobs.reserve_start(), Ok(()));
+        assert!(jobs.reserve_start(1).is_ok());
     }
 
     #[test]
-    fn blocks_new_exports_while_an_update_is_restarting_the_application() {
+    fn failed_update_releases_its_export_start_barrier() {
         let jobs = DataExportJobs::default();
 
-        jobs.block_starts().expect("block export starts");
-        assert_eq!(jobs.reserve_start(), Err(DataExportCommandError::Cancelled));
+        jobs.block_starts_and_wait().expect("block export starts");
+        assert!(matches!(
+            jobs.reserve_start(1),
+            Err(DataExportCommandError::Cancelled)
+        ));
 
         jobs.allow_starts();
-        assert_eq!(jobs.reserve_start(), Ok(()));
+        assert!(jobs.reserve_start(1).is_ok());
     }
 
     #[test]
-    fn changing_the_open_source_cancels_the_running_export() {
-        let opened_source = OpenedSource::default();
-        let job = test_running_job();
-        opened_source
-            .data_exports
-            .install(Arc::clone(&job))
-            .expect("install running job");
+    fn temporary_drain_allows_future_exports_after_cleanup() {
+        let jobs = DataExportJobs::default();
 
-        opened_source
-            .install(
-                None,
-                PathBuf::from("replacement.parquet"),
-                SourceSummary {
-                    display_name: "replacement.parquet".to_owned(),
-                    size_bytes: 0,
-                    row_count: 0,
-                    row_group_count: 0,
-                    schema: Vec::new(),
-                },
-                SourceOpenIntent::Explicit,
-            )
-            .expect("replace source");
+        jobs.drain_temporarily(|| {
+            assert!(matches!(
+                jobs.reserve_start(1),
+                Err(DataExportCommandError::Cancelled)
+            ));
+        })
+        .expect("temporary export drain");
 
-        assert!(job.cancel_requested.load(Ordering::Acquire));
-        job.finish(Err(DataExportError::Cancelled));
+        assert!(jobs.reserve_start(1).is_ok());
     }
 
     #[test]
-    fn a_stale_export_cannot_start_after_the_source_changes() {
-        let opened_source = OpenedSource::default();
-        opened_source
-            .install(
-                None,
-                PathBuf::from("first.parquet"),
-                SourceSummary {
-                    display_name: "first.parquet".to_owned(),
-                    size_bytes: 0,
-                    row_count: 0,
-                    row_group_count: 0,
-                    schema: Vec::new(),
-                },
-                SourceOpenIntent::Explicit,
-            )
-            .expect("open first source");
-        opened_source
-            .install(
-                None,
-                PathBuf::from("second.parquet"),
-                SourceSummary {
-                    display_name: "second.parquet".to_owned(),
-                    size_bytes: 0,
-                    row_count: 0,
-                    row_group_count: 0,
-                    schema: Vec::new(),
-                },
-                SourceOpenIntent::Explicit,
-            )
-            .expect("replace source");
+    fn permanent_shutdown_keeps_future_exports_blocked() {
+        let jobs = DataExportJobs::default();
+
+        jobs.cancel_all_and_wait();
 
         assert!(matches!(
-            opened_source.install_export_job(1, 0, test_running_job()),
+            jobs.reserve_start(1),
+            Err(DataExportCommandError::Cancelled)
+        ));
+    }
+
+    #[test]
+    fn opening_another_source_keeps_the_running_export() {
+        let opened_source = OpenedSource::default();
+        open_test_source(&opened_source, "exporting.parquet");
+        let job = test_running_job(1);
+        install_test_job(&opened_source.data_exports, Arc::clone(&job));
+
+        open_test_source(&opened_source, "second.parquet");
+
+        assert!(!job.cancel_requested.load(Ordering::Acquire));
+        job.finish(Ok(42));
+    }
+
+    #[test]
+    fn the_close_confirmation_covers_only_the_exports_of_one_source() {
+        let jobs = DataExportJobs::default();
+        let job = test_running_job(2);
+        install_test_job(&jobs, Arc::clone(&job));
+
+        assert_eq!(
+            jobs.running_file_names_for(2).expect("running exports"),
+            vec!["example-view.csv"]
+        );
+        assert!(
+            jobs.running_file_names_for(1)
+                .expect("other source exports")
+                .is_empty()
+        );
+
+        job.finish(Ok(42));
+    }
+
+    #[test]
+    fn a_stale_export_cannot_start_after_its_source_closed() {
+        let opened_source = OpenedSource::default();
+        let closed = open_test_source(&opened_source, "closed.parquet");
+        open_test_source(&opened_source, "second.parquet");
+        assert!(
+            opened_source
+                .close(closed.generation)
+                .expect("opened source state")
+        );
+
+        assert!(matches!(
+            opened_source.reserve_export_start(closed.generation),
             Err(DataExportCommandError::SourceChanged)
         ));
         assert!(
@@ -815,33 +1093,165 @@ mod tests {
     }
 
     #[test]
+    fn source_close_barrier_rejects_an_export_installed_after_the_snapshot() {
+        let jobs = DataExportJobs::default();
+        let reservation = jobs.reserve_start(7).expect("reserve export start");
+        let (close, names) = jobs.begin_source_close(7).expect("begin close");
+        assert!(names.is_empty());
+
+        let job = test_running_job(7);
+        assert_eq!(
+            jobs.install(&reservation, Arc::clone(&job)),
+            Err(DataExportCommandError::Cancelled)
+        );
+        assert!(job.cancel_requested.load(Ordering::Acquire));
+        assert!(jobs.state.lock().expect("export state").active.is_none());
+
+        assert!(matches!(
+            jobs.reserve_start(7),
+            Err(DataExportCommandError::Cancelled)
+        ));
+        drop(close);
+        let second = jobs.reserve_start(8).expect("reserve second export");
+        drop(reservation);
+        assert!(matches!(
+            jobs.reserve_start(9),
+            Err(DataExportCommandError::AlreadyRunning)
+        ));
+        drop(second);
+    }
+
+    #[test]
+    fn source_close_cancels_and_waits_for_export_construction() {
+        let jobs = DataExportJobs::default();
+        let reservation = jobs.reserve_start(7).expect("reserve construction");
+        let cancelled = Arc::clone(&reservation.cancelled);
+        let (close, _) = jobs.begin_source_close(7).expect("begin close");
+
+        std::thread::scope(|scope| {
+            let closing = scope.spawn(move || close.cancel_and_wait());
+            while !cancelled.load(Ordering::Acquire) {
+                std::thread::yield_now();
+            }
+            assert!(!closing.is_finished());
+            drop(reservation);
+            closing.join().expect("source close");
+        });
+
+        let state = jobs.state.lock().expect("export state");
+        assert!(state.starting.is_none());
+        assert!(state.active.is_none());
+        assert!(state.closing_generations.is_empty());
+    }
+
+    #[test]
+    fn global_block_cancels_and_waits_for_export_construction() {
+        let jobs = DataExportJobs::default();
+        let reservation = jobs.reserve_start(7).expect("reserve construction");
+        let cancelled = Arc::clone(&reservation.cancelled);
+
+        std::thread::scope(|scope| {
+            let blocking = scope.spawn(|| jobs.block_starts_and_wait());
+            while !cancelled.load(Ordering::Acquire) {
+                std::thread::yield_now();
+            }
+            assert!(!blocking.is_finished());
+            drop(reservation);
+            blocking
+                .join()
+                .expect("global block")
+                .expect("block starts");
+        });
+
+        assert!(matches!(
+            jobs.reserve_start(8),
+            Err(DataExportCommandError::Cancelled)
+        ));
+        let state = jobs.state.lock().expect("export state");
+        assert!(state.starting.is_none());
+        assert!(state.active.is_none());
+    }
+
+    #[test]
+    fn duplicate_source_close_keeps_the_first_barrier_until_every_close_finishes() {
+        let jobs = DataExportJobs::default();
+        let (first, _) = jobs.begin_source_close(7).expect("first close");
+        let (second, _) = jobs.begin_source_close(7).expect("second close");
+
+        drop(second);
+        assert!(matches!(
+            jobs.reserve_start(7),
+            Err(DataExportCommandError::Cancelled)
+        ));
+        drop(first);
+        assert!(jobs.reserve_start(7).is_ok());
+    }
+
+    #[test]
+    fn completed_source_closes_leave_no_export_bookkeeping() {
+        let jobs = DataExportJobs::default();
+        for generation in 1..=64 {
+            let job = test_running_job(generation);
+            install_test_job(&jobs, Arc::clone(&job));
+            job.finish(Ok(42));
+            let (close, _) = jobs
+                .begin_source_close(generation)
+                .expect("begin source close");
+            close.cancel_and_wait();
+            drop(close);
+        }
+
+        let state = jobs.state.lock().expect("export state");
+        assert!(state.starting.is_none());
+        assert!(state.active.is_none());
+        assert!(state.closing_generations.is_empty());
+    }
+
+    #[test]
+    fn export_worker_panic_still_releases_waiters() {
+        let job = test_running_job(7);
+        let completion_job = Arc::clone(&job);
+        let panicked = std::panic::catch_unwind(move || {
+            let _completion = DataExportCompletion::new(completion_job);
+            panic!("simulated export panic");
+        });
+
+        assert!(panicked.is_err());
+        job.wait_until_finished();
+        assert!(matches!(
+            job.status(),
+            Ok(DataExportStatus::Failed {
+                error: DataExportFailureCode::QueryFailed,
+                ..
+            })
+        ));
+    }
+
+    #[test]
     fn a_stale_export_cannot_start_after_the_view_changes() {
         let opened_source = OpenedSource::default();
-        opened_source
-            .install(
-                None,
-                PathBuf::from("view.parquet"),
-                SourceSummary {
-                    display_name: "view.parquet".to_owned(),
-                    size_bytes: 0,
-                    row_count: 0,
-                    row_group_count: 0,
-                    schema: Vec::new(),
-                },
-                SourceOpenIntent::Explicit,
-            )
-            .expect("open source");
+        let opened = open_test_source(&opened_source, "view.parquet");
         opened_source
             .state
             .lock()
             .expect("opened source")
-            .session
-            .as_mut()
+            .session(opened.generation)
             .expect("session")
+            .state
+            .lock()
+            .expect("session state")
             .view_revision = 2;
 
+        let reservation = opened_source
+            .reserve_export_start(opened.generation)
+            .expect("reserve export");
         assert!(matches!(
-            opened_source.install_export_job(1, 1, test_running_job()),
+            opened_source.install_export_job(
+                &reservation,
+                opened.generation,
+                1,
+                test_running_job(opened.generation)
+            ),
             Err(DataExportCommandError::ViewChanged)
         ));
         assert!(
@@ -870,8 +1280,8 @@ mod tests {
     #[test]
     fn shutdown_waits_for_the_cancelled_export_worker() {
         let jobs = Arc::new(DataExportJobs::default());
-        let job = test_running_job();
-        jobs.install(Arc::clone(&job)).expect("install running job");
+        let job = test_running_job(1);
+        install_test_job(&jobs, Arc::clone(&job));
         let shutdown_jobs = Arc::clone(&jobs);
         let shutdown = std::thread::spawn(move || shutdown_jobs.cancel_all_and_wait());
 
@@ -887,8 +1297,8 @@ mod tests {
     #[test]
     fn close_guard_reports_only_running_export_targets() {
         let jobs = DataExportJobs::default();
-        let job = test_running_job();
-        jobs.install(Arc::clone(&job)).expect("install running job");
+        let job = test_running_job(1);
+        install_test_job(&jobs, Arc::clone(&job));
 
         assert_eq!(
             jobs.running_file_names().expect("running exports"),
@@ -904,9 +1314,10 @@ mod tests {
         );
     }
 
-    fn test_running_job() -> Arc<ActiveDataExportJob> {
+    fn test_running_job(generation: u64) -> Arc<ActiveDataExportJob> {
         Arc::new(ActiveDataExportJob {
             id: 1,
+            generation,
             file_name: "example-view.csv".to_owned(),
             target_path: PathBuf::from("example-view.csv"),
             progress: None,
@@ -915,5 +1326,13 @@ mod tests {
             state: Mutex::new(DataExportExecutionState::Running),
             finished: Condvar::new(),
         })
+    }
+
+    fn install_test_job(jobs: &DataExportJobs, job: Arc<ActiveDataExportJob>) {
+        let reservation = jobs
+            .reserve_start(job.generation)
+            .expect("reserve test export");
+        jobs.install(&reservation, job)
+            .expect("install test export");
     }
 }

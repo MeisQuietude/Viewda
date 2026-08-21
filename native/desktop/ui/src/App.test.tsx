@@ -18,12 +18,28 @@ vi.mock("./data-grid/DataGrid", () => ({
 
 let requestSettings: (() => void) | undefined;
 let requestOpenSource: (() => void) | undefined;
+let requestCloseSource: ((generation: number) => void) | undefined;
 let reportUpdate: ((update: desktop.UpdateInfo) => void) | undefined;
 let reportOpenedSource: (() => void) | undefined;
 let requestDataExportClose:
   ((dialog: desktop.DataExportCloseDialog) => void) | undefined;
 let systemDark = false;
 let themeChangeListeners = new Set<EventListener>();
+let listedSources: desktop.OpenedSourceEntry[] = [];
+
+function listedSource(
+  generation: number,
+  name: string,
+  active = true,
+): desktop.OpenedSourceEntry {
+  return {
+    generation,
+    name,
+    directory: "~/Data",
+    path: `/home/test/Data/${name}`,
+    active,
+  };
+}
 
 afterEach(() => {
   cleanup();
@@ -36,11 +52,13 @@ afterEach(() => {
 beforeEach(() => {
   requestSettings = undefined;
   requestOpenSource = undefined;
+  requestCloseSource = undefined;
   reportUpdate = undefined;
   reportOpenedSource = undefined;
   requestDataExportClose = undefined;
   systemDark = false;
   themeChangeListeners = new Set();
+  listedSources = [];
   vi.stubGlobal(
     "matchMedia",
     vi.fn(() => ({
@@ -102,6 +120,19 @@ beforeEach(() => {
   vi.spyOn(desktop, "installPendingUpdate").mockResolvedValue(true);
   vi.spyOn(desktop, "takePostUpdateState").mockResolvedValue(null);
   vi.spyOn(desktop, "takeOpenedSource").mockResolvedValue(null);
+  vi.spyOn(desktop, "listOpenedSources").mockImplementation(async () =>
+    listedSources.map((entry) => ({ ...entry })),
+  );
+  vi.spyOn(desktop, "activateOpenedSource").mockResolvedValue();
+  vi.spyOn(desktop, "cycleOpenedSource").mockResolvedValue(null);
+  vi.spyOn(desktop, "closeOpenedSource").mockResolvedValue(true);
+  vi.spyOn(desktop, "removeRecentSource").mockResolvedValue();
+  vi.spyOn(desktop, "revealOpenedSource").mockResolvedValue();
+  vi.spyOn(desktop, "onCloseSourceRequested").mockImplementation((handler) => {
+    requestCloseSource = handler;
+    return Promise.resolve(() => {});
+  });
+  vi.spyOn(desktop, "onRecentSourcesChanged").mockResolvedValue(() => {});
   vi.spyOn(desktop, "openReleasesPage").mockResolvedValue();
   vi.spyOn(desktop, "getDefaultApplicationStatus").mockResolvedValue({
     kind: "canSet",
@@ -124,6 +155,23 @@ async function readyOpenButton() {
     ).toBeEnabled(),
   );
   return screen.getByRole("button", { name: "Open Parquet file…" });
+}
+
+function renderWithOpenSources(...sources: desktop.OpenedSourceEntry[]) {
+  listedSources = sources;
+  vi.spyOn(desktop, "takePostUpdateState").mockResolvedValue({
+    version: "0.1.0",
+    sourceError: null,
+    sources: sources.map((source) => ({
+      generation: source.generation,
+      displayName: source.name,
+      sizeBytes: 8,
+      rowCount: 1,
+      rowGroupCount: 1,
+      schema: [],
+    })),
+  });
+  render(<App />);
 }
 
 function expectShortcutHints() {
@@ -187,19 +235,27 @@ describe("App", () => {
       screen.getByText("Your data never leaves this machine."),
     ).toBeInTheDocument();
     expectShortcutHints();
+
+    fireEvent.keyDown(window, { key: "p", ctrlKey: true });
+    expect(
+      await screen.findByRole("region", { name: "File switcher" }),
+    ).toBeInTheDocument();
   });
 
   it("renders recent files and opens the keyboard-selected entry by id", async () => {
+    listedSources = [listedSource(1, "events.parquet")];
     vi.spyOn(desktop, "getRecentSources").mockResolvedValue([
       {
         id: "recent-8",
         name: "people.parquet",
         directory: "~/Data",
+        path: "/home/tester/Data/people.parquet",
       },
       {
         id: "recent-7",
         name: "events.parquet",
         directory: "~/Projects/metrics",
+        path: "/home/tester/Projects/metrics/events.parquet",
       },
     ]);
     vi.spyOn(desktop, "openRecentSource").mockResolvedValue({
@@ -231,9 +287,11 @@ describe("App", () => {
     await waitFor(() =>
       expect(desktop.openRecentSource).toHaveBeenCalledWith("recent-7"),
     );
-    expect(await screen.findByText("events.parquet")).toHaveClass(
-      "file-context",
-    );
+    expect(
+      (await screen.findAllByText("events.parquet")).some((element) =>
+        element.closest(".file-context"),
+      ),
+    ).toBe(true);
   });
 
   it("does not render the recent-files block for an empty list", async () => {
@@ -252,6 +310,7 @@ describe("App", () => {
         id: "recent-missing",
         name: "gone.parquet",
         directory: "~/Data",
+        path: "/home/tester/Data/gone.parquet",
       },
     ]);
     vi.spyOn(desktop, "openRecentSource").mockRejectedValue(
@@ -288,6 +347,7 @@ describe("App", () => {
   });
 
   it("opens a local source and renders its path-free summary", async () => {
+    listedSources = [listedSource(1, "people.parquet")];
     const openSource = vi.spyOn(desktop, "openLocalSource").mockResolvedValue({
       generation: 1,
       displayName: "people.parquet",
@@ -327,15 +387,15 @@ describe("App", () => {
     const { container } = render(<App />);
     fireEvent.click(await readyOpenButton());
 
-    expect(await screen.findByText("people.parquet")).toHaveClass(
-      "file-context",
-    );
+    expect(
+      (await screen.findByText("people.parquet")).closest(".file-context"),
+    ).not.toBeNull();
     expect(screen.queryByText("Parquet source")).not.toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Data" })).toHaveAttribute(
       "aria-pressed",
       "true",
     );
-    const dataGrid = screen.getByLabelText("Data");
+    const dataGrid = await screen.findByLabelText("Data");
     expect(dataGrid).toHaveTextContent("Grid data");
     fireEvent.click(screen.getByRole("button", { name: "Structure" }));
     expect(screen.getByLabelText("Data")).toBe(dataGrid);
@@ -441,6 +501,7 @@ describe("App", () => {
   });
 
   it("renders a path-free source forwarded by native file activation", async () => {
+    listedSources = [listedSource(2, "launched.parquet")];
     vi.spyOn(desktop, "takeOpenedSource")
       .mockResolvedValueOnce(null)
       .mockResolvedValueOnce({
@@ -459,12 +520,13 @@ describe("App", () => {
     await waitFor(() => expect(reportOpenedSource).toBeTypeOf("function"));
     act(() => reportOpenedSource?.());
 
-    expect(await screen.findByText("launched.parquet")).toHaveClass(
-      "file-context",
-    );
+    expect(
+      (await screen.findByText("launched.parquet")).closest(".file-context"),
+    ).not.toBeNull();
   });
 
-  it("keeps an explicitly opened source ahead of post-update restore", async () => {
+  it("merges a partial post-update restore after an explicit activation", async () => {
+    listedSources = [listedSource(2, "launched.parquet")];
     let resolveRestore: (
       state: desktop.PostUpdateState | null,
     ) => void = () => {};
@@ -473,37 +535,346 @@ describe("App", () => {
         resolveRestore = resolve;
       }),
     );
-    vi.spyOn(desktop, "takeOpenedSource").mockResolvedValue({
-      source: {
-        generation: 2,
-        displayName: "launched.parquet",
-        sizeBytes: 128,
-        rowCount: 3,
-        rowGroupCount: 1,
-        schema: [],
-      },
-      sourceError: null,
-    });
-    render(<App />);
-
-    expect(await screen.findByText("launched.parquet")).toBeInTheDocument();
-    await act(async () => {
-      resolveRestore({
-        version: "0.1.0",
+    vi.spyOn(desktop, "takeOpenedSource")
+      .mockResolvedValueOnce({
         source: {
-          generation: 1,
-          displayName: "restored.parquet",
-          sizeBytes: 256,
-          rowCount: 6,
+          generation: 2,
+          displayName: "launched.parquet",
+          sizeBytes: 128,
+          rowCount: 3,
           rowGroupCount: 1,
           schema: [],
         },
+        sourceError: null,
+      })
+      .mockResolvedValue(null);
+    render(<App />);
+
+    expect(await screen.findByText("launched.parquet")).toBeInTheDocument();
+    listedSources = [
+      listedSource(2, "launched.parquet"),
+      { ...listedSource(1, "restored.parquet"), active: false },
+    ];
+    await act(async () => {
+      resolveRestore({
+        version: "0.1.0",
+        sources: [
+          {
+            generation: 1,
+            displayName: "restored.parquet",
+            sizeBytes: 256,
+            rowCount: 6,
+            rowGroupCount: 1,
+            schema: [],
+          },
+        ],
         sourceError: null,
       });
     });
 
     expect(screen.getByText("launched.parquet")).toBeInTheDocument();
-    expect(screen.queryByText("restored.parquet")).not.toBeInTheDocument();
+    fireEvent.keyDown(window, { key: "p", ctrlKey: true });
+    expect(
+      await screen.findByRole("option", { name: /restored\.parquet/ }),
+    ).toBeInTheDocument();
+  });
+
+  it("switches and closes independent file sessions in native MRU order", async () => {
+    listedSources = [
+      {
+        ...listedSource(2, "part-0.parquet"),
+        directory: "~/data/2026/08",
+        path: "/data/2026/08/part-0.parquet",
+      },
+      {
+        ...listedSource(1, "part-0.parquet", false),
+        directory: "~/data/2026/07",
+        path: "/data/2026/07/part-0.parquet",
+      },
+    ];
+    vi.spyOn(desktop, "takePostUpdateState").mockResolvedValue({
+      version: "0.1.0",
+      sourceError: null,
+      sources: [
+        {
+          generation: 2,
+          displayName: "part-0.parquet",
+          sizeBytes: 16,
+          rowCount: 2,
+          rowGroupCount: 1,
+          schema: [],
+        },
+        {
+          generation: 1,
+          displayName: "part-0.parquet",
+          sizeBytes: 8,
+          rowCount: 1,
+          rowGroupCount: 1,
+          schema: [],
+        },
+      ],
+    });
+
+    render(<App />);
+    const title = await screen.findByRole("button", { name: "Switch files" });
+    expect(title).toHaveTextContent("part-0.parquet— 08· 2▾");
+
+    fireEvent.keyDown(window, { key: "p", ctrlKey: true });
+    const openRows = await screen.findAllByRole("option", {
+      name: /part-0\.parquet/,
+    });
+    expect(
+      openRows.map((row) =>
+        row.closest(".file-switcher-row")?.getAttribute("title"),
+      ),
+    ).toEqual(["/data/2026/08/part-0.parquet", "/data/2026/07/part-0.parquet"]);
+    fireEvent.keyDown(screen.getByRole("combobox", { name: "Search files" }), {
+      key: "Escape",
+    });
+
+    vi.spyOn(desktop, "cycleOpenedSource").mockImplementation(async () => {
+      listedSources = [
+        { ...listedSources[1]!, active: true },
+        { ...listedSources[0]!, active: false },
+      ];
+      return 1;
+    });
+    expect(fireEvent.keyDown(window, { key: "Tab", ctrlKey: true })).toBe(
+      false,
+    );
+    await waitFor(() =>
+      expect(desktop.cycleOpenedSource).toHaveBeenCalledWith(false),
+    );
+    act(() => requestCloseSource?.(2));
+    await waitFor(() =>
+      expect(desktop.closeOpenedSource).toHaveBeenCalledWith(2),
+    );
+  });
+
+  it("dismisses the switcher when native closes its last open file", async () => {
+    renderWithOpenSources(listedSource(1, "single.parquet"));
+    vi.spyOn(desktop, "closeOpenedSource").mockImplementation(async () => {
+      listedSources = [];
+      return true;
+    });
+
+    fireEvent.click(
+      await screen.findByRole("button", { name: "Switch files" }),
+    );
+    await waitFor(() => expect(requestCloseSource).toBeTypeOf("function"));
+    act(() => requestCloseSource?.(1));
+
+    await waitFor(() =>
+      expect(
+        screen.queryByRole("region", { name: "File switcher" }),
+      ).not.toBeInTheDocument(),
+    );
+    expect(screen.getByText("No file open")).toBeInTheDocument();
+  });
+
+  it.each([
+    {
+      condition: "export cancellation leaves native close unconfirmed",
+      outcome: false,
+      expectedListCalls: 0,
+    },
+    {
+      condition: "native close rejects while the file remains open",
+      outcome: new Error("native close failed"),
+      expectedListCalls: 1,
+    },
+  ])(
+    "keeps the switcher open when $condition",
+    async ({ outcome, expectedListCalls }) => {
+      renderWithOpenSources(listedSource(1, "single.parquet"));
+      let settleClose = () => {};
+      vi.spyOn(desktop, "closeOpenedSource").mockImplementation(
+        () =>
+          new Promise<boolean>((resolve, reject) => {
+            settleClose = () => {
+              if (outcome instanceof Error) reject(outcome);
+              else resolve(outcome);
+            };
+          }),
+      );
+
+      fireEvent.click(
+        await screen.findByRole("button", { name: "Switch files" }),
+      );
+      const listCalls = vi.mocked(desktop.listOpenedSources).mock.calls.length;
+      fireEvent.click(
+        screen.getByRole("button", { name: "Close single.parquet" }),
+      );
+
+      await waitFor(() =>
+        expect(desktop.closeOpenedSource).toHaveBeenCalledWith(1),
+      );
+      await act(async () => settleClose());
+      expect(desktop.listOpenedSources).toHaveBeenCalledTimes(
+        listCalls + expectedListCalls,
+      );
+      expect(
+        screen.getByRole("region", { name: "File switcher" }),
+      ).toBeInTheDocument();
+      expect(
+        screen.getByRole("option", { name: /single\.parquet/ }),
+      ).toBeInTheDocument();
+    },
+  );
+
+  it("dismisses after a rejected native close if the source is gone", async () => {
+    renderWithOpenSources(listedSource(1, "single.parquet"));
+    vi.spyOn(desktop, "closeOpenedSource").mockImplementation(async () => {
+      listedSources = [];
+      throw new Error("native response was lost");
+    });
+
+    fireEvent.click(
+      await screen.findByRole("button", { name: "Switch files" }),
+    );
+    act(() => requestCloseSource?.(1));
+
+    await waitFor(() =>
+      expect(
+        screen.queryByRole("region", { name: "File switcher" }),
+      ).not.toBeInTheDocument(),
+    );
+    expect(screen.getByText("No file open")).toBeInTheDocument();
+  });
+
+  it("dismisses after two open rows are closed without waiting between clicks", async () => {
+    renderWithOpenSources(
+      listedSource(2, "second.parquet"),
+      listedSource(1, "first.parquet", false),
+    );
+    vi.spyOn(desktop, "closeOpenedSource").mockImplementation(
+      async (generation) => {
+        listedSources = listedSources.filter(
+          (source) => source.generation !== generation,
+        );
+        return true;
+      },
+    );
+
+    fireEvent.click(
+      await screen.findByRole("button", { name: "Switch files" }),
+    );
+    const firstClose = screen.getByRole("button", {
+      name: "Close first.parquet",
+    });
+    const secondClose = screen.getByRole("button", {
+      name: "Close second.parquet",
+    });
+    fireEvent.click(firstClose);
+    fireEvent.click(secondClose);
+
+    await waitFor(() =>
+      expect(
+        screen.queryByRole("region", { name: "File switcher" }),
+      ).not.toBeInTheDocument(),
+    );
+    expect(desktop.closeOpenedSource).toHaveBeenCalledTimes(2);
+  });
+
+  it("ignores an older empty listing after a newer file is synchronized", async () => {
+    renderWithOpenSources(listedSource(1, "old.parquet"));
+    fireEvent.click(
+      await screen.findByRole("button", { name: "Switch files" }),
+    );
+    await waitFor(() => expect(reportOpenedSource).toBeTypeOf("function"));
+
+    let resolveOldListing: (
+      entries: desktop.OpenedSourceEntry[],
+    ) => void = () => undefined;
+    vi.mocked(desktop.listOpenedSources)
+      .mockImplementationOnce(
+        () =>
+          new Promise((resolve) => {
+            resolveOldListing = resolve;
+          }),
+      )
+      .mockResolvedValueOnce([listedSource(2, "new.parquet")]);
+    const listCalls = vi.mocked(desktop.listOpenedSources).mock.calls.length;
+    fireEvent.click(screen.getByRole("button", { name: "Close old.parquet" }));
+    await waitFor(() =>
+      expect(desktop.listOpenedSources).toHaveBeenCalledTimes(listCalls + 1),
+    );
+
+    vi.mocked(desktop.takeOpenedSource)
+      .mockResolvedValueOnce({
+        source: {
+          generation: 2,
+          displayName: "new.parquet",
+          sizeBytes: 8,
+          rowCount: 1,
+          rowGroupCount: 1,
+          schema: [],
+        },
+        sourceError: null,
+      })
+      .mockResolvedValueOnce(null);
+    act(() => reportOpenedSource?.());
+
+    expect(
+      await screen.findByRole("option", { name: /new\.parquet/ }),
+    ).toBeInTheDocument();
+    const recentCalls = vi.mocked(desktop.getRecentSources).mock.calls.length;
+    await act(async () => resolveOldListing([]));
+    await waitFor(() =>
+      expect(desktop.getRecentSources).toHaveBeenCalledTimes(recentCalls + 1),
+    );
+
+    expect(
+      screen.getByRole("option", { name: /new\.parquet/ }),
+    ).toBeInTheDocument();
+    expect(screen.queryByText("No file open")).not.toBeInTheDocument();
+    expect(
+      screen.getByRole("region", { name: "File switcher" }),
+    ).toBeInTheDocument();
+  });
+
+  it("captures Ctrl+Tab and serializes rapid native MRU cycles", async () => {
+    listedSources = [listedSource(1, "single.parquet")];
+    vi.spyOn(desktop, "takeOpenedSource")
+      .mockResolvedValueOnce({
+        source: {
+          generation: 1,
+          displayName: "single.parquet",
+          sizeBytes: 8,
+          rowCount: 1,
+          rowGroupCount: 1,
+          schema: [],
+        },
+        sourceError: null,
+      })
+      .mockResolvedValue(null);
+    render(<App />);
+    expect(await screen.findByText("single.parquet")).toBeInTheDocument();
+
+    let resolveFirst = () => {};
+    vi.mocked(desktop.cycleOpenedSource)
+      .mockImplementationOnce(
+        () =>
+          new Promise((resolve) => {
+            resolveFirst = () => resolve(1);
+          }),
+      )
+      .mockResolvedValue(null);
+
+    expect(fireEvent.keyDown(window, { key: "Tab", ctrlKey: true })).toBe(
+      false,
+    );
+    expect(fireEvent.keyDown(window, { key: "Tab", ctrlKey: true })).toBe(
+      false,
+    );
+    await waitFor(() =>
+      expect(desktop.cycleOpenedSource).toHaveBeenCalledOnce(),
+    );
+    act(resolveFirst);
+    await waitFor(() =>
+      expect(desktop.cycleOpenedSource).toHaveBeenCalledTimes(2),
+    );
+    expect(desktop.cycleOpenedSource).toHaveBeenNthCalledWith(2, false);
   });
 
   it("shows a recoverable error for a missing native file activation", async () => {
@@ -907,22 +1278,27 @@ describe("App", () => {
 
   it("restores the source and removes post-update status after one minute", async () => {
     vi.useFakeTimers();
+    listedSources = [listedSource(2, "restored.parquet")];
     vi.spyOn(desktop, "takePostUpdateState").mockResolvedValue({
       version: "0.1.0",
       sourceError: null,
-      source: {
-        generation: 2,
-        displayName: "restored.parquet",
-        sizeBytes: 4096,
-        rowCount: 12,
-        rowGroupCount: 2,
-        schema: [],
-      },
+      sources: [
+        {
+          generation: 2,
+          displayName: "restored.parquet",
+          sizeBytes: 4096,
+          rowCount: 12,
+          rowGroupCount: 2,
+          schema: [],
+        },
+      ],
     });
     render(<App />);
     await act(async () => Promise.resolve());
 
-    expect(screen.getByText("restored.parquet")).toHaveClass("file-context");
+    expect(
+      screen.getByText("restored.parquet").closest(".file-context"),
+    ).not.toBeNull();
     const status = screen.getByRole("status");
     expect(status).toHaveTextContent("updated to 0.1.0 · what's new");
 
@@ -937,7 +1313,7 @@ describe("App", () => {
     vi.spyOn(desktop, "takePostUpdateState").mockResolvedValue({
       version: "0.1.0-alpha.2",
       sourceError: null,
-      source: null,
+      sources: [],
     });
     const openPage = vi.spyOn(desktop, "openReleasesPage");
     render(<App />);

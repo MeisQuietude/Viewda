@@ -1,9 +1,11 @@
 import {
+  Fragment,
   lazy,
   Suspense,
   useCallback,
   useEffect,
   useLayoutEffect,
+  useMemo,
   useRef,
   useState,
   type KeyboardEvent,
@@ -11,7 +13,10 @@ import {
 } from "react";
 
 import {
+  activateOpenedSource,
+  cycleOpenedSource,
   checkForUpdate,
+  closeOpenedSource,
   discardPendingUpdate,
   getPendingDataExportCloseDialog,
   getDefaultApplicationStatus,
@@ -20,8 +25,11 @@ import {
   getRecentSources,
   getUpdateSettings,
   installPendingUpdate,
+  listOpenedSources,
+  onCloseSourceRequested,
   onOpenSourceRequested,
   onOpenedSourceAvailable,
+  onRecentSourcesChanged,
   onDataExportCloseRequested,
   onSettingsRequested,
   onUpdateAvailable,
@@ -29,6 +37,7 @@ import {
   openRecentSource,
   openReleasesPage,
   OpenSourceError,
+  removeRecentSource,
   resolveDataExportCloseDialog,
   setThemePreference as persistThemePreference,
   setDataViewSettings as persistDataViewSettings,
@@ -43,6 +52,7 @@ import {
   type DataViewSettings,
   type DataExportCloseDialog,
   type EngineStatus,
+  type OpenedSourceEntry,
   type RecentSource,
   type SourceErrorCode,
   type SourceSummary,
@@ -51,8 +61,17 @@ import {
   type UpdateSettings,
   UpdateCommandError,
 } from "./desktop";
+import {
+  activeOpenFile,
+  distinguishingTail,
+  mergeOpenFiles,
+  type OpenFile,
+  type SourceMode,
+} from "./open-files";
 import { SchemaTreeNode } from "./SchemaTree";
+import { FileContextMenu, FileSwitcher } from "./FileSwitcher";
 import { GridPerformanceDebug } from "./data-grid/GridPerformanceDebug";
+import type { GridDiagnosticsSink } from "./data-grid/diagnostics/session";
 import {
   applyDocumentTheme,
   SYSTEM_THEME_QUERY,
@@ -68,8 +87,6 @@ type Readiness =
   | { kind: "loading" }
   | { kind: "ready"; engine: EngineStatus }
   | { kind: "error" };
-
-type SourceMode = "data" | "structure";
 
 type TitlebarUpdate =
   | { kind: "available"; version: string; simulated: boolean }
@@ -98,11 +115,16 @@ export function App({
   initialTheme?: ThemePreference;
 }) {
   const [readiness, setReadiness] = useState<Readiness>({ kind: "loading" });
-  const [source, setSource] = useState<SourceSummary | null>(null);
+  const [openFiles, setOpenFiles] = useState<OpenFile[]>([]);
   const [sourceError, setSourceError] = useState<SourceErrorCode | null>(null);
-  const [sourceMode, setSourceMode] = useState<SourceMode>("data");
   const [opening, setOpening] = useState(false);
   const [recentSources, setRecentSources] = useState<RecentSource[]>([]);
+  const [switcherOpen, setSwitcherOpen] = useState(false);
+  const [fileContextMenu, setFileContextMenu] = useState<{
+    generation: number;
+    x: number;
+    y: number;
+  } | null>(null);
   const [updateSettings, setUpdateSettings] = useState<UpdateSettings | null>(
     null,
   );
@@ -139,7 +161,29 @@ export function App({
   const [updateMessage, setUpdateMessage] = useState<string | null>(null);
   const simulatedInstallTimer = useRef<number | null>(null);
   const dismissTimer = useRef<number | null>(null);
-  const receivedOpenedSource = useRef(false);
+  const cycleFilesTail = useRef<Promise<void>>(Promise.resolve());
+  const previousOpenFileCount = useRef(0);
+  const openFilesSyncSequence = useRef(0);
+  // Native listings carry no schema, so the window keeps the summary of every
+  // file it opened for as long as that file stays open.
+  const summaries = useRef(new Map<number, SourceSummary>());
+  const activeFile = activeOpenFile(openFiles);
+  const activeGeneration = activeFile?.generation ?? null;
+
+  useLayoutEffect(() => {
+    if (previousOpenFileCount.current > 0 && openFiles.length === 0) {
+      setSwitcherOpen(false);
+    }
+    previousOpenFileCount.current = openFiles.length;
+  }, [openFiles.length]);
+
+  const refreshRecentSources = useCallback(async () => {
+    try {
+      setRecentSources(await getRecentSources());
+    } catch {
+      setRecentSources([]);
+    }
+  }, []);
 
   useLayoutEffect(() => {
     const systemTheme = window.matchMedia(SYSTEM_THEME_QUERY);
@@ -162,6 +206,28 @@ export function App({
     return () => systemTheme.removeEventListener("change", applyTheme);
   }, [themePreference]);
 
+  /// Mirrors the native open set, adding the summaries of files opened just now.
+  const syncOpenFiles = useCallback(async (opened: SourceSummary[] = []) => {
+    const sequence = ++openFilesSyncSequence.current;
+    for (const summary of opened) {
+      summaries.current.set(summary.generation, summary);
+    }
+    const entries = await listOpenedSources();
+    if (sequence !== openFilesSyncSequence.current) {
+      return entries;
+    }
+    const open = new Set(entries.map((entry) => entry.generation));
+    for (const generation of summaries.current.keys()) {
+      if (!open.has(generation)) {
+        summaries.current.delete(generation);
+      }
+    }
+    setOpenFiles((previous) =>
+      mergeOpenFiles(entries, summaries.current, previous),
+    );
+    return entries;
+  }, []);
+
   const openSource = useCallback(async () => {
     setOpening(true);
     setSourceError(null);
@@ -169,8 +235,7 @@ export function App({
     try {
       const selected = await openLocalSource();
       if (selected !== null) {
-        setSource(selected);
-        setSourceMode("data");
+        await syncOpenFiles([selected]);
       }
     } catch (error) {
       setSourceError(
@@ -179,44 +244,134 @@ export function App({
     } finally {
       setOpening(false);
     }
-  }, []);
+  }, [syncOpenFiles]);
 
-  const openRecent = useCallback(async (id: string) => {
-    setOpening(true);
-    setSourceError(null);
+  const openRecent = useCallback(
+    async (id: string) => {
+      setOpening(true);
+      setSourceError(null);
 
-    try {
-      setSource(await openRecentSource(id));
-      setSourceMode("data");
-    } catch (error) {
-      const code =
-        error instanceof OpenSourceError ? error.code : "unsupported";
-      setSourceError(code);
-      if (code === "notFound") {
-        setRecentSources((entries) =>
-          entries.filter((entry) => entry.id !== id),
-        );
+      try {
+        await syncOpenFiles([await openRecentSource(id)]);
+        await refreshRecentSources();
+        setSwitcherOpen(false);
+      } catch (error) {
+        const code =
+          error instanceof OpenSourceError ? error.code : "unsupported";
+        setSourceError(code);
+        if (code === "notFound") {
+          setRecentSources((entries) =>
+            entries.filter((entry) => entry.id !== id),
+          );
+        }
+      } finally {
+        setOpening(false);
       }
-    } finally {
-      setOpening(false);
-    }
-  }, []);
+    },
+    [refreshRecentSources, syncOpenFiles],
+  );
 
   const receiveOpenedSource = useCallback(async () => {
     try {
-      const activation = await takeOpenedSource();
-      if (activation === null) {
+      // One drag and drop can queue several activations; each of them opened a file.
+      const opened: SourceSummary[] = [];
+      let received = false;
+      let failure: SourceErrorCode | null = null;
+      for (;;) {
+        const activation = await takeOpenedSource();
+        if (activation === null) {
+          break;
+        }
+        received = true;
+        failure = activation.sourceError;
+        if (activation.source !== null) {
+          opened.push(activation.source);
+        }
+      }
+      if (!received) {
         return;
       }
-      receivedOpenedSource.current = true;
-      setSourceError(activation.sourceError);
-      if (activation.source !== null) {
-        setSource(activation.source);
-        setSourceMode("data");
+      setSourceError(failure);
+      if (opened.length > 0) {
+        await syncOpenFiles(opened);
       }
     } catch {
       setSourceError("unsupported");
     }
+  }, [syncOpenFiles]);
+
+  const activateFile = useCallback(
+    async (generation: number) => {
+      try {
+        await activateOpenedSource(generation);
+      } catch {
+        // The file is gone natively; the refresh below settles the window.
+      }
+      await syncOpenFiles();
+    },
+    [syncOpenFiles],
+  );
+
+  const closeFile = useCallback(
+    async (generation: number) => {
+      try {
+        if (!(await closeOpenedSource(generation))) {
+          return false;
+        }
+      } catch {
+        // A rejected request can still mean native state changed; verify it below.
+      }
+      let entries: OpenedSourceEntry[];
+      try {
+        entries = await syncOpenFiles();
+      } catch {
+        return false;
+      }
+      if (entries.some((entry) => entry.generation === generation)) {
+        return false;
+      }
+      await refreshRecentSources();
+      return true;
+    },
+    [refreshRecentSources, syncOpenFiles],
+  );
+
+  const closeOtherFiles = useCallback(
+    async (generation: number) => {
+      for (const file of openFiles) {
+        if (
+          file.generation !== generation &&
+          !(await closeFile(file.generation))
+        ) {
+          break;
+        }
+      }
+    },
+    [closeFile, openFiles],
+  );
+
+  const setFileBusy = useCallback((generation: number, busy: boolean) => {
+    setOpenFiles((files) =>
+      files.map((file) =>
+        file.generation === generation && file.busy !== busy
+          ? { ...file, busy }
+          : file,
+      ),
+    );
+  }, []);
+
+  const removeRecent = useCallback(
+    async (id: string) => {
+      await removeRecentSource(id);
+      await refreshRecentSources();
+    },
+    [refreshRecentSources],
+  );
+
+  const setActiveMode = useCallback((mode: SourceMode) => {
+    setOpenFiles((files) =>
+      files.map((file) => (file.active ? { ...file, mode } : file)),
+    );
   }, []);
 
   useEffect(() => {
@@ -243,24 +398,26 @@ export function App({
     if (readiness.kind !== "ready") {
       return;
     }
-    let active = true;
+    void refreshRecentSources();
+  }, [readiness.kind, refreshRecentSources]);
 
-    getRecentSources()
-      .then((entries) => {
+  useEffect(() => {
+    let active = true;
+    let unlisten = () => {};
+    onRecentSourcesChanged(() => void refreshRecentSources())
+      .then((stopListening) => {
         if (active) {
-          setRecentSources(entries);
+          unlisten = stopListening;
+        } else {
+          stopListening();
         }
       })
-      .catch(() => {
-        if (active) {
-          setRecentSources([]);
-        }
-      });
-
+      .catch(() => {});
     return () => {
       active = false;
+      unlisten();
     };
-  }, [readiness.kind]);
+  }, [refreshRecentSources]);
 
   useEffect(() => {
     if (readiness.kind === "ready") {
@@ -291,6 +448,30 @@ export function App({
       unlisten();
     };
   }, [openSource]);
+
+  useEffect(() => {
+    let active = true;
+    let unlisten = () => {};
+
+    onCloseSourceRequested((generation) => {
+      void closeFile(generation);
+    })
+      .then((stopListening) => {
+        if (active) {
+          unlisten = stopListening;
+        } else {
+          stopListening();
+        }
+      })
+      .catch(() => {
+        // Without native events the file stays open until it is closed again.
+      });
+
+    return () => {
+      active = false;
+      unlisten();
+    };
+  }, [closeFile]);
 
   useEffect(() => {
     let active = true;
@@ -431,12 +612,10 @@ export function App({
           simulated: false,
           dismissing: false,
         });
-        if (!receivedOpenedSource.current && restored.source !== null) {
-          setSource(restored.source);
-          setSourceMode("data");
-          setSourceMode("data");
+        if (restored.sources.length > 0) {
+          void syncOpenFiles(restored.sources);
         }
-        if (!receivedOpenedSource.current && restored.sourceError !== null) {
+        if (restored.sourceError !== null) {
           setSourceError(restored.sourceError);
         }
       })
@@ -479,7 +658,7 @@ export function App({
     return () => {
       active = false;
     };
-  }, []);
+  }, [syncOpenFiles]);
 
   useEffect(() => {
     if (titlebarUpdate?.kind !== "installed") {
@@ -521,7 +700,7 @@ export function App({
   );
 
   useEffect(() => {
-    if (source === null) {
+    if (activeGeneration === null) {
       return;
     }
     const switchMode = (event: globalThis.KeyboardEvent) => {
@@ -540,12 +719,57 @@ export function App({
       }
       if (event.key === "1" || event.key === "2") {
         event.preventDefault();
-        setSourceMode(event.key === "1" ? "data" : "structure");
+        setActiveMode(event.key === "1" ? "data" : "structure");
       }
     };
     window.addEventListener("keydown", switchMode);
     return () => window.removeEventListener("keydown", switchMode);
-  }, [source]);
+  }, [activeGeneration, setActiveMode]);
+
+  useEffect(() => {
+    const cycleFiles = (event: globalThis.KeyboardEvent) => {
+      if (
+        event.key !== "Tab" ||
+        !event.ctrlKey ||
+        event.metaKey ||
+        event.altKey
+      ) {
+        return;
+      }
+      // Claimed in the capture phase: the webview would otherwise move keyboard
+      // focus out of the grid before the window sees the shortcut.
+      event.preventDefault();
+      event.stopPropagation();
+      cycleFilesTail.current = cycleFilesTail.current
+        .then(async () => {
+          await cycleOpenedSource(event.shiftKey);
+          await syncOpenFiles();
+        })
+        .catch(() => undefined);
+    };
+    window.addEventListener("keydown", cycleFiles, { capture: true });
+    return () =>
+      window.removeEventListener("keydown", cycleFiles, { capture: true });
+  }, [syncOpenFiles]);
+
+  useEffect(() => {
+    const openSwitcher = (event: globalThis.KeyboardEvent) => {
+      if (
+        !(event.metaKey || event.ctrlKey) ||
+        event.altKey ||
+        event.shiftKey ||
+        !["p", "n"].includes(event.key.toLowerCase())
+      ) {
+        return;
+      }
+      event.preventDefault();
+      setFileContextMenu(null);
+      setSwitcherOpen(true);
+    };
+    window.addEventListener("keydown", openSwitcher, { capture: true });
+    return () =>
+      window.removeEventListener("keydown", openSwitcher, { capture: true });
+  }, []);
 
   const runUpdateCheck = useCallback(async (allowDowngrade = false) => {
     setCheckingUpdates(true);
@@ -783,6 +1007,17 @@ export function App({
     }
   }, []);
 
+  // Panels keep the order the files were opened in. Following the
+  // most-recently-used order instead would move their DOM nodes on every switch,
+  // and a moved scroll box loses the reading position it was showing.
+  const panels = useMemo(
+    () =>
+      [...openFiles].sort(
+        (first, second) => first.generation - second.generation,
+      ),
+    [openFiles],
+  );
+
   const makeDefaultApplication = useCallback(async () => {
     setChangingDefaultApplication(true);
     setDefaultApplicationMessage(null);
@@ -798,18 +1033,23 @@ export function App({
   return (
     <GridPerformanceDebug
       engine={readiness.kind === "ready" ? readiness.engine : null}
-      source={source}
+      source={activeFile?.summary ?? null}
     >
       {({ diagnostics, settings: gridPerformanceDebug }) => (
         <main className="app-shell">
           <header className="titlebar">
-            <span
-              className={`file-context${source === null ? " is-empty" : ""}`}
-            >
-              {source?.displayName ?? "No file open"}
-            </span>
-            {source !== null && (
-              <ModeSwitch mode={sourceMode} onMode={setSourceMode} />
+            {activeFile === null ? (
+              <span className="file-context is-empty">No file open</span>
+            ) : (
+              <FileContext
+                file={activeFile}
+                tail={distinguishingTail(activeFile, openFiles)}
+                count={openFiles.length}
+                onOpen={() => setSwitcherOpen((open) => !open)}
+              />
+            )}
+            {activeFile !== null && (
+              <ModeSwitch mode={activeFile.mode} onMode={setActiveMode} />
             )}
             <TitlebarUpdateStatus
               update={titlebarUpdate}
@@ -819,8 +1059,46 @@ export function App({
             />
           </header>
 
-          <div className={`workspace${source === null ? " is-empty" : ""}`}>
-            {source === null ? (
+          {switcherOpen && (
+            <FileSwitcher
+              files={openFiles}
+              recentSources={recentSources}
+              opening={opening}
+              onActivate={activateFile}
+              onClose={closeFile}
+              onDismiss={() => setSwitcherOpen(false)}
+              onContextMenu={(generation, x, y) => {
+                setFileContextMenu({ generation, x, y });
+              }}
+              onOpenFile={openSource}
+              onOpenRecent={openRecent}
+              onRemoveRecent={removeRecent}
+            />
+          )}
+
+          {fileContextMenu !== null && (
+            <FileContextMenu
+              file={
+                openFiles.find(
+                  (file) => file.generation === fileContextMenu.generation,
+                ) ?? null
+              }
+              x={fileContextMenu.x}
+              y={fileContextMenu.y}
+              onClose={() => {
+                setFileContextMenu(null);
+                void closeFile(fileContextMenu.generation);
+              }}
+              onDismiss={() => setFileContextMenu(null)}
+              onCloseOthers={() => {
+                setFileContextMenu(null);
+                void closeOtherFiles(fileContextMenu.generation);
+              }}
+            />
+          )}
+
+          <div className={`workspace${activeFile === null ? " is-empty" : ""}`}>
+            {activeFile === null ? (
               <section className="empty-state" aria-label="Open a Parquet file">
                 {readiness.kind === "loading" && (
                   <>
@@ -855,40 +1133,37 @@ export function App({
                 )}
               </section>
             ) : (
-              <>
-                <div className="mode-panel" hidden={sourceMode !== "data"}>
-                  <div className="data-mode">
-                    {sourceError !== null && (
-                      <SourceErrorMessage code={sourceError} />
-                    )}
-                    <Suspense
-                      fallback={
-                        <p className="data-grid-loading" role="status">
-                          Loading data grid…
-                        </p>
-                      }
-                    >
-                      <DataGrid
-                        key={source.generation}
-                        source={source}
+              panels.map((file) => (
+                <Fragment key={file.generation}>
+                  <div
+                    className="mode-panel"
+                    hidden={!file.active || file.mode !== "data"}
+                  >
+                    <div className="data-mode">
+                      {file.active && sourceError !== null && (
+                        <SourceErrorMessage code={sourceError} />
+                      )}
+                      <OpenFileDataGrid
+                        file={file}
                         viewSettings={dataViewSettings}
-                        diagnostics={diagnostics}
+                        diagnostics={file.active ? diagnostics : undefined}
+                        onBusyChange={setFileBusy}
                       />
-                    </Suspense>
+                    </div>
                   </div>
-                </div>
-                <div
-                  className="mode-panel structure-mode-panel"
-                  hidden={sourceMode !== "structure"}
-                >
-                  <SourceDetails
-                    opening={opening}
-                    source={source}
-                    sourceError={sourceError}
-                    onOpen={openSource}
-                  />
-                </div>
-              </>
+                  <div
+                    className="mode-panel structure-mode-panel"
+                    hidden={!file.active || file.mode !== "structure"}
+                  >
+                    <SourceDetails
+                      opening={opening}
+                      source={file.summary}
+                      sourceError={file.active ? sourceError : null}
+                      onOpen={openSource}
+                    />
+                  </div>
+                </Fragment>
+              ))
             )}
           </div>
 
@@ -935,6 +1210,40 @@ export function App({
         </main>
       )}
     </GridPerformanceDebug>
+  );
+}
+
+function OpenFileDataGrid({
+  file,
+  viewSettings,
+  diagnostics,
+  onBusyChange,
+}: {
+  file: OpenFile;
+  viewSettings: DataViewSettings;
+  diagnostics: GridDiagnosticsSink | undefined;
+  onBusyChange: (generation: number, busy: boolean) => void;
+}) {
+  const reportOperation = useCallback(
+    (running: boolean) => onBusyChange(file.generation, running),
+    [file.generation, onBusyChange],
+  );
+  return (
+    <Suspense
+      fallback={
+        <p className="data-grid-loading" role="status">
+          Loading data grid…
+        </p>
+      }
+    >
+      <DataGrid
+        source={file.summary}
+        viewSettings={viewSettings}
+        diagnostics={diagnostics}
+        active={file.active}
+        onOperationChange={reportOperation}
+      />
+    </Suspense>
   );
 }
 
@@ -1028,6 +1337,34 @@ function RecentFiles({
         </li>
       ))}
     </ul>
+  );
+}
+
+function FileContext({
+  file,
+  tail,
+  count,
+  onOpen,
+}: {
+  file: OpenFile;
+  tail: string | null;
+  count: number;
+  onOpen: () => void;
+}) {
+  return (
+    <button
+      className="file-context"
+      type="button"
+      aria-label="Switch files"
+      onClick={onOpen}
+    >
+      <span className="file-context-name">{file.name}</span>
+      {tail !== null && <span className="file-context-tail">— {tail}</span>}
+      {count > 1 && <span className="file-context-count">· {count}</span>}
+      <span className="file-context-caret" aria-hidden="true">
+        ▾
+      </span>
+    </button>
   );
 }
 

@@ -1,6 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import {
+  activateOpenedSource,
   cancelDataView,
   cancelTextValueSuggestions,
   ColumnStatisticsCommandError,
@@ -14,8 +15,14 @@ import {
   getDataViewStatus,
   getTextValueSuggestions,
   installPendingUpdate,
+  listOpenedSources,
   prepareDataView,
   revealDataExport,
+  revealOpenedSource,
+  closeOpenedSource,
+  removeRecentSource,
+  clearRecentSources,
+  cycleOpenedSource,
   setDataViewSettings,
   startDataExport,
   takePostUpdateState,
@@ -76,6 +83,41 @@ describe("desktop seam", () => {
     });
   });
 
+  it("uses generation-scoped commands for open file sessions", async () => {
+    invokeMock
+      .mockResolvedValueOnce([])
+      .mockResolvedValueOnce(undefined)
+      .mockResolvedValueOnce(true)
+      .mockResolvedValueOnce(undefined)
+      .mockResolvedValueOnce(4);
+
+    await expect(listOpenedSources()).resolves.toEqual([]);
+    await expect(activateOpenedSource(7)).resolves.toBeUndefined();
+    await expect(closeOpenedSource(7)).resolves.toBe(true);
+    await expect(revealOpenedSource(7)).resolves.toBeUndefined();
+    await expect(cycleOpenedSource(true)).resolves.toBe(4);
+
+    expect(invokeMock.mock.calls).toEqual([
+      ["list_opened_sources"],
+      ["activate_opened_source", { generation: 7 }],
+      ["close_opened_source", { generation: 7 }],
+      ["reveal_opened_source", { generation: 7 }],
+      ["cycle_opened_source", { reverse: true }],
+    ]);
+  });
+
+  it("mutates recent history only through opaque identifiers", async () => {
+    invokeMock.mockResolvedValue(undefined);
+
+    await removeRecentSource("recent-4");
+    await clearRecentSources();
+
+    expect(invokeMock.mock.calls).toEqual([
+      ["remove_recent_source", { id: "recent-4" }],
+      ["clear_recent_sources"],
+    ]);
+  });
+
   it("passes text suggestion revisions through the desktop seam", async () => {
     invokeMock
       .mockResolvedValueOnce({
@@ -116,13 +158,13 @@ describe("desktop seam", () => {
   it("unwraps a restored source error from the Rust wire shape", async () => {
     invokeMock.mockResolvedValue({
       version: "0.1.0",
-      source: null,
+      sources: [],
       sourceError: { code: "notFound" },
     });
 
     await expect(takePostUpdateState()).resolves.toEqual({
       version: "0.1.0",
-      source: null,
+      sources: [],
       sourceError: "notFound",
     });
     expect(invokeMock).toHaveBeenCalledWith("take_post_update_state");
@@ -285,10 +327,12 @@ describe("desktop seam", () => {
   it("uses narrow commands for export status and dismissal", async () => {
     invokeMock.mockResolvedValueOnce(null).mockResolvedValueOnce(true);
 
-    await expect(getDataExportStatus()).resolves.toBeNull();
+    await expect(getDataExportStatus(7)).resolves.toBeNull();
     await expect(dismissDataExport(9)).resolves.toBe(true);
 
-    expect(invokeMock).toHaveBeenNthCalledWith(1, "get_data_export_status");
+    expect(invokeMock).toHaveBeenNthCalledWith(1, "get_data_export_status", {
+      generation: 7,
+    });
     expect(invokeMock).toHaveBeenNthCalledWith(2, "dismiss_data_export", {
       id: 9,
     });

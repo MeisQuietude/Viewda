@@ -1827,9 +1827,14 @@ describe("DataGrid window rendering", () => {
 
   it("keeps the current grid live until the prepared view and its count are ready", async () => {
     const preparation = deferred<desktop.DataViewStatus>();
+    const onOperationChange = vi.fn();
+    const replacementOperationChange = vi.fn();
     vi.mocked(desktop.prepareDataView).mockReturnValueOnce(preparation.promise);
-    render(<DataGrid source={source} />);
+    const { rerender } = render(
+      <DataGrid source={source} onOperationChange={onOperationChange} />,
+    );
     await waitFor(() => expect(desktop.getDataWindow).toHaveBeenCalledOnce());
+    onOperationChange.mockClear();
 
     addNumberFilter("1");
 
@@ -1844,6 +1849,14 @@ describe("DataGrid window rendering", () => {
     );
     expect(gridMock.props?.rowCount).toBe(10_000);
     expect(screen.getByLabelText("Query")).toHaveTextContent("preparing view…");
+    expect(onOperationChange).toHaveBeenLastCalledWith(true);
+    rerender(
+      <DataGrid
+        source={source}
+        onOperationChange={replacementOperationChange}
+      />,
+    );
+    expect(onOperationChange).not.toHaveBeenCalledWith(false);
     expect(screen.getByLabelText("Query")).not.toHaveTextContent(
       '"column_0" = 1',
     );
@@ -1853,6 +1866,8 @@ describe("DataGrid window rendering", () => {
     await waitFor(() => expect(gridMock.props?.rowCount).toBe(37));
     expect(screen.getByLabelText("Query")).toHaveTextContent('"column_0" = 1');
     expect(screen.getByLabelText("Query")).toHaveTextContent("37 rows");
+    expect(onOperationChange).toHaveBeenLastCalledWith(true);
+    expect(replacementOperationChange).toHaveBeenLastCalledWith(false);
   });
 
   it("loads the current viewport after preparation completes during scrolling", async () => {

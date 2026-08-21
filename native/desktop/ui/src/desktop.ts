@@ -1,8 +1,8 @@
 // The only module allowed to import Tauri APIs (an ESLint rule enforces
 // this). Keeping the shell behind one seam is what lets a different shell —
 // or a future web build — replace it without touching the rest of the UI.
-// Note what is absent: no dialog API and no paths. File selection lives
-// entirely in Rust, and the UI only ever receives a path-free summary.
+// File selection and filesystem access live in Rust. The switcher receives
+// canonical paths only for identity, search, tooltip, copy, and reveal actions.
 import { Channel, invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
@@ -28,6 +28,16 @@ export interface RecentSource {
   id: string;
   name: string;
   directory: string;
+  path: string;
+}
+
+/** One open file, as Rust lists them in most-recently-used order. */
+export interface OpenedSourceEntry {
+  generation: number;
+  name: string;
+  directory: string;
+  path: string;
+  active: boolean;
 }
 
 export interface SchemaField {
@@ -189,7 +199,7 @@ export interface UpdateCheckOptions {
 
 export interface PostUpdateState {
   version: string;
-  source: SourceSummary | null;
+  sources: SourceSummary[];
   sourceError: SourceErrorCode | null;
 }
 
@@ -211,7 +221,7 @@ interface NativeSourceError {
 
 interface NativePostUpdateState {
   version: string;
-  source: SourceSummary | null;
+  sources: SourceSummary[];
   sourceError: NativeSourceError | null;
 }
 
@@ -415,6 +425,35 @@ export function openRecentSource(id: string): Promise<SourceSummary> {
   return invokeSource<SourceSummary>("open_recent_source", { id });
 }
 
+export function removeRecentSource(id: string): Promise<void> {
+  return invoke("remove_recent_source", { id });
+}
+
+export function clearRecentSources(): Promise<void> {
+  return invoke("clear_recent_sources");
+}
+
+export function listOpenedSources(): Promise<OpenedSourceEntry[]> {
+  return invoke<OpenedSourceEntry[]>("list_opened_sources");
+}
+
+export function activateOpenedSource(generation: number): Promise<void> {
+  return invoke("activate_opened_source", { generation });
+}
+
+export function cycleOpenedSource(reverse: boolean): Promise<number | null> {
+  return invoke<number | null>("cycle_opened_source", { reverse });
+}
+
+/** Closes one open file; `false` means a running export kept it open. */
+export function closeOpenedSource(generation: number): Promise<boolean> {
+  return invoke<boolean>("close_opened_source", { generation });
+}
+
+export function revealOpenedSource(generation: number): Promise<void> {
+  return invoke("reveal_opened_source", { generation });
+}
+
 async function invokeSource<T>(
   command: string,
   args?: Record<string, unknown>,
@@ -505,8 +544,12 @@ export async function startDataExport(
   }
 }
 
-export function getDataExportStatus(): Promise<DataExportStatus | null> {
-  return invoke<DataExportStatus | null>("get_data_export_status");
+export function getDataExportStatus(
+  generation: number,
+): Promise<DataExportStatus | null> {
+  return invoke<DataExportStatus | null>("get_data_export_status", {
+    generation,
+  });
 }
 
 export function cancelDataExport(id: number): Promise<boolean> {
@@ -585,6 +628,20 @@ export function onOpenSourceRequested(
   handler: () => void,
 ): Promise<UnlistenFn> {
   return listen("open-source-requested", handler);
+}
+
+export function onCloseSourceRequested(
+  handler: (generation: number) => void,
+): Promise<UnlistenFn> {
+  return listen<number>("close-source-requested", (event) => {
+    handler(event.payload);
+  });
+}
+
+export function onRecentSourcesChanged(
+  handler: () => void,
+): Promise<UnlistenFn> {
+  return listen("recent-sources-changed", handler);
 }
 
 export function onSettingsRequested(handler: () => void): Promise<UnlistenFn> {
