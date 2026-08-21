@@ -3077,12 +3077,10 @@ describe("DataGrid window rendering", () => {
     expect(within(sidebar).getByText("profile")).toBeInTheDocument();
     expect(within(sidebar).getByText("address")).toBeInTheDocument();
     expect(within(sidebar).getByText("city")).toBeInTheDocument();
-    expect(within(sidebar).getByText("BYTE_ARRAY · String")).toHaveClass(
-      "schema-type",
-    );
-    expect(within(sidebar).getByText("BYTE_ARRAY · String")).toHaveAttribute(
+    expect(within(sidebar).getByText("string")).toHaveClass("schema-type");
+    expect(within(sidebar).getByText("string")).toHaveAttribute(
       "title",
-      "BYTE_ARRAY · String",
+      "string",
     );
     expect(
       within(sidebar).queryByRole("heading", { name: "Schema" }),
@@ -3097,6 +3095,335 @@ describe("DataGrid window rendering", () => {
     expect(await within(sidebar).findByText("12.5%")).toBeInTheDocument();
     expect(within(sidebar).getByText("≈ 42")).toBeInTheDocument();
     expect(gridMock.scrollToColumn).toHaveBeenCalledWith(0, 16);
+  });
+
+  it("keeps Peek open and updates it as the active cell moves", async () => {
+    render(<DataGrid source={source} />);
+    await waitFor(() => expect(desktop.getDataWindow).toHaveBeenCalledOnce());
+    const first = {
+      columns: CompactSelection.empty(),
+      rows: CompactSelection.empty(),
+      current: {
+        cell: { column: 0, row: 0 },
+        range: { x: 0, y: 0, width: 1, height: 1 },
+        rangeStack: [],
+      },
+    };
+    act(() => {
+      gridMock.props?.onSelectionChange(first);
+      gridMock.props?.onCellPeek?.(first.current.cell, {
+        x: 20,
+        y: 20,
+        width: 120,
+        height: 28,
+      });
+    });
+    expect(
+      screen.getByRole("dialog", { name: "Peek column_0" }),
+    ).toHaveTextContent("row 0");
+
+    act(() => {
+      gridMock.props?.onSelectionChange({
+        ...first,
+        current: {
+          ...first.current,
+          cell: { column: 0, row: 1 },
+          range: { x: 0, y: 1, width: 1, height: 1 },
+        },
+      });
+    });
+    expect(
+      screen.getByRole("dialog", { name: "Peek column_0" }),
+    ).toHaveTextContent("row 1");
+    expect(gridMock.focus).not.toHaveBeenCalled();
+
+    act(() => {
+      gridMock.props?.onActiveCellBoundsChange?.(
+        { column: 0, row: 1 },
+        { x: 300, y: 120, width: 120, height: 28 },
+      );
+    });
+    expect(screen.getByRole("dialog", { name: "Peek column_0" })).toHaveStyle({
+      left: "428px",
+      top: "156px",
+    });
+
+    act(() => gridMock.props?.onPeekFocus?.());
+    expect(screen.getByRole("tree")).toHaveFocus();
+    act(() => gridMock.props?.onScrollInteraction?.());
+    expect(
+      screen.queryByRole("dialog", { name: "Peek column_0" }),
+    ).not.toBeInTheDocument();
+  });
+
+  it("shares one active-cell materialization between the grid and Peek", async () => {
+    const emojiFont = deferred<void>();
+    Object.defineProperty(document, "fonts", {
+      configurable: true,
+      value: {
+        *[Symbol.iterator]() {
+          yield { family: '"Noto Emoji"', load: () => emojiFont.promise };
+        },
+      },
+    });
+    const at = vi.fn((row: number) => `row ${row}`);
+    decodeArrowWindow.mockImplementation(
+      (
+        _bytes: ArrayBuffer,
+        rowOffset: number,
+        sourceIndices: readonly number[],
+      ): ArrowDataWindow => ({
+        rowOffset,
+        rowCount: 512,
+        sourceIndices,
+        sourceColumnOffsets: new Map(
+          sourceIndices.map((sourceIndex, offset) => [sourceIndex, offset]),
+        ),
+        table: {
+          schema: {
+            fields: sourceIndices.map(() => ({ type: utf8() })),
+          },
+          getChildAt: () => ({ at }),
+        } as unknown as ArrowDataWindow["table"],
+      }),
+    );
+    const view = render(<DataGrid source={source} />);
+    await waitFor(() => expect(desktop.getDataWindow).toHaveBeenCalledOnce());
+    const selection = {
+      columns: CompactSelection.empty(),
+      rows: CompactSelection.empty(),
+      current: {
+        cell: { column: 0, row: 0 },
+        range: { x: 0, y: 0, width: 1, height: 1 },
+        rangeStack: [],
+      },
+    };
+    act(() => {
+      gridMock.props?.onSelectionChange(selection);
+    });
+    expect(at).not.toHaveBeenCalled();
+
+    expect(
+      gridMock.props?.getCellContent(selection.current.cell),
+    ).toMatchObject({ kind: "text", displayData: "row 0" });
+    expect(at).toHaveBeenCalledOnce();
+
+    act(() => {
+      gridMock.props?.onCellPeek?.(selection.current.cell, {
+        x: 20,
+        y: 20,
+        width: 120,
+        height: 28,
+      });
+    });
+    expect(at).toHaveBeenCalledOnce();
+
+    view.rerender(<DataGrid source={source} />);
+    fireEvent.click(screen.getByRole("button", { name: "Schema" }));
+    gridMock.revisionChanged.mockClear();
+    await act(async () => emojiFont.resolve());
+    await waitFor(() => expect(gridMock.revisionChanged).toHaveBeenCalled());
+    expect(at).toHaveBeenCalledOnce();
+
+    const secondSelection = {
+      ...selection,
+      current: {
+        ...selection.current,
+        cell: { column: 0, row: 1 },
+        range: { x: 0, y: 1, width: 1, height: 1 },
+      },
+    };
+    act(() => {
+      gridMock.props?.onSelectionChange(secondSelection);
+    });
+    expect(at).toHaveBeenCalledTimes(2);
+    expect(
+      gridMock.props?.getCellContent(secondSelection.current.cell),
+    ).toMatchObject({ kind: "text", displayData: "row 1" });
+    expect(at).toHaveBeenCalledTimes(2);
+
+    act(() => gridMock.props?.onSort(0, false));
+    await waitFor(() => expect(desktop.getDataWindow).toHaveBeenCalledTimes(2));
+    act(() => gridMock.props?.onSelectionChange(secondSelection));
+    expect(
+      gridMock.props?.getCellContent(secondSelection.current.cell),
+    ).toMatchObject({ kind: "text", displayData: "row 1" });
+    expect(at).toHaveBeenCalledTimes(3);
+    act(() => {
+      gridMock.props?.onCellPeek?.(secondSelection.current.cell, {
+        x: 20,
+        y: 20,
+        width: 120,
+        height: 28,
+      });
+    });
+    expect(at).toHaveBeenCalledTimes(3);
+  });
+
+  it("releases a cached large value when its selection or window is replaced", async () => {
+    const largeValue = "x".repeat(2 * 1024 * 1024);
+    const firstAt = vi.fn(() => largeValue);
+    const replacementAt = vi.fn((row: number) => `replacement ${row}`);
+    let decodeCount = 0;
+    decodeArrowWindow.mockImplementation(
+      (
+        _bytes: ArrayBuffer,
+        rowOffset: number,
+        sourceIndices: readonly number[],
+      ): ArrowDataWindow => {
+        const at = decodeCount === 0 ? firstAt : replacementAt;
+        decodeCount += 1;
+        return {
+          rowOffset,
+          rowCount: 512,
+          sourceIndices,
+          sourceColumnOffsets: new Map(
+            sourceIndices.map((sourceIndex, offset) => [sourceIndex, offset]),
+          ),
+          table: {
+            schema: {
+              fields: sourceIndices.map(() => ({ type: utf8() })),
+            },
+            getChildAt: () => ({ at }),
+          } as unknown as ArrowDataWindow["table"],
+        };
+      },
+    );
+    render(<DataGrid source={source} />);
+    await waitFor(() => expect(desktop.getDataWindow).toHaveBeenCalledOnce());
+    const activeSelection = {
+      columns: CompactSelection.empty(),
+      rows: CompactSelection.empty(),
+      current: {
+        cell: { column: 0, row: 0 },
+        range: { x: 0, y: 0, width: 1, height: 1 },
+        rangeStack: [],
+      },
+    };
+    act(() => gridMock.props?.onSelectionChange(activeSelection));
+    gridMock.props?.getCellContent(activeSelection.current.cell);
+    expect(firstAt).toHaveBeenCalledOnce();
+
+    act(() =>
+      gridMock.props?.onSelectionChange({
+        columns: CompactSelection.empty(),
+        rows: CompactSelection.empty(),
+      }),
+    );
+    act(() => gridMock.props?.onSelectionChange(activeSelection));
+    gridMock.props?.getCellContent(activeSelection.current.cell);
+    expect(firstAt).toHaveBeenCalledTimes(2);
+
+    act(() => {
+      gridMock.props?.onViewportChange({
+        rowStart: 1_000,
+        rowCount: 5,
+        columnIndices: [0],
+        mountedRowStart: 997,
+        mountedRowCount: 11,
+        mountedColumnIndices: [0],
+      });
+    });
+    await waitFor(() => expect(desktop.getDataWindow).toHaveBeenCalledTimes(2));
+    const replacementSelection = {
+      ...activeSelection,
+      current: {
+        ...activeSelection.current,
+        cell: { column: 0, row: 1_000 },
+        range: { x: 0, y: 1_000, width: 1, height: 1 },
+      },
+    };
+    act(() => gridMock.props?.onSelectionChange(replacementSelection));
+    gridMock.props?.getCellContent(replacementSelection.current.cell);
+    act(() => {
+      gridMock.props?.onCellPeek?.(replacementSelection.current.cell, {
+        x: 20,
+        y: 20,
+        width: 120,
+        height: 28,
+      });
+    });
+    expect(replacementAt).toHaveBeenCalledOnce();
+  });
+
+  it("does not populate or replace the active-cell cache while copying", async () => {
+    const at = vi.fn((row: number) => `row ${row}`);
+    decodeArrowWindow.mockImplementation(
+      (
+        _bytes: ArrayBuffer,
+        rowOffset: number,
+        sourceIndices: readonly number[],
+      ): ArrowDataWindow => ({
+        rowOffset,
+        rowCount: 512,
+        sourceIndices,
+        sourceColumnOffsets: new Map(
+          sourceIndices.map((sourceIndex, offset) => [sourceIndex, offset]),
+        ),
+        table: {
+          schema: {
+            fields: sourceIndices.map(() => ({ type: utf8() })),
+          },
+          getChildAt: () => ({ at }),
+        } as unknown as ArrowDataWindow["table"],
+      }),
+    );
+    render(<DataGrid source={source} />);
+    await waitFor(() => expect(desktop.getDataWindow).toHaveBeenCalledOnce());
+    const selection = {
+      columns: CompactSelection.empty(),
+      rows: CompactSelection.empty(),
+      current: {
+        cell: { column: 0, row: 0 },
+        range: { x: 0, y: 0, width: 1, height: 1 },
+        rangeStack: [],
+      },
+    };
+    act(() => gridMock.props?.onSelectionChange(selection));
+
+    copyFromGrid();
+    await waitFor(() => expect(clipboardWrite).toHaveBeenCalledOnce());
+    expect(at).toHaveBeenCalledOnce();
+    gridMock.props?.getCellContent(selection.current.cell);
+    expect(at).toHaveBeenCalledTimes(2);
+    act(() => {
+      gridMock.props?.onCellPeek?.(selection.current.cell, {
+        x: 20,
+        y: 20,
+        width: 120,
+        height: 28,
+      });
+    });
+    expect(at).toHaveBeenCalledTimes(2);
+
+    clipboardWrite.mockClear();
+    copyFromGrid();
+    await waitFor(() => expect(clipboardWrite).toHaveBeenCalledOnce());
+    expect(at).toHaveBeenCalledTimes(3);
+    gridMock.props?.getCellContent(selection.current.cell);
+    expect(at).toHaveBeenCalledTimes(3);
+  });
+
+  it("opens Peek from the cell context menu and returns focus to the grid", async () => {
+    render(<DataGrid source={source} />);
+    await waitFor(() => expect(desktop.getDataWindow).toHaveBeenCalledOnce());
+    act(() => {
+      gridMock.props?.onCellContextMenu(
+        { column: 0, row: 2 },
+        { x: 20, y: 20, width: 120, height: 28 },
+      );
+    });
+    fireEvent.click(screen.getByRole("menuitem", { name: /Peek/ }));
+
+    expect(
+      screen.getByRole("dialog", { name: "Peek column_0" }),
+    ).toHaveTextContent("row 2");
+    expect(gridMock.focus).toHaveBeenCalledOnce();
+    fireEvent.click(screen.getByRole("button", { name: "Close Peek" }));
+    expect(
+      screen.queryByRole("dialog", { name: "Peek column_0" }),
+    ).not.toBeInTheDocument();
+    expect(gridMock.focus).toHaveBeenCalledTimes(2);
   });
 
   it("keeps duplicate sibling names as distinct schema nodes", () => {

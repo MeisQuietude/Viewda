@@ -115,6 +115,10 @@ export interface TextGridCell {
   copyData: string;
   alignment: CellAlignment;
   faded: boolean;
+  segments?: readonly {
+    text: string;
+    tone: "null" | "secondary" | "value";
+  }[];
 }
 
 export type GridCell = LoadingGridCell | TextGridCell;

@@ -8,6 +8,16 @@ Backward-incompatible entries start with **Breaking:**.
 
 ## Unreleased
 
+### Added
+
+- Read typed previews for nested values in the data grid and copy them as
+  lossless JSON, including decimals, temporal values, binary data, large
+  integers, lists, structs, and maps.
+- Open any cell in a resizable Peek tree with Space, double-click, or the cell
+  menu; navigate and copy nodes or paths without leaving the grid.
+- Read nested columns as logical list, struct, and map types in the Data schema
+  sidebar while the Structure view keeps the physical Parquet layout.
+
 ## 0.2.0 — 2026-08-21
 
 ### Added

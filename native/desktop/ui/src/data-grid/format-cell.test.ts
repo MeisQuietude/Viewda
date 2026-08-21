@@ -1,12 +1,29 @@
 import {
   binary,
+  binaryView,
+  bool,
+  dateDay,
+  dateMillisecond,
+  decimal128,
+  dictionary,
+  duration,
+  fixedSizeBinary,
+  float32,
   int64,
+  IntervalUnit,
+  interval,
+  largeBinary,
+  largeUtf8,
   list,
   map,
+  nullType,
   struct,
+  timeMicrosecond,
   TimeUnit,
   timestamp,
   utf8,
+  utf8View,
+  type DataType,
 } from "@uwdata/flechette";
 import { describe, expect, it } from "vitest";
 
@@ -66,13 +83,13 @@ describe("formatCellValue", () => {
     });
   });
 
-  it("renders nested values as compact JSON and copies the full JSON", () => {
+  it("renders nested values with the preview grammar and copies full JSON", () => {
     const type = struct({ tags: list(int64()) });
     const value = { tags: [1n, 2n] };
 
-    expect(formatCellValue(value, type)).toEqual({
-      displayData: '{"tags":["1","2"]}',
-      copyData: '{"tags":["1","2"]}',
+    expect(formatCellValue(value, type)).toMatchObject({
+      displayData: "{tags: […]}",
+      copyData: '{"tags":[1,2]}',
       align: "left",
       faded: false,
     });
@@ -91,38 +108,44 @@ describe("formatCellValue", () => {
     const presentation = formatCellValue(value, type, false);
 
     expect(presentation.displayData).toHaveLength(120);
-    expect(presentation.displayData.endsWith("…")).toBe(true);
+    expect(presentation.displayData.endsWith('…"')).toBe(true);
     expect(presentation.copyData).toBe("");
   });
 
-  it("matches full formatting for deeply nested values within the preview budget", () => {
+  it("collapses nesting below the first preview level", () => {
     let value: unknown = 1;
-    for (let depth = 0; depth < 40; depth += 1) value = [value];
+    let type: DataType = int64();
+    for (let depth = 0; depth < 40; depth += 1) {
+      value = [value];
+      type = list(type);
+    }
 
-    const full = formatCellValue(value, list(utf8()));
-    const displayOnly = formatCellValue(value, list(utf8()), false);
+    const full = formatCellValue(value, type);
+    const displayOnly = formatCellValue(value, type, false);
 
-    expect(displayOnly.displayData).toBe(full.displayData);
+    expect(displayOnly.displayData).toBe("[1] […]");
+    expect(full.displayData).toBe("[1] […]");
     expect(displayOnly.copyData).toBe("");
   });
 
-  it("matches full formatting for maps with bigint and binary values", () => {
+  it("uses count-first map previews without serializing copy data on scroll", () => {
     const value = new Map<unknown, unknown>([
-      ["count", 7n],
-      ["bytes", new Uint8Array([1, 2, 3])],
+      ["count", "7"],
+      ["bytes", "three"],
     ]);
     const type = map(utf8(), utf8());
 
     expect(formatCellValue(value, type, false).displayData).toBe(
-      formatCellValue(value, type).displayData,
+      '{2} "count" → "7", "bytes" → "three"',
     );
+    expect(formatCellValue(value, type, false).copyData).toBe("");
   });
 
   it("keeps large nested copy data complete when its display is truncated", () => {
     const value = Array.from({ length: 200 }, (_, index) => `value-${index}`);
     const presentation = formatCellValue(value, list(utf8()));
 
-    expect(presentation.displayData.endsWith("…")).toBe(true);
+    expect(presentation.displayData.endsWith('…"')).toBe(true);
     expect(presentation.copyData).toBe(JSON.stringify(value));
   });
 
@@ -145,4 +168,70 @@ describe("formatCellValue", () => {
     });
     expect(usesMonospaceCells(int64())).toBe(true);
   });
+
+  it.each([
+    ["null", null, nullType(), "null", ""],
+    ["int", 42n, int64(), "42", "42"],
+    ["float", 1.5, float32(), "1.5", "1.5"],
+    ["binary", new Uint8Array([1, 2]), binary(), "binary · 2 B", "AQI="],
+    [
+      "large binary",
+      new Uint8Array([1, 2]),
+      largeBinary(),
+      "binary · 2 B",
+      "AQI=",
+    ],
+    [
+      "fixed binary",
+      new Uint8Array([1, 2]),
+      fixedSizeBinary(2),
+      "binary · 2 B",
+      "AQI=",
+    ],
+    [
+      "binary view",
+      new Uint8Array([1, 2]),
+      binaryView(),
+      "binary · 2 B",
+      "AQI=",
+    ],
+    ["utf8", "duck", utf8(), "duck", "duck"],
+    ["large utf8", "duck", largeUtf8(), "duck", "duck"],
+    ["utf8 view", "duck", utf8View(), "duck", "duck"],
+    ["boolean", true, bool(), "true", "true"],
+    ["decimal", 1999n, decimal128(9, 2), "19.99", "19.99"],
+    ["date day", 0, dateDay(), "1970-01-01", "1970-01-01"],
+    [
+      "date millisecond",
+      86_400_000,
+      dateMillisecond(),
+      "1970-01-02",
+      "1970-01-02",
+    ],
+    ["time", 1_234n, timeMicrosecond(), "1234", "1234"],
+    [
+      "timestamp",
+      1_000n,
+      timestamp(TimeUnit.MILLISECOND, "UTC"),
+      "1970-01-01T00:00:01.000Z",
+      "1000",
+    ],
+    [
+      "interval",
+      new Int32Array([1, 2]),
+      interval(IntervalUnit.DAY_TIME),
+      "1,2",
+      "1,2",
+    ],
+    ["duration", 42n, duration(TimeUnit.SECOND), "42", "42"],
+    ["dictionary", "duck", dictionary(utf8()), "duck", "duck"],
+  ] as const)(
+    "preserves top-level %s formatting",
+    (_name, value, type, displayData, copyData) => {
+      expect(formatCellValue(value, type)).toMatchObject({
+        displayData,
+        copyData,
+      });
+    },
+  );
 });

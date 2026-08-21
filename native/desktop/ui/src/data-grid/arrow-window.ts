@@ -60,6 +60,8 @@ export function windowValue(
   row: number,
 ): unknown {
   const columnOffset = window.sourceColumnOffsets.get(column);
+  // Flechette may materialize a nested JavaScript value at this Arrow boundary.
+  // Preview formatting must not add a full traversal or serialization afterward.
   return columnOffset === undefined
     ? undefined
     : window.table.getChildAt(columnOffset).at(row - window.rowOffset);

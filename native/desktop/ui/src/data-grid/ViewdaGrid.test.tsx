@@ -1120,6 +1120,99 @@ describe("ViewdaGrid foundation", () => {
     );
   });
 
+  it("routes Peek keyboard, double-click, focus, and scroll interactions", () => {
+    const onCellPeek = vi.fn();
+    const onPeekFocus = vi.fn();
+    const onScrollInteraction = vi.fn();
+    const selection = selectCell(
+      emptyGridSelection(),
+      { row: 0, column: 0 },
+      false,
+      false,
+    );
+    render(
+      <ViewdaGrid
+        {...props({
+          selection,
+          onCellPeek,
+          onPeekFocus,
+          onScrollInteraction,
+        })}
+      />,
+    );
+    const grid = screen.getByRole("grid");
+    const cell = screen.getByRole("gridcell", { name: "0:0" });
+
+    fireEvent.keyDown(grid, { key: " " });
+    fireEvent.doubleClick(cell);
+    expect(onCellPeek).toHaveBeenCalledTimes(2);
+    expect(onCellPeek).toHaveBeenLastCalledWith(
+      { row: 0, column: 0 },
+      { x: 1, y: 2, width: 100, height: 28 },
+    );
+    fireEvent.keyDown(grid, { key: "Tab" });
+    expect(onPeekFocus).toHaveBeenCalledOnce();
+
+    act(() => grid.dispatchEvent(wheelEvent({ deltaY: 28 }, 1)));
+    expect(onScrollInteraction).toHaveBeenCalledOnce();
+  });
+
+  it("reports fresh active-cell bounds after virtual navigation", () => {
+    vi.spyOn(window, "requestAnimationFrame").mockImplementation((callback) => {
+      callback(0);
+      return 1;
+    });
+    const onActiveCellBoundsChange = vi.fn();
+    const gridRef = createRef<ViewdaGridHandle>();
+    const port = measurementPort(420, 84);
+    port.bounds = (element) => ({
+      x: Number(element.dataset.column) * 100,
+      y: Number(element.dataset.row) * 28,
+      width: 100,
+      height: 28,
+    });
+    const initial = selectCell(
+      emptyGridSelection(),
+      { row: 0, column: 0 },
+      false,
+      false,
+    );
+    const view = render(
+      <ViewdaGrid
+        ref={gridRef}
+        {...props({
+          selection: initial,
+          measurementPort: port,
+          onActiveCellBoundsChange,
+        })}
+      />,
+    );
+    expect(onActiveCellBoundsChange).toHaveBeenLastCalledWith(
+      { row: 0, column: 0 },
+      { x: 0, y: 0, width: 100, height: 28 },
+    );
+
+    act(() => {
+      gridRef.current?.scrollToRow(20);
+      gridRef.current?.scrollToColumn(8);
+    });
+    const next = selectCell(initial, { row: 20, column: 8 }, false, false);
+    view.rerender(
+      <ViewdaGrid
+        ref={gridRef}
+        {...props({
+          selection: next,
+          measurementPort: port,
+          onActiveCellBoundsChange,
+        })}
+      />,
+    );
+    expect(onActiveCellBoundsChange).toHaveBeenLastCalledWith(
+      { row: 20, column: 8 },
+      { x: 800, y: 560, width: 100, height: 28 },
+    );
+  });
+
   it("extends a cell selection while the pointer is captured", () => {
     const onSelectionChange = vi.fn();
     const { setPointerCapture, releasePointerCapture } =
@@ -1896,6 +1989,35 @@ describe("ViewdaGrid foundation", () => {
     expect(screen.getAllByRole("gridcell", { name: "loaded" })).toHaveLength(
       renderedCellCount,
     );
+  });
+
+  it("keeps nested preview values primary while dimming syntax and nulls", () => {
+    render(
+      <ViewdaGrid
+        {...props({
+          columns: [column(0)],
+          rowCount: 1,
+          getCellContent: () => ({
+            kind: "text",
+            displayData: "{a: null}",
+            copyData: '{"a":null}',
+            alignment: "left",
+            faded: false,
+            segments: [
+              { text: "{", tone: "secondary" },
+              { text: "a", tone: "value" },
+              { text: ": ", tone: "secondary" },
+              { text: "null", tone: "null" },
+              { text: "}", tone: "secondary" },
+            ],
+          }),
+        })}
+      />,
+    );
+    const cell = screen.getByRole("gridcell", { name: "{a: null}" });
+    expect(cell.querySelectorAll(".cell-preview-secondary")).toHaveLength(3);
+    expect(cell.querySelector(".cell-preview-value")).toHaveTextContent("a");
+    expect(cell.querySelector(".cell-preview-null")).toHaveTextContent("null");
   });
 
   it("supports keyboard navigation without moving DOM focus into a cell", () => {

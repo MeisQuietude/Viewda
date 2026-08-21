@@ -272,6 +272,13 @@ describe("grid layout containment", () => {
     });
   });
 
+  it("lets tiny viewport placement override Peek's normal resize floor", () => {
+    expectDeclarations(".value-peek", {
+      "min-width": "0px",
+      "min-height": "0px",
+    });
+  });
+
   it("moves only the scrolling header outside native body layout", () => {
     expect(declaration(".viewda-grid-scrolling-headers", "will-change")).toBe(
       "transform",
