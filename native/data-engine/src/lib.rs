@@ -27,8 +27,9 @@ use thiserror::Error;
 #[cfg(feature = "query-engine")]
 pub use dataset::{
     DatasetError, DatasetInspectionInterruptHandle, DatasetInspectionProgress, DatasetInspector,
-    DatasetMemberPage, DatasetMemberSummary, DatasetPartitionNode, DatasetPartitionPage,
-    DatasetPreview, DatasetSource, DatasetSummary, DatasetWindowReader, PartitionValue,
+    DatasetMemberPage, DatasetMemberSnapshot, DatasetMemberSummary, DatasetPartitionNode,
+    DatasetPartitionPage, DatasetPreview, DatasetSource, DatasetSummary, DatasetWindowReader,
+    PartitionValue,
 };
 #[cfg(feature = "query-engine")]
 pub use export::{

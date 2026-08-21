@@ -14,8 +14,12 @@ use parquet::arrow::ArrowWriter;
 use parquet::file::reader::{FileReader, SerializedFileReader};
 use tempfile::TempDir;
 use viewda_data_engine::{
-    DataFilter, DataFilterOperator, DatasetError, DatasetPartitionNode, DatasetPartitionPage,
-    DatasetSource, DatasetWindowReader, PartitionValue,
+    ColumnStatisticsReader, CsvExportOptions, DataExportError, DataExportFormat, DataExportReader,
+    DataExportRequest, DataFilter, DataFilterOperator, DataSort, DataSortDirection,
+    DataViewBuilder, DataViewError, DataViewMemoryLimit, DataWindowError, DatasetError,
+    DatasetPartitionNode, DatasetPartitionPage, DatasetSource, DatasetWindowReader, ExportRowRange,
+    PartitionValue, StructureCancellation, StructureLoadProgress, StructureReader,
+    TextValueSuggestionsReader,
 };
 
 #[test]
@@ -698,9 +702,19 @@ fn treats_glob_metacharacters_quotes_and_unicode_as_exact_member_paths() {
 
     assert_eq!(
         string_values(&batch, 1),
-        expected.into_iter().map(Some).collect::<Vec<_>>()
+        expected.iter().copied().map(Some).collect::<Vec<_>>()
     );
     assert_eq!(batch.num_rows(), names.len());
+
+    let view = DataViewBuilder::for_dataset(&reader, &[], &[], DataViewMemoryLimit::Mb384)
+        .expect("dataset view builder")
+        .build()
+        .expect("prepared dataset view");
+    let batch = decode_one(&view.fetch_window(0, 16).expect("prepared exact paths"));
+    assert_eq!(
+        string_values(&batch, 1),
+        expected.into_iter().map(Some).collect::<Vec<_>>()
+    );
 }
 
 #[test]
@@ -1218,6 +1232,23 @@ fn preserves_physical_filename_and_file_row_number_columns() {
     assert_eq!(string_values(&batch, 0), [Some("physical-name")]);
     assert_eq!(int64_values(&batch, 1), [99]);
     assert_eq!(string_values(&batch, 2), [Some("part.parquet")]);
+
+    let view = DataViewBuilder::for_dataset(
+        &reader,
+        &[],
+        &[DataSort {
+            source_index: 1,
+            direction: DataSortDirection::Ascending,
+        }],
+        DataViewMemoryLimit::Mb384,
+    )
+    .expect("dataset view builder")
+    .build()
+    .expect("prepared dataset view");
+    let batch = decode_one(&view.fetch_window(0, 8).expect("prepared window"));
+    assert_eq!(string_values(&batch, 0), [Some("physical-name")]);
+    assert_eq!(int64_values(&batch, 1), [99]);
+    assert_eq!(string_values(&batch, 2), [Some("part.parquet")]);
 }
 
 #[test]
@@ -1375,11 +1406,778 @@ fn column_index(reader: &DatasetWindowReader, name: &str) -> u32 {
         .expect("dataset column")
 }
 
+#[test]
+fn prepared_dataset_view_sorts_stably_and_projects_partition_and_file_columns() {
+    let directory = TempDir::new().expect("dataset directory");
+    write_ints(
+        &directory.path().join("year=2025/a.parquet"),
+        "value",
+        &[2, 1, 1],
+    );
+    write_ints(&directory.path().join("year=2025/z.parquet"), "value", &[]);
+    write_ints(
+        &directory.path().join("year=2026/b.parquet"),
+        "value",
+        &[1, 3],
+    );
+    let reader =
+        complete_reader(DatasetSource::open_folder(directory.path()).expect("folder dataset"));
+    let value = column_index(&reader, "value");
+    let year = column_index(&reader, "year");
+    let file = column_index(&reader, "file");
+    let view = DataViewBuilder::for_dataset(
+        &reader,
+        &[],
+        &[DataSort {
+            source_index: value,
+            direction: DataSortDirection::Ascending,
+        }],
+        DataViewMemoryLimit::Mb384,
+    )
+    .expect("dataset view builder")
+    .build()
+    .expect("prepared dataset view");
+
+    let batch = decode_one(
+        &view
+            .fetch_window_columns(0, 8, &[file, year, value])
+            .expect("prepared dataset window"),
+    );
+    assert_eq!(
+        string_values(&batch, 0),
+        [
+            Some("year=2025/a.parquet"),
+            Some("year=2025/a.parquet"),
+            Some("year=2026/b.parquet"),
+            Some("year=2025/a.parquet"),
+            Some("year=2026/b.parquet"),
+        ]
+    );
+    assert_eq!(
+        string_values(&batch, 1),
+        [
+            Some("2025"),
+            Some("2025"),
+            Some("2026"),
+            Some("2025"),
+            Some("2026")
+        ]
+    );
+    assert_eq!(int64_values(&batch, 2), [1, 1, 1, 2, 3]);
+}
+
+#[test]
+fn prepared_dataset_view_preserves_native_order_across_parallel_row_group_scans() {
+    let directory = TempDir::new().expect("dataset directory");
+    write_ordered_member(&directory.path().join("a.parquet"), 0, 3, 64);
+    write_ordered_member(&directory.path().join("b.parquet"), 1_000, 3, 64);
+    write_ordered_member(&directory.path().join("c.parquet"), 2_000, 3, 64);
+    let reader =
+        complete_reader(DatasetSource::open_folder(directory.path()).expect("folder dataset"));
+    let key = column_index(&reader, "key");
+    let id = column_index(&reader, "id");
+    let file = column_index(&reader, "file");
+    let view = DataViewBuilder::for_dataset(
+        &reader,
+        &[],
+        &[DataSort {
+            source_index: key,
+            direction: DataSortDirection::Ascending,
+        }],
+        DataViewMemoryLimit::Mb768,
+    )
+    .expect("dataset view builder")
+    .build()
+    .expect("prepared dataset view");
+
+    let crossing = decode_one(
+        &view
+            .fetch_window_columns(180, 40, &[file, id])
+            .expect("cross-member page"),
+    );
+    assert_eq!(
+        string_values(&crossing, 0),
+        [Some("a.parquet"); 12]
+            .into_iter()
+            .chain([Some("b.parquet"); 28])
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(
+        int64_values(&crossing, 1),
+        (180..192).chain(1_000..1_028).collect::<Vec<_>>()
+    );
+
+    let mut actual = int64_values(
+        &decode_one(
+            &view
+                .fetch_window_columns(0, 512, &[id])
+                .expect("first prepared page"),
+        ),
+        0,
+    );
+    actual.extend(int64_values(
+        &decode_one(
+            &view
+                .fetch_window_columns(512, 64, &[id])
+                .expect("last prepared page"),
+        ),
+        0,
+    ));
+    let expected = (0..192)
+        .chain(1_000..1_192)
+        .chain(2_000..2_192)
+        .collect::<Vec<_>>();
+    assert_eq!(actual, expected);
+}
+
+#[test]
+fn prepared_dataset_view_preserves_union_schema_after_partition_pruning() {
+    let directory = TempDir::new().expect("dataset directory");
+    write_columns(
+        &directory.path().join("year=2025/a.parquet"),
+        vec![("value", Arc::new(Int32Array::from(vec![1_i32])) as ArrayRef)],
+    );
+    write_columns(
+        &directory.path().join("year=2026/b.parquet"),
+        vec![
+            ("value", Arc::new(Int64Array::from(vec![2_i64])) as ArrayRef),
+            ("later", Arc::new(Int64Array::from(vec![9_i64])) as ArrayRef),
+        ],
+    );
+    let reader =
+        complete_reader(DatasetSource::open_folder(directory.path()).expect("folder dataset"));
+    let value = column_index(&reader, "value");
+    let later = column_index(&reader, "later");
+    let year = column_index(&reader, "year");
+    let filter = DataFilter {
+        column_index: year,
+        operator: DataFilterOperator::Equals,
+        values: vec!["2025".to_owned()],
+        match_case: false,
+    };
+    let view = DataViewBuilder::for_dataset(
+        &reader,
+        &[filter],
+        &[DataSort {
+            source_index: value,
+            direction: DataSortDirection::Ascending,
+        }],
+        DataViewMemoryLimit::Mb384,
+    )
+    .expect("dataset view builder")
+    .build()
+    .expect("prepared dataset view");
+
+    let batch = decode_one(
+        &view
+            .fetch_window_columns(0, 4, &[value, later])
+            .expect("pruned union window"),
+    );
+    assert_eq!(integer_optional_values(&batch, 0), [Some(1)]);
+    assert_eq!(integer_optional_values(&batch, 1), [None]);
+}
+
+#[test]
+fn prepared_dataset_view_offsets_are_relative_to_pruned_candidates() {
+    let directory = TempDir::new().expect("dataset directory");
+    write_ints(&directory.path().join("year=2024/a.parquet"), "value", &[]);
+    write_ints(&directory.path().join("year=2025/b.parquet"), "value", &[9]);
+    write_ints(
+        &directory.path().join("year=2026/c.parquet"),
+        "value",
+        &[4, 5],
+    );
+    write_ints(
+        &directory.path().join("year=2025/d.parquet"),
+        "value",
+        &[10],
+    );
+    write_ints(&directory.path().join("year=2026/e.parquet"), "value", &[6]);
+    let reader =
+        complete_reader(DatasetSource::open_folder(directory.path()).expect("folder dataset"));
+    let value = column_index(&reader, "value");
+    let year = column_index(&reader, "year");
+    let file = column_index(&reader, "file");
+    let view = DataViewBuilder::for_dataset(
+        &reader,
+        &[DataFilter {
+            column_index: year,
+            operator: DataFilterOperator::Equals,
+            values: vec!["2026".to_owned()],
+            match_case: false,
+        }],
+        &[DataSort {
+            source_index: value,
+            direction: DataSortDirection::Ascending,
+        }],
+        DataViewMemoryLimit::Mb384,
+    )
+    .expect("dataset view builder")
+    .build()
+    .expect("prepared dataset view");
+    let batch = decode_one(
+        &view
+            .fetch_window_columns(0, 8, &[file, value])
+            .expect("pruned candidate window"),
+    );
+    assert_eq!(
+        string_values(&batch, 0),
+        [
+            Some("year=2026/c.parquet"),
+            Some("year=2026/c.parquet"),
+            Some("year=2026/e.parquet")
+        ]
+    );
+    assert_eq!(int64_values(&batch, 1), [4, 5, 6]);
+
+    let empty = DataViewBuilder::for_dataset(
+        &reader,
+        &[DataFilter {
+            column_index: year,
+            operator: DataFilterOperator::Equals,
+            values: vec!["2099".to_owned()],
+            match_case: false,
+        }],
+        &[],
+        DataViewMemoryLimit::Mb384,
+    )
+    .expect("empty dataset view builder")
+    .build()
+    .expect("empty prepared dataset view");
+    assert_eq!(empty.row_count(), 0);
+    let mut stream = StreamReader::try_new(
+        Cursor::new(empty.fetch_window(0, 8).expect("empty prepared window")),
+        None,
+    )
+    .expect("empty Arrow stream");
+    assert_eq!(
+        stream.schema().fields().len(),
+        reader.summary().schema.len()
+    );
+    assert!(stream.next().is_none());
+}
+
+#[test]
+fn prepared_dataset_view_honors_cancellation_and_the_source_change_latch() {
+    let directory = TempDir::new().expect("dataset directory");
+    let first = directory.path().join("a.parquet");
+    let second = directory.path().join("b.parquet");
+    write_ints(&first, "value", &[1]);
+    write_ints(&second, "value", &[2]);
+    let source = DatasetSource::open_folder(directory.path()).expect("folder dataset");
+    let reader = complete_reader(source.clone());
+
+    let cancelled = DataViewBuilder::for_dataset(
+        &reader,
+        &[],
+        &[DataSort {
+            source_index: 0,
+            direction: DataSortDirection::Ascending,
+        }],
+        DataViewMemoryLimit::Mb384,
+    )
+    .expect("dataset view builder");
+    cancelled.interrupt_handle().interrupt();
+    assert!(matches!(
+        cancelled.build(),
+        Err(DataViewError::Engine(DataWindowError::Cancelled))
+    ));
+
+    let invalid_filter = DataViewBuilder::for_dataset(
+        &reader,
+        &[DataFilter {
+            column_index: 0,
+            operator: DataFilterOperator::TextContains,
+            values: vec!["1".to_owned()],
+            match_case: false,
+        }],
+        &[],
+        DataViewMemoryLimit::Mb384,
+    )
+    .expect("dataset view builder");
+    assert!(matches!(
+        invalid_filter.build(),
+        Err(DataViewError::Engine(DataWindowError::InvalidFilter))
+    ));
+
+    let builder = DataViewBuilder::for_dataset(
+        &reader,
+        &[],
+        &[DataSort {
+            source_index: 0,
+            direction: DataSortDirection::Ascending,
+        }],
+        DataViewMemoryLimit::Mb384,
+    )
+    .expect("dataset view builder");
+    write_ints(&second, "value", &[3, 4]);
+    assert!(matches!(
+        builder.build(),
+        Err(DataViewError::Engine(DataWindowError::SourceChanged))
+    ));
+    assert!(matches!(
+        DataViewBuilder::for_dataset(&reader, &[], &[], DataViewMemoryLimit::Mb384),
+        Err(DataViewError::Engine(DataWindowError::SourceChanged))
+    ));
+}
+
+#[test]
+fn prepared_dataset_view_rechecks_all_members_before_each_window() {
+    let directory = TempDir::new().expect("dataset directory");
+    let first = directory.path().join("a.parquet");
+    let second = directory.path().join("b.parquet");
+    write_ints(&first, "value", &[1]);
+    write_ints(&second, "value", &[2]);
+    let reader =
+        complete_reader(DatasetSource::open_folder(directory.path()).expect("folder dataset"));
+    let view = DataViewBuilder::for_dataset(
+        &reader,
+        &[],
+        &[DataSort {
+            source_index: 0,
+            direction: DataSortDirection::Ascending,
+        }],
+        DataViewMemoryLimit::Mb384,
+    )
+    .expect("dataset view builder")
+    .build()
+    .expect("prepared dataset view");
+
+    write_ints(&second, "value", &[3, 4]);
+    assert!(matches!(
+        view.fetch_window(0, 2),
+        Err(DataViewError::Engine(DataWindowError::SourceChanged))
+    ));
+    assert!(matches!(
+        view.fetch_window(0, 2),
+        Err(DataViewError::Engine(DataWindowError::SourceChanged))
+    ));
+}
+
+#[test]
+fn exports_whole_dataset_with_union_partition_and_file_columns_in_native_order() {
+    let directory = TempDir::new().expect("dataset directory");
+    write_columns(
+        &directory.path().join("year=2025/a.parquet"),
+        vec![
+            (
+                "value",
+                Arc::new(Int64Array::from(vec![2_i64, 1])) as ArrayRef,
+            ),
+            (
+                "note",
+                Arc::new(StringArray::from(vec![Some("alpha"), None])) as ArrayRef,
+            ),
+        ],
+    );
+    write_ints(&directory.path().join("year=2026/b.parquet"), "value", &[3]);
+    let reader =
+        complete_reader(DatasetSource::open_folder(directory.path()).expect("folder dataset"));
+    let target = directory.path().join("whole.csv");
+    let request = dataset_csv_request(
+        [&reader, &reader, &reader, &reader]
+            .into_iter()
+            .zip(["value", "note", "year", "file"])
+            .map(|(reader, name)| column_index(reader, name))
+            .collect(),
+        vec![],
+    );
+
+    let bytes = DataExportReader::for_dataset(&reader, target.clone(), request, None)
+        .expect("dataset export reader")
+        .export()
+        .expect("whole dataset export");
+    let csv = fs::read_to_string(&target).expect("exported CSV");
+
+    assert_eq!(bytes, csv.len() as u64);
+    assert_eq!(
+        csv,
+        "value,note,year,file\r\n\
+         2,alpha,2025,year=2025/a.parquet\r\n\
+         1,,2025,year=2025/a.parquet\r\n\
+         3,,2026,year=2026/b.parquet\r\n"
+    );
+
+    let ranged_target = directory.path().join("whole-range.csv");
+    DataExportReader::for_dataset(
+        &reader,
+        ranged_target.clone(),
+        dataset_csv_request(
+            vec![
+                column_index(&reader, "value"),
+                column_index(&reader, "file"),
+            ],
+            vec![ExportRowRange { start: 1, end: 3 }],
+        ),
+        None,
+    )
+    .expect("ranged dataset export reader")
+    .export()
+    .expect("ranged whole dataset export");
+    assert_eq!(
+        fs::read_to_string(ranged_target).expect("ranged exported CSV"),
+        "value,file\r\n1,year=2025/a.parquet\r\n3,year=2026/b.parquet\r\n"
+    );
+}
+
+#[test]
+fn exports_dataset_view_ranges_in_exact_filtered_and_sorted_order() {
+    let directory = TempDir::new().expect("dataset directory");
+    write_ints(&directory.path().join("a.parquet"), "value", &[3, 1]);
+    write_ints(&directory.path().join("b.parquet"), "value", &[2, 1]);
+    let reader =
+        complete_reader(DatasetSource::open_folder(directory.path()).expect("folder dataset"));
+    let value = column_index(&reader, "value");
+    let file = column_index(&reader, "file");
+    let view = DataViewBuilder::for_dataset(
+        &reader,
+        &[DataFilter {
+            column_index: value,
+            operator: DataFilterOperator::LessThanOrEqual,
+            values: vec!["2".to_owned()],
+            match_case: false,
+        }],
+        &[DataSort {
+            source_index: value,
+            direction: DataSortDirection::Ascending,
+        }],
+        DataViewMemoryLimit::Mb384,
+    )
+    .expect("dataset view builder")
+    .build()
+    .expect("prepared dataset view");
+    let target = directory.path().join("view.csv");
+    let request = dataset_csv_request(vec![file, value], vec![ExportRowRange { start: 1, end: 3 }]);
+
+    DataExportReader::for_dataset(
+        &reader,
+        target.clone(),
+        request,
+        Some(view.export_snapshot()),
+    )
+    .expect("dataset view export reader")
+    .export()
+    .expect("dataset view export");
+
+    assert_eq!(
+        fs::read_to_string(target).expect("exported CSV"),
+        "file,value\r\nb.parquet,1\r\nb.parquet,2\r\n"
+    );
+}
+
+#[test]
+fn dataset_export_rejects_foreign_views_member_targets_and_preserves_cancelled_targets() {
+    let first_directory = TempDir::new().expect("first dataset directory");
+    let first_member = first_directory.path().join("part.parquet");
+    write_ints(&first_member, "value", &[1]);
+    let first = complete_reader(
+        DatasetSource::open_folder(first_directory.path()).expect("first folder dataset"),
+    );
+    let second_directory = TempDir::new().expect("second dataset directory");
+    write_ints(&second_directory.path().join("part.parquet"), "value", &[1]);
+    let second = complete_reader(
+        DatasetSource::open_folder(second_directory.path()).expect("second folder dataset"),
+    );
+    let view = DataViewBuilder::for_dataset(&first, &[], &[], DataViewMemoryLimit::Mb384)
+        .expect("dataset view builder")
+        .build()
+        .expect("prepared dataset view");
+    let request = dataset_csv_request(vec![column_index(&first, "value")], vec![]);
+
+    assert!(matches!(
+        DataExportReader::for_dataset(
+            &second,
+            second_directory.path().join("foreign.csv"),
+            request.clone(),
+            Some(view.export_snapshot()),
+        ),
+        Err(DataExportError::InvalidRequest)
+    ));
+    let reopened = complete_reader(
+        DatasetSource::open_folder(first_directory.path()).expect("reopened folder dataset"),
+    );
+    assert!(matches!(
+        DataExportReader::for_dataset(
+            &reopened,
+            first_directory.path().join("reopened.csv"),
+            request.clone(),
+            Some(view.export_snapshot()),
+        ),
+        Err(DataExportError::InvalidRequest)
+    ));
+    assert!(matches!(
+        DataExportReader::for_dataset(&first, first_member.clone(), request.clone(), None),
+        Err(DataExportError::InvalidRequest)
+    ));
+    #[cfg(unix)]
+    {
+        let alias = first_directory.path().join("member-alias.parquet");
+        std::os::unix::fs::symlink(&first_member, &alias).expect("member alias");
+        assert!(matches!(
+            DataExportReader::for_dataset(&first, alias, request.clone(), None),
+            Err(DataExportError::InvalidRequest)
+        ));
+        let hardlink = first_directory.path().join("member-hardlink.parquet");
+        fs::hard_link(&first_member, &hardlink).expect("member hardlink");
+        let source_bytes = fs::read(&first_member).expect("source bytes before rejection");
+        assert!(matches!(
+            DataExportReader::for_dataset(&first, hardlink, request.clone(), None),
+            Err(DataExportError::InvalidRequest)
+        ));
+        assert_eq!(
+            fs::read(&first_member).expect("source bytes after rejection"),
+            source_bytes
+        );
+    }
+
+    let target = first_directory.path().join("cancelled.csv");
+    fs::write(&target, "keep\n").expect("existing target");
+    let export = DataExportReader::for_dataset(&first, target.clone(), request, None)
+        .expect("dataset export reader");
+    export.cancellation().cancel();
+    assert!(matches!(export.export(), Err(DataExportError::Cancelled)));
+    assert_eq!(
+        fs::read_to_string(target).expect("preserved target"),
+        "keep\n"
+    );
+}
+
+#[test]
+fn dataset_statistics_and_suggestions_cover_union_partition_and_file_columns() {
+    let directory = TempDir::new().expect("dataset directory");
+    write_columns(
+        &directory.path().join("year=2025/a.parquet"),
+        vec![
+            (
+                "value",
+                Arc::new(Int32Array::from(vec![1_i32, 2])) as ArrayRef,
+            ),
+            (
+                "label",
+                Arc::new(StringArray::from(vec![Some("alpha"), None])) as ArrayRef,
+            ),
+        ],
+    );
+    write_columns(
+        &directory.path().join("year=2026/b.parquet"),
+        vec![("value", Arc::new(Int64Array::from(vec![3_i64])) as ArrayRef)],
+    );
+    let reader =
+        complete_reader(DatasetSource::open_folder(directory.path()).expect("folder dataset"));
+
+    let label_statistics = ColumnStatisticsReader::for_dataset(&reader)
+        .expect("dataset statistics reader")
+        .fetch("label", true)
+        .expect("label statistics");
+    assert_eq!(label_statistics.minimum.as_deref(), Some("alpha"));
+    assert_eq!(label_statistics.maximum.as_deref(), Some("alpha"));
+    assert_eq!(label_statistics.null_share, 2.0 / 3.0);
+    assert_eq!(label_statistics.approximate_distinct_count, 1);
+
+    let value_statistics = ColumnStatisticsReader::for_dataset(&reader)
+        .expect("dataset statistics reader")
+        .fetch("value", true)
+        .expect("promoted numeric statistics");
+    assert_eq!(value_statistics.minimum.as_deref(), Some("1"));
+    assert_eq!(value_statistics.maximum.as_deref(), Some("3"));
+
+    let file_statistics = ColumnStatisticsReader::for_dataset(&reader)
+        .expect("dataset statistics reader")
+        .fetch("file", true)
+        .expect("file statistics");
+    assert_eq!(
+        file_statistics.minimum.as_deref(),
+        Some("year=2025/a.parquet")
+    );
+    assert_eq!(
+        file_statistics.maximum.as_deref(),
+        Some("year=2026/b.parquet")
+    );
+    assert_eq!(file_statistics.null_share, 0.0);
+
+    let suggestions =
+        TextValueSuggestionsReader::for_dataset(&reader).expect("dataset suggestion reader");
+    let label = reader
+        .summary()
+        .schema
+        .get(column_index(&reader, "label") as usize)
+        .expect("label schema");
+    let handle = suggestions.interrupt_handle();
+    assert_eq!(
+        suggestions
+            .fetch("alp", label, DataFilterOperator::TextContains, &handle)
+            .expect("label suggestions")
+            .values,
+        ["alpha"]
+    );
+    let file = reader
+        .summary()
+        .schema
+        .get(column_index(&reader, "file") as usize)
+        .expect("file schema");
+    let handle = suggestions.interrupt_handle();
+    assert_eq!(
+        suggestions
+            .fetch("2026", file, DataFilterOperator::TextContains, &handle)
+            .expect("file suggestions")
+            .values,
+        ["year=2026/b.parquet"]
+    );
+    let year = reader
+        .summary()
+        .schema
+        .get(column_index(&reader, "year") as usize)
+        .expect("year schema");
+    let handle = suggestions.interrupt_handle();
+    assert_eq!(
+        suggestions
+            .fetch("2025", year, DataFilterOperator::Equals, &handle)
+            .expect("partition suggestions")
+            .values,
+        ["2025"]
+    );
+    let cancelled = suggestions.interrupt_handle();
+    cancelled.interrupt();
+    assert!(matches!(
+        suggestions.fetch("", file, DataFilterOperator::TextContains, &cancelled),
+        Err(DataWindowError::Cancelled)
+    ));
+}
+
+#[test]
+fn dataset_operations_diagnose_only_scanned_members_and_latch_selected_corruption() {
+    let directory = TempDir::new().expect("dataset directory");
+    let pruned = directory.path().join("year=2025/a.parquet");
+    write_ints(&pruned, "value", &[1]);
+    write_ints(&directory.path().join("year=2026/b.parquet"), "value", &[2]);
+    let reader =
+        complete_reader(DatasetSource::open_folder(directory.path()).expect("folder dataset"));
+    let year = column_index(&reader, "year");
+    let view = DataViewBuilder::for_dataset(
+        &reader,
+        &[equals(year, "2026")],
+        &[],
+        DataViewMemoryLimit::Mb384,
+    )
+    .expect("dataset view builder")
+    .build()
+    .expect("prepared dataset view");
+    corrupt_first_column_data(&pruned);
+
+    let cancelled_statistics =
+        ColumnStatisticsReader::for_dataset(&reader).expect("dataset statistics reader");
+    cancelled_statistics.interrupt_handle().interrupt();
+    assert!(matches!(
+        cancelled_statistics.fetch("value", true),
+        Err(viewda_data_engine::ColumnStatisticsError::QueryFailed)
+    ));
+
+    let target = directory.path().join("pruned.csv");
+    DataExportReader::for_dataset(
+        &reader,
+        target.clone(),
+        dataset_csv_request(vec![column_index(&reader, "value")], vec![]),
+        Some(view.export_snapshot()),
+    )
+    .expect("pruned view export reader")
+    .export()
+    .expect("unscanned damaged member must not affect the view query");
+    assert_eq!(
+        fs::read_to_string(target).expect("pruned export"),
+        "value\r\n2\r\n"
+    );
+
+    assert!(matches!(
+        ColumnStatisticsReader::for_dataset(&reader)
+            .expect("dataset statistics reader")
+            .fetch("value", true),
+        Err(viewda_data_engine::ColumnStatisticsError::CorruptSource)
+    ));
+    assert!(matches!(
+        ColumnStatisticsReader::for_dataset(&reader),
+        Err(viewda_data_engine::ColumnStatisticsError::SourceChanged)
+    ));
+}
+
+#[test]
+fn selected_dataset_member_snapshot_is_stable_and_loads_structure_without_an_absolute_name() {
+    let directory = TempDir::new().expect("dataset directory");
+    write_ints(&directory.path().join("a/part.parquet"), "value", &[1]);
+    write_ints(&directory.path().join("b/part.parquet"), "value", &[2, 3]);
+    let reader =
+        complete_reader(DatasetSource::open_folder(directory.path()).expect("folder dataset"));
+
+    let selected = reader.member_snapshot(1).expect("selected member snapshot");
+    assert_eq!(selected.ordinal(), 1);
+    assert_eq!(selected.relative_path(), "b/part.parquet");
+    let structure = StructureReader::from_snapshot(
+        selected.snapshot(),
+        &StructureLoadProgress::default(),
+        &StructureCancellation::default(),
+    )
+    .expect("selected member structure");
+    assert_eq!(structure.summary().row_count, 2);
+    selected.validate().expect("unchanged selected member");
+    assert!(matches!(
+        reader.member_snapshot(2),
+        Err(DatasetError::Unsupported)
+    ));
+    let replacement = directory.path().join("replacement.parquet");
+    write_ints(&replacement, "value", &[9]);
+    fs::rename(replacement, directory.path().join("a/part.parquet"))
+        .expect("replace unrelated member");
+    assert_eq!(
+        selected.validate(),
+        Err(DatasetError::SourceChanged {
+            member: "a/part.parquet".to_owned(),
+        })
+    );
+}
+
+fn dataset_csv_request(
+    column_indices: Vec<u32>,
+    row_ranges: Vec<ExportRowRange>,
+) -> DataExportRequest {
+    DataExportRequest {
+        column_indices,
+        row_ranges,
+        output: DataExportFormat::Csv {
+            options: CsvExportOptions::default(),
+        },
+    }
+}
+
 fn write_ints(path: &std::path::Path, name: &str, values: &[i64]) {
     write_columns(
         path,
         vec![(name, Arc::new(Int64Array::from(values.to_vec())))],
     );
+}
+
+fn write_ordered_member(path: &std::path::Path, first_id: i64, groups: usize, rows: usize) {
+    fs::create_dir_all(path.parent().expect("fixture parent")).expect("fixture directory");
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("key", arrow_schema::DataType::Int64, false),
+        Field::new("id", arrow_schema::DataType::Int64, false),
+    ]));
+    let file = std::fs::File::create(path).expect("fixture file");
+    let mut writer = ArrowWriter::try_new(file, Arc::clone(&schema), None).expect("Parquet writer");
+    for group in 0..groups {
+        let group_start = first_id + i64::try_from(group * rows).expect("row group offset");
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int64Array::from(vec![1; rows])),
+                Arc::new(Int64Array::from_iter_values(
+                    group_start..group_start + i64::try_from(rows).expect("row count"),
+                )),
+            ],
+        )
+        .expect("record batch");
+        writer.write(&batch).expect("member rows");
+        writer.flush().expect("row group");
+    }
+    writer.close().expect("member footer");
 }
 
 fn write_columns(path: &std::path::Path, columns: Vec<(&str, ArrayRef)>) {

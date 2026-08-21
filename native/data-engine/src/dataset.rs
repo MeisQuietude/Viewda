@@ -39,7 +39,7 @@ use parquet::arrow::ArrowWriter;
 use crate::{
     DataFilter, DataFilterOperator, SchemaField,
     filter::{build_filter_predicate, quote_identifier},
-    source::{SourceError, inspect_local_source},
+    source::{SourceError, SourceSnapshot, inspect_local_source},
     window::{DataWindowError, MAX_WINDOW_ROWS, classify_query_error, set_utc_session_timezone},
 };
 
@@ -91,6 +91,39 @@ pub struct DatasetMemberSummary {
     pub relative_path: String,
     /// Hive values derived from the member's parent directories.
     pub partitions: Vec<PartitionValue>,
+}
+
+/// One selected fixed member and its retained footer snapshot.
+pub struct DatasetMemberSnapshot {
+    snapshot: SourceSnapshot,
+    source: DatasetSource,
+    member: DatasetMember,
+}
+
+impl DatasetMemberSnapshot {
+    /// Returns the member's stable zero-based ordinal in the fixed composition.
+    pub fn ordinal(&self) -> u64 {
+        self.member.ordinal
+    }
+
+    /// Returns the slash-separated logical path without exposing its absolute path.
+    pub fn relative_path(&self) -> &str {
+        &self.member.relative_path
+    }
+
+    /// Returns the retained footer snapshot used by Structure.
+    pub fn snapshot(&self) -> &SourceSnapshot {
+        &self.snapshot
+    }
+
+    /// Rechecks every fixed member and the retained selected snapshot.
+    /// A changed member latches its relative path even when it is not selected.
+    pub fn validate(&self) -> Result<(), DatasetError> {
+        self.source.ensure_members_unchanged(&self.source.members)?;
+        self.snapshot
+            .validate_for_install(&self.member.path)
+            .map_err(|error| self.source.latch_member_error(error, &self.member))
+    }
 }
 
 /// A bounded page of dataset members.
@@ -539,6 +572,7 @@ pub struct DatasetInspector {
     size_bytes: u64,
     row_count: u64,
     row_group_count: u64,
+    member_row_counts: Vec<u64>,
     drift_count: u64,
     deviating_members: Vec<usize>,
     initial_schema_reported: bool,
@@ -548,6 +582,7 @@ pub struct DatasetInspector {
 
 impl DatasetInspector {
     fn new(source: DatasetSource) -> Self {
+        let member_count = source.members.len();
         let mut partition_names = Vec::new();
         for member in source.members.iter() {
             for partition in &member.partitions {
@@ -569,6 +604,7 @@ impl DatasetInspector {
             size_bytes: 0,
             row_count: 0,
             row_group_count: 0,
+            member_row_counts: Vec::with_capacity(member_count),
             drift_count: 0,
             deviating_members: Vec::new(),
             initial_schema_reported: false,
@@ -599,6 +635,7 @@ impl DatasetInspector {
             summary,
             Some(1),
             self.deviating_members.clone(),
+            self.member_row_counts.clone(),
         )?;
         let arrow_ipc = reader.fetch(0, row_count, &[])?;
         self.preview_reader = Some(reader);
@@ -638,6 +675,7 @@ impl DatasetInspector {
                 .row_count
                 .checked_add(member_summary.row_count)
                 .ok_or(DatasetError::Unsupported)?;
+            self.member_row_counts.push(member_summary.row_count);
             self.row_group_count = self
                 .row_group_count
                 .checked_add(member_summary.row_group_count as u64)
@@ -730,10 +768,14 @@ impl DatasetInspector {
         self.source.ensure_members_unchanged(&self.source.members)?;
         let summary = self.current_summary()?;
         match self.preview_reader.take() {
-            Some(reader) => reader.upgrade(summary, self.deviating_members),
-            None => {
-                DatasetWindowReader::from_parts(self.source, summary, None, self.deviating_members)
-            }
+            Some(reader) => reader.upgrade(summary, self.deviating_members, self.member_row_counts),
+            None => DatasetWindowReader::from_parts(
+                self.source,
+                summary,
+                None,
+                self.deviating_members,
+                self.member_row_counts,
+            ),
         }
     }
 }
@@ -759,14 +801,323 @@ pub struct DatasetWindowReader {
     physical_column_count: usize,
     initialized_member_count: usize,
     schema_seed: Option<NamedTempFile>,
+    member_row_counts: Vec<u64>,
+}
+
+/// Completed dataset relation state reused by isolated query operations.
+pub(crate) struct DatasetQuerySource {
+    source: DatasetSource,
+    summary: DatasetSummary,
+    filename_column: String,
+    row_column: String,
+    ordinal_column: String,
+    physical_column_count: usize,
+    schema_seed: NamedTempFile,
+    member_row_counts: Vec<u64>,
+}
+
+#[derive(Clone)]
+pub(crate) struct DatasetSessionToken {
+    members: Arc<[DatasetMember]>,
+}
+
+impl DatasetSessionToken {
+    fn matches(&self, source: &DatasetSource) -> bool {
+        Arc::ptr_eq(&self.members, &source.members)
+    }
+}
+
+#[derive(Debug)]
+pub(crate) enum DatasetSetupError {
+    Dataset(DatasetError),
+    Query(DuckDbError),
+}
+
+impl DatasetSetupError {
+    fn into_dataset(self) -> DatasetError {
+        match self {
+            Self::Dataset(error) => error,
+            Self::Query(error) => classify_query_error(error, false).into(),
+        }
+    }
+}
+
+impl From<DatasetError> for DatasetSetupError {
+    fn from(error: DatasetError) -> Self {
+        Self::Dataset(error)
+    }
+}
+
+impl From<DuckDbError> for DatasetSetupError {
+    fn from(error: DuckDbError) -> Self {
+        Self::Query(error)
+    }
+}
+
+impl DatasetQuerySource {
+    pub(crate) fn session_token(&self) -> DatasetSessionToken {
+        DatasetSessionToken {
+            members: Arc::clone(&self.source.members),
+        }
+    }
+
+    pub(crate) fn matches_session(&self, token: &DatasetSessionToken) -> bool {
+        token.matches(&self.source)
+    }
+
+    pub(crate) fn target_matches_member(&self, target: &Path) -> bool {
+        let canonical_target = fs::canonicalize(target).ok();
+        let target_platform = fs::metadata(target)
+            .ok()
+            .and_then(|metadata| platform_file_identity(target, &metadata).ok());
+        self.source.members.iter().any(|member| {
+            member.path == target
+                || target_platform
+                    .as_ref()
+                    .is_some_and(|target| same_file_identity(target, &member.identity.platform))
+                || canonical_target.as_ref().is_some_and(|target| {
+                    &member.path == target
+                        || fs::canonicalize(&member.path)
+                            .ok()
+                            .is_some_and(|member| member == *target)
+                })
+        })
+    }
+    pub(crate) fn schema(&self) -> &[SchemaField] {
+        &self.summary.schema
+    }
+
+    pub(crate) fn row_count(&self) -> u64 {
+        self.summary.row_count
+    }
+
+    pub(crate) fn size_bytes(&self) -> u64 {
+        self.summary.size_bytes
+    }
+
+    pub(crate) fn row_group_count(&self) -> Result<usize, DatasetError> {
+        usize::try_from(self.summary.row_group_count).map_err(|_| DatasetError::Unsupported)
+    }
+
+    pub(crate) fn temporary_directory_hint(&self) -> Option<&Path> {
+        self.source.members.first()?.path.parent()
+    }
+
+    pub(crate) fn redact_paths(&self, message: &str) -> String {
+        let message = self
+            .source
+            .members
+            .iter()
+            .fold(message.to_owned(), |message, member| {
+                let path = member.path.to_string_lossy();
+                message
+                    .replace(&escape_glob_path(&path), "<source>")
+                    .replace(path.as_ref(), "<source>")
+            });
+        let seed = self.schema_seed.path().to_string_lossy();
+        message
+            .replace(&escape_glob_path(&seed), "<temporary file>")
+            .replace(seed.as_ref(), "<temporary file>")
+    }
+
+    pub(crate) fn install(&self, connection: &Connection) -> Result<(), DatasetSetupError> {
+        self.source.require_active()?;
+        self.source.ensure_members_unchanged(&self.source.members)?;
+        initialize_member_tables(
+            connection,
+            &self.source.members,
+            &self.summary,
+            &self.member_row_counts,
+        )?;
+        install_member_maps(connection, &self.summary)?;
+        install_ordinal_map(connection)?;
+        let seed_path = self
+            .schema_seed
+            .path()
+            .to_str()
+            .ok_or(DatasetError::Unsupported)?;
+        connection
+            .execute(
+                "SET VARIABLE __viewda_seed_path = ?",
+                [Value::Text(seed_path.to_owned())],
+            )
+            .map_err(DatasetSetupError::Query)?;
+        Ok(())
+    }
+
+    pub(crate) fn bind_candidates(
+        &self,
+        connection: &Connection,
+        filters: &[DataFilter],
+    ) -> Result<(), DatasetSetupError> {
+        self.source.require_active()?;
+        self.source.ensure_members_unchanged(&self.source.members)?;
+        let candidates = candidate_members(&self.source.members, &self.summary, filters);
+        self.bind_members(connection, candidates)
+    }
+
+    pub(crate) fn bind_window_members(
+        &self,
+        connection: &Connection,
+        ordinals: &[u64],
+    ) -> Result<usize, DatasetSetupError> {
+        self.source.require_active()?;
+        self.source.ensure_members_unchanged(&self.source.members)?;
+        let members = self.members_for_ordinals(ordinals)?;
+        let count = members.len();
+        self.bind_members(connection, members)?;
+        Ok(count)
+    }
+
+    fn bind_members(
+        &self,
+        connection: &Connection,
+        candidates: Vec<&DatasetMember>,
+    ) -> Result<(), DatasetSetupError> {
+        bind_candidate_members(connection, &candidates, Some(self.schema_seed.path()))?;
+        install_candidate_offsets(connection)?;
+        Ok(())
+    }
+
+    pub(crate) fn relation_sql(&self) -> String {
+        dataset_relation_sql(
+            &self.summary,
+            self.physical_column_count,
+            &self.filename_column,
+            Some((&self.row_column, &self.ordinal_column)),
+            true,
+        )
+    }
+
+    pub(crate) fn ordinal_column(&self) -> &str {
+        &self.ordinal_column
+    }
+
+    pub(crate) fn row_column(&self) -> &str {
+        &self.row_column
+    }
+
+    pub(crate) fn validate(&self) -> Result<(), DatasetError> {
+        self.source.require_active()?;
+        self.source.ensure_members_unchanged(&self.source.members)
+    }
+
+    pub(crate) fn classify_query_failure(
+        &self,
+        error: DuckDbError,
+        filters: &[DataFilter],
+        filters_applied: bool,
+    ) -> DatasetError {
+        let candidates = candidate_members(&self.source.members, &self.summary, filters);
+        diagnose_query_failure(&self.source, &candidates, error, filters_applied)
+    }
+
+    pub(crate) fn classify_window_query_failure(
+        &self,
+        error: DuckDbError,
+        ordinals: &[u64],
+    ) -> DatasetError {
+        match self.members_for_ordinals(ordinals) {
+            Ok(members) => diagnose_query_failure(&self.source, &members, error, false),
+            Err(error) => error,
+        }
+    }
+
+    pub(crate) fn classify_window_lazy_query_failure(
+        &self,
+        panic: &(dyn Any + Send),
+        ordinals: &[u64],
+    ) -> DatasetError {
+        match self.members_for_ordinals(ordinals) {
+            Ok(members) => diagnose_lazy_query_failure(&self.source, &members, panic, false),
+            Err(error) => error,
+        }
+    }
+
+    pub(crate) fn classify_lazy_query_failure(&self, panic: &(dyn Any + Send)) -> DatasetError {
+        let candidates = self.source.members.iter().collect::<Vec<_>>();
+        diagnose_lazy_query_failure(&self.source, &candidates, panic, false)
+    }
+
+    fn members_for_ordinals(&self, ordinals: &[u64]) -> Result<Vec<&DatasetMember>, DatasetError> {
+        let mut ordinals = ordinals.to_vec();
+        ordinals.sort_unstable();
+        ordinals.dedup();
+        ordinals
+            .iter()
+            .map(|ordinal| {
+                let index = usize::try_from(*ordinal).map_err(|_| DatasetError::Unsupported)?;
+                self.source
+                    .members
+                    .get(index)
+                    .filter(|member| member.ordinal == *ordinal)
+                    .ok_or(DatasetError::Unsupported)
+            })
+            .collect()
+    }
 }
 
 impl DatasetWindowReader {
+    /// Opens one selected fixed member without exposing its absolute path.
+    pub fn member_snapshot(&self, ordinal: u64) -> Result<DatasetMemberSnapshot, DatasetError> {
+        self.member_snapshot_checked(ordinal, || {})
+    }
+
+    fn member_snapshot_checked(
+        &self,
+        ordinal: u64,
+        after_open: impl FnOnce(),
+    ) -> Result<DatasetMemberSnapshot, DatasetError> {
+        let index = usize::try_from(ordinal).map_err(|_| DatasetError::Unsupported)?;
+        let member = self
+            .source
+            .members
+            .get(index)
+            .filter(|member| member.ordinal == ordinal)
+            .ok_or(DatasetError::Unsupported)?;
+        self.source.ensure_members_unchanged(&self.source.members)?;
+        let snapshot = SourceSnapshot::open(&member.path)
+            .map_err(|error| self.source.latch_member_error(error, member))?;
+        after_open();
+        self.source.ensure_members_unchanged(&self.source.members)?;
+        snapshot
+            .validate_for_install(&member.path)
+            .map_err(|error| self.source.latch_member_error(error, member))?;
+        Ok(DatasetMemberSnapshot {
+            snapshot,
+            source: self.source.clone(),
+            member: member.clone(),
+        })
+    }
+
+    /// Captures the completed fixed relation for an isolated prepared view.
+    pub(crate) fn query_source(&self) -> Result<DatasetQuerySource, DatasetError> {
+        if self.member_limit.is_some() {
+            return Err(DatasetError::Unsupported);
+        }
+        self.source.require_active()?;
+        self.source.ensure_members_unchanged(&self.source.members)?;
+        let filename_column = unique_internal_column(&self.summary.schema, "__viewda_filename");
+        let row_column = unique_internal_column(&self.summary.schema, "__viewda_native_row");
+        let ordinal_column =
+            unique_internal_column(&self.summary.schema, "__viewda_member_ordinal");
+        Ok(DatasetQuerySource {
+            source: self.source.clone(),
+            summary: self.summary.clone(),
+            filename_column,
+            row_column,
+            ordinal_column,
+            physical_column_count: self.physical_column_count,
+            schema_seed: write_schema_seed(&self.arrow_schema)?,
+            member_row_counts: self.member_row_counts.clone(),
+        })
+    }
     fn from_parts(
         source: DatasetSource,
         summary: DatasetSummary,
         member_limit: Option<usize>,
         deviating_members: Vec<usize>,
+        member_row_counts: Vec<u64>,
     ) -> Result<Self, DatasetError> {
         let config = Config::default()
             .enable_object_cache(false)
@@ -793,8 +1144,10 @@ impl DatasetWindowReader {
             &connection,
             &source.members[..active_member_count],
             &summary,
-        )?;
-        install_member_maps(&connection, &summary)?;
+            &member_row_counts,
+        )
+        .map_err(DatasetSetupError::into_dataset)?;
+        install_member_maps(&connection, &summary).map_err(DatasetSetupError::into_dataset)?;
         let mut reader = Self {
             source,
             summary,
@@ -806,6 +1159,7 @@ impl DatasetWindowReader {
             physical_column_count,
             initialized_member_count: active_member_count,
             schema_seed: None,
+            member_row_counts,
         };
         let members = reader.active_members();
         let candidates = members.iter().collect::<Vec<_>>();
@@ -821,18 +1175,22 @@ impl DatasetWindowReader {
         mut self,
         summary: DatasetSummary,
         deviating_members: Vec<usize>,
+        member_row_counts: Vec<u64>,
     ) -> Result<Self, DatasetError> {
         self.source.ensure_members_unchanged(&self.source.members)?;
         append_member_metadata(
             &self.connection,
             &self.source.members[self.initialized_member_count..],
             &summary,
-        )?;
-        install_member_maps(&self.connection, &summary)?;
+            &member_row_counts[self.initialized_member_count..],
+        )
+        .map_err(DatasetSetupError::into_dataset)?;
+        install_member_maps(&self.connection, &summary).map_err(DatasetSetupError::into_dataset)?;
         self.initialized_member_count = self.source.members.len();
         self.summary = summary;
         self.member_limit = None;
         self.deviating_members = deviating_members;
+        self.member_row_counts = member_row_counts;
         self.physical_column_count =
             self.summary
                 .partition_column_indices
@@ -954,27 +1312,12 @@ impl DatasetWindowReader {
     }
 
     fn bind_candidate_paths(&self, candidates: &[&DatasetMember]) -> Result<(), DatasetError> {
-        let mut paths =
-            Vec::with_capacity(candidates.len() + usize::from(self.schema_seed.is_some()));
-        paths.extend(
-            candidates
-                .iter()
-                .map(|member| member.path.to_str().ok_or(DatasetError::Unsupported))
-                .collect::<Result<Vec<_>, _>>()?
-                .into_iter()
-                .map(escape_glob_path),
-        );
-        if let Some(seed) = &self.schema_seed {
-            let path = seed.path().to_str().ok_or(DatasetError::Unsupported)?;
-            paths.push(escape_glob_path(path));
-        }
-        self.connection
-            .execute(
-                "SET VARIABLE __viewda_paths = string_split(?, chr(0))",
-                [Value::Text(paths.join("\0"))],
-            )
-            .map_err(|error| classify_query_error(error, false))?;
-        Ok(())
+        bind_candidate_members(
+            &self.connection,
+            candidates,
+            self.schema_seed.as_ref().map(NamedTempFile::path),
+        )
+        .map_err(DatasetSetupError::into_dataset)
     }
 
     fn query_schema(&self, candidates: &[&DatasetMember]) -> Result<SchemaRef, DatasetError> {
@@ -1020,6 +1363,13 @@ impl DatasetWindowReader {
     }
 
     fn query_sql(&self, where_clause: &str) -> String {
+        let relation = dataset_relation_sql(
+            &self.summary,
+            self.physical_column_count,
+            &self.filename_column,
+            None,
+            self.schema_seed.is_some(),
+        );
         let projection = self
             .summary
             .schema
@@ -1027,61 +1377,96 @@ impl DatasetWindowReader {
             .map(|field| quote_identifier(&field.name))
             .collect::<Vec<_>>()
             .join(", ");
-        let physical_projection = self.summary.schema[..self.physical_column_count]
-            .iter()
-            .map(|field| {
-                format!(
-                    "s.{} AS {}",
-                    quote_identifier(&field.name),
-                    quote_identifier(&field.name)
-                )
-            })
-            .collect::<Vec<_>>();
-        let partition_projection = self
-            .summary
-            .partition_column_indices
-            .iter()
-            .enumerate()
-            .map(|(partition_index, schema_index)| {
-                format!(
-                    "map_extract_value(getvariable('__viewda_partition_{partition_index}'), \
-                     s.{filename}) AS {column}",
-                    filename = quote_identifier(&self.filename_column),
-                    column = quote_identifier(&self.summary.schema[*schema_index as usize].name),
-                )
-            });
-        let visible_projection = physical_projection
-            .into_iter()
-            .chain(partition_projection)
-            .chain([format!(
-                "map_extract_value(getvariable('__viewda_relative_map'), s.{filename}) AS {}",
-                quote_identifier(PROVENANCE_COLUMN),
-                filename = quote_identifier(&self.filename_column),
-            )])
-            .collect::<Vec<_>>()
-            .join(", ");
-        let seed_filter = self.schema_seed.as_ref().map_or_else(String::new, |_| {
-            format!(
-                " WHERE s.{} <> getvariable('__viewda_seed_path')",
-                quote_identifier(&self.filename_column)
-            )
-        });
-        format!(
-            "SELECT {projection} FROM (\
-             SELECT {visible_projection} \
-             FROM read_parquet(getvariable('__viewda_paths'), union_by_name = true, \
-             hive_partitioning = false, filename = {filename_option}) s{seed_filter}\
-             ){where_clause} LIMIT ? OFFSET ?",
-            filename_option = quote_string_literal(&self.filename_column),
-        )
+        format!("SELECT {projection} FROM {relation}{where_clause} LIMIT ? OFFSET ?",)
     }
+}
+
+fn dataset_relation_sql(
+    summary: &DatasetSummary,
+    physical_column_count: usize,
+    filename_column: &str,
+    positions: Option<(&str, &str)>,
+    has_schema_seed: bool,
+) -> String {
+    let physical_projection = summary.schema[..physical_column_count]
+        .iter()
+        .map(|field| {
+            format!(
+                "s.{} AS {}",
+                quote_identifier(&field.name),
+                quote_identifier(&field.name)
+            )
+        })
+        .collect::<Vec<_>>();
+    let partition_projection = summary.partition_column_indices.iter().enumerate().map(
+        |(partition_index, schema_index)| {
+            format!(
+                "map_extract_value(getvariable('__viewda_partition_{partition_index}'), \
+                 s.{filename}) AS {column}",
+                filename = quote_identifier(filename_column),
+                column = quote_identifier(&summary.schema[*schema_index as usize].name),
+            )
+        },
+    );
+    let provenance_projection = format!(
+        "map_extract_value(getvariable('__viewda_relative_map'), s.{filename}) AS {}",
+        quote_identifier(PROVENANCE_COLUMN),
+        filename = quote_identifier(filename_column),
+    );
+    let global_row_column = unique_internal_column(&summary.schema, "__viewda_global_row");
+    let position_projection = positions.into_iter().flat_map(|(row, ordinal)| {
+        [
+            format!(
+                "map_extract_value(getvariable('__viewda_ordinal_map'), s.{filename}) AS {}",
+                quote_identifier(ordinal),
+                filename = quote_identifier(filename_column),
+            ),
+            format!(
+                "p.{global_row} - CAST(map_extract_value(\
+                 getvariable('__viewda_candidate_start_map'), s.{filename}) AS BIGINT) AS {}",
+                quote_identifier(row),
+                global_row = quote_identifier(&global_row_column),
+                filename = quote_identifier(filename_column),
+            ),
+        ]
+    });
+    let projection = physical_projection
+        .into_iter()
+        .chain(partition_projection)
+        .chain([provenance_projection])
+        .chain(position_projection)
+        .collect::<Vec<_>>()
+        .join(", ");
+    let seed_filter = has_schema_seed.then(|| {
+        format!(
+            " WHERE s.{} <> getvariable('__viewda_seed_path')",
+            quote_identifier(filename_column)
+        )
+    });
+    let position_join = positions.map_or_else(String::new, |_| {
+        format!(
+            " POSITIONAL JOIN range(CAST(\
+             getvariable('__viewda_candidate_row_count') AS BIGINT)) \
+             p({})",
+            quote_identifier(&global_row_column)
+        )
+    });
+    format!(
+        "(SELECT {projection} \
+         FROM read_parquet(getvariable('__viewda_paths'), union_by_name = true, \
+         hive_partitioning = false, filename = {filename_option}) \
+         s{position_join}{seed_filter})",
+        filename_option = quote_string_literal(filename_column),
+        seed_filter = seed_filter.as_deref().unwrap_or(""),
+    )
 }
 
 fn initialize_member_tables(
     connection: &Connection,
     members: &[DatasetMember],
     summary: &DatasetSummary,
-) -> Result<(), DatasetError> {
+    row_counts: &[u64],
+) -> Result<(), DatasetSetupError> {
     let partition_columns = summary
         .partition_column_indices
         .iter()
@@ -1092,26 +1477,32 @@ fn initialize_member_tables(
         .execute_batch(&format!(
             "CREATE TEMP TABLE __viewda_members (\
              __ordinal UBIGINT PRIMARY KEY, __path VARCHAR NOT NULL UNIQUE, \
-             __relative VARCHAR NOT NULL{partition_columns})"
+             __relative VARCHAR NOT NULL, __row_count UBIGINT NOT NULL{partition_columns}); \
+             CREATE TEMP TABLE __viewda_candidates (__ordinal UBIGINT PRIMARY KEY)"
         ))
-        .map_err(|error| classify_query_error(error, false))?;
-    append_member_metadata(connection, members, summary)
+        .map_err(DatasetSetupError::Query)?;
+    append_member_metadata(connection, members, summary, row_counts)
 }
 
 fn append_member_metadata(
     connection: &Connection,
     members: &[DatasetMember],
     summary: &DatasetSummary,
-) -> Result<(), DatasetError> {
+    row_counts: &[u64],
+) -> Result<(), DatasetSetupError> {
+    if members.len() != row_counts.len() {
+        return Err(DatasetError::Unsupported.into());
+    }
     let mut appender = connection
         .appender("__viewda_members")
-        .map_err(|error| classify_query_error(error, false))?;
-    for member in members {
+        .map_err(DatasetSetupError::Query)?;
+    for (member, row_count) in members.iter().zip(row_counts) {
         let path = member.path.to_str().ok_or(DatasetError::Unsupported)?;
         let mut values = vec![
             Value::UBigInt(member.ordinal),
             Value::Text(path.to_owned()),
             Value::Text(member.relative_path.clone()),
+            Value::UBigInt(*row_count),
         ];
         for schema_index in &summary.partition_column_indices {
             let name = &summary.schema[*schema_index as usize].name;
@@ -1127,25 +1518,23 @@ fn append_member_metadata(
         }
         appender
             .append_row(appender_params_from_iter(values))
-            .map_err(|error| classify_query_error(error, false))?;
+            .map_err(DatasetSetupError::Query)?;
     }
-    appender
-        .flush()
-        .map_err(|error| classify_query_error(error, false))?;
+    appender.flush().map_err(DatasetSetupError::Query)?;
     Ok(())
 }
 
 fn install_member_maps(
     connection: &Connection,
     summary: &DatasetSummary,
-) -> Result<(), DatasetError> {
+) -> Result<(), DatasetSetupError> {
     connection
         .execute_batch(
             "SET VARIABLE __viewda_relative_map = (\
              SELECT map(list(__path ORDER BY __ordinal), list(__relative ORDER BY __ordinal)) \
              FROM __viewda_members)",
         )
-        .map_err(|error| classify_query_error(error, false))?;
+        .map_err(DatasetSetupError::Query)?;
     for partition_index in 0..summary.partition_column_indices.len() {
         connection
             .execute_batch(&format!(
@@ -1154,8 +1543,74 @@ fn install_member_maps(
                  list({} ORDER BY __ordinal)) FROM __viewda_members)",
                 quote_identifier(&format!("__partition_{partition_index}"))
             ))
-            .map_err(|error| classify_query_error(error, false))?;
+            .map_err(DatasetSetupError::Query)?;
     }
+    Ok(())
+}
+
+fn install_ordinal_map(connection: &Connection) -> Result<(), DatasetSetupError> {
+    connection
+        .execute_batch(
+            "SET VARIABLE __viewda_ordinal_map = (\
+             SELECT map(list(__path ORDER BY __ordinal), list(__ordinal ORDER BY __ordinal)) \
+             FROM __viewda_members)",
+        )
+        .map_err(DatasetSetupError::Query)?;
+    Ok(())
+}
+
+fn install_candidate_offsets(connection: &Connection) -> Result<(), DatasetSetupError> {
+    connection
+        .execute_batch(
+            "SET VARIABLE __viewda_candidate_start_map = (\
+             SELECT map(list(__path ORDER BY __ordinal), list(__start ORDER BY __ordinal)) \
+             FROM (SELECT __path, __ordinal, coalesce(sum(__row_count) OVER (\
+             ORDER BY __ordinal ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING), 0) __start \
+             FROM __viewda_members JOIN __viewda_candidates USING (__ordinal))); \
+             SET VARIABLE __viewda_candidate_row_count = (\
+             SELECT coalesce(sum(__row_count), 0) FROM __viewda_members \
+             JOIN __viewda_candidates USING (__ordinal))",
+        )
+        .map_err(DatasetSetupError::Query)?;
+    Ok(())
+}
+
+fn bind_candidate_members(
+    connection: &Connection,
+    candidates: &[&DatasetMember],
+    schema_seed: Option<&Path>,
+) -> Result<(), DatasetSetupError> {
+    connection
+        .execute_batch("DELETE FROM __viewda_candidates")
+        .map_err(DatasetSetupError::Query)?;
+    let mut appender = connection
+        .appender("__viewda_candidates")
+        .map_err(DatasetSetupError::Query)?;
+    for member in candidates {
+        appender
+            .append_row([Value::UBigInt(member.ordinal)])
+            .map_err(DatasetSetupError::Query)?;
+    }
+    appender.flush().map_err(DatasetSetupError::Query)?;
+    drop(appender);
+
+    let mut paths = candidates
+        .iter()
+        .map(|member| member.path.to_str().ok_or(DatasetError::Unsupported))
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
+        .map(escape_glob_path)
+        .collect::<Vec<_>>();
+    if let Some(seed) = schema_seed {
+        let seed = seed.to_str().ok_or(DatasetError::Unsupported)?;
+        paths.push(escape_glob_path(seed));
+    }
+    connection
+        .execute(
+            "SET VARIABLE __viewda_paths = string_split(?, chr(0))",
+            [Value::Text(paths.join("\0"))],
+        )
+        .map_err(DatasetSetupError::Query)?;
     Ok(())
 }
 
@@ -1793,6 +2248,37 @@ fn member_identity(path: &Path, metadata: &fs::Metadata) -> Result<MemberIdentit
 }
 
 #[cfg(unix)]
+fn same_file_identity(left: &PlatformFileIdentity, right: &PlatformFileIdentity) -> bool {
+    let PlatformFileIdentity::Unix {
+        device: left_device,
+        inode: left_inode,
+    } = left;
+    let PlatformFileIdentity::Unix {
+        device: right_device,
+        inode: right_inode,
+    } = right;
+    left_device == right_device && left_inode == right_inode
+}
+
+#[cfg(windows)]
+fn same_file_identity(left: &PlatformFileIdentity, right: &PlatformFileIdentity) -> bool {
+    let PlatformFileIdentity::Windows {
+        volume: left_volume,
+        file_index: left_index,
+    } = left;
+    let PlatformFileIdentity::Windows {
+        volume: right_volume,
+        file_index: right_index,
+    } = right;
+    left_volume == right_volume && left_index == right_index
+}
+
+#[cfg(not(any(unix, windows)))]
+fn same_file_identity(_left: &PlatformFileIdentity, _right: &PlatformFileIdentity) -> bool {
+    false
+}
+
+#[cfg(unix)]
 fn platform_file_identity(
     _path: &Path,
     metadata: &fs::Metadata,
@@ -1846,11 +2332,151 @@ fn map_member_error(error: SourceError, member: &DatasetMember) -> DatasetError 
 
 #[cfg(test)]
 mod tests {
+    use std::{
+        fs::{FileTimes, OpenOptions},
+        io::{Seek, SeekFrom, Write},
+    };
+
     use arrow_array::Int64Array;
     use arrow_schema::Field;
+    use parquet::file::reader::{FileReader, SerializedFileReader};
     use tempfile::tempdir;
 
     use super::*;
+
+    #[test]
+    fn query_source_redacts_every_internal_path_from_diagnostics() {
+        let directory = tempdir().expect("dataset directory");
+        let first = directory.path().join("br[ack].parquet");
+        let second = directory.path().join("b.parquet");
+        write_test_member(&first, 1);
+        write_test_member(&second, 2);
+        let source = DatasetSource::open_folder(directory.path()).expect("dataset source");
+        let mut inspector = source.inspector();
+        inspector.advance(2).expect("footer pass");
+        let reader = inspector.into_window_reader().expect("dataset reader");
+        let query_source = reader.query_source().expect("query source");
+        let first_escaped = escape_glob_path(first.to_string_lossy().as_ref());
+        let seed_escaped =
+            escape_glob_path(query_source.schema_seed.path().to_string_lossy().as_ref());
+        let message = format!(
+            "failed to read {}, {}, {}, {}, and {}",
+            first.display(),
+            first_escaped,
+            second.display(),
+            query_source.schema_seed.path().display(),
+            seed_escaped,
+        );
+
+        let redacted = query_source.redact_paths(&message);
+
+        assert_eq!(
+            redacted,
+            "failed to read <source>, <source>, <source>, <temporary file>, and <temporary file>"
+        );
+    }
+
+    #[test]
+    fn member_snapshot_rejects_and_latches_replacement_during_open() {
+        let directory = tempdir().expect("dataset directory");
+        let selected = directory.path().join("a.parquet");
+        let unrelated = directory.path().join("b.parquet");
+        write_test_member(&selected, 1);
+        write_test_member(&unrelated, 2);
+        let source = DatasetSource::open_folder(directory.path()).expect("dataset source");
+        let mut inspector = source.inspector();
+        inspector.advance(2).expect("footer pass");
+        let reader = inspector.into_window_reader().expect("dataset reader");
+
+        let error = match reader.member_snapshot_checked(0, || {
+            let replacement = directory.path().join("replacement.parquet");
+            write_test_member(&replacement, 3);
+            fs::rename(replacement, &unrelated).expect("replace unrelated member");
+        }) {
+            Ok(_) => panic!("replacement during snapshot open must fail"),
+            Err(error) => error,
+        };
+
+        assert_eq!(
+            error,
+            DatasetError::SourceChanged {
+                member: "b.parquet".to_owned(),
+            }
+        );
+        assert_eq!(reader.member_snapshot(0).err(), Some(error));
+    }
+
+    #[test]
+    fn window_query_diagnostics_probe_only_the_bound_page_members() {
+        let directory = tempdir().expect("dataset directory");
+        let first = directory.path().join("a.parquet");
+        write_test_member(&first, 1);
+        write_test_member(&directory.path().join("b.parquet"), 2);
+        write_test_member(&directory.path().join("c.parquet"), 3);
+        let source = DatasetSource::open_folder(directory.path()).expect("dataset source");
+        let mut inspector = source.inspector();
+        inspector.advance(3).expect("footer pass");
+        let reader = inspector.into_window_reader().expect("dataset reader");
+        let query_source = reader.query_source().expect("query source");
+        corrupt_test_member_data(&first);
+
+        let failure = DuckDbError::DuckDBFailure(
+            duckdb::ffi::Error::new(duckdb::ffi::DuckDBError),
+            Some("independent query failure".to_owned()),
+        );
+        assert_eq!(
+            query_source.classify_window_query_failure(failure, &[2]),
+            DatasetError::Window {
+                error: DataWindowError::QueryFailed,
+            }
+        );
+        assert_eq!(query_source.source.require_active(), Ok(()));
+
+        let failure = DuckDbError::DuckDBFailure(
+            duckdb::ffi::Error::new(duckdb::ffi::DuckDBError),
+            Some("independent query failure".to_owned()),
+        );
+        assert_eq!(
+            query_source.classify_window_query_failure(failure, &[0]),
+            DatasetError::InvalidMember {
+                member: "a.parquet".to_owned(),
+            }
+        );
+    }
+
+    #[test]
+    fn prepared_view_index_contains_only_dataset_row_positions() {
+        let directory = tempdir().expect("dataset directory");
+        write_test_member(&directory.path().join("a.parquet"), 2);
+        write_test_member(&directory.path().join("b.parquet"), 1);
+        let source = DatasetSource::open_folder(directory.path()).expect("dataset source");
+        let mut inspector = source.inspector();
+        inspector.advance(2).expect("footer pass");
+        let reader = inspector.into_window_reader().expect("dataset reader");
+        let view = crate::DataViewBuilder::for_dataset(
+            &reader,
+            &[],
+            &[crate::DataSort {
+                source_index: 0,
+                direction: crate::DataSortDirection::Ascending,
+            }],
+            crate::DataViewMemoryLimit::Mb384,
+        )
+        .expect("dataset view builder")
+        .build()
+        .expect("prepared dataset view");
+        let index = inspect_local_source(view.position_index_path()).expect("position index");
+
+        assert_eq!(index.row_count, 2);
+        assert_eq!(
+            index
+                .schema
+                .iter()
+                .map(|field| field.name.as_str())
+                .collect::<Vec<_>>(),
+            ["__viewda_member_ordinal", "__viewda_native_row"]
+        );
+    }
 
     #[test]
     fn preview_session_is_upgraded_without_reprocessing_its_first_footer() {
@@ -2031,7 +2657,8 @@ mod tests {
         assert_eq!(candidates[0].relative_path, "year=2026/b.parquet");
         assert_eq!(candidates[0].path, PathBuf::from("year=2026/b.parquet"));
         let connection = Connection::open_in_memory().expect("DuckDB connection");
-        initialize_member_tables(&connection, &members, &summary).expect("member metadata");
+        initialize_member_tables(&connection, &members, &summary, &[0, 0])
+            .expect("member metadata");
         let source = DatasetSource {
             display_name: "dataset/".to_owned(),
             ignored_file_count: 0,
@@ -2049,6 +2676,7 @@ mod tests {
             physical_column_count: 0,
             initialized_member_count: 2,
             schema_seed: None,
+            member_row_counts: vec![0, 0],
         };
         reader
             .bind_candidate_paths(&candidates)
@@ -2085,7 +2713,9 @@ mod tests {
             provenance_column_index: 2,
         };
         let connection = Connection::open_in_memory().expect("DuckDB connection");
-        initialize_member_tables(&connection, &members, &summary).expect("static metadata");
+        let row_counts = vec![0; members.len()];
+        initialize_member_tables(&connection, &members, &summary, &row_counts)
+            .expect("static metadata");
         let source = DatasetSource {
             display_name: "dataset/".to_owned(),
             ignored_file_count: 0,
@@ -2103,6 +2733,7 @@ mod tests {
             physical_column_count: 1,
             initialized_member_count: 1_000,
             schema_seed: None,
+            member_row_counts: row_counts,
         };
 
         let query = reader.query_sql("");
@@ -2111,17 +2742,28 @@ mod tests {
         assert!(!query.contains("part-0000.parquet"));
         assert!(!query.contains("part-0999.parquet"));
         reader
-            .bind_candidate_paths(&[&members[999]])
-            .expect("one candidate bind");
-        let (bound_paths, static_members) = reader
+            .bind_candidate_paths(&[&members[0], &members[500], &members[999]])
+            .expect("bounded candidate bind");
+        let (bound_paths, bound_candidates, static_members) = reader
             .connection
             .query_row(
-                "SELECT len(getvariable('__viewda_paths')), count(*) FROM __viewda_members",
+                "SELECT len(getvariable('__viewda_paths')), \
+                 (SELECT count(*) FROM __viewda_candidates), \
+                 (SELECT count(*) FROM __viewda_members)",
                 [],
-                |row| Ok((row.get::<_, u64>(0)?, row.get::<_, u64>(1)?)),
+                |row| {
+                    Ok((
+                        row.get::<_, u64>(0)?,
+                        row.get::<_, u64>(1)?,
+                        row.get::<_, u64>(2)?,
+                    ))
+                },
             )
             .expect("bounded per-fetch metadata");
-        assert_eq!((bound_paths, static_members), (1, 1_000));
+        assert_eq!(
+            (bound_paths, bound_candidates, static_members),
+            (3, 3, 1_000)
+        );
     }
 
     #[test]
@@ -2167,6 +2809,52 @@ mod tests {
             query_compatible_canonical_path(canonical_member),
             Err(DatasetError::Unsupported)
         );
+    }
+
+    #[test]
+    fn platform_file_identity_distinguishes_aliases_from_other_files() {
+        #[cfg(unix)]
+        let (identity, alias, other) = (
+            PlatformFileIdentity::Unix {
+                device: 7,
+                inode: 11,
+            },
+            PlatformFileIdentity::Unix {
+                device: 7,
+                inode: 11,
+            },
+            PlatformFileIdentity::Unix {
+                device: 7,
+                inode: 12,
+            },
+        );
+        #[cfg(windows)]
+        let (identity, alias, other) = (
+            PlatformFileIdentity::Windows {
+                volume: 7,
+                file_index: 11,
+            },
+            PlatformFileIdentity::Windows {
+                volume: 7,
+                file_index: 11,
+            },
+            PlatformFileIdentity::Windows {
+                volume: 7,
+                file_index: 12,
+            },
+        );
+        #[cfg(not(any(unix, windows)))]
+        let (identity, alias, other) = (
+            PlatformFileIdentity::Unavailable,
+            PlatformFileIdentity::Unavailable,
+            PlatformFileIdentity::Unavailable,
+        );
+
+        assert_eq!(
+            same_file_identity(&identity, &alias),
+            cfg!(any(unix, windows))
+        );
+        assert!(!same_file_identity(&identity, &other));
     }
 
     #[test]
@@ -2237,6 +2925,33 @@ mod tests {
         let mut writer = ArrowWriter::try_new(file, schema, None).expect("Parquet writer");
         writer.write(&batch).expect("member rows");
         writer.close().expect("member footer");
+    }
+
+    fn corrupt_test_member_data(path: &Path) {
+        let metadata = fs::metadata(path).expect("member metadata");
+        let modified = metadata.modified().expect("member modification time");
+        let reader = SerializedFileReader::new(fs::File::open(path).expect("member file"))
+            .expect("Parquet metadata");
+        let column = reader.metadata().row_group(0).column(0);
+        let start = column
+            .dictionary_page_offset()
+            .unwrap_or_else(|| column.data_page_offset());
+        let length = usize::try_from(column.compressed_size()).expect("column chunk size");
+        drop(reader);
+
+        let mut file = OpenOptions::new()
+            .write(true)
+            .open(path)
+            .expect("writable member");
+        file.seek(SeekFrom::Start(
+            u64::try_from(start).expect("column chunk offset"),
+        ))
+        .expect("column chunk seek");
+        file.write_all(&vec![0; length])
+            .expect("overwrite column chunk");
+        file.flush().expect("flush damaged data");
+        file.set_times(FileTimes::new().set_modified(modified))
+            .expect("restore member identity timestamp");
     }
 
     #[cfg(unix)]
