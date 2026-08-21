@@ -923,7 +923,6 @@ export const ViewdaGrid = forwardRef<ViewdaGridHandle, ViewdaGridProps>(
         ) {
           return;
         }
-        event.preventDefault();
         const advance = advanceWheelGesture(
           wheelGestureRef.current,
           horizontalDelta,
@@ -931,25 +930,36 @@ export const ViewdaGrid = forwardRef<ViewdaGridHandle, ViewdaGridProps>(
           event.timeStamp,
           GRID_ROW_HEIGHT,
         );
-        wheelGestureRef.current = advance.state;
         const decision = advance.state.axis ?? "ambiguous";
         let appliedHorizontalPixels = 0;
         let verticalTarget: number | null = null;
         let outcome: GridWheelOutcome | null = null;
-        if (advance.horizontalDelta !== 0) {
+        const logicalTopAtStart = scrollStateRef.current.logicalTop;
+        const dominantVerticalBlocked =
+          Math.abs(verticalDelta) >= Math.abs(horizontalDelta) &&
+          verticalDelta !== 0 &&
+          (layout.logicalMax <= 0 ||
+            (verticalDelta < 0
+              ? logicalTopAtStart <= 0
+              : logicalTopAtStart >= layout.logicalMax));
+        if (!dominantVerticalBlocked && advance.horizontalDelta !== 0) {
           const previousLeft = scrollport.scrollLeft;
           const actualLeft = syncHorizontalScroll(
             previousLeft + advance.horizontalDelta,
           );
-          if (
-            actualLeft !== null &&
-            positionsDiffer(previousLeft, actualLeft)
-          ) {
+          if (actualLeft !== null && previousLeft !== actualLeft) {
             appliedHorizontalPixels = actualLeft - previousLeft;
             scheduleMeasurement();
           }
         }
-        if (decision === "horizontal") {
+        if (dominantVerticalBlocked) {
+          outcome =
+            layout.logicalMax <= 0
+              ? "noScrollableExtent"
+              : verticalDelta < 0
+                ? "atStartBoundary"
+                : "atEndBoundary";
+        } else if (decision === "horizontal") {
           if (advance.horizontalDelta === 0) {
             outcome = "axisLockedNoise";
           } else if (scrollingWidth <= scrollingViewportWidth) {
@@ -986,6 +996,36 @@ export const ViewdaGrid = forwardRef<ViewdaGridHandle, ViewdaGridProps>(
             ? (verticalTarget - scrollStateRef.current.logicalTop) /
               GRID_ROW_HEIGHT
             : 0;
+        const logicalTop = scrollStateRef.current.logicalTop;
+        const canMoveVertically =
+          verticalDelta < 0
+            ? logicalTop > 0
+            : verticalDelta > 0
+              ? logicalTop < layout.logicalMax
+              : false;
+        const horizontalMax = Math.max(
+          0,
+          scrollingWidth - scrollingViewportWidth,
+        );
+        const canMoveHorizontally =
+          horizontalDelta < 0
+            ? scrollport.scrollLeft > 0
+            : horizontalDelta > 0
+              ? scrollport.scrollLeft < horizontalMax
+              : false;
+        const shouldConsume =
+          !dominantVerticalBlocked &&
+          (outcome === "appliedMovement" ||
+            (decision === "vertical" &&
+              outcome === "accumulatingWholeRow" &&
+              canMoveVertically) ||
+            (decision === "ambiguous" &&
+              (canMoveVertically || canMoveHorizontally)));
+        if (shouldConsume) {
+          event.preventDefault();
+        }
+        const consumed = event.defaultPrevented;
+        wheelGestureRef.current = consumed ? advance.state : null;
         if (
           decision === "vertical" &&
           outcome === "appliedMovement" &&
@@ -998,7 +1038,7 @@ export const ViewdaGrid = forwardRef<ViewdaGridHandle, ViewdaGridProps>(
           const diagnosticFrame = diagnostics.wheel(diagnosticWheelStartedAt, {
             timeStamp: event.timeStamp,
             decision,
-            consumed: true,
+            consumed,
             takeover: advance.takeover,
             requestedHorizontalPixels:
               decision === "horizontal" ? advance.horizontalDelta : 0,

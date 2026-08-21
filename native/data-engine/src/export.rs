@@ -20,7 +20,7 @@ use thiserror::Error;
 
 use crate::{
     filter::{DataFilter, FilterPredicate, build_filter_predicate_with_names},
-    source::{SchemaField, SourceError, inspect_local_source},
+    source::{SchemaField, SourceError, inspect_local_source_for_query},
     view::PreparedDataViewExport,
 };
 
@@ -75,6 +75,9 @@ pub enum DataExportError {
     /// The operating system denied source or destination access.
     #[error("Viewda does not have permission to read or write this file.")]
     PermissionDenied,
+    /// The source path no longer identifies the opened file.
+    #[error("The selected file changed after it was opened.")]
+    SourceChanged,
     /// The selected source does not have Parquet file markers.
     #[error("The selected file is not a Parquet file.")]
     NotParquet,
@@ -162,7 +165,8 @@ impl DataExportReader {
         mut request: DataExportRequest,
         view: Option<PreparedDataViewExport>,
     ) -> Result<Self, DataExportError> {
-        let summary = inspect_local_source(&source_path).map_err(DataExportError::from)?;
+        let summary =
+            inspect_local_source_for_query(&source_path).map_err(DataExportError::from)?;
         if paths_match(&source_path, &target_path) {
             return Err(DataExportError::InvalidRequest);
         }
@@ -685,6 +689,7 @@ impl From<SourceError> for DataExportError {
         match error {
             SourceError::NotFound => Self::NotFound,
             SourceError::PermissionDenied => Self::PermissionDenied,
+            SourceError::SourceChanged => Self::SourceChanged,
             SourceError::NotParquet => Self::NotParquet,
             SourceError::CorruptFooter => Self::CorruptSource,
             SourceError::Unsupported => Self::Unsupported,

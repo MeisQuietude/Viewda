@@ -303,10 +303,198 @@ describe("schema field layout", () => {
   });
 
   it("keeps field type colors in the light and dark themes", () => {
-    expect(styles).toMatch(/\.schema-type\s*\{[^}]*color:\s*#777c7c;/s);
+    expect(styles).toMatch(
+      /\.schema-type\s*\{[^}]*color:\s*var\(--grid-text-muted\);/s,
+    );
     expect(styles).toMatch(
       /:root\[data-theme="dark"\] \.schema-type\s*\{\s*color:\s*#b6bbba;\s*\}/,
     );
+  });
+
+  it("keeps selectable schema fields readable on dark surfaces", () => {
+    const darkVariables = styles.match(
+      /:root\[data-theme="dark"\] \{([^}]*)\}/s,
+    )?.[1];
+    expect(darkVariables).toBeDefined();
+    if (darkVariables === undefined) {
+      throw new Error("Dark theme variables are missing.");
+    }
+    expect(declaration(".schema-field", "color")).toBe("inherit");
+    expect(
+      contrastRatio(
+        readColorVariable(darkVariables, "grid-text"),
+        readColorVariable(darkVariables, "grid-cell"),
+      ),
+    ).toBeGreaterThanOrEqual(4.5);
+
+    expect(declaration(".schema-tree button.schema-field", "background")).toBe(
+      "transparent",
+    );
+    expect(
+      declaration(
+        ".sidebar-schema-tree button.schema-field:hover",
+        "background",
+      ),
+    ).toBe("var(--grid-selection)");
+    expect(
+      declaration(
+        '.sidebar-schema-tree button.schema-field[aria-pressed="true"]',
+        "background",
+      ),
+    ).toBe("var(--grid-selection)");
+    expect(
+      declaration(
+        ".sidebar-schema-tree button.schema-field:focus-visible",
+        "outline",
+      ),
+    ).toBe("2px solid var(--grid-selection-strong)");
+  });
+});
+
+describe("structure workspace hierarchy", () => {
+  it("keeps the quiet action header clear of section anchors", () => {
+    expectDeclarations(".mode-panel.structure-mode-panel", {
+      position: "relative",
+      display: "block",
+      overflow: "auto",
+      isolation: "isolate",
+    });
+    expectDeclarations(".titlebar", {
+      position: "relative",
+      "z-index": "10",
+      background: "var(--app-background)",
+    });
+    expectDeclarations(".source-heading", {
+      position: "sticky",
+      top: "0px",
+      "min-height": "46px",
+      background: "var(--app-background)",
+    });
+    expect(declaration(".structure-mode-panel", "scroll-padding-top")).toBe(
+      "58px",
+    );
+    expect(declaration(".structure-card", "scroll-margin-top")).toBe("58px");
+    expectDeclarations(".source-heading .open-button", {
+      "min-height": "32px",
+      color: "var(--grid-text-muted)",
+      background: "var(--grid-cell-muted)",
+    });
+  });
+
+  it("uses open facts and dividers instead of nested cards", () => {
+    expect(declaration(".source-view", "width")).toContain("1180px");
+    expectDeclarations(".source-summary-row", {
+      display: "grid",
+      "border-top": "1px solid var(--grid-border-soft)",
+    });
+    expectDeclarations(".structure-card", {
+      "border-top": "1px solid var(--grid-border)",
+      "border-radius": "0px",
+      background: "transparent",
+    });
+    expectDeclarations(".columns-tabs", {
+      display: "flex",
+      background: "var(--grid-cell-muted)",
+    });
+  });
+
+  it("wraps primary facts and reserves monospace for technical values", () => {
+    expect(declaration(".source-summary-fact strong", "overflow-wrap")).toBe(
+      "anywhere",
+    );
+    expect(declaration(".source-summary .is-technical", "font-family")).toBe(
+      "var(--font-mono)",
+    );
+    expectDeclarations(".structure-help-info", {
+      width: "15px",
+      height: "15px",
+      cursor: "help",
+    });
+  });
+
+  it("keeps Structure actions and chunk text readable in both themes", () => {
+    expect(declaration(".copy-structure-report button", "color")).toBe(
+      "var(--grid-text-muted)",
+    );
+    for (const selector of [
+      ".chunk-panel-heading span",
+      ".chunk-panel-heading button",
+      ".chunk-section p",
+      ".probe-results",
+    ]) {
+      expect(declaration(selector, "color")).toBe("var(--grid-text-muted)");
+    }
+    expect(declaration(".chunk-facts dt", "color")).toBe(
+      "var(--grid-text-muted)",
+    );
+    for (const selector of [".chunk-panel-heading h3", ".chunk-section h4"]) {
+      expect(declaration(selector, "color")).toBe("var(--grid-text)");
+    }
+
+    const lightRoot = styles.match(/:root \{([^}]*)\}/s)?.[1];
+    const darkRoot = styles.match(
+      /:root\[data-theme="dark"\] \{([^}]*)\}/s,
+    )?.[1];
+    expect(lightRoot).toBeDefined();
+    expect(darkRoot).toBeDefined();
+    if (lightRoot === undefined || darkRoot === undefined) {
+      throw new Error("Theme variables are missing.");
+    }
+    for (const root of [lightRoot, darkRoot]) {
+      const background = readColorVariable(root, "grid-cell");
+      expect(
+        contrastRatio(readColorVariable(root, "grid-text-muted"), background),
+      ).toBeGreaterThanOrEqual(4.5);
+      expect(
+        contrastRatio(readColorVariable(root, "grid-text-faint"), background),
+      ).toBeGreaterThanOrEqual(4.5);
+      expect(
+        contrastRatio(readColorVariable(root, "grid-text"), background),
+      ).toBeGreaterThanOrEqual(4.5);
+      expect(
+        contrastRatio(readColorVariable(root, "bloom-marker"), background),
+      ).toBeGreaterThanOrEqual(3);
+    }
+    expect(styles).not.toContain("color: #777c7c");
+    expectDeclarations(".bloom-probe input", {
+      border: "1px solid var(--grid-selection-strong)",
+    });
+    expectDeclarations(".bloom-probe input:focus-visible", {
+      outline: "2px solid var(--grid-text)",
+    });
+  });
+
+  it("keeps structure tables dense and visually continuous in both themes", () => {
+    expectDeclarations(".structure-grid", {
+      height: "var(--structure-grid-height, 320px)",
+      "--grid-header": "transparent",
+      "--grid-cell": "transparent",
+    });
+    expectDeclarations(':root[data-theme="dark"] .structure-grid', {
+      "--grid-header": "transparent",
+      "--grid-cell": "transparent",
+    });
+  });
+
+  it("fits equal layout cells in the canvas and leaves rows in document flow", () => {
+    expectDeclarations(".layout-axis-items", {
+      display: "grid",
+      "min-width": "0px",
+      overflow: "hidden",
+    });
+    expectDeclarations(".layout-row-track", {
+      display: "grid",
+      width: "100%",
+      "min-width": "0px",
+      overflow: "hidden",
+    });
+    expectDeclarations(".layout-tail:focus-visible", {
+      outline: "2px solid var(--grid-selection-strong)",
+      "outline-offset": "-2px",
+    });
+    const rows = styles.match(/\.layout-rows\s*\{([^}]*)\}/s)?.[1];
+    expect(rows).toBeDefined();
+    expect(rows).not.toMatch(/max-height|overflow-y/);
   });
 });
 

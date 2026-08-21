@@ -96,12 +96,16 @@ const source: desktop.SourceSummary = {
   sizeBytes: 1_000_000_000,
   rowCount: 10_000,
   rowGroupCount: 1,
+  columnCount: 8,
   schema: Array.from({ length: 8 }, (_, index) => ({
     name: `column_${index}`,
     physicalType: "INT32",
     logicalType: null,
     children: [],
   })),
+  schemaNodeCount: 8,
+  schemaIsTruncated: false,
+  stringsTruncated: false,
 };
 
 beforeEach(() => {
@@ -147,6 +151,11 @@ beforeEach(() => {
     },
   );
   vi.spyOn(desktop, "getDataWindow").mockResolvedValue(new ArrayBuffer(0));
+  vi.spyOn(desktop, "getSourceSchemaPage").mockResolvedValue({
+    offset: source.schema.length,
+    totalCount: source.schema.length,
+    columns: [],
+  });
   vi.spyOn(desktop, "prepareDataView").mockImplementation(
     async (_generation, revision, filters) => ({
       revision,
@@ -341,6 +350,82 @@ describe("DataGrid window rendering", () => {
       "text",
     );
     expect(desktop.prepareDataView).not.toHaveBeenCalled();
+  });
+
+  it("loads a bounded schema page and fetches a column beyond the open prefix", async () => {
+    const prefix = Array.from({ length: 256 }, (_, index) => ({
+      ...source.schema[0]!,
+      name: `column_${index}`,
+    }));
+    const wideSource = {
+      ...source,
+      columnCount: 300,
+      schema: prefix,
+      schemaNodeCount: 300,
+      schemaIsTruncated: true,
+    };
+    vi.mocked(desktop.getSourceSchemaPage).mockResolvedValue({
+      offset: 256,
+      totalCount: 300,
+      columns: Array.from({ length: 44 }, (_, index) => ({
+        ...source.schema[0]!,
+        name: `column_${256 + index}`,
+      })),
+    });
+
+    render(<DataGrid source={wideSource} />);
+    await waitFor(() => expect(desktop.getDataWindow).toHaveBeenCalled());
+    vi.mocked(desktop.getDataWindow).mockClear();
+
+    await waitFor(() =>
+      expect(desktop.getSourceSchemaPage).toHaveBeenCalledWith(7, 256, 256),
+    );
+    expect(
+      screen.queryByRole("button", { name: "Load more columns" }),
+    ).not.toBeInTheDocument();
+
+    act(() => {
+      reportViewport({
+        rowStart: 0,
+        rowCount: 5,
+        columnIndices: [299],
+        mountedColumnIndices: [299],
+      });
+    });
+    await waitFor(() =>
+      expect(desktop.getDataWindow).toHaveBeenCalledWith(7, 0, 0, 10, [299]),
+    );
+  });
+
+  it("does not offer top-level columns when only a nested schema prefix is truncated", async () => {
+    const nestedSource = {
+      ...source,
+      columnCount: 1,
+      schema: [
+        {
+          name: "wrapper",
+          physicalType: "GROUP",
+          logicalType: null,
+          children: [],
+        },
+      ],
+      schemaNodeCount: 302,
+      schemaIsTruncated: true,
+    };
+    vi.mocked(desktop.getSourceSchemaPage).mockResolvedValue({
+      offset: 1,
+      totalCount: 1,
+      columns: [],
+    });
+
+    render(<DataGrid source={nestedSource} />);
+
+    await waitFor(() =>
+      expect(desktop.getSourceSchemaPage).toHaveBeenCalledWith(7, 1, 256),
+    );
+    expect(
+      screen.queryByRole("button", { name: "Load more columns" }),
+    ).not.toBeInTheDocument();
   });
 
   it("loads only viewport and frozen columns from a prepared view", async () => {
