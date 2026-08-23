@@ -818,6 +818,10 @@ button {
   white-space: normal;
 }
 
+.where-popup.is-empty {
+  width: min(140px, calc(100vw - 32px));
+}
+
 .sort-popup {
   position: absolute;
   z-index: 24;
@@ -911,6 +915,7 @@ button {
   margin: 4px;
   color: var(--grid-text-faint);
   font-family: inherit;
+  font-size: 11px;
 }
 
 .where-popup ol {
