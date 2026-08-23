@@ -311,6 +311,12 @@ describe("schema field layout", () => {
 });
 
 describe("query row", () => {
+  it("keeps its popups above the grid column headers", () => {
+    expect(Number(declaration(".query-row", "z-index"))).toBeGreaterThan(
+      Number(declaration(".viewda-grid-header", "z-index")),
+    );
+  });
+
   it("keeps inline clauses clipped and their popups complete", () => {
     expect(styles).toMatch(
       /\.query-where,\s*\.query-order,\s*\.query-select\s*\{[^}]*overflow:\s*hidden;[^}]*text-overflow:\s*ellipsis;[^}]*white-space:\s*nowrap;/s,

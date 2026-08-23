@@ -492,7 +492,7 @@ button {
 
 .query-row {
   position: relative;
-  z-index: 3;
+  z-index: 5;
   display: flex;
   min-width: 0;
   min-height: 34px;
