@@ -306,12 +306,15 @@ describe("ViewdaGrid foundation", () => {
     );
   });
 
-  it("keeps the native horizontal track outside sticky columns", () => {
+  it("keeps the horizontal scrollbar outside sticky columns", () => {
     const columns = [column(0, true), column(1), column(2), column(3)];
     const { container } = render(
       <ViewdaGrid {...props({ columns, rowCount: 1_000 })} />,
     );
 
+    const horizontalScrollbar = screen.getByRole("scrollbar", {
+      name: "Horizontal grid scroll",
+    });
     const horizontalScrollport = container.querySelector(
       ".viewda-grid-horizontal-scrollport",
     ) as HTMLElement;
@@ -321,11 +324,15 @@ describe("ViewdaGrid foundation", () => {
     const scrollingHeaders = container.querySelector(
       ".viewda-grid-scrolling-headers",
     ) as HTMLElement;
-    expect(horizontalScrollport).not.toHaveAttribute("hidden");
-    expect(horizontalScrollport).toHaveStyle({ marginLeft: "153px" });
+    expect(horizontalScrollbar).not.toHaveAttribute("hidden");
+    expect(horizontalScrollbar).toHaveStyle({ marginLeft: "153px" });
     expect(
       horizontalScrollport.querySelector(".viewda-grid-horizontal-spacer"),
     ).toHaveStyle({ width: "300px" });
+    expect(horizontalScrollbar).toHaveAttribute(
+      "aria-controls",
+      bodyScrollport.id,
+    );
 
     horizontalScrollport.scrollLeft = 40;
     fireEvent.scroll(horizontalScrollport);
@@ -338,6 +345,243 @@ describe("ViewdaGrid foundation", () => {
         (cell) => cell.getAttribute("aria-colindex"),
       ),
     ).toEqual(["2", "3", "4", "5"]);
+  });
+
+  it("keeps the horizontal thumb visible, clickable, and draggable", () => {
+    installPointerCapture();
+    const basePort = measurementPort(420, 84);
+    const port: GridMeasurementPort = {
+      ...basePort,
+      bounds: (element) =>
+        element.classList.contains("viewda-grid-horizontal-scrollbar")
+          ? { x: 100, y: 200, width: 367, height: 14 }
+          : basePort.bounds(element),
+    };
+    const { container } = render(
+      <ViewdaGrid {...props({ measurementPort: port })} />,
+    );
+    const horizontalScrollbar = screen.getByRole("scrollbar", {
+      name: "Horizontal grid scroll",
+    });
+    const horizontalThumb = horizontalScrollbar.querySelector(
+      ".viewda-grid-horizontal-thumb",
+    ) as HTMLElement;
+    const horizontalScrollport = container.querySelector(
+      ".viewda-grid-horizontal-scrollport",
+    ) as HTMLElement;
+    const bodyScrollport = container.querySelector(
+      ".viewda-grid-body-scrollport",
+    ) as HTMLElement;
+    const thumbWidth = Number.parseFloat(horizontalThumb.style.width);
+
+    expect(thumbWidth).toBeGreaterThanOrEqual(28);
+    expect(horizontalThumb.style.transform).toBe("translateX(0px)");
+
+    fireEvent.pointerDown(horizontalScrollbar, {
+      button: 0,
+      clientX: 400,
+      pointerId: 6,
+    });
+    expect(bodyScrollport.scrollLeft).toBeGreaterThan(0);
+    fireEvent.pointerUp(horizontalScrollbar, { pointerId: 6 });
+    fireEvent.keyDown(horizontalScrollbar, { key: "Home" });
+
+    fireEvent.pointerDown(horizontalScrollbar, {
+      button: 0,
+      clientX: 105,
+      pointerId: 7,
+    });
+    fireEvent.pointerMove(horizontalScrollbar, {
+      clientX: 300,
+      pointerId: 7,
+    });
+
+    const expectedScrollLeft = (195 / (367 - thumbWidth)) * 833;
+    expect(bodyScrollport.scrollLeft).toBeCloseTo(expectedScrollLeft);
+    expect(horizontalScrollport.scrollLeft).toBeCloseTo(expectedScrollLeft);
+    expect(horizontalScrollbar).toHaveAttribute(
+      "aria-valuenow",
+      String(Math.round(expectedScrollLeft)),
+    );
+    expect(horizontalThumb.style.transform).not.toBe("translateX(0px)");
+
+    fireEvent.pointerUp(horizontalScrollbar, { pointerId: 7 });
+    expect(horizontalScrollbar).not.toHaveAttribute("data-dragging");
+  });
+
+  it("uses current scrollbar geometry throughout a horizontal drag", () => {
+    installPointerCapture();
+    const frames: FrameRequestCallback[] = [];
+    vi.spyOn(window, "requestAnimationFrame").mockImplementation((callback) => {
+      frames.push(callback);
+      return frames.length;
+    });
+    let resize: (() => void) | undefined;
+    let viewportWidth = 420;
+    const basePort = measurementPort(viewportWidth, 84);
+    const port: GridMeasurementPort = {
+      ...basePort,
+      read: (scrollport) => ({
+        width: viewportWidth,
+        height: 84,
+        scrollTop: scrollport.scrollTop,
+        scrollLeft: scrollport.scrollLeft,
+        devicePixelRatio: 1.5,
+      }),
+      observe: (_element, callback) => {
+        resize = callback;
+        return () => undefined;
+      },
+      bounds: (element) => {
+        if (!element.classList.contains("viewda-grid-horizontal-scrollbar")) {
+          return basePort.bounds(element);
+        }
+        const declaredWidth = Number.parseFloat(element.style.width);
+        return {
+          x: 100,
+          y: 200,
+          width: Number.isNaN(declaredWidth)
+            ? viewportWidth - 53
+            : declaredWidth,
+          height: 14,
+        };
+      },
+    };
+    const { container } = render(
+      <ViewdaGrid {...props({ measurementPort: port })} />,
+    );
+    const horizontalScrollbar = screen.getByRole("scrollbar", {
+      name: "Horizontal grid scroll",
+    });
+    const bodyScrollport = container.querySelector(
+      ".viewda-grid-body-scrollport",
+    ) as HTMLElement;
+
+    fireEvent.pointerDown(horizontalScrollbar, {
+      button: 0,
+      clientX: 105,
+      pointerId: 7,
+    });
+    viewportWidth = 320;
+    act(() => resize?.());
+    fireEvent.pointerMove(horizontalScrollbar, {
+      clientX: 367,
+      pointerId: 7,
+    });
+
+    expect(bodyScrollport.scrollLeft).toBeCloseTo(933);
+    act(() => frames.shift()?.(0));
+    expect(bodyScrollport.scrollLeft).toBeCloseTo(933);
+    fireEvent.pointerUp(horizontalScrollbar, { pointerId: 7 });
+  });
+
+  it("does not let another pointer replace or finish an active drag", () => {
+    const { setPointerCapture, releasePointerCapture } =
+      installPointerCapture();
+    const basePort = measurementPort(420, 84);
+    const port: GridMeasurementPort = {
+      ...basePort,
+      bounds: (element) =>
+        element.classList.contains("viewda-grid-horizontal-scrollbar")
+          ? { x: 100, y: 200, width: 367, height: 14 }
+          : basePort.bounds(element),
+    };
+    const { container } = render(
+      <ViewdaGrid {...props({ measurementPort: port })} />,
+    );
+    const horizontalScrollbar = screen.getByRole("scrollbar", {
+      name: "Horizontal grid scroll",
+    });
+    const bodyScrollport = container.querySelector(
+      ".viewda-grid-body-scrollport",
+    ) as HTMLElement;
+
+    fireEvent.pointerDown(horizontalScrollbar, {
+      button: 0,
+      clientX: 105,
+      pointerId: 7,
+    });
+    fireEvent.pointerDown(horizontalScrollbar, {
+      button: 0,
+      clientX: 106,
+      pointerId: 8,
+    });
+    fireEvent.pointerUp(horizontalScrollbar, { pointerId: 8 });
+    fireEvent.pointerMove(horizontalScrollbar, {
+      clientX: 300,
+      pointerId: 7,
+    });
+
+    expect(setPointerCapture).toHaveBeenCalledTimes(1);
+    expect(horizontalScrollbar).toHaveAttribute("data-dragging", "true");
+    expect(bodyScrollport.scrollLeft).toBeGreaterThan(0);
+
+    fireEvent.pointerUp(horizontalScrollbar, { pointerId: 7 });
+    expect(releasePointerCapture).toHaveBeenCalledWith(7);
+    expect(horizontalScrollbar).not.toHaveAttribute("data-dragging");
+  });
+
+  it("allows another drag after pointer capture is lost", () => {
+    const { setPointerCapture } = installPointerCapture();
+    const basePort = measurementPort(420, 84);
+    const port: GridMeasurementPort = {
+      ...basePort,
+      bounds: (element) =>
+        element.classList.contains("viewda-grid-horizontal-scrollbar")
+          ? { x: 100, y: 200, width: 367, height: 14 }
+          : basePort.bounds(element),
+    };
+    render(<ViewdaGrid {...props({ measurementPort: port })} />);
+    const horizontalScrollbar = screen.getByRole("scrollbar", {
+      name: "Horizontal grid scroll",
+    });
+
+    fireEvent.pointerDown(horizontalScrollbar, {
+      button: 0,
+      clientX: 105,
+      pointerId: 7,
+    });
+    fireEvent.lostPointerCapture(horizontalScrollbar, { pointerId: 7 });
+    expect(horizontalScrollbar).not.toHaveAttribute("data-dragging");
+
+    fireEvent.pointerDown(horizontalScrollbar, {
+      button: 0,
+      clientX: 105,
+      pointerId: 8,
+    });
+    expect(setPointerCapture).toHaveBeenNthCalledWith(2, 8);
+    expect(horizontalScrollbar).toHaveAttribute("data-dragging", "true");
+  });
+
+  it("supports keyboard scrolling from the horizontal scrollbar", () => {
+    const { container } = render(<ViewdaGrid {...props()} />);
+    const horizontalScrollbar = screen.getByRole("scrollbar", {
+      name: "Horizontal grid scroll",
+    });
+    const bodyScrollport = container.querySelector(
+      ".viewda-grid-body-scrollport",
+    ) as HTMLElement;
+
+    fireEvent.keyDown(horizontalScrollbar, { key: "End" });
+    expect(bodyScrollport.scrollLeft).toBe(833);
+    expect(horizontalScrollbar).toHaveAttribute("aria-valuenow", "833");
+
+    fireEvent.keyDown(horizontalScrollbar, { key: "Home" });
+    expect(bodyScrollport.scrollLeft).toBe(0);
+    expect(horizontalScrollbar).toHaveAttribute("aria-valuenow", "0");
+  });
+
+  it("keeps vertical navigation keys inside the horizontal scrollbar", () => {
+    const onSelectionChange = vi.fn();
+    render(<ViewdaGrid {...props({ onSelectionChange })} />);
+    const horizontalScrollbar = screen.getByRole("scrollbar", {
+      name: "Horizontal grid scroll",
+    });
+
+    fireEvent.keyDown(horizontalScrollbar, { key: "ArrowUp" });
+    fireEvent.keyDown(horizontalScrollbar, { key: "ArrowDown" });
+
+    expect(onSelectionChange).not.toHaveBeenCalled();
   });
 
   it("mirrors horizontal input through the body authority without feedback", () => {
@@ -430,7 +674,7 @@ describe("ViewdaGrid foundation", () => {
     );
 
     expect(
-      container.querySelector(".viewda-grid-horizontal-scrollport"),
+      container.querySelector(".viewda-grid-horizontal-scrollbar"),
     ).toHaveAttribute("hidden");
   });
 
@@ -549,6 +793,10 @@ describe("ViewdaGrid foundation", () => {
     const scrollport = container.querySelector(
       ".viewda-grid-body-scrollport",
     ) as HTMLElement;
+    const horizontalTrack = container.querySelector(
+      ".viewda-grid-horizontal-scrollport",
+    ) as HTMLElement;
+    const grid = scrollport.closest(".viewda-grid") as HTMLElement;
     scrollport.scrollTop = 4_200;
     scrollLeft = 640;
     scrollport.scrollLeft = 640;
@@ -561,14 +809,162 @@ describe("ViewdaGrid foundation", () => {
     scrollport.scrollTop = 0;
     scrollLeft = 0;
     scrollport.scrollLeft = 0;
+    grid.hidden = true;
+    fireEvent.scroll(scrollport);
+    horizontalTrack.scrollLeft = 0;
+    fireEvent.scroll(horizontalTrack);
     act(() => resize?.());
     act(() => frames.shift()?.(0));
 
     visible = true;
+    grid.hidden = false;
     act(() => resize?.());
     act(() => frames.shift()?.(0));
 
     expect(scrollport.scrollTop).toBe(4_200);
+    expect(scrollport.scrollLeft).toBe(640);
+  });
+
+  it("keeps pending scroll input when its panel hides before measurement", () => {
+    const frames: FrameRequestCallback[] = [];
+    vi.spyOn(window, "requestAnimationFrame").mockImplementation((callback) => {
+      frames.push(callback);
+      return frames.length;
+    });
+    let resize: (() => void) | undefined;
+    let visible = true;
+    let scrollLeft = 0;
+    const port: GridMeasurementPort = {
+      ...measurementPort(420, 84),
+      read: (scrollport) => ({
+        width: visible ? 420 : 0,
+        height: visible ? 84 : 0,
+        scrollTop: visible ? scrollport.scrollTop : 0,
+        scrollLeft: visible ? scrollLeft : 0,
+        devicePixelRatio: 1,
+      }),
+      observe: (_element, callback) => {
+        resize = callback;
+        return () => undefined;
+      },
+    };
+    const { container } = render(
+      <ViewdaGrid {...props({ measurementPort: port })} />,
+    );
+    const scrollport = container.querySelector(
+      ".viewda-grid-body-scrollport",
+    ) as HTMLElement;
+    const horizontalTrack = container.querySelector(
+      ".viewda-grid-horizontal-scrollport",
+    ) as HTMLElement;
+    const grid = scrollport.closest(".viewda-grid") as HTMLElement;
+    scrollport.scrollTop = 4_200;
+    scrollLeft = 640;
+    scrollport.scrollLeft = 640;
+    fireEvent.scroll(scrollport);
+
+    visible = false;
+    scrollport.scrollTop = 0;
+    scrollLeft = 0;
+    scrollport.scrollLeft = 0;
+    grid.hidden = true;
+    fireEvent.scroll(scrollport);
+    horizontalTrack.scrollLeft = 0;
+    fireEvent.scroll(horizontalTrack);
+    act(() => resize?.());
+    act(() => frames.shift()?.(0));
+
+    visible = true;
+    grid.hidden = false;
+    act(() => resize?.());
+    act(() => frames.shift()?.(0));
+
+    expect(scrollport.scrollTop).toBe(4_200);
+    expect(scrollport.scrollLeft).toBe(640);
+  });
+
+  it("does not quantize compressed vertical state after horizontal input", () => {
+    const frames: FrameRequestCallback[] = [];
+    vi.spyOn(window, "requestAnimationFrame").mockImplementation((callback) => {
+      frames.push(callback);
+      return frames.length;
+    });
+    let resize: (() => void) | undefined;
+    let visible = true;
+    const port: GridMeasurementPort = {
+      ...measurementPort(420, 84, 1_000_000),
+      read: (scrollport) => ({
+        width: visible ? 420 : 0,
+        height: visible ? 84 : 0,
+        scrollTop: visible ? scrollport.scrollTop : 0,
+        scrollLeft: visible ? scrollport.scrollLeft : 0,
+        devicePixelRatio: 1,
+      }),
+      observe: (_element, callback) => {
+        resize = callback;
+        return () => undefined;
+      },
+    };
+    const onViewportChange = vi.fn();
+    const { container } = render(
+      <ViewdaGrid
+        {...props({
+          rowCount: 3_514_000,
+          onViewportChange,
+          measurementPort: port,
+        })}
+      />,
+    );
+    const scrollport = container.querySelector(
+      ".viewda-grid-body-scrollport",
+    ) as HTMLElement;
+    const horizontalTrack = container.querySelector(
+      ".viewda-grid-horizontal-scrollport",
+    ) as HTMLElement;
+    const grid = scrollport.closest(".viewda-grid") as HTMLElement;
+    let quantizedScrollTop = Math.floor(scrollport.scrollTop);
+    Object.defineProperty(scrollport, "scrollTop", {
+      configurable: true,
+      get: () => quantizedScrollTop,
+      set: (value: number) => {
+        quantizedScrollTop = Math.floor(value);
+      },
+    });
+    frames.length = 0;
+    onViewportChange.mockClear();
+
+    act(() => scrollport.dispatchEvent(wheelEvent({ deltaY: 56 }, 0)));
+    act(() => frames.shift()?.(0));
+    expect(onViewportChange).toHaveBeenLastCalledWith(
+      expect.objectContaining({ rowStart: 2 }),
+    );
+
+    scrollport.scrollLeft = 320;
+    fireEvent.scroll(scrollport);
+    act(() => frames.shift()?.(0));
+    expect(onViewportChange).toHaveBeenLastCalledWith(
+      expect.objectContaining({ rowStart: 2 }),
+    );
+
+    scrollport.scrollLeft = 640;
+    fireEvent.scroll(scrollport);
+    visible = false;
+    scrollport.scrollLeft = 0;
+    grid.hidden = true;
+    fireEvent.scroll(scrollport);
+    horizontalTrack.scrollLeft = 0;
+    fireEvent.scroll(horizontalTrack);
+    act(() => resize?.());
+    act(() => frames.shift()?.(0));
+
+    visible = true;
+    grid.hidden = false;
+    act(() => resize?.());
+    act(() => frames.shift()?.(0));
+
+    expect(onViewportChange).toHaveBeenLastCalledWith(
+      expect.objectContaining({ rowStart: 2 }),
+    );
     expect(scrollport.scrollLeft).toBe(640);
   });
 

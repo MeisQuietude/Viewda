@@ -73,6 +73,8 @@ const OVERSIZED_PROBE_EXTENT = 1_000_000_000;
 // and fast drag presets if users need control.
 const DRAG_AUTO_SCROLL_EDGE = GRID_ROW_HEIGHT * 2;
 
+const HORIZONTAL_SCROLLBAR_MIN_THUMB_WIDTH = 28;
+
 export interface GridViewport {
   rowStart: number;
   rowCount: number;
@@ -144,6 +146,52 @@ interface SelectionDrag {
   clientY: number;
 }
 
+interface HorizontalScrollbarDrag {
+  pointerId: number;
+  captureTarget: HTMLElement;
+  grabRatio: number;
+}
+
+interface HorizontalThumbGeometry {
+  left: number;
+  width: number;
+  travel: number;
+  maximumScrollLeft: number;
+}
+
+function horizontalThumbGeometry(
+  trackWidth: number,
+  viewportWidth: number,
+  contentWidth: number,
+  scrollLeft: number,
+): HorizontalThumbGeometry {
+  const safeTrackWidth = Math.max(0, trackWidth);
+  const maximumScrollLeft = Math.max(0, contentWidth - viewportWidth);
+  const width = Math.min(
+    safeTrackWidth,
+    Math.max(
+      HORIZONTAL_SCROLLBAR_MIN_THUMB_WIDTH,
+      contentWidth > 0
+        ? (safeTrackWidth * viewportWidth) / contentWidth
+        : safeTrackWidth,
+    ),
+  );
+  const travel = Math.max(0, safeTrackWidth - width);
+  const clampedScrollLeft = Math.max(
+    0,
+    Math.min(maximumScrollLeft, scrollLeft),
+  );
+  return {
+    left:
+      maximumScrollLeft > 0
+        ? (clampedScrollLeft / maximumScrollLeft) * travel
+        : 0,
+    width,
+    travel,
+    maximumScrollLeft,
+  };
+}
+
 function dragAutoScrollDirection(
   position: number,
   start: number,
@@ -203,15 +251,25 @@ export const ViewdaGrid = forwardRef<ViewdaGridHandle, ViewdaGridProps>(
     const instanceId = useId().replaceAll(":", "");
     const rootRef = useRef<HTMLDivElement>(null);
     const scrollportRef = useRef<HTMLDivElement>(null);
+    const horizontalScrollbarRef = useRef<HTMLDivElement>(null);
     const horizontalTrackRef = useRef<HTMLDivElement>(null);
+    const horizontalThumbRef = useRef<HTMLDivElement>(null);
     const scrollingHeadersRef = useRef<HTMLDivElement>(null);
     const resizeGestureRef = useRef<ResizeGesture | null>(null);
     const selectionDragRef = useRef<SelectionDrag | null>(null);
+    const horizontalScrollbarDragRef = useRef<HorizontalScrollbarDrag | null>(
+      null,
+    );
     const autoScrollFrameRef = useRef<number | null>(null);
     const suppressClickRef = useRef(false);
     // Distinguishes quantized read-back of our logical command from external
     // physical input such as a compressed scrollbar-thumb drag.
     const expectedPhysicalTopRef = useRef<number | null>(null);
+    const pendingPhysicalScrollRef = useRef<{
+      physicalTop: number;
+      ownWrite: boolean;
+    } | null>(null);
+    const pendingHorizontalScrollLeftRef = useRef<number | null>(null);
     const hiddenScrollportRef = useRef(false);
     const horizontalScrollLeftRef = useRef(0);
     const wheelGestureRef = useRef<WheelGestureState | null>(null);
@@ -425,33 +483,63 @@ export const ViewdaGrid = forwardRef<ViewdaGridHandle, ViewdaGridProps>(
       }
     }, []);
 
-    const syncHorizontalScroll = useCallback((requestedLeft?: number) => {
-      const scrollport = scrollportRef.current;
-      const horizontalTrack = horizontalTrackRef.current;
-      if (scrollport === null || horizontalTrack === null) {
-        return null;
-      }
-      if (
-        requestedLeft !== undefined &&
-        positionsDiffer(scrollport.scrollLeft, requestedLeft)
-      ) {
-        scrollport.scrollLeft = requestedLeft;
-      }
-      const actualLeft = scrollport.scrollLeft;
-      // Browser-clamped body scrollLeft is authoritative. Mirror it before the
-      // measurement rAF so header, cells, and the exposed track move together.
-      if (!samePosition(horizontalTrack.scrollLeft, actualLeft)) {
-        horizontalTrack.scrollLeft = actualLeft;
-      }
-      const scrollingHeaders = scrollingHeadersRef.current;
-      if (scrollingHeaders !== null) {
-        const transform = `translateX(${-actualLeft}px)`;
-        if (scrollingHeaders.style.transform !== transform) {
-          scrollingHeaders.style.transform = transform;
+    const syncHorizontalScroll = useCallback(
+      (requestedLeft?: number, liveViewportWidth?: number) => {
+        const scrollport = scrollportRef.current;
+        const horizontalTrack = horizontalTrackRef.current;
+        if (scrollport === null || horizontalTrack === null) {
+          return null;
         }
-      }
-      return actualLeft;
-    }, []);
+        if (
+          requestedLeft !== undefined &&
+          positionsDiffer(scrollport.scrollLeft, requestedLeft)
+        ) {
+          scrollport.scrollLeft = requestedLeft;
+        }
+        const actualLeft = scrollport.scrollLeft;
+        if (requestedLeft !== undefined) {
+          horizontalScrollLeftRef.current = actualLeft;
+        }
+        // Browser-clamped body scrollLeft is authoritative. Mirror it before the
+        // measurement rAF so header, cells, and the exposed track move together.
+        if (!samePosition(horizontalTrack.scrollLeft, actualLeft)) {
+          horizontalTrack.scrollLeft = actualLeft;
+        }
+        const horizontalScrollbar = horizontalScrollbarRef.current;
+        const horizontalThumb = horizontalThumbRef.current;
+        if (horizontalScrollbar !== null && horizontalThumb !== null) {
+          const viewportWidth =
+            liveViewportWidth ??
+            Math.max(0, geometryRef.current.width - markerWidth - pinnedWidth);
+          const trackWidth = horizontalScrollbar.clientWidth || viewportWidth;
+          const thumb = horizontalThumbGeometry(
+            trackWidth,
+            viewportWidth,
+            scrollingWidth,
+            actualLeft,
+          );
+          horizontalThumb.style.width = `${thumb.width}px`;
+          horizontalThumb.style.transform = `translateX(${thumb.left}px)`;
+          horizontalScrollbar.setAttribute(
+            "aria-valuemax",
+            String(Math.round(thumb.maximumScrollLeft)),
+          );
+          horizontalScrollbar.setAttribute(
+            "aria-valuenow",
+            String(Math.round(actualLeft)),
+          );
+        }
+        const scrollingHeaders = scrollingHeadersRef.current;
+        if (scrollingHeaders !== null) {
+          const transform = `translateX(${-actualLeft}px)`;
+          if (scrollingHeaders.style.transform !== transform) {
+            scrollingHeaders.style.transform = transform;
+          }
+        }
+        return actualLeft;
+      },
+      [markerWidth, pinnedWidth, scrollingWidth],
+    );
 
     useLayoutEffect(() => {
       const clamped = clampScrollState(scrollStateRef.current, layout);
@@ -481,6 +569,11 @@ export const ViewdaGrid = forwardRef<ViewdaGridHandle, ViewdaGridProps>(
           const ownWrite =
             expected !== null && samePosition(expected, read.scrollTop);
           expectedPhysicalTopRef.current = null;
+          const pendingPhysicalScroll = pendingPhysicalScrollRef.current;
+          pendingPhysicalScrollRef.current = null;
+          const pendingHorizontalScrollLeft =
+            pendingHorizontalScrollLeftRef.current;
+          pendingHorizontalScrollLeftRef.current = null;
           // A grid inside a `hidden` panel has no scroll box: the browser reports
           // a zero viewport and drops scrollTop. The retained position stays
           // authoritative across the hidden phase and is written back on return,
@@ -489,19 +582,23 @@ export const ViewdaGrid = forwardRef<ViewdaGridHandle, ViewdaGridProps>(
           const restored = !hidden && hiddenScrollportRef.current;
           hiddenScrollportRef.current = hidden;
           const scrollLeft = hidden
-            ? horizontalScrollLeftRef.current
+            ? (pendingHorizontalScrollLeft ?? horizontalScrollLeftRef.current)
             : (syncHorizontalScroll(
                 restored ? horizontalScrollLeftRef.current : read.scrollLeft,
               ) ?? read.scrollLeft);
-          if (!hidden) horizontalScrollLeftRef.current = scrollLeft;
+          if (!hidden || pendingHorizontalScrollLeft !== null) {
+            horizontalScrollLeftRef.current = scrollLeft;
+          }
           const next =
-            hidden || restored
-              ? scrollStateRef.current
-              : layout.mode === "native"
-                ? {
-                    logicalTop: read.scrollTop,
-                    physicalTop: read.scrollTop,
-                  }
+            pendingPhysicalScroll !== null
+              ? applyPhysicalScroll(
+                  scrollStateRef.current,
+                  pendingPhysicalScroll.physicalTop,
+                  layout,
+                  pendingPhysicalScroll.ownWrite,
+                )
+              : hidden || restored || expected === null
+                ? scrollStateRef.current
                 : applyPhysicalScroll(
                     scrollStateRef.current,
                     read.scrollTop,
@@ -629,6 +726,9 @@ export const ViewdaGrid = forwardRef<ViewdaGridHandle, ViewdaGridProps>(
     );
     const hasHorizontalOverflow =
       scrollingViewportWidth > 0 && scrollingWidth > scrollingViewportWidth;
+    useLayoutEffect(() => {
+      syncHorizontalScroll();
+    }, [scrollingViewportWidth, scrollingWidth, syncHorizontalScroll]);
     const initialColumnWindow = hystereticColumnWindow(
       scrollingOffsets,
       0,
@@ -1032,7 +1132,29 @@ export const ViewdaGrid = forwardRef<ViewdaGridHandle, ViewdaGridProps>(
     ]);
 
     const handleScroll = useCallback(() => {
-      syncHorizontalScroll();
+      const scrollport = scrollportRef.current;
+      if (scrollport === null) {
+        return;
+      }
+      if (scrollport.closest("[hidden]") !== null) {
+        scheduleMeasurement();
+        return;
+      }
+      const expected = expectedPhysicalTopRef.current;
+      const physicalTop = scrollport.scrollTop;
+      pendingPhysicalScrollRef.current =
+        expected !== null ||
+        positionsDiffer(scrollStateRef.current.physicalTop, physicalTop)
+          ? {
+              physicalTop,
+              ownWrite:
+                expected !== null && samePosition(expected, physicalTop),
+            }
+          : null;
+      const actualLeft = syncHorizontalScroll();
+      if (actualLeft !== null) {
+        pendingHorizontalScrollLeftRef.current = actualLeft;
+      }
       scheduleMeasurement();
     }, [scheduleMeasurement, syncHorizontalScroll]);
 
@@ -1042,12 +1164,181 @@ export const ViewdaGrid = forwardRef<ViewdaGridHandle, ViewdaGridProps>(
       if (scrollport === null || horizontalTrack === null) {
         return;
       }
+      if (horizontalTrack.closest("[hidden]") !== null) {
+        scheduleMeasurement();
+        return;
+      }
       const previousLeft = scrollport.scrollLeft;
       const actualLeft = syncHorizontalScroll(horizontalTrack.scrollLeft);
       if (actualLeft !== null && positionsDiffer(previousLeft, actualLeft)) {
         scheduleMeasurement();
       }
     }, [scheduleMeasurement, syncHorizontalScroll]);
+
+    const scrollFromHorizontalScrollbar = useCallback(
+      (scrollLeft: number, viewportWidth = scrollingViewportWidth) => {
+        const scrollport = scrollportRef.current;
+        if (scrollport === null) {
+          return;
+        }
+        const maximumScrollLeft = Math.max(0, scrollingWidth - viewportWidth);
+        const previousLeft = scrollport.scrollLeft;
+        const actualLeft = syncHorizontalScroll(
+          Math.max(0, Math.min(maximumScrollLeft, scrollLeft)),
+          viewportWidth,
+        );
+        if (actualLeft !== null && positionsDiffer(previousLeft, actualLeft)) {
+          scheduleMeasurement();
+        }
+      },
+      [
+        scheduleMeasurement,
+        scrollingViewportWidth,
+        scrollingWidth,
+        syncHorizontalScroll,
+      ],
+    );
+
+    const finishHorizontalScrollbarDrag = useCallback((pointerId?: number) => {
+      const drag = horizontalScrollbarDragRef.current;
+      if (
+        drag === null ||
+        (pointerId !== undefined && pointerId !== drag.pointerId)
+      ) {
+        return;
+      }
+      horizontalScrollbarDragRef.current = null;
+      drag.captureTarget.removeAttribute("data-dragging");
+      if (drag.captureTarget.hasPointerCapture(drag.pointerId)) {
+        drag.captureTarget.releasePointerCapture(drag.pointerId);
+      }
+    }, []);
+
+    const handleHorizontalScrollbarPointerDown = useCallback(
+      (event: ReactPointerEvent<HTMLDivElement>) => {
+        if (event.button !== 0 || horizontalScrollbarDragRef.current !== null) {
+          return;
+        }
+        const scrollport = scrollportRef.current;
+        if (scrollport === null) {
+          return;
+        }
+        const captureTarget = event.currentTarget;
+        const bounds = measurementPort.bounds(captureTarget);
+        const thumb = horizontalThumbGeometry(
+          bounds.width,
+          bounds.width,
+          scrollingWidth,
+          scrollport.scrollLeft,
+        );
+        if (thumb.maximumScrollLeft <= 0 || thumb.travel <= 0) {
+          return;
+        }
+        event.preventDefault();
+        event.stopPropagation();
+        captureTarget.focus();
+        captureTarget.setPointerCapture(event.pointerId);
+        captureTarget.setAttribute("data-dragging", "true");
+        const pointerPosition = Math.max(
+          0,
+          Math.min(bounds.width, event.clientX - bounds.x),
+        );
+        const grabbedThumb =
+          pointerPosition >= thumb.left &&
+          pointerPosition <= thumb.left + thumb.width;
+        const grabRatio = grabbedThumb
+          ? (pointerPosition - thumb.left) / thumb.width
+          : 0.5;
+        horizontalScrollbarDragRef.current = {
+          pointerId: event.pointerId,
+          captureTarget,
+          grabRatio,
+        };
+        if (!grabbedThumb) {
+          scrollFromHorizontalScrollbar(
+            ((pointerPosition - thumb.width * grabRatio) / thumb.travel) *
+              thumb.maximumScrollLeft,
+            bounds.width,
+          );
+        }
+      },
+      [measurementPort, scrollFromHorizontalScrollbar, scrollingWidth],
+    );
+
+    const handleHorizontalScrollbarPointerMove = useCallback(
+      (event: ReactPointerEvent<HTMLDivElement>) => {
+        const drag = horizontalScrollbarDragRef.current;
+        if (drag === null || drag.pointerId !== event.pointerId) {
+          return;
+        }
+        const scrollport = scrollportRef.current;
+        if (scrollport === null) {
+          return;
+        }
+        event.preventDefault();
+        event.stopPropagation();
+        const bounds = measurementPort.bounds(drag.captureTarget);
+        const thumb = horizontalThumbGeometry(
+          bounds.width,
+          bounds.width,
+          scrollingWidth,
+          scrollport.scrollLeft,
+        );
+        if (thumb.maximumScrollLeft <= 0 || thumb.travel <= 0) {
+          return;
+        }
+        const thumbLeft = Math.max(
+          0,
+          Math.min(
+            thumb.travel,
+            event.clientX - bounds.x - thumb.width * drag.grabRatio,
+          ),
+        );
+        scrollFromHorizontalScrollbar(
+          (thumbLeft / thumb.travel) * thumb.maximumScrollLeft,
+          bounds.width,
+        );
+      },
+      [measurementPort, scrollFromHorizontalScrollbar, scrollingWidth],
+    );
+
+    const handleHorizontalScrollbarKeyDown = useCallback(
+      (event: ReactKeyboardEvent<HTMLDivElement>) => {
+        const scrollport = scrollportRef.current;
+        if (scrollport === null) {
+          return;
+        }
+        const maximumScrollLeft = Math.max(
+          0,
+          scrollingWidth - scrollingViewportWidth,
+        );
+        if (event.key === "ArrowUp" || event.key === "ArrowDown") {
+          event.preventDefault();
+          event.stopPropagation();
+          return;
+        }
+        let target: number;
+        if (event.key === "ArrowLeft") {
+          target = scrollport.scrollLeft - GRID_ROW_HEIGHT;
+        } else if (event.key === "ArrowRight") {
+          target = scrollport.scrollLeft + GRID_ROW_HEIGHT;
+        } else if (event.key === "PageUp") {
+          target = scrollport.scrollLeft - scrollingViewportWidth;
+        } else if (event.key === "PageDown") {
+          target = scrollport.scrollLeft + scrollingViewportWidth;
+        } else if (event.key === "Home") {
+          target = 0;
+        } else if (event.key === "End") {
+          target = maximumScrollLeft;
+        } else {
+          return;
+        }
+        event.preventDefault();
+        event.stopPropagation();
+        scrollFromHorizontalScrollbar(target);
+      },
+      [scrollFromHorizontalScrollbar, scrollingViewportWidth, scrollingWidth],
+    );
 
     const scrollToRow = useCallback(
       (row: number) => {
@@ -1481,8 +1772,9 @@ export const ViewdaGrid = forwardRef<ViewdaGridHandle, ViewdaGridProps>(
       () => () => {
         finishResize();
         finishSelectionDrag();
+        finishHorizontalScrollbarDrag();
       },
-      [finishResize, finishSelectionDrag],
+      [finishHorizontalScrollbarDrag, finishResize, finishSelectionDrag],
     );
 
     const handleDoubleClick = useCallback(
@@ -1778,6 +2070,7 @@ export const ViewdaGrid = forwardRef<ViewdaGridHandle, ViewdaGridProps>(
         </div>
         <div
           ref={scrollportRef}
+          id={`viewda-grid-scrollport-${instanceId}`}
           className="viewda-grid-body-scrollport"
           onScroll={handleScroll}
         >
@@ -1800,20 +2093,52 @@ export const ViewdaGrid = forwardRef<ViewdaGridHandle, ViewdaGridProps>(
           </div>
         </div>
         <div
-          ref={horizontalTrackRef}
-          className="viewda-grid-horizontal-scrollport"
+          ref={horizontalScrollbarRef}
+          className="viewda-grid-horizontal-scrollbar"
+          id={`viewda-grid-horizontal-scrollbar-${instanceId}`}
+          role="scrollbar"
           aria-label="Horizontal grid scroll"
+          aria-controls={`viewda-grid-scrollport-${instanceId}`}
+          aria-orientation="horizontal"
+          aria-valuemin={0}
+          aria-valuemax={Math.max(
+            0,
+            Math.round(scrollingWidth - scrollingViewportWidth),
+          )}
+          aria-valuenow={Math.round(horizontalScrollLeftRef.current)}
           hidden={!hasHorizontalOverflow}
-          onScroll={handleHorizontalTrackScroll}
+          tabIndex={hasHorizontalOverflow ? 0 : -1}
+          onKeyDown={handleHorizontalScrollbarKeyDown}
+          onPointerDown={handleHorizontalScrollbarPointerDown}
+          onPointerMove={handleHorizontalScrollbarPointerMove}
+          onPointerUp={(event) =>
+            finishHorizontalScrollbarDrag(event.pointerId)
+          }
+          onPointerCancel={(event) =>
+            finishHorizontalScrollbarDrag(event.pointerId)
+          }
+          onLostPointerCapture={(event) =>
+            finishHorizontalScrollbarDrag(event.pointerId)
+          }
           style={{
             marginLeft: markerWidth + pinnedWidth,
-            width: scrollingViewportWidth,
           }}
         >
           <div
-            className="viewda-grid-horizontal-spacer"
+            ref={horizontalTrackRef}
+            className="viewda-grid-horizontal-scrollport"
             aria-hidden="true"
-            style={{ width: scrollingWidth }}
+            onScroll={handleHorizontalTrackScroll}
+          >
+            <div
+              className="viewda-grid-horizontal-spacer"
+              style={{ width: scrollingWidth }}
+            />
+          </div>
+          <div
+            ref={horizontalThumbRef}
+            className="viewda-grid-horizontal-thumb"
+            aria-hidden="true"
           />
         </div>
       </div>
