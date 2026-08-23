@@ -8,6 +8,10 @@ Backward-incompatible entries start with **Breaking:**.
 
 ## Unreleased
 
+### Fixed
+
+- Keep the column selector visible above the data grid's column headers.
+
 ## 0.2.0 — 2026-08-21
 
 ### Added
