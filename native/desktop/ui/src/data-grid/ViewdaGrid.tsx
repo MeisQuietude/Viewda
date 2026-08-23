@@ -923,7 +923,6 @@ export const ViewdaGrid = forwardRef<ViewdaGridHandle, ViewdaGridProps>(
         ) {
           return;
         }
-        event.preventDefault();
         const advance = advanceWheelGesture(
           wheelGestureRef.current,
           horizontalDelta,
@@ -931,25 +930,36 @@ export const ViewdaGrid = forwardRef<ViewdaGridHandle, ViewdaGridProps>(
           event.timeStamp,
           GRID_ROW_HEIGHT,
         );
-        wheelGestureRef.current = advance.state;
         const decision = advance.state.axis ?? "ambiguous";
         let appliedHorizontalPixels = 0;
         let verticalTarget: number | null = null;
         let outcome: GridWheelOutcome | null = null;
-        if (advance.horizontalDelta !== 0) {
+        const logicalTopAtStart = scrollStateRef.current.logicalTop;
+        const dominantVerticalBlocked =
+          Math.abs(verticalDelta) >= Math.abs(horizontalDelta) &&
+          verticalDelta !== 0 &&
+          (layout.logicalMax <= 0 ||
+            (verticalDelta < 0
+              ? logicalTopAtStart <= 0
+              : logicalTopAtStart >= layout.logicalMax));
+        if (!dominantVerticalBlocked && advance.horizontalDelta !== 0) {
           const previousLeft = scrollport.scrollLeft;
           const actualLeft = syncHorizontalScroll(
             previousLeft + advance.horizontalDelta,
           );
-          if (
-            actualLeft !== null &&
-            positionsDiffer(previousLeft, actualLeft)
-          ) {
+          if (actualLeft !== null && previousLeft !== actualLeft) {
             appliedHorizontalPixels = actualLeft - previousLeft;
             scheduleMeasurement();
           }
         }
-        if (decision === "horizontal") {
+        if (dominantVerticalBlocked) {
+          outcome =
+            layout.logicalMax <= 0
+              ? "noScrollableExtent"
+              : verticalDelta < 0
+                ? "atStartBoundary"
+                : "atEndBoundary";
+        } else if (decision === "horizontal") {
           if (advance.horizontalDelta === 0) {
             outcome = "axisLockedNoise";
           } else if (scrollingWidth <= scrollingViewportWidth) {
@@ -981,11 +991,77 @@ export const ViewdaGrid = forwardRef<ViewdaGridHandle, ViewdaGridProps>(
               advance.rowSteps < 0 ? "atStartBoundary" : "atEndBoundary";
           }
         }
+        const requestedVerticalPixels =
+          decision === "vertical"
+            ? advance.rowSteps * GRID_ROW_HEIGHT +
+              advance.state.verticalRemainder
+            : 0;
+        const boundaryTarget =
+          verticalDelta > 0 &&
+          requestedVerticalPixels > 0 &&
+          requestedVerticalPixels >= layout.logicalMax - logicalTopAtStart
+            ? layout.logicalMax
+            : verticalDelta < 0 &&
+                requestedVerticalPixels < 0 &&
+                -requestedVerticalPixels >= logicalTopAtStart
+              ? 0
+              : null;
+        if (boundaryTarget !== null && layout.logicalMax > 0) {
+          verticalTarget = boundaryTarget;
+          outcome = positionsDiffer(logicalTopAtStart, boundaryTarget)
+            ? "appliedMovement"
+            : requestedVerticalPixels < 0
+              ? "atStartBoundary"
+              : "atEndBoundary";
+        }
         const appliedVerticalRowSteps =
           outcome === "appliedMovement" && verticalTarget !== null
             ? (verticalTarget - scrollStateRef.current.logicalTop) /
               GRID_ROW_HEIGHT
             : 0;
+        const verticalRemainder =
+          boundaryTarget === null
+            ? 0
+            : requestedVerticalPixels -
+              appliedVerticalRowSteps * GRID_ROW_HEIGHT;
+        // Native default cannot route a header-originated wheel through the
+        // body scrollport, so boundary remainder is forwarded deliberately.
+        const forwardedVerticalPixels = scrollVerticalAncestors(
+          root,
+          verticalRemainder,
+        );
+        const logicalTop = scrollStateRef.current.logicalTop;
+        const canMoveVertically =
+          verticalDelta < 0
+            ? logicalTop > 0
+            : verticalDelta > 0
+              ? logicalTop < layout.logicalMax
+              : false;
+        const horizontalMax = Math.max(
+          0,
+          scrollingWidth - scrollingViewportWidth,
+        );
+        const canMoveHorizontally =
+          horizontalDelta < 0
+            ? scrollport.scrollLeft > 0
+            : horizontalDelta > 0
+              ? scrollport.scrollLeft < horizontalMax
+              : false;
+        const shouldConsume =
+          forwardedVerticalPixels !== 0 ||
+          (!dominantVerticalBlocked &&
+            (outcome === "appliedMovement" ||
+              (decision === "vertical" &&
+                outcome === "accumulatingWholeRow" &&
+                canMoveVertically) ||
+              (decision === "ambiguous" &&
+                (canMoveVertically || canMoveHorizontally))));
+        if (shouldConsume) {
+          event.preventDefault();
+        }
+        const consumed = event.defaultPrevented;
+        wheelGestureRef.current =
+          consumed && boundaryTarget === null ? advance.state : null;
         if (
           decision === "vertical" &&
           outcome === "appliedMovement" &&
@@ -998,7 +1074,7 @@ export const ViewdaGrid = forwardRef<ViewdaGridHandle, ViewdaGridProps>(
           const diagnosticFrame = diagnostics.wheel(diagnosticWheelStartedAt, {
             timeStamp: event.timeStamp,
             decision,
-            consumed: true,
+            consumed,
             takeover: advance.takeover,
             requestedHorizontalPixels:
               decision === "horizontal" ? advance.horizontalDelta : 0,
@@ -1166,12 +1242,20 @@ export const ViewdaGrid = forwardRef<ViewdaGridHandle, ViewdaGridProps>(
           rootRef.current?.focus();
           return;
         }
-        if (target.dataset.action === "sort" && column !== null) {
+        if (
+          target.dataset.action === "sort" &&
+          column !== null &&
+          columns[column]?.sortable === true
+        ) {
           onSort(column, additive || event.shiftKey);
           rootRef.current?.focus();
           return;
         }
-        if (target.dataset.action === "filter" && column !== null) {
+        if (
+          target.dataset.action === "filter" &&
+          column !== null &&
+          columns[column]?.filterable === true
+        ) {
           onFilter(column, measurementPort.bounds(target));
           rootRef.current?.focus();
           return;
@@ -1194,6 +1278,7 @@ export const ViewdaGrid = forwardRef<ViewdaGridHandle, ViewdaGridProps>(
         rootRef.current?.focus();
       },
       [
+        columns,
         measurementPort,
         onFilter,
         onSelectionChange,
@@ -2006,47 +2091,59 @@ function GridHeader({
         : `Sort ${details.title}`;
   return (
     <div
-      className={`viewda-grid-column-header${pinned ? " is-pinned" : ""}${details.pending ? " is-pending" : ""}`}
+      className={`viewda-grid-column-header${pinned ? " is-pinned" : ""}${details.pending ? " is-pending" : ""}${details.filterable ? " has-filter" : ""}`}
       role="columnheader"
       aria-label={details.title}
       aria-colindex={ariaColumnIndex}
       aria-sort={
-        details.sort.direction === "neutral" ? "none" : details.sort.direction
+        details.sortable
+          ? details.sort.direction === "neutral"
+            ? "none"
+            : details.sort.direction
+          : undefined
       }
       data-grid-kind="header"
       data-column={column}
       style={{ left, width: details.width }}
     >
-      <button
-        className={`viewda-grid-sort is-${details.sort.direction}`}
-        type="button"
-        tabIndex={-1}
-        aria-label={sortLabel}
-        data-grid-kind="header"
-        data-action="sort"
-        data-column={column}
-      >
-        <SortGlyph direction={details.sort.direction} />
-        {details.sort.priority === undefined ? null : (
-          <span className="viewda-grid-sort-priority">
-            {details.sort.priority}
-          </span>
-        )}
-      </button>
+      {details.sortable && (
+        <button
+          className={`viewda-grid-sort is-${details.sort.direction}`}
+          type="button"
+          tabIndex={-1}
+          aria-label={sortLabel}
+          data-grid-kind="header"
+          data-action="sort"
+          data-column={column}
+        >
+          <SortGlyph direction={details.sort.direction} />
+          {details.sort.priority === undefined ? null : (
+            <span className="viewda-grid-sort-priority">
+              {details.sort.priority}
+            </span>
+          )}
+        </button>
+      )}
       <span className="viewda-grid-header-title">{details.title}</span>
-      <button
-        className="viewda-grid-filter"
-        type="button"
-        tabIndex={-1}
-        aria-label={`Filter ${details.title}`}
-        data-grid-kind="header"
-        data-action="filter"
-        data-column={column}
-      >
-        <svg aria-hidden="true" width="12" height="12" viewBox="0 0 12 12">
-          <path d="M1.5 2h9L7 6v3L5 10V6z" fill="none" stroke="currentColor" />
-        </svg>
-      </button>
+      {details.filterable && (
+        <button
+          className="viewda-grid-filter"
+          type="button"
+          tabIndex={-1}
+          aria-label={`Filter ${details.title}`}
+          data-grid-kind="header"
+          data-action="filter"
+          data-column={column}
+        >
+          <svg aria-hidden="true" width="12" height="12" viewBox="0 0 12 12">
+            <path
+              d="M1.5 2h9L7 6v3L5 10V6z"
+              fill="none"
+              stroke="currentColor"
+            />
+          </svg>
+        </button>
+      )}
       <span
         className="viewda-grid-resize-handle"
         data-grid-kind="header"
@@ -2080,6 +2177,26 @@ function SortGlyph({
       />
     </svg>
   );
+}
+
+function scrollVerticalAncestors(root: HTMLElement, delta: number): number {
+  let remaining = delta;
+  for (
+    let ancestor = root.parentElement;
+    ancestor !== null && remaining !== 0;
+    ancestor = ancestor.parentElement
+  ) {
+    const overflowY = getComputedStyle(ancestor).overflowY;
+    const maximum = Math.max(0, ancestor.scrollHeight - ancestor.clientHeight);
+    if ((overflowY !== "auto" && overflowY !== "scroll") || maximum === 0) {
+      continue;
+    }
+    const previous = ancestor.scrollTop;
+    const next = Math.max(0, Math.min(maximum, previous + remaining));
+    ancestor.scrollTop = next;
+    remaining -= ancestor.scrollTop - previous;
+  }
+  return delta - remaining;
 }
 
 export const browserMeasurementPort: GridMeasurementPort = {

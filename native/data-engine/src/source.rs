@@ -1,7 +1,8 @@
 use std::{
-    fs::File,
+    fs::{File, Metadata},
     io::{self, Read, Seek, SeekFrom},
     path::Path,
+    sync::Arc,
 };
 
 use parquet::{
@@ -10,13 +11,30 @@ use parquet::{
         Type as ParquetPhysicalType,
     },
     errors::ParquetError,
-    file::reader::{FileReader, SerializedFileReader},
+    file::metadata::{FooterTail, ParquetMetaData, ParquetMetaDataReader},
     schema::types::Type,
 };
 use serde::Serialize;
 use thiserror::Error;
 
 const PARQUET_MAGIC: &[u8; 4] = b"PAR1";
+/// Schema nodes handed to the UI when a source opens.
+const MAX_SOURCE_SCHEMA_NODES: usize = 256;
+/// UTF-8 bytes retained from one footer- or filesystem-controlled display string.
+const MAX_SOURCE_FIELD_BYTES: usize = 128;
+const MAX_FOOTER_BYTES: usize = 256 * 1024 * 1024;
+const FOOTER_READ_CHUNK_BYTES: usize = 64 * 1024;
+
+/// Truthful coarse phases of opening a local Parquet footer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SourceOpenPhase {
+    /// The bounded footer bytes are being read from disk.
+    ReadingFooter,
+    /// One non-interruptible Thrift decode is running over the retained bytes.
+    DecodingFooter,
+    /// The bounded wire summary is being derived from decoded metadata.
+    Summarizing,
+}
 
 /// A path-free description of an inspected local Parquet source.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -30,9 +48,20 @@ pub struct SourceSummary {
     pub row_count: u64,
     /// Number of row groups recorded in the Parquet footer.
     pub row_group_count: usize,
+    /// Leaf columns in the complete physical schema.
+    pub column_count: usize,
     /// Physical Parquet schema, preserving nested fields.
     pub schema: Vec<SchemaField>,
+    /// Nodes present in the complete physical schema.
+    pub schema_node_count: usize,
+    /// Whether `schema` is only a prefix of the physical schema.
+    pub schema_is_truncated: bool,
+    /// Whether any display string was shortened to keep the wire payload bounded.
+    pub strings_truncated: bool,
 }
+
+/// Largest exact integer JavaScript can receive through the JSON command wire.
+pub(crate) const MAX_SAFE_WIRE_INTEGER: u64 = 9_007_199_254_740_991;
 
 /// One field in the physical Parquet schema tree.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -58,6 +87,9 @@ pub enum SourceError {
     /// The operating system denied access to the selected source.
     #[error("Viewda does not have permission to read the selected file.")]
     PermissionDenied,
+    /// The path no longer identifies the file that the caller opened.
+    #[error("The selected file changed after it was opened.")]
+    SourceChanged,
     /// The selected source does not have Parquet file markers.
     #[error("The selected file is not a Parquet file.")]
     NotParquet,
@@ -69,36 +101,409 @@ pub enum SourceError {
     Unsupported,
 }
 
+/// One verified local file and its decoded Parquet footer.
+///
+/// Footer decoding is a single non-interruptible Thrift call. Desktop callers
+/// keep this snapshot after the blocking open finishes so Structure can add
+/// cancellable per-chunk analysis without decoding the footer a second time.
+pub struct SourceSnapshot {
+    file: File,
+    metadata: Arc<ParquetMetaData>,
+    file_bytes: u64,
+    footer_bytes: u64,
+    data_end: u64,
+    identity: SourceIdentity,
+}
+
+/// Narrow filesystem identity captured when a source is opened.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SourceIdentity {
+    len: u64,
+    modified_nanos: Option<u128>,
+    #[cfg(unix)]
+    device: u64,
+    #[cfg(unix)]
+    inode: u64,
+    #[cfg(unix)]
+    change_seconds: i64,
+    #[cfg(unix)]
+    change_nanos: i64,
+    #[cfg(windows)]
+    volume_serial_number: u64,
+    #[cfg(windows)]
+    file_id: [u8; 16],
+}
+
+impl SourceIdentity {
+    fn from_file(file: &File) -> Result<Self, SourceError> {
+        let metadata = file.metadata().map_err(map_io_error)?;
+        #[cfg(windows)]
+        {
+            use std::os::windows::io::AsRawHandle;
+            use windows_sys::Win32::Storage::FileSystem::{
+                FILE_ID_INFO, FileIdInfo, GetFileInformationByHandleEx,
+            };
+
+            let mut file_id_information = FILE_ID_INFO::default();
+            let file_id_information_bytes = u32::try_from(std::mem::size_of::<FILE_ID_INFO>())
+                .map_err(|_| SourceError::Unsupported)?;
+            // SAFETY: `file` keeps this valid OS handle alive for the duration of the call,
+            // and the output pointer and byte count describe writable `FILE_ID_INFO` storage.
+            let succeeded = unsafe {
+                GetFileInformationByHandleEx(
+                    file.as_raw_handle(),
+                    FileIdInfo,
+                    std::ptr::from_mut(&mut file_id_information).cast(),
+                    file_id_information_bytes,
+                )
+            };
+            if succeeded == 0 {
+                return Err(map_io_error(io::Error::last_os_error()));
+            }
+
+            Ok(Self {
+                len: metadata.len(),
+                modified_nanos: modified_nanos(&metadata),
+                volume_serial_number: file_id_information.VolumeSerialNumber,
+                file_id: file_id_information.FileId.Identifier,
+            })
+        }
+        #[cfg(not(windows))]
+        {
+            Ok(Self::from_metadata(&metadata))
+        }
+    }
+
+    #[cfg(not(windows))]
+    fn from_metadata(metadata: &Metadata) -> Self {
+        let modified_nanos = modified_nanos(metadata);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            Self {
+                len: metadata.len(),
+                modified_nanos,
+                device: metadata.dev(),
+                inode: metadata.ino(),
+                change_seconds: metadata.ctime(),
+                change_nanos: metadata.ctime_nsec(),
+            }
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            Self {
+                len: metadata.len(),
+                modified_nanos,
+            }
+        }
+    }
+
+    /// Rejects a path that no longer identifies the opened file.
+    pub fn validate_path(&self, path: &Path) -> Result<(), SourceError> {
+        let file = File::open(path).map_err(map_io_error)?;
+        if Self::from_file(&file)? == *self {
+            Ok(())
+        } else {
+            Err(SourceError::SourceChanged)
+        }
+    }
+
+    pub(crate) fn validate_file(&self, file: &File) -> Result<(), SourceError> {
+        if self.matches_retained_file(&Self::from_file(file)?) {
+            Ok(())
+        } else {
+            Err(SourceError::SourceChanged)
+        }
+    }
+
+    fn matches_retained_file(&self, current: &Self) -> bool {
+        #[cfg(unix)]
+        {
+            self.len == current.len
+                && self.modified_nanos == current.modified_nanos
+                && self.device == current.device
+                && self.inode == current.inode
+        }
+        #[cfg(windows)]
+        {
+            // A retained handle already pins the opened file, while FAT may change its file ID
+            // during rename. Content signals still reject in-place mutations.
+            self.len == current.len && self.modified_nanos == current.modified_nanos
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            self == current
+        }
+    }
+}
+
+fn modified_nanos(metadata: &Metadata) -> Option<u128> {
+    metadata
+        .modified()
+        .ok()?
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .map(|duration| duration.as_nanos())
+}
+
+impl SourceSnapshot {
+    /// Opens and decodes one local Parquet source without reading data pages.
+    pub fn open(path: &Path) -> Result<Self, SourceError> {
+        Self::open_cancellable(path, |_| true)?.ok_or(SourceError::Unsupported)
+    }
+
+    /// Opens one snapshot while allowing cancellation between bounded reads.
+    ///
+    /// Footer Thrift decoding remains one library atom. The callback runs before
+    /// and after that atom so callers can serialize it and discard stale work.
+    pub fn open_cancellable(
+        path: &Path,
+        mut keep_going: impl FnMut(SourceOpenPhase) -> bool,
+    ) -> Result<Option<Self>, SourceError> {
+        let (file, file_bytes) = open_local_source(path)?;
+        let identity = SourceIdentity::from_file(&file)?;
+        if !keep_going(SourceOpenPhase::ReadingFooter) {
+            return Ok(None);
+        }
+        let mut footer_tail = [0_u8; 8];
+        (&file)
+            .seek(SeekFrom::End(-8))
+            .and_then(|_| (&file).read_exact(&mut footer_tail))
+            .map_err(map_io_error)?;
+        let metadata_bytes = FooterTail::try_from(footer_tail)
+            .map_err(map_parquet_error)?
+            .metadata_length();
+        let footer_bytes = metadata_bytes
+            .checked_add(footer_tail.len())
+            .ok_or(SourceError::CorruptFooter)?;
+        if footer_bytes > MAX_FOOTER_BYTES
+            || u64::try_from(footer_bytes).map_err(|_| SourceError::CorruptFooter)? > file_bytes
+        {
+            return Err(SourceError::CorruptFooter);
+        }
+        (&file)
+            .seek(SeekFrom::End(
+                -i64::try_from(footer_bytes).map_err(|_| SourceError::CorruptFooter)?,
+            ))
+            .map_err(map_io_error)?;
+        let mut suffix = Vec::new();
+        while suffix.len() < footer_bytes {
+            if !keep_going(SourceOpenPhase::ReadingFooter) {
+                return Ok(None);
+            }
+            let read_bytes = FOOTER_READ_CHUNK_BYTES.min(footer_bytes - suffix.len());
+            suffix
+                .try_reserve_exact(read_bytes)
+                .map_err(|_| SourceError::Unsupported)?;
+            let start = suffix.len();
+            suffix.resize(start + read_bytes, 0);
+            (&file)
+                .read_exact(&mut suffix[start..])
+                .map_err(map_io_error)?;
+        }
+        if !keep_going(SourceOpenPhase::DecodingFooter) {
+            return Ok(None);
+        }
+        let mut metadata_reader = ParquetMetaDataReader::new();
+        metadata_reader
+            .try_parse_sized(&bytes::Bytes::from(suffix), file_bytes)
+            .map_err(map_parquet_error)?;
+        if !keep_going(SourceOpenPhase::Summarizing) {
+            return Ok(None);
+        }
+        let decoded_footer_bytes = u64::try_from(
+            metadata_reader
+                .metadata_size()
+                .ok_or(SourceError::CorruptFooter)?,
+        )
+        .map_err(|_| SourceError::CorruptFooter)?;
+        let metadata = metadata_reader.finish().map_err(map_parquet_error)?;
+        let data_end = file_bytes
+            .checked_sub(decoded_footer_bytes)
+            .ok_or(SourceError::CorruptFooter)?;
+        Ok(Some(Self {
+            file,
+            metadata: Arc::new(metadata),
+            file_bytes,
+            footer_bytes: decoded_footer_bytes,
+            data_end,
+            identity,
+        }))
+    }
+
+    pub(crate) fn cloned_file(&self) -> Result<File, SourceError> {
+        self.file.try_clone().map_err(map_io_error)
+    }
+
+    pub(crate) fn metadata(&self) -> &ParquetMetaData {
+        &self.metadata
+    }
+
+    pub(crate) fn metadata_snapshot(&self) -> Arc<ParquetMetaData> {
+        Arc::clone(&self.metadata)
+    }
+
+    pub(crate) fn file_bytes(&self) -> u64 {
+        self.file_bytes
+    }
+
+    /// Returns the exact encoded footer bytes retained by this snapshot.
+    pub fn footer_bytes(&self) -> u64 {
+        self.footer_bytes
+    }
+
+    pub(crate) fn data_end(&self) -> u64 {
+        self.data_end
+    }
+
+    /// Returns the filesystem identity paired with this footer snapshot.
+    pub fn identity(&self) -> &SourceIdentity {
+        &self.identity
+    }
+
+    /// Verifies that both the retained handle and canonical path still identify this snapshot.
+    pub fn validate_for_install(&self, path: &Path) -> Result<(), SourceError> {
+        self.identity.validate_file(&self.file)?;
+        self.identity.validate_path(path)
+    }
+
+    /// Returns the complete logical schema for native query planning.
+    ///
+    /// This value stays native. UI callers use [`SourceSummary::schema`] and
+    /// bounded schema pages instead of serializing this potentially wide tree.
+    pub fn query_schema(&self) -> Vec<SchemaField> {
+        let mut remaining = usize::MAX;
+        let mut strings_truncated = false;
+        self.metadata
+            .file_metadata()
+            .schema_descr()
+            .root_schema()
+            .get_fields()
+            .iter()
+            .filter_map(|field| {
+                schema_field_bounded(field, &mut remaining, &mut strings_truncated, usize::MAX)
+            })
+            .collect()
+    }
+}
+
 /// Reads local Parquet metadata without loading row values or exposing the path.
 pub fn inspect_local_source(path: &Path) -> Result<SourceSummary, SourceError> {
-    let (mut file, size_bytes) = open_local_source(path)?;
-    file.seek(SeekFrom::Start(0)).map_err(map_io_error)?;
+    inspect_local_source_snapshot(path).map(|(summary, _)| summary)
+}
 
-    let reader = SerializedFileReader::new(file).map_err(map_parquet_error)?;
-    let parquet_metadata = reader.metadata();
+/// Opens a source once and returns both its bounded summary and retained footer snapshot.
+pub fn inspect_local_source_snapshot(
+    path: &Path,
+) -> Result<(SourceSummary, SourceSnapshot), SourceError> {
+    let snapshot = SourceSnapshot::open(path)?;
+    let summary = source_summary(
+        path,
+        &snapshot,
+        MAX_SOURCE_SCHEMA_NODES,
+        MAX_SOURCE_FIELD_BYTES,
+    )?;
+    Ok((summary, snapshot))
+}
+
+/// Opens one snapshot and derives its summary under the caller's cancellation policy.
+pub fn inspect_local_source_snapshot_cancellable(
+    path: &Path,
+    mut keep_going: impl FnMut(SourceOpenPhase) -> bool,
+) -> Result<Option<(SourceSummary, SourceSnapshot)>, SourceError> {
+    let Some(snapshot) = SourceSnapshot::open_cancellable(path, &mut keep_going)? else {
+        return Ok(None);
+    };
+    if !keep_going(SourceOpenPhase::Summarizing) {
+        return Ok(None);
+    }
+    let summary = source_summary(
+        path,
+        &snapshot,
+        MAX_SOURCE_SCHEMA_NODES,
+        MAX_SOURCE_FIELD_BYTES,
+    )?;
+    Ok(Some((summary, snapshot)))
+}
+
+#[cfg(feature = "query-engine")]
+pub(crate) fn inspect_local_source_for_query(path: &Path) -> Result<SourceSummary, SourceError> {
+    let snapshot = SourceSnapshot::open(path)?;
+    source_summary(path, &snapshot, usize::MAX, usize::MAX)
+}
+
+fn source_summary(
+    path: &Path,
+    snapshot: &SourceSnapshot,
+    schema_node_limit: usize,
+    field_byte_limit: usize,
+) -> Result<SourceSummary, SourceError> {
+    let parquet_metadata = snapshot.metadata();
     let file_metadata = parquet_metadata.file_metadata();
     let row_count =
         u64::try_from(file_metadata.num_rows()).map_err(|_| SourceError::CorruptFooter)?;
+    ensure_safe_wire_integer(snapshot.file_bytes)?;
+    ensure_safe_wire_integer(row_count)?;
+    ensure_safe_wire_count(parquet_metadata.num_row_groups())?;
+    ensure_safe_wire_count(file_metadata.schema_descr().num_columns())?;
+    let schema_node_count = file_metadata
+        .schema_descr()
+        .root_schema()
+        .get_fields()
+        .iter()
+        .fold(0_usize, |count, field| {
+            count.saturating_add(schema_node_count(field))
+        });
+    ensure_safe_wire_count(schema_node_count)?;
+    let mut remaining_schema_nodes = schema_node_limit;
+    let mut strings_truncated = false;
     let schema = file_metadata
         .schema_descr()
         .root_schema()
         .get_fields()
         .iter()
-        .map(|field| schema_field(field))
+        .filter_map(|field| {
+            schema_field_bounded(
+                field,
+                &mut remaining_schema_nodes,
+                &mut strings_truncated,
+                field_byte_limit,
+            )
+        })
         .collect();
     let display_name = path
         .file_name()
         .map(|name| name.to_string_lossy().into_owned())
         .filter(|name| !name.is_empty())
         .ok_or(SourceError::Unsupported)?;
+    let (display_name, display_name_truncated) =
+        truncate_utf8(&display_name, MAX_SOURCE_FIELD_BYTES);
+    strings_truncated |= display_name_truncated;
 
-    Ok(SourceSummary {
+    let summary = SourceSummary {
         display_name,
-        size_bytes,
+        size_bytes: snapshot.file_bytes,
         row_count,
         row_group_count: parquet_metadata.num_row_groups(),
+        column_count: file_metadata.schema_descr().num_columns(),
         schema,
-    })
+        schema_node_count,
+        schema_is_truncated: schema_node_count > schema_node_limit,
+        strings_truncated,
+    };
+    Ok(summary)
+}
+
+fn ensure_safe_wire_integer(value: u64) -> Result<(), SourceError> {
+    if value > MAX_SAFE_WIRE_INTEGER {
+        return Err(SourceError::Unsupported);
+    }
+    Ok(())
+}
+
+fn ensure_safe_wire_count(value: usize) -> Result<(), SourceError> {
+    let value = u64::try_from(value).map_err(|_| SourceError::Unsupported)?;
+    ensure_safe_wire_integer(value)
 }
 
 pub(crate) fn open_local_source(path: &Path) -> Result<(File, u64), SourceError> {
@@ -139,7 +544,7 @@ fn map_io_error(error: io::Error) -> SourceError {
     }
 }
 
-fn map_parquet_error(error: ParquetError) -> SourceError {
+pub(crate) fn map_parquet_error(error: ParquetError) -> SourceError {
     match error {
         ParquetError::NYI(_) => SourceError::Unsupported,
         ParquetError::External(external) => external
@@ -150,33 +555,63 @@ fn map_parquet_error(error: ParquetError) -> SourceError {
     }
 }
 
-fn schema_field(field: &Type) -> SchemaField {
+fn schema_field_bounded(
+    field: &Type,
+    remaining: &mut usize,
+    strings_truncated: &mut bool,
+    field_byte_limit: usize,
+) -> Option<SchemaField> {
+    *remaining = remaining.checked_sub(1)?;
     let basic = field.get_basic_info();
     let logical_type = basic
         .logical_type_ref()
         .map(logical_type_name)
         .or_else(|| converted_type_name(field, basic.converted_type()));
 
+    let (name, name_truncated) = truncate_utf8(field.name(), field_byte_limit);
+    *strings_truncated |= name_truncated;
     match field {
-        Type::PrimitiveType { physical_type, .. } => SchemaField {
-            name: field.name().to_owned(),
+        Type::PrimitiveType { physical_type, .. } => Some(SchemaField {
+            name,
             physical_type: physical_type_name(physical_type).to_owned(),
             logical_type,
             children: Vec::new(),
-        },
-        Type::GroupType { fields, .. } => SchemaField {
-            name: field.name().to_owned(),
+        }),
+        Type::GroupType { fields, .. } => Some(SchemaField {
+            name,
             physical_type: "GROUP".to_owned(),
             logical_type,
             children: fields
                 .iter()
-                .map(|child| schema_field(child))
+                .filter_map(|child| {
+                    schema_field_bounded(child, remaining, strings_truncated, field_byte_limit)
+                })
                 .collect::<Vec<_>>(),
-        },
+        }),
     }
 }
 
-fn physical_type_name(physical_type: &ParquetPhysicalType) -> &'static str {
+fn schema_node_count(field: &Type) -> usize {
+    match field {
+        Type::PrimitiveType { .. } => 1,
+        Type::GroupType { fields, .. } => fields.iter().fold(1, |count, child| {
+            count.saturating_add(schema_node_count(child))
+        }),
+    }
+}
+
+fn truncate_utf8(value: &str, max_bytes: usize) -> (String, bool) {
+    if value.len() <= max_bytes {
+        return (value.to_owned(), false);
+    }
+    let mut end = max_bytes.saturating_sub('…'.len_utf8());
+    while !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    (format!("{}…", &value[..end]), true)
+}
+
+pub(crate) fn physical_type_name(physical_type: &ParquetPhysicalType) -> &'static str {
     match physical_type {
         ParquetPhysicalType::BOOLEAN => "BOOLEAN",
         ParquetPhysicalType::INT32 => "INT32",
@@ -189,7 +624,7 @@ fn physical_type_name(physical_type: &ParquetPhysicalType) -> &'static str {
     }
 }
 
-fn logical_type_name(logical_type: &LogicalType) -> String {
+pub(crate) fn logical_type_name(logical_type: &LogicalType) -> String {
     match logical_type {
         LogicalType::String => "String".to_owned(),
         LogicalType::Map => "Map".to_owned(),
@@ -246,7 +681,7 @@ fn logical_type_name(logical_type: &LogicalType) -> String {
     }
 }
 
-fn converted_type_name(field: &Type, converted_type: ConvertedType) -> Option<String> {
+pub(crate) fn converted_type_name(field: &Type, converted_type: ConvertedType) -> Option<String> {
     let name = match converted_type {
         ConvertedType::NONE => return None,
         ConvertedType::UTF8 => "String".to_owned(),
@@ -313,12 +748,182 @@ mod tests {
     use parquet::{
         arrow::ArrowWriter,
         basic::{Repetition, Type as PhysicalType},
-        file::writer::SerializedFileWriter,
+        file::{
+            metadata::{FileMetaData, ParquetMetaData},
+            writer::SerializedFileWriter,
+        },
         schema::types::TypePtr,
     };
     use tempfile::NamedTempFile;
 
     use super::*;
+
+    #[test]
+    fn bounds_schema_nodes_before_the_summary_crosses_the_ui_boundary() {
+        let children = (0..4)
+            .map(|index| {
+                Arc::new(
+                    Type::primitive_type_builder(
+                        match index {
+                            0 => "column_0",
+                            1 => "column_1",
+                            2 => "column_2",
+                            _ => "column_3",
+                        },
+                        ParquetPhysicalType::INT64,
+                    )
+                    .with_repetition(parquet::basic::Repetition::OPTIONAL)
+                    .build()
+                    .expect("field"),
+                )
+            })
+            .collect();
+        let group = Type::group_type_builder("record")
+            .with_fields(children)
+            .build()
+            .expect("group");
+        let mut remaining = 3;
+        let mut strings_truncated = false;
+
+        let bounded = schema_field_bounded(
+            &group,
+            &mut remaining,
+            &mut strings_truncated,
+            MAX_SOURCE_FIELD_BYTES,
+        )
+        .expect("root fits");
+
+        assert_eq!(bounded.children.len(), 2);
+        assert_eq!(remaining, 0);
+    }
+
+    #[test]
+    fn bounds_the_serialized_open_summary_for_a_wide_long_named_schema() {
+        let fields = (0..10_000)
+            .map(|index| {
+                Arc::new(
+                    Type::primitive_type_builder(
+                        &format!("column_{index}_{}", "界|\\".repeat(100)),
+                        ParquetPhysicalType::INT64,
+                    )
+                    .with_repetition(parquet::basic::Repetition::OPTIONAL)
+                    .build()
+                    .expect("field"),
+                )
+            })
+            .collect::<Vec<_>>();
+        let mut remaining = MAX_SOURCE_SCHEMA_NODES;
+        let mut strings_truncated = false;
+        let schema = fields
+            .iter()
+            .filter_map(|field| {
+                schema_field_bounded(
+                    field,
+                    &mut remaining,
+                    &mut strings_truncated,
+                    MAX_SOURCE_FIELD_BYTES,
+                )
+            })
+            .collect::<Vec<_>>();
+        let summary = SourceSummary {
+            display_name: "wide.parquet".to_owned(),
+            size_bytes: 8,
+            row_count: 0,
+            row_group_count: 0,
+            column_count: fields.len(),
+            schema,
+            schema_node_count: fields.len(),
+            schema_is_truncated: fields.len() > MAX_SOURCE_SCHEMA_NODES,
+            strings_truncated,
+        };
+
+        let wire = serde_json::to_vec(&summary).expect("summary serializes");
+
+        assert_eq!(summary.schema.len(), MAX_SOURCE_SCHEMA_NODES);
+        assert!(summary.schema_is_truncated);
+        assert!(summary.strings_truncated);
+        assert!(
+            wire.len() < 80 * 1024,
+            "bounded JSON was {} bytes",
+            wire.len()
+        );
+        assert!(
+            summary
+                .schema
+                .iter()
+                .all(|field| field.name.len() <= MAX_SOURCE_FIELD_BYTES)
+        );
+    }
+
+    #[test]
+    fn snapshot_keeps_complete_wide_and_nested_query_schemas_native() {
+        let wide = write_empty_parquet(
+            (0..300)
+                .map(|index| {
+                    primitive_field(
+                        format!("column_{index}"),
+                        PhysicalType::INT64,
+                        None,
+                        ConvertedType::NONE,
+                        None,
+                        None,
+                    )
+                })
+                .collect(),
+        );
+        let nested = write_empty_parquet(vec![Arc::new(
+            Type::group_type_builder("wrapper")
+                .with_repetition(Repetition::OPTIONAL)
+                .with_fields(
+                    (0..300)
+                        .map(|index| {
+                            primitive_field(
+                                format!("nested_{index}"),
+                                PhysicalType::INT64,
+                                None,
+                                ConvertedType::NONE,
+                                None,
+                                None,
+                            )
+                        })
+                        .collect(),
+                )
+                .build()
+                .expect("nested wrapper"),
+        )]);
+
+        for source in [wide, nested] {
+            let (summary, snapshot) =
+                inspect_local_source_snapshot(source.path()).expect("wide source snapshot");
+            let query_schema = snapshot.query_schema();
+
+            assert!(summary.schema_is_truncated);
+            assert!(summary.schema_node_count > summary.schema.len());
+            assert_eq!(
+                query_schema.len(),
+                snapshot
+                    .metadata()
+                    .file_metadata()
+                    .schema_descr()
+                    .root_schema()
+                    .get_fields()
+                    .len(),
+            );
+            assert_eq!(
+                query_schema
+                    .iter()
+                    .map(schema_node_count_from_summary)
+                    .sum::<usize>(),
+                summary.schema_node_count,
+            );
+        }
+    }
+
+    fn schema_node_count_from_summary(field: &SchemaField) -> usize {
+        field.children.iter().fold(1, |count, child| {
+            count.saturating_add(schema_node_count_from_summary(child))
+        })
+    }
 
     #[test]
     fn inspects_basic_parquet_metadata_without_returning_a_path() {
@@ -340,6 +945,7 @@ mod tests {
                     .len(),
                 row_count: 3,
                 row_group_count: 1,
+                column_count: 2,
                 schema: vec![
                     SchemaField {
                         name: "id".to_owned(),
@@ -354,8 +960,108 @@ mod tests {
                         children: vec![],
                     },
                 ],
+                schema_node_count: 2,
+                schema_is_truncated: false,
+                strings_truncated: false,
             }
         );
+    }
+
+    #[test]
+    fn rejects_an_open_summary_that_javascript_cannot_represent_exactly() {
+        let source = write_basic_parquet();
+        let mut snapshot = SourceSnapshot::open(source.path()).expect("source snapshot");
+        let file = snapshot.metadata.file_metadata();
+        let metadata = FileMetaData::new(
+            file.version(),
+            i64::try_from(MAX_SAFE_WIRE_INTEGER + 1).expect("limit fits i64"),
+            file.created_by().map(str::to_owned),
+            file.key_value_metadata().cloned(),
+            file.schema_descr_ptr(),
+            file.column_orders().cloned(),
+        );
+        snapshot.metadata = Arc::new(ParquetMetaData::new(
+            metadata,
+            snapshot.metadata.row_groups().to_vec(),
+        ));
+
+        assert_eq!(
+            source_summary(
+                source.path(),
+                &snapshot,
+                MAX_SOURCE_SCHEMA_NODES,
+                MAX_SOURCE_FIELD_BYTES,
+            ),
+            Err(SourceError::Unsupported),
+        );
+    }
+
+    #[test]
+    fn source_identity_rejects_path_replacement_and_in_place_mutation() {
+        let source = write_basic_parquet();
+        let replacement = write_basic_parquet();
+        let snapshot = SourceSnapshot::open(source.path()).expect("source snapshot");
+
+        #[cfg(windows)]
+        {
+            let _: u64 = snapshot.identity().volume_serial_number;
+            assert_eq!(snapshot.identity().file_id.len(), 16);
+        }
+        snapshot
+            .identity()
+            .validate_path(source.path())
+            .expect("unchanged source");
+        std::fs::rename(replacement.path(), source.path()).expect("replace source path");
+        snapshot
+            .identity()
+            .validate_file(&snapshot.file)
+            .expect("retained handle still identifies the opened file");
+        assert_eq!(
+            snapshot.validate_for_install(source.path()),
+            Err(SourceError::SourceChanged)
+        );
+
+        let mutated = write_basic_parquet();
+        let mutated_snapshot = SourceSnapshot::open(mutated.path()).expect("mutable snapshot");
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(mutated.path())
+            .expect("mutable source");
+        std::io::Write::write_all(&mut file, b"changed").expect("mutate in place");
+        assert_eq!(
+            mutated_snapshot.validate_for_install(mutated.path()),
+            Err(SourceError::SourceChanged)
+        );
+    }
+
+    #[test]
+    fn cancellable_snapshot_reports_real_phases_before_summary() {
+        let source = write_basic_parquet();
+        let mut reading_calls = 0;
+        let cancelled_read = SourceSnapshot::open_cancellable(source.path(), |phase| {
+            if phase == SourceOpenPhase::ReadingFooter {
+                reading_calls += 1;
+            }
+            reading_calls < 2
+        })
+        .expect("cancelled footer read");
+        assert!(cancelled_read.is_none());
+
+        let mut phases = Vec::new();
+
+        let snapshot = SourceSnapshot::open_cancellable(source.path(), |phase| {
+            phases.push(phase);
+            phase != SourceOpenPhase::Summarizing
+        })
+        .expect("cancellable source open");
+
+        assert!(snapshot.is_none());
+        assert!(phases.starts_with(&[
+            SourceOpenPhase::ReadingFooter,
+            SourceOpenPhase::ReadingFooter,
+        ]));
+        assert!(phases.contains(&SourceOpenPhase::DecodingFooter));
+        assert_eq!(phases.last(), Some(&SourceOpenPhase::Summarizing));
     }
 
     #[test]

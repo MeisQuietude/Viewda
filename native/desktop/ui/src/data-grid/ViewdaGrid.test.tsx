@@ -89,6 +89,8 @@ function column(index: number, pinned = false): GridColumn {
     monospace: false,
     pinned,
     pending: false,
+    sortable: true,
+    filterable: true,
     sort: { direction: "neutral" },
   };
 }
@@ -445,15 +447,60 @@ describe("ViewdaGrid foundation", () => {
     expect(
       screen.getByRole("columnheader", { name: "Row numbers" }),
     ).toBeInTheDocument();
-    expect(
-      screen.getByRole("columnheader", { name: "Column 0" }),
-    ).toBeInTheDocument();
+    expect(screen.getByRole("columnheader", { name: "Column 0" })).toHaveClass(
+      "has-filter",
+    );
     const sort = screen.getByRole("button", { name: "Sort Column 0" });
     expect(sort).toBeInTheDocument();
     expect(sort.querySelector("svg")).toBeInTheDocument();
     expect(sort.textContent).toBe("");
     expect(
       screen.getByRole("button", { name: "Filter Column 0" }),
+    ).toBeInTheDocument();
+  });
+
+  it("omits unavailable header actions and keeps the title and resize handle", () => {
+    render(
+      <ViewdaGrid
+        {...props({
+          columns: [
+            { ...column(0), filterable: false },
+            {
+              ...column(1),
+              sortable: false,
+              filterable: false,
+            },
+          ],
+          rowCount: 1,
+        })}
+      />,
+    );
+
+    const sortableHeader = screen.getByRole("columnheader", {
+      name: "Column 0",
+    });
+    expect(sortableHeader).toHaveAttribute("aria-sort", "none");
+    expect(sortableHeader).not.toHaveClass("has-filter");
+    expect(
+      screen.getByRole("button", { name: "Sort Column 0" }),
+    ).toBeInTheDocument();
+    expect(
+      screen.queryByRole("button", { name: "Filter Column 0" }),
+    ).toBeNull();
+
+    const descriptiveHeader = screen.getByRole("columnheader", {
+      name: "Column 1",
+    });
+    expect(descriptiveHeader).not.toHaveAttribute("aria-sort");
+    expect(screen.queryByRole("button", { name: "Sort Column 1" })).toBeNull();
+    expect(
+      screen.queryByRole("button", { name: "Filter Column 1" }),
+    ).toBeNull();
+    expect(
+      descriptiveHeader.querySelector(".viewda-grid-header-title"),
+    ).toHaveTextContent("Column 1");
+    expect(
+      descriptiveHeader.querySelector(".viewda-grid-resize-handle"),
     ).toBeInTheDocument();
   });
 
@@ -776,6 +823,7 @@ describe("ViewdaGrid foundation", () => {
 
     const report = JSON.parse(diagnostics.stop() ?? "null");
     expect(report.wheel).toMatchObject({
+      consumedEvents: 1,
       movedEvents: 0,
       horizontal: {
         movedEvents: 0,
@@ -788,7 +836,7 @@ describe("ViewdaGrid foundation", () => {
     });
   });
 
-  it("reports only the vertical movement applied by a final partial row", () => {
+  it("routes a boundary-reaching delta without discarding its remainder", () => {
     const frames: FrameRequestCallback[] = [];
     vi.spyOn(window, "requestAnimationFrame").mockImplementation((callback) => {
       frames.push(callback);
@@ -796,30 +844,130 @@ describe("ViewdaGrid foundation", () => {
     });
     const diagnostics = createDiagnostics();
     const { container } = render(
-      <ViewdaGrid
-        {...props({
-          rowCount: 4,
-          measurementPort: measurementPort(420, 70),
-          diagnostics: diagnostics.sink,
-        })}
-      />,
+      <div data-testid="outer-scroll-owner">
+        <ViewdaGrid
+          {...props({
+            rowCount: 4,
+            measurementPort: measurementPort(420, 70),
+            diagnostics: diagnostics.sink,
+          })}
+        />
+      </div>,
     );
+    const outer = screen.getByTestId("outer-scroll-owner");
+    outer.style.overflowY = "auto";
+    Object.defineProperties(outer, {
+      clientHeight: { configurable: true, value: 100 },
+      scrollHeight: { configurable: true, value: 2_000 },
+    });
     const scrollport = container.querySelector(
       ".viewda-grid-body-scrollport",
+    ) as HTMLElement;
+    const header = container.querySelector(
+      ".viewda-grid-header",
     ) as HTMLElement;
     frames.length = 0;
     scrollport.scrollTop = 30;
     fireEvent.scroll(scrollport);
     act(() => frames.shift()?.(0));
     startDiagnostics(diagnostics);
-    act(() => scrollport.dispatchEvent(wheelEvent({ deltaY: 84 }, 10)));
+    const wheel = wheelEvent({ deltaY: 84 }, 10);
+    act(() => header.dispatchEvent(wheel));
 
     const report = JSON.parse(diagnostics.stop() ?? "null");
-    expect(report.wheel.vertical).toMatchObject({
-      requestedPixels: 84,
-      appliedRowSteps: 12 / 28,
-      outcomes: { appliedMovement: 1 },
+    expect(wheel.defaultPrevented).toBe(true);
+    expect(scrollport.scrollTop).toBe(42);
+    expect(outer.scrollTop).toBe(72);
+    expect(report.wheel).toMatchObject({
+      consumedEvents: 1,
+      movedEvents: 1,
+      vertical: {
+        requestedPixels: 84,
+        appliedRowSteps: 12 / 28,
+        outcomes: { appliedMovement: 1 },
+      },
     });
+  });
+
+  it("forwards accumulated downward and upward boundary remainder", () => {
+    const { container } = render(
+      <div data-testid="outer-scroll-owner">
+        <ViewdaGrid
+          {...props({
+            rowCount: 5,
+            measurementPort: measurementPort(420, 84),
+          })}
+        />
+      </div>,
+    );
+    const outer = screen.getByTestId("outer-scroll-owner");
+    outer.style.overflowY = "auto";
+    Object.defineProperties(outer, {
+      clientHeight: { configurable: true, value: 100 },
+      scrollHeight: { configurable: true, value: 2_000 },
+    });
+    const scrollport = container.querySelector(
+      ".viewda-grid-body-scrollport",
+    ) as HTMLElement;
+
+    const downPending = wheelEvent({ deltaY: 20 }, 1);
+    act(() => scrollport.dispatchEvent(downPending));
+    expect(downPending.defaultPrevented).toBe(true);
+    expect(scrollport.scrollTop).toBe(0);
+    expect(outer.scrollTop).toBe(0);
+
+    const downBoundary = wheelEvent({ deltaY: 50 }, 2);
+    act(() => scrollport.dispatchEvent(downBoundary));
+    expect(downBoundary.defaultPrevented).toBe(true);
+    expect(scrollport.scrollTop).toBe(56);
+    expect(outer.scrollTop).toBe(14);
+
+    outer.scrollTop = 100;
+    const upPending = wheelEvent({ deltaY: -20 }, 200);
+    act(() => scrollport.dispatchEvent(upPending));
+    expect(upPending.defaultPrevented).toBe(true);
+    expect(scrollport.scrollTop).toBe(56);
+    expect(outer.scrollTop).toBe(100);
+
+    const upBoundary = wheelEvent({ deltaY: -50 }, 201);
+    act(() => scrollport.dispatchEvent(upBoundary));
+    expect(upBoundary.defaultPrevented).toBe(true);
+    expect(scrollport.scrollTop).toBe(0);
+    expect(outer.scrollTop).toBe(86);
+  });
+
+  it("does not flush retained vertical remainder on opposing noise", () => {
+    const ref = createRef<ViewdaGridHandle>();
+    const { container } = render(
+      <div data-testid="outer-scroll-owner">
+        <ViewdaGrid
+          ref={ref}
+          {...props({
+            rowCount: 5,
+            measurementPort: measurementPort(420, 84),
+          })}
+        />
+      </div>,
+    );
+    const outer = screen.getByTestId("outer-scroll-owner");
+    outer.style.overflowY = "auto";
+    Object.defineProperties(outer, {
+      clientHeight: { configurable: true, value: 100 },
+      scrollHeight: { configurable: true, value: 2_000 },
+    });
+    outer.scrollTop = 100;
+    const scrollport = container.querySelector(
+      ".viewda-grid-body-scrollport",
+    ) as HTMLElement;
+
+    act(() => scrollport.dispatchEvent(wheelEvent({ deltaY: 20 }, 1)));
+    act(() => ref.current?.scrollToRow(5));
+    const opposingNoise = wheelEvent({ deltaY: -1 }, 2);
+    act(() => scrollport.dispatchEvent(opposingNoise));
+
+    expect(opposingNoise.defaultPrevented).toBe(true);
+    expect(scrollport.scrollTop).toBe(56);
+    expect(outer.scrollTop).toBe(100);
   });
 
   it("uses the newest frame when older measurement and newer input share a commit", () => {
@@ -918,6 +1066,7 @@ describe("ViewdaGrid foundation", () => {
     const eventCount = 400;
 
     for (let eventIndex = 1; eventIndex <= eventCount; eventIndex += 1) {
+      const previousLeft = bodyScrollport.scrollLeft;
       const wheel = wheelEvent(
         { deltaX: 10, deltaY: 0.5, deltaMode: WheelEvent.DOM_DELTA_PIXEL },
         (eventIndex - 1) * 8,
@@ -930,7 +1079,9 @@ describe("ViewdaGrid foundation", () => {
       act(() => {
         frames.shift()?.(eventIndex * 8);
       });
-      expect(wheel.defaultPrevented).toBe(true);
+      expect(wheel.defaultPrevented).toBe(
+        bodyScrollport.scrollLeft !== previousLeft,
+      );
       maximumCells = Math.max(
         maximumCells,
         container.querySelectorAll(".viewda-grid-cell").length,
@@ -1851,7 +2002,7 @@ describe("ViewdaGrid foundation", () => {
     expect(scrollport.scrollTop).toBeCloseTo(336, 10);
   });
 
-  it("prevents native double movement when a row step reaches a bound", () => {
+  it("yields a downward wheel at the bottom and resets the gesture", () => {
     const ref = createRef<ViewdaGridHandle>();
     const { container } = render(
       <ViewdaGrid
@@ -1871,8 +2022,144 @@ describe("ViewdaGrid foundation", () => {
     const wheel = wheelEvent({ deltaY: 84 }, 1);
     act(() => scrollport.dispatchEvent(wheel));
 
-    expect(wheel.defaultPrevented).toBe(true);
+    expect(wheel.defaultPrevented).toBe(false);
     expect(scrollport.scrollTop).toBe(maximum);
+
+    const inward = wheelEvent({ deltaY: -28 }, 2);
+    act(() => scrollport.dispatchEvent(inward));
+    expect(inward.defaultPrevented).toBe(true);
+    expect(scrollport.scrollTop).toBeLessThan(maximum);
+  });
+
+  it("resolves a sustained interior diagonal tie to vertical movement", () => {
+    const { container } = render(
+      <ViewdaGrid
+        {...props({
+          columns: Array.from({ length: 20 }, (_, index) => column(index)),
+          rowCount: 100,
+          measurementPort: measurementPort(420, 84, 1_000_000),
+        })}
+      />,
+    );
+    const scrollport = container.querySelector(
+      ".viewda-grid-body-scrollport",
+    ) as HTMLElement;
+    const wheels = [1, 2, 3].map((timeStamp) =>
+      wheelEvent({ deltaX: 10, deltaY: 10 }, timeStamp),
+    );
+
+    act(() => scrollport.dispatchEvent(wheels[0]!));
+    act(() => scrollport.dispatchEvent(wheels[1]!));
+    expect(scrollport.scrollTop).toBe(0);
+    expect(scrollport.scrollLeft).toBe(0);
+
+    act(() => scrollport.dispatchEvent(wheels[2]!));
+
+    expect(wheels.every((wheel) => wheel.defaultPrevented)).toBe(true);
+    expect(scrollport.scrollTop).toBe(28);
+    expect(scrollport.scrollLeft).toBe(0);
+  });
+
+  it("repeatedly yields a vertical diagonal tie at a row boundary", () => {
+    const ref = createRef<ViewdaGridHandle>();
+    const { container } = render(
+      <ViewdaGrid
+        ref={ref}
+        {...props({
+          rowCount: 1_000,
+          measurementPort: measurementPort(420, 84, 1_000_000),
+        })}
+      />,
+    );
+    const scrollport = container.querySelector(
+      ".viewda-grid-body-scrollport",
+    ) as HTMLElement;
+    act(() => ref.current?.scrollToRow(1_000));
+    const maximum = scrollport.scrollTop;
+    const horizontalStart = scrollport.scrollLeft;
+
+    const first = wheelEvent({ deltaY: 10, deltaX: 10 }, 1);
+    act(() => scrollport.dispatchEvent(first));
+    const repeated = wheelEvent({ deltaY: 10, deltaX: 10 }, 2);
+    act(() => scrollport.dispatchEvent(repeated));
+
+    expect(first.defaultPrevented).toBe(false);
+    expect(repeated.defaultPrevented).toBe(false);
+    expect(scrollport.scrollTop).toBe(maximum);
+    expect(scrollport.scrollLeft).toBe(horizontalStart);
+
+    act(() => ref.current?.scrollToRow(0));
+    const upward = wheelEvent({ deltaY: -10, deltaX: 10 }, 3);
+    act(() => scrollport.dispatchEvent(upward));
+    expect(upward.defaultPrevented).toBe(false);
+    expect(scrollport.scrollTop).toBe(0);
+    expect(scrollport.scrollLeft).toBe(horizontalStart);
+  });
+
+  it("never traps a vertical wheel when there is no row extent", () => {
+    const outerWheel = vi.fn<(event: Event) => void>();
+    const { container } = render(
+      <div>
+        <ViewdaGrid
+          {...props({
+            rowCount: 1,
+            measurementPort: measurementPort(420, 84, 1_000_000),
+          })}
+        />
+      </div>,
+    );
+    container.firstElementChild?.addEventListener("wheel", outerWheel);
+    const scrollport = container.querySelector(
+      ".viewda-grid-body-scrollport",
+    ) as HTMLElement;
+
+    const wheel = wheelEvent({ deltaY: 28 }, 1);
+    act(() => scrollport.dispatchEvent(wheel));
+
+    expect(wheel.defaultPrevented).toBe(false);
+    expect(outerWheel).toHaveBeenCalledOnce();
+    expect(outerWheel.mock.calls[0]?.[0].defaultPrevented).toBe(false);
+  });
+
+  it("yields an upward wheel at the top", () => {
+    const { container } = render(
+      <ViewdaGrid
+        {...props({
+          rowCount: 100,
+          measurementPort: measurementPort(420, 84, 1_000_000),
+        })}
+      />,
+    );
+    const scrollport = container.querySelector(
+      ".viewda-grid-body-scrollport",
+    ) as HTMLElement;
+
+    const wheel = wheelEvent({ deltaY: -28 }, 1);
+    act(() => scrollport.dispatchEvent(wheel));
+
+    expect(wheel.defaultPrevented).toBe(false);
+    expect(scrollport.scrollTop).toBe(0);
+  });
+
+  it("consumes interior movement and sub-row accumulation", () => {
+    const { container } = render(
+      <ViewdaGrid
+        {...props({
+          rowCount: 100,
+          measurementPort: measurementPort(420, 84, 1_000_000),
+        })}
+      />,
+    );
+    const scrollport = container.querySelector(
+      ".viewda-grid-body-scrollport",
+    ) as HTMLElement;
+
+    for (let index = 0; index < 4; index += 1) {
+      const wheel = wheelEvent({ deltaY: 7 }, index + 1);
+      act(() => scrollport.dispatchEvent(wheel));
+      expect(wheel.defaultPrevented).toBe(true);
+    }
+    expect(scrollport.scrollTop).toBe(28);
   });
 
   it("re-reads bounded cells when content revision changes", () => {

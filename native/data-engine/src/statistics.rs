@@ -47,6 +47,9 @@ pub enum ColumnStatisticsError {
     /// The operating system denied access to the selected source.
     #[error("Viewda does not have permission to read the selected file.")]
     PermissionDenied,
+    /// The source path no longer identifies the opened file.
+    #[error("The selected file changed after it was opened.")]
+    SourceChanged,
     /// The selected source does not have Parquet file markers.
     #[error("The selected file is not a Parquet file.")]
     NotParquet,
@@ -175,6 +178,7 @@ impl From<SourceError> for ColumnStatisticsError {
         match error {
             SourceError::NotFound => Self::NotFound,
             SourceError::PermissionDenied => Self::PermissionDenied,
+            SourceError::SourceChanged => Self::SourceChanged,
             SourceError::NotParquet => Self::NotParquet,
             SourceError::CorruptFooter => Self::CorruptSource,
             SourceError::Unsupported => Self::Unsupported,

@@ -10,7 +10,7 @@ use thiserror::Error;
 
 use crate::{
     filter::quote_identifier,
-    source::{SchemaField, SourceError, inspect_local_source, open_local_source},
+    source::{SchemaField, SourceError, inspect_local_source_for_query, open_local_source},
 };
 
 // Keep in sync with DataGrid.tsx's MAX_WINDOW_ROWS; this is the authoritative IPC guard.
@@ -26,6 +26,9 @@ pub enum DataWindowError {
     /// The operating system denied access to the selected source.
     #[error("Viewda does not have permission to read the selected file.")]
     PermissionDenied,
+    /// The source path no longer identifies the file opened by the caller.
+    #[error("The selected file changed after it was opened.")]
+    SourceChanged,
     /// The selected source does not have Parquet file markers.
     #[error("The selected file is not a Parquet file.")]
     NotParquet,
@@ -99,7 +102,7 @@ impl DataWindowReader {
             let schema = match &self.schema {
                 Some(schema) => schema,
                 None => self.schema.insert(
-                    inspect_local_source(&self.source_path)
+                    inspect_local_source_for_query(&self.source_path)
                         .map_err(DataWindowError::from)?
                         .schema,
                 ),
@@ -259,6 +262,7 @@ impl From<SourceError> for DataWindowError {
         match error {
             SourceError::NotFound => Self::NotFound,
             SourceError::PermissionDenied => Self::PermissionDenied,
+            SourceError::SourceChanged => Self::SourceChanged,
             SourceError::NotParquet => Self::NotParquet,
             SourceError::CorruptFooter => Self::CorruptSource,
             SourceError::Unsupported => Self::Unsupported,

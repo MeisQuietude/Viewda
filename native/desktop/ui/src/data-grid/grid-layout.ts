@@ -339,6 +339,15 @@ export function advanceWheelGesture(
     state.pendingY = 0;
     return finish(verticalGestureAdvance(state, pendingY, rowHeight));
   }
+  // A persistent diagonal must not be consumed without movement forever.
+  // Less than one row remains noise; then vertical page navigation wins.
+  if (verticalMagnitude >= Math.max(1, rowHeight)) {
+    state.axis = "vertical";
+    const pendingY = state.pendingY;
+    state.pendingX = 0;
+    state.pendingY = 0;
+    return finish(verticalGestureAdvance(state, pendingY, rowHeight));
+  }
   return finish({ state, horizontalDelta: 0, rowSteps: 0 });
 }
 

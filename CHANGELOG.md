@@ -8,6 +8,14 @@ Backward-incompatible entries start with **Breaking:**.
 
 ## Unreleased
 
+### Added
+
+- Inspect Parquet storage in Structure view with exact chunk coverage and
+  row-group ranges; sortable row-group and physical-column tables with stable
+  leaf numbers for shortened paths; an optional chunk map with compression,
+  codec and statistics lenses plus independent Bloom markers; chunk details and
+  Bloom probes; and a path-free, value-free Markdown report.
+
 ### Fixed
 
 - Keep the column selector visible above the data grid's column headers.
