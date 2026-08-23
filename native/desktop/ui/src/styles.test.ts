@@ -325,6 +325,10 @@ describe("query row", () => {
       /\.where-popup\s*\{[^}]*position:\s*fixed;[^}]*max-height:[^}]*overflow:\s*auto;[^}]*white-space:\s*normal;/s,
     );
     expect(styles).toMatch(
+      /\.where-popup\.is-empty\s*\{[^}]*width:\s*min\(140px,\s*calc\(100vw - 32px\)\);/s,
+    );
+    expect(styles).toMatch(/\.where-popup p\s*\{[^}]*font-size:\s*11px;/s);
+    expect(styles).toMatch(
       /\.sort-popup\s*\{[^}]*max-height:[^}]*overflow:\s*auto;[^}]*color:\s*var\(--grid-text\);[^}]*background:\s*var\(--grid-header\);[^}]*white-space:\s*normal;/s,
     );
     expect(styles).toMatch(

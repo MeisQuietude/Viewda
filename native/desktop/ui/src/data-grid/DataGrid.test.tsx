@@ -845,7 +845,9 @@ describe("DataGrid window rendering", () => {
     );
 
     const popup = screen.getByRole("dialog", { name: "WHERE conditions" });
-    expect(popup).toHaveStyle({ left: "16px", top: "88px" });
+    expect(within(popup).getByText("No conditions yet.")).toBeVisible();
+    expect(popup).toHaveClass("is-empty");
+    expect(popup).toHaveStyle({ left: "444px", top: "88px" });
     expect(wrap).not.toContainElement(popup);
     expect(popup.parentElement).toBe(document.querySelector(".data-grid-view"));
 
@@ -1731,6 +1733,7 @@ describe("DataGrid window rendering", () => {
     );
     fireEvent.click(screen.getByRole("button", { name: '"column_0" = -3' }));
     const popup = screen.getByRole("dialog", { name: "WHERE conditions" });
+    expect(popup).not.toHaveClass("is-empty");
     expect(within(popup).getByText('"column_0" = -3')).toBeInTheDocument();
 
     fireEvent.click(within(popup).getByRole("button", { name: "Edit" }));

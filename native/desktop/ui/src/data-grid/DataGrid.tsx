@@ -91,6 +91,7 @@ const MIN_COLUMN_WIDTH = 112;
 const MAX_COLUMN_WIDTH = 500;
 const WHERE_POPUP_MARGIN = 16;
 const WHERE_POPUP_MAX_WIDTH = 680;
+const WHERE_POPUP_EMPTY_WIDTH = 140;
 const WHERE_POPUP_OFFSET = -42;
 const SELECT_TOOLTIP_COLUMN_LIMIT = 50;
 const GRID_HEADER_HORIZONTAL_PADDING = 16;
@@ -2283,12 +2284,15 @@ export function DataGrid({
             bounds,
             window.innerWidth,
             window.innerHeight,
+            filters.length === 0
+              ? WHERE_POPUP_EMPTY_WIDTH
+              : WHERE_POPUP_MAX_WIDTH,
           ),
         );
       }
     }
     setWherePopupOpen((open) => !open);
-  }, [wherePopupOpen]);
+  }, [filters.length, wherePopupOpen]);
 
   return (
     <section className="data-grid-view" aria-label="Data">
@@ -2738,13 +2742,13 @@ export function DataGrid({
       {wherePopupOpen && (
         <div
           ref={wherePopupRef}
-          className="where-popup"
+          className={`where-popup${filters.length === 0 ? " is-empty" : ""}`}
           role="dialog"
           aria-label="WHERE conditions"
           style={wherePopupPosition}
         >
           {filters.length === 0 ? (
-            <p>No WHERE conditions.</p>
+            <p>No conditions yet.</p>
           ) : (
             <ol>
               {filters.map((filter, index) => {
@@ -3341,9 +3345,10 @@ function clampedWherePopupPosition(
   anchor: Pick<DOMRect, "left" | "bottom">,
   viewportWidth: number,
   viewportHeight: number,
+  maxWidth: number,
 ): { left: number; top: number } {
   const popupWidth = Math.min(
-    WHERE_POPUP_MAX_WIDTH,
+    maxWidth,
     Math.max(0, viewportWidth - WHERE_POPUP_MARGIN * 2),
   );
   return {

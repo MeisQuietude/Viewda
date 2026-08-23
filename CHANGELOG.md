@@ -11,6 +11,7 @@ Backward-incompatible entries start with **Breaking:**.
 ### Fixed
 
 - Keep the column selector visible above the data grid's column headers.
+- Made the empty WHERE popup shorter, narrower, and consistent in size with the query controls.
 
 ## 0.2.0 — 2026-08-21
 
