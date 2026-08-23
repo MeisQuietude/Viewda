@@ -354,28 +354,48 @@ button {
   pointer-events: none;
 }
 
-.viewda-grid-horizontal-scrollport {
+.viewda-grid-horizontal-scrollbar {
+  position: relative;
   min-width: 0;
   height: 14px;
-  overflow-x: scroll;
-  overflow-y: hidden;
+  overflow: hidden;
   background: var(--grid-header);
-  scrollbar-color: var(--grid-text-faint) var(--grid-header);
   flex: 0 0 14px;
+  cursor: pointer;
+  touch-action: none;
+}
+
+.viewda-grid-horizontal-scrollbar:focus-visible {
+  outline: 2px solid var(--grid-selection-strong);
+  outline-offset: -2px;
+}
+
+.viewda-grid-horizontal-scrollbar[data-dragging="true"] {
+  cursor: grabbing;
+}
+
+.viewda-grid-horizontal-scrollport {
+  position: absolute;
+  inset: 0;
+  overflow: hidden;
+  pointer-events: none;
+  scrollbar-width: none;
 }
 
 .viewda-grid-horizontal-scrollport::-webkit-scrollbar {
-  height: 14px;
+  display: none;
 }
 
-.viewda-grid-horizontal-scrollport::-webkit-scrollbar-track {
-  background: var(--grid-header);
-}
-
-.viewda-grid-horizontal-scrollport::-webkit-scrollbar-thumb {
-  border: 3px solid var(--grid-header);
-  border-radius: 7px;
+.viewda-grid-horizontal-thumb {
+  position: absolute;
+  top: 3px;
+  left: 0;
+  height: 8px;
+  border-radius: 4px;
   background: var(--grid-text-faint);
+  opacity: 1;
+  pointer-events: none;
+  will-change: transform;
 }
 
 .viewda-grid-horizontal-spacer {

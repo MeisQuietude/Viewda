@@ -192,16 +192,27 @@ describe("color theme", () => {
     expect(hasSelector(".viewda-grid-cell:hover")).toBe(false);
   });
 
-  it("reserves a visible cross-platform horizontal scrollbar lane", () => {
-    expectDeclarations(".viewda-grid-horizontal-scrollport", {
+  it("keeps a persistent cross-platform horizontal scrollbar lane", () => {
+    expectDeclarations(".viewda-grid-horizontal-scrollbar", {
+      position: "relative",
       height: "14px",
-      "overflow-x": "scroll",
+      overflow: "hidden",
       flex: "0 0 14px",
+      "touch-action": "none",
     });
-    expectDeclarations(
-      ".viewda-grid-horizontal-scrollport::-webkit-scrollbar-thumb",
-      { background: "var(--grid-text-faint)" },
-    );
+    expectDeclarations(".viewda-grid-horizontal-scrollport", {
+      position: "absolute",
+      inset: "0px",
+      overflow: "hidden",
+      "pointer-events": "none",
+    });
+    expectDeclarations(".viewda-grid-horizontal-thumb", {
+      top: "3px",
+      height: "8px",
+      background: "var(--grid-text-faint)",
+      opacity: "1",
+      "pointer-events": "none",
+    });
   });
 
   it("keeps statistics errors readable in the dark sidebar", () => {
