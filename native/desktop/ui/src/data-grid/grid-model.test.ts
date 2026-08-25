@@ -2,8 +2,8 @@ import { describe, expect, it } from "vitest";
 
 import {
   CompactSelection,
-  copyBufferContents,
-  type GridCell,
+  CopyBufferLimitError,
+  IncrementalCopyBuffer,
 } from "./grid-model";
 
 describe("CompactSelection", () => {
@@ -30,40 +30,60 @@ describe("CompactSelection", () => {
   });
 });
 
-describe("copyBufferContents", () => {
-  const cell = (copyData: string): GridCell => ({
-    kind: "text",
-    displayData: copyData,
-    copyData,
-    alignment: "left",
-    faded: false,
-  });
+describe("IncrementalCopyBuffer", () => {
+  const build = (
+    rows: readonly (readonly string[])[],
+    columnIndices: readonly number[],
+    characterLimit?: number,
+  ) => {
+    const buffer = new IncrementalCopyBuffer(characterLimit);
+    rows.forEach((row, rowIndex) => {
+      columnIndices.forEach((column, columnIndex) => {
+        buffer.beginCell(row[column] ?? "", columnIndex === 0, rowIndex === 0);
+        while (!buffer.stepCell(Infinity, 1).done) {
+          // One-unit steps assert that escaping can stop between large chunks.
+        }
+      });
+      buffer.endRow();
+    });
+    return buffer.finish();
+  };
 
   it("uses lossless values in requested column order", () => {
     expect(
-      copyBufferContents(
+      build(
         [
-          [cell("12345678901234567890"), cell("🙂")],
-          [cell(""), cell("line")],
+          ["12345678901234567890", "🙂"],
+          ["", "line"],
         ],
         [1, 0],
-      ).textPlain,
-    ).toBe("🙂\t12345678901234567890\nline\t");
+      ),
+    ).toMatchObject({
+      textPlain: "🙂\t12345678901234567890\nline\t",
+    });
   });
 
   it("quotes TSV values without changing their shape", () => {
-    expect(
-      copyBufferContents([[cell("tab\tvalue"), cell('line\n"quoted"')]], [0, 1])
-        .textPlain,
-    ).toBe('"tab\tvalue"\t"line\n""quoted"""');
+    expect(build([["tab\tvalue", 'line\n"quoted"']], [0, 1])).toMatchObject({
+      textPlain: '"tab\tvalue"\t"line\n""quoted"""',
+    });
   });
 
   it("escapes HTML and preserves whitespace inside table cells", () => {
-    expect(
-      copyBufferContents([[cell("<value>  one\nnext"), cell("A & B")]], [1, 0])
-        .textHtml,
-    ).toBe(
-      '<table><tbody><tr><td style="white-space: pre-wrap">A &amp; B</td><td style="white-space: pre-wrap">&lt;value&gt;  one<br>next</td></tr></tbody></table>',
+    expect(build([["<value>  one\nnext", "A & B"]], [1, 0])).toMatchObject({
+      textHtml:
+        '<table><tbody><tr><td style="white-space: pre-wrap">A &amp; B</td><td style="white-space: pre-wrap">&lt;value&gt;  one<br>next</td></tr></tbody></table>',
+    });
+  });
+
+  it("caps aggregate plain and HTML output before final joins", () => {
+    expect(build([["1234"]], [0], 87)).toBeDefined();
+    expect(() => build([["12345"]], [0], 87)).toThrow(CopyBufferLimitError);
+  });
+
+  it("accounts for escaped expansion incrementally", () => {
+    expect(() => build([["&".repeat(100)]], [0], 400)).toThrow(
+      CopyBufferLimitError,
     );
   });
 });

@@ -283,6 +283,57 @@ describe("grid layout containment", () => {
     });
   });
 
+  it("lets tiny viewport placement override Peek's normal resize floor", () => {
+    expectDeclarations(".value-peek", {
+      "min-width": "0px",
+      "min-height": "0px",
+    });
+    expect(styles).not.toMatch(/\.value-peek\s*\{[^}]*resize:/s);
+    expectDeclarations(".value-peek-resize-hint", {
+      width: "14px",
+      height: "14px",
+      cursor: "nwse-resize",
+      "touch-action": "none",
+    });
+  });
+
+  it("reserves default-width space for ordinary Peek leaf types", () => {
+    expect(styles).toMatch(
+      /\.value-tree-row\s*\{[^}]*grid-template-columns:\s*16px minmax\(36px,\s*0\.7fr\) minmax\(40px,\s*1\.3fr\) minmax\(\s*14ch,\s*1fr\s*\);/s,
+    );
+    expectDeclarations(".value-tree-preview", {
+      overflow: "hidden",
+      "text-overflow": "ellipsis",
+    });
+    expectDeclarations(".value-tree-type", {
+      overflow: "hidden",
+      "text-overflow": "ellipsis",
+    });
+  });
+
+  it("aligns the compact binary legend and rows without a content floor", () => {
+    expect(styles).toMatch(
+      /\.value-peek-binary-head,\s*\.value-peek-binary-row\s*\{[^}]*grid-template-columns:\s*8ch minmax\(0,\s*23ch\) 8ch;/s,
+    );
+    expectDeclarations(".value-peek-binary-spacer", {
+      position: "relative",
+      "min-width": "100%",
+    });
+  });
+
+  it("places scalar and binary detail directly below the root row", () => {
+    expectDeclarations(".value-tree-wrap.has-detail .value-tree", {
+      "min-height": "28px",
+      overflow: "hidden",
+      flex: "0 0 28px",
+    });
+    expectDeclarations(".value-tree-wrap.has-detail .value-peek-detail", {
+      "min-height": "0px",
+      "max-height": "none",
+      flex: "1 1 0%",
+    });
+  });
+
   it("moves only the scrolling header outside native body layout", () => {
     expect(declaration(".viewda-grid-scrolling-headers", "will-change")).toBe(
       "transform",

@@ -1,4 +1,12 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import {
+  useCallback,
+  useEffect,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
+import { Type, type DataType } from "@uwdata/flechette";
 
 import {
   cancelDataExport,
@@ -27,6 +35,7 @@ import {
 import { loadBundledEmojiFont } from "../fonts";
 import {
   decodeArrowWindow,
+  windowArrowValue,
   windowContainsRow,
   windowDataType,
   windowValue,
@@ -35,16 +44,22 @@ import {
 import { copyRowLimit } from "./copy-limit";
 import { projectedSourceIndices, projectionContains } from "./column-window";
 import { exportSelectionShape } from "./export-selection";
-import { formatCellValue, usesMonospaceCells } from "./format-cell";
+import {
+  formatTypedScalarCopyData,
+  formatTypedCellValue,
+  usesMonospaceCells,
+} from "./format-cell";
 import {
   CompactSelection,
-  copyBufferContents,
+  CopyBufferLimitError,
+  IncrementalCopyBuffer,
   type GridAddress,
   type GridCell,
   type GridColumn,
   type GridSelection,
   type Rectangle,
 } from "./grid-model";
+import { ChunkScheduler } from "./chunk-scheduler";
 import { createGridClipboard } from "./grid-clipboard";
 import {
   gridDiagnosticsNoopSink,
@@ -52,7 +67,11 @@ import {
   type GridDiagnosticsSink,
 } from "./grid-performance-report";
 import { GRID_INITIAL_COLUMNS, GRID_INITIAL_ROWS } from "./grid-layout";
-import { boundedSelectionScope, selectColumn } from "./grid-selection";
+import {
+  boundedSelectionScope,
+  selectCell,
+  selectColumn,
+} from "./grid-selection";
 import { gridFontStrings } from "./grid-typography";
 import {
   defaultFilterOperator,
@@ -80,6 +99,13 @@ import {
 import { SchemaSidebar } from "./SchemaSidebar";
 import { nextSort } from "./sort";
 import { ColumnPicker } from "./ColumnPicker";
+import { ValuePeek } from "./ValuePeek";
+import { arrowTypedValue, typedValue, type TypedValue } from "./value-format";
+import {
+  createValueCopySerializer,
+  VALUE_COPY_CHARACTER_LIMIT,
+  ValueCopyLimitError,
+} from "./value-json-serializer";
 import {
   ViewdaGrid,
   type GridViewport,
@@ -110,6 +136,7 @@ const PROJECTION_REQUEST_IDLE_MS = 120;
 // profiles if workloads eventually need different defaults.
 const SUPPLEMENT_WINDOW_MULTIPLIER = 2;
 const DEFAULT_DATA_VIEW_SETTINGS: DataViewSettings = { memoryLimit: "mb384" };
+const EMPTY_LOGICAL_DATA_TYPES: ReadonlyMap<number, DataType> = new Map();
 
 // Detect clipboard support once per webview so copy format stays consistent.
 // There is no user choice here.
@@ -170,10 +197,38 @@ interface HeaderMenu {
 
 interface GridMenu {
   bounds: Rectangle;
+  column: number;
   row: number;
   sourceIndex: number;
   left: number;
   top: number;
+}
+
+interface PeekState {
+  address: GridAddress;
+  bounds: Rectangle;
+}
+
+interface PeekValue {
+  label: string;
+  value: TypedValue;
+}
+
+interface ActiveCellValueCache {
+  sourceIndex: number;
+  row: number;
+  dataWindow: ArrowDataWindow;
+  value: TypedValue;
+  dataType: DataType;
+}
+
+interface PeekValueCache {
+  sourceIndex: number;
+  row: number;
+  dataWindow: ArrowDataWindow;
+  label: string;
+  logicalType: string | null | undefined;
+  peekValue: PeekValue;
 }
 
 type GridFilterAnchor = { kind: "header" } | { kind: "cell"; row: number };
@@ -494,6 +549,14 @@ export function DataGrid({
   const [monospaceColumns, setMonospaceColumns] = useState<ReadonlySet<number>>(
     () => new Set(),
   );
+  const [logicalSchema, setLogicalSchema] = useState<{
+    generation: number;
+    dataTypes: ReadonlyMap<number, DataType>;
+  }>(() => ({ generation: source.generation, dataTypes: new Map() }));
+  const logicalDataTypes =
+    logicalSchema.generation === source.generation
+      ? logicalSchema.dataTypes
+      : EMPTY_LOGICAL_DATA_TYPES;
   const [loadError, setLoadError] = useState<ViewErrorState | null>(null);
   const [horizontalExtentError, setHorizontalExtentError] = useState<
     string | null
@@ -503,8 +566,15 @@ export function DataGrid({
     emptySelection(),
   );
   const [copyLimit, setCopyLimit] = useState<number | null>(null);
+  const [copyingSelection, setCopyingSelection] = useState(false);
   const [headerMenu, setHeaderMenu] = useState<HeaderMenu | null>(null);
   const [gridMenu, setGridMenu] = useState<GridMenu | null>(null);
+  const [peek, setPeek] = useState<PeekState | null>(null);
+  const [resolvedPeek, setResolvedPeek] = useState<{
+    address: GridAddress;
+    value: PeekValue;
+  } | null>(null);
+  const [peekFocusRequest, setPeekFocusRequest] = useState(0);
   const [exportStatus, setExportStatus] = useState<DataExportStatus | null>(
     null,
   );
@@ -535,6 +605,9 @@ export function DataGrid({
   >(null);
   const [schemaFocusRequest, setSchemaFocusRequest] = useState(0);
   const gridRef = useRef<ViewdaGridHandle>(null);
+  useEffect(() => {
+    if (!active) setPeek(null);
+  }, [active]);
   const appliedRequestedRow = useRef<number | null>(null);
   useEffect(() => {
     if (
@@ -554,9 +627,16 @@ export function DataGrid({
   // This reuses shared columns while keeping Arrow memory bounded for wide values.
   const baseWindowRef = useRef<ArrowDataWindow | null>(null);
   const supplementWindowRef = useRef<ArrowDataWindow | null>(null);
+  const activeCellValueCacheRef = useRef<ActiveCellValueCache | null>(null);
+  const peekValueCacheRef = useRef<PeekValueCache | null>(null);
+  const [activeCellRef] = useState(() => ({
+    current: selection.current?.cell as GridAddress | undefined,
+  }));
   const visibleViewportRef = useRef<GridViewport | null>(null);
   const copyTailRef = useRef<Promise<void>>(Promise.resolve());
-  const copyWindowsRef = useRef(new Map<string, Promise<ArrowDataWindow>>());
+  const [copyWindowsRef] = useState(() => ({
+    current: new Map<string, Promise<ArrowDataWindow>>(),
+  }));
   const copyAbortRef = useRef<AbortController | null>(null);
   const pendingRequestRef = useRef<VersionedRowRequest | null>(null);
   const deferredProjectionRef = useRef<VersionedRowRequest | null>(null);
@@ -584,6 +664,29 @@ export function DataGrid({
   const onOperationChangeRef = useRef(onOperationChange);
   onOperationChangeRef.current = onOperationChange;
 
+  const replaceDataWindow = useCallback(
+    (
+      windowRef: { current: ArrowDataWindow | null },
+      next: ArrowDataWindow | null,
+    ) => {
+      const previous = windowRef.current;
+      if (
+        previous !== next &&
+        activeCellValueCacheRef.current?.dataWindow === previous
+      ) {
+        activeCellValueCacheRef.current = null;
+      }
+      if (
+        previous !== next &&
+        peekValueCacheRef.current?.dataWindow === previous
+      ) {
+        peekValueCacheRef.current = null;
+      }
+      windowRef.current = next;
+    },
+    [],
+  );
+
   useEffect(() => {
     const exportRunning = exportStarting || exportStatus?.state === "running";
     onOperationChangeRef.current?.(pendingView !== null || exportRunning);
@@ -604,6 +707,16 @@ export function DataGrid({
     [columnStates],
   );
   visibleColumnStatesRef.current = visibleColumnStates;
+  const activeCell = selection.current?.cell;
+  useLayoutEffect(() => {
+    if (
+      activeCellRef.current?.column !== activeCell?.column ||
+      activeCellRef.current?.row !== activeCell?.row
+    ) {
+      activeCellValueCacheRef.current = null;
+    }
+    activeCellRef.current = activeCell;
+  }, [activeCell, activeCellRef]);
   const hiddenCount = columnStates.length - visibleColumnStates.length;
   activeViewRef.current = activeView;
 
@@ -760,6 +873,46 @@ export function DataGrid({
     [monospaceColumns, pendingView, sort, visibleColumnStates],
   );
 
+  const materializeCellValue = useCallback(
+    (
+      dataWindow: ArrowDataWindow,
+      sourceIndex: number,
+      row: number,
+      useActiveCellCache: boolean,
+    ): { value: TypedValue; dataType: DataType } | undefined => {
+      const cache = activeCellValueCacheRef.current;
+      if (
+        useActiveCellCache &&
+        cache !== null &&
+        cache.sourceIndex === sourceIndex &&
+        cache.row === row &&
+        cache.dataWindow === dataWindow
+      ) {
+        return cache;
+      }
+      const dataType = windowDataType(dataWindow, sourceIndex);
+      if (dataType === undefined) return undefined;
+      const arrowValue = windowArrowValue(dataWindow, sourceIndex, row);
+      const result = {
+        value:
+          arrowValue === undefined
+            ? typedValue(windowValue(dataWindow, sourceIndex, row), dataType)
+            : arrowTypedValue(arrowValue),
+        dataType,
+      };
+      if (useActiveCellCache) {
+        activeCellValueCacheRef.current = {
+          sourceIndex,
+          row,
+          dataWindow,
+          ...result,
+        };
+      }
+      return result;
+    },
+    [],
+  );
+
   const readCell = useCallback(
     (
       window: ArrowDataWindow,
@@ -772,13 +925,20 @@ export function DataGrid({
       if (column === undefined || !windowContainsRow(window, row)) {
         return loadingCell();
       }
-      const dataType = windowDataType(window, column.sourceIndex);
-      if (dataType === undefined) {
-        return loadingCell();
-      }
-      const formatted = formatCellValue(
-        windowValue(window, column.sourceIndex, row),
-        dataType,
+      const activeCell = activeCellRef.current;
+      const cacheActiveCell =
+        !includeRawCopy &&
+        activeCell?.column === visibleColumn &&
+        activeCell.row === row;
+      const materialized = materializeCellValue(
+        window,
+        column.sourceIndex,
+        row,
+        cacheActiveCell,
+      );
+      if (materialized === undefined) return loadingCell();
+      const formatted = formatTypedCellValue(
+        materialized.value,
         includeRawCopy,
       );
       return {
@@ -787,9 +947,12 @@ export function DataGrid({
         copyData: formatted.copyData,
         alignment: formatted.align,
         faded: formatted.faded,
+        ...(formatted.segments === undefined
+          ? {}
+          : { segments: formatted.segments }),
       };
     },
-    [visibleColumnStates],
+    [materializeCellValue, visibleColumnStates],
   );
 
   const getCellContent = useCallback(
@@ -808,6 +971,87 @@ export function DataGrid({
       return base === null ? loadingCell() : readCell(base, column, row);
     },
     [readCell],
+  );
+
+  const readPeekValue = useCallback(
+    (address: GridAddress): PeekValue | undefined => {
+      const column = visibleColumnStatesRef.current[address.column];
+      if (column === undefined) return undefined;
+      const supplement = supplementWindowRef.current;
+      const base = baseWindowRef.current;
+      const dataWindow =
+        supplement !== null &&
+        windowContainsRow(supplement, address.row) &&
+        supplement.sourceColumnOffsets.has(column.sourceIndex)
+          ? supplement
+          : base;
+      if (dataWindow === null || !windowContainsRow(dataWindow, address.row)) {
+        return undefined;
+      }
+      const materialized = materializeCellValue(
+        dataWindow,
+        column.sourceIndex,
+        address.row,
+        true,
+      );
+      if (materialized === undefined) return undefined;
+      const logicalType = schema[column.sourceIndex]?.logicalType;
+      const cached = peekValueCacheRef.current;
+      if (
+        cached !== null &&
+        cached.dataWindow === dataWindow &&
+        cached.sourceIndex === column.sourceIndex &&
+        cached.row === address.row &&
+        cached.label === column.title &&
+        cached.logicalType === logicalType
+      ) {
+        return cached.peekValue;
+      }
+      const peekValue = {
+        label: column.title,
+        value:
+          materialized.value.kind === "arrow"
+            ? arrowTypedValue(materialized.value, logicalType)
+            : materialized.value.kind === "value"
+              ? typedValue(
+                  materialized.value.value,
+                  materialized.dataType,
+                  logicalType,
+                )
+              : materialized.value,
+      };
+      peekValueCacheRef.current = {
+        sourceIndex: column.sourceIndex,
+        row: address.row,
+        dataWindow,
+        label: column.title,
+        logicalType,
+        peekValue,
+      };
+      return peekValue;
+    },
+    [materializeCellValue, schema],
+  );
+
+  const openPeek = useCallback(
+    (
+      address: GridAddress,
+      bounds: Rectangle,
+      behavior: "toggle" | "open" = "toggle",
+    ) => {
+      setHeaderMenu(null);
+      setGridMenu(null);
+      setFilterEditor(null);
+      setPeek((current) =>
+        behavior === "toggle" &&
+        current !== null &&
+        current.address.row === address.row &&
+        current.address.column === address.column
+          ? null
+          : { address, bounds },
+      );
+    },
+    [],
   );
 
   const queueRequestTrace = useCallback(
@@ -873,17 +1117,18 @@ export function DataGrid({
       clearDeferredProjection("invalidatedBeforeStart");
       failedRequestRef.current = null;
       desiredRequestRef.current = null;
-      baseWindowRef.current = null;
-      supplementWindowRef.current = null;
+      replaceDataWindow(baseWindowRef, null);
+      replaceDataWindow(supplementWindowRef, null);
       copyWindowsRef.current.clear();
       copyAbortRef.current?.abort();
       setSelection(emptySelection());
       setCopyLimit(null);
       setHeaderMenu(null);
       setGridMenu(null);
+      setPeek(null);
       setContentRevision((current) => current + 1);
     },
-    [clearDeferredProjection, diagnostics],
+    [clearDeferredProjection, diagnostics, replaceDataWindow],
   );
 
   const drainRequests = useCallback(async () => {
@@ -951,6 +1196,18 @@ export function DataGrid({
           });
           return next.size === current.size ? current : next;
         });
+        setLogicalSchema((current) => {
+          const next = new Map(
+            current.generation === source.generation
+              ? current.dataTypes
+              : EMPTY_LOGICAL_DATA_TYPES,
+          );
+          decoded.table.schema.fields.forEach((field, columnOffset) => {
+            const sourceIndex = decoded.sourceIndices[columnOffset];
+            if (sourceIndex !== undefined) next.set(sourceIndex, field.type);
+          });
+          return { generation: source.generation, dataTypes: next };
+        });
         if (fullySatisfiesDesired) {
           const pending =
             pendingRequestRef.current as VersionedRowRequest | null;
@@ -964,10 +1221,10 @@ export function DataGrid({
           clearDeferredProjection("satisfiedByCompletedWindow");
         }
         if (request.cacheSlot === "rowWindow") {
-          baseWindowRef.current = decoded;
-          supplementWindowRef.current = null;
+          replaceDataWindow(baseWindowRef, decoded);
+          replaceDataWindow(supplementWindowRef, null);
         } else {
-          supplementWindowRef.current = decoded;
+          replaceDataWindow(supplementWindowRef, decoded);
         }
         failedRequestRef.current = null;
         setContentRevision((current) => current + 1);
@@ -1076,6 +1333,7 @@ export function DataGrid({
     diagnostics,
     promoteView,
     queueRequestTrace,
+    replaceDataWindow,
     source.generation,
   ]);
 
@@ -1325,8 +1583,8 @@ export function DataGrid({
     pendingRequestRef.current = null;
     clearDeferredProjection("invalidatedBeforeStart");
     desiredRequestRef.current = null;
-    baseWindowRef.current = null;
-    supplementWindowRef.current = null;
+    replaceDataWindow(baseWindowRef, null);
+    replaceDataWindow(supplementWindowRef, null);
     setContentRevision((current) => current + 1);
     if (active.rowCount === 0) {
       return;
@@ -1336,7 +1594,7 @@ export function DataGrid({
       visible?.rowStart ?? 0,
       visible?.rowCount ?? Math.min(GRID_INITIAL_ROWS, active.rowCount),
     );
-  }, [clearDeferredProjection, diagnostics, requestRows]);
+  }, [clearDeferredProjection, diagnostics, replaceDataWindow, requestRows]);
 
   useEffect(() => {
     const previous = previousProjectionRef.current;
@@ -1344,7 +1602,6 @@ export function DataGrid({
     if (previous === null) {
       return;
     }
-    copyAbortRef.current?.abort();
     if (
       previous.length === visibleSourceIndices.length &&
       projectionContains(previous, visibleSourceIndices)
@@ -1355,6 +1612,7 @@ export function DataGrid({
       }
       return;
     }
+    copyAbortRef.current?.abort();
     projectionRevisionRef.current += 1;
     diagnostics.disposeRequest(
       pendingRequestRef.current?.traceId ?? null,
@@ -1364,14 +1622,19 @@ export function DataGrid({
     clearDeferredProjection("invalidatedBeforeStart");
     failedRequestRef.current = null;
     desiredRequestRef.current = null;
-    baseWindowRef.current = null;
-    supplementWindowRef.current = null;
+    replaceDataWindow(baseWindowRef, null);
+    replaceDataWindow(supplementWindowRef, null);
     copyWindowsRef.current.clear();
     setLoadError(null);
     setSelection(clearColumnSelection);
     setCopyLimit(null);
     setContentRevision((current) => current + 1);
-  }, [clearDeferredProjection, diagnostics, visibleSourceIndices]);
+  }, [
+    clearDeferredProjection,
+    diagnostics,
+    replaceDataWindow,
+    visibleSourceIndices,
+  ]);
 
   useEffect(() => {
     setHeaderMenu((current) =>
@@ -1778,6 +2041,7 @@ export function DataGrid({
       setViewError(null);
       setHeaderMenu(null);
       setFilterEditor(null);
+      setPeek(null);
       setWherePopupOpen(false);
       setSortPopupOpen(false);
 
@@ -1923,7 +2187,6 @@ export function DataGrid({
     (
       row: number,
       selectedSourceIndices: readonly number[],
-      abortSignal: AbortSignal,
     ): Promise<ArrowDataWindow> => {
       const offset = Math.floor(row / COPY_CHUNK_ROWS) * COPY_CHUNK_ROWS;
       const view = activeViewRef.current;
@@ -1938,9 +2201,6 @@ export function DataGrid({
 
       const count = Math.min(COPY_CHUNK_ROWS, view.rowCount - offset);
       const request = copyTailRef.current.then(async () => {
-        if (abortSignal.aborted) {
-          throw new DOMException("Copy was cancelled.", "AbortError");
-        }
         const bytes = await getDataWindow(
           source.generation,
           view.revision,
@@ -1968,38 +2228,178 @@ export function DataGrid({
     [source.generation],
   );
 
-  const loadCopyCells = useCallback(
-    async (
+  const loadCopyContents = useCallback(
+    (
       rows: readonly number[],
       columnIndices: readonly number[],
       abortSignal: AbortSignal,
-    ): Promise<GridCell[][]> => {
+    ) => {
       const selectedColumns = columnIndices.flatMap((index) => {
         const column = visibleColumnStates[index];
         return column === undefined ? [] : [column];
       });
       const sourceIndices = selectedColumns.map((column) => column.sourceIndex);
-      const windows = new Map<number, ArrowDataWindow>();
-      const cells: GridCell[][] = [];
-      for (const row of rows) {
-        if (abortSignal.aborted) {
-          throw new DOMException("Copy was cancelled.", "AbortError");
-        }
-        const offset = Math.floor(row / COPY_CHUNK_ROWS) * COPY_CHUNK_ROWS;
-        let dataWindow = windows.get(offset);
-        if (dataWindow === undefined) {
-          dataWindow = await loadCopyWindow(row, sourceIndices, abortSignal);
-          windows.set(offset, dataWindow);
-        }
-        cells.push(
-          selectedColumns.map((_, column) =>
-            readCell(dataWindow, column, row, selectedColumns, true),
-          ),
-        );
-      }
-      return cells;
+      const scheduler = new ChunkScheduler();
+      const buffer = new IncrementalCopyBuffer();
+      return new Promise<{ textPlain: string; textHtml: string }>(
+        (resolve, reject) => {
+          let rowIndex = 0;
+          let columnIndex = 0;
+          let dataWindow: ArrowDataWindow | null = null;
+          let serializer: ReturnType<typeof createValueCopySerializer> | null =
+            null;
+          let cellPending = false;
+          let settled = false;
+          const settle = (
+            result:
+              | { contents: { textPlain: string; textHtml: string } }
+              | { error: unknown },
+          ) => {
+            if (settled) return;
+            settled = true;
+            abortSignal.removeEventListener("abort", cancel);
+            scheduler.cancel();
+            if ("error" in result) reject(result.error);
+            else resolve(result.contents);
+          };
+          const cancel = () =>
+            settle({
+              error: new DOMException("Copy was cancelled.", "AbortError"),
+            });
+          if (abortSignal.aborted) {
+            cancel();
+            return;
+          }
+          abortSignal.addEventListener("abort", cancel, { once: true });
+          scheduler.start({
+            runChunk: (deadline, maxUnits) => {
+              try {
+                let units = 0;
+                while (
+                  rowIndex < rows.length &&
+                  units < maxUnits &&
+                  (units === 0 || performance.now() < deadline)
+                ) {
+                  throwIfCopyAborted(abortSignal);
+                  const row = rows[rowIndex]!;
+                  const expectedOffset =
+                    Math.floor(row / COPY_CHUNK_ROWS) * COPY_CHUNK_ROWS;
+                  if (dataWindow?.rowOffset !== expectedOffset) {
+                    scheduler.pause();
+                    void loadCopyWindow(row, sourceIndices).then(
+                      (loaded) => {
+                        if (abortSignal.aborted) {
+                          cancel();
+                          return;
+                        }
+                        dataWindow = loaded;
+                        scheduler.resume();
+                      },
+                      (error: unknown) => settle({ error }),
+                    );
+                    return false;
+                  }
+                  if (serializer !== null) {
+                    const previousUnits = serializer.units;
+                    const serialized = serializer.stepUntil(
+                      deadline,
+                      () => performance.now(),
+                      Math.max(1, maxUnits - units),
+                    );
+                    units += serializer.units - previousUnits;
+                    if (serialized.status === "pending") return false;
+                    if (serialized.status === "limit") {
+                      settle({
+                        error: new CopyBufferLimitError(
+                          VALUE_COPY_CHARACTER_LIMIT,
+                        ),
+                      });
+                      return true;
+                    }
+                    buffer.beginCell(
+                      serialized.text,
+                      columnIndex === 0,
+                      rowIndex === 0,
+                    );
+                    serializer = null;
+                    cellPending = true;
+                  }
+                  if (cellPending) {
+                    if (
+                      units >= maxUnits ||
+                      (units > 0 && performance.now() >= deadline)
+                    ) {
+                      return false;
+                    }
+                    const step = buffer.stepCell(
+                      deadline,
+                      Math.max(1, maxUnits - units),
+                    );
+                    units += step.units;
+                    if (!step.done) return false;
+                    cellPending = false;
+                    columnIndex += 1;
+                    if (columnIndex >= selectedColumns.length) {
+                      buffer.endRow();
+                      columnIndex = 0;
+                      rowIndex += 1;
+                    }
+                    continue;
+                  }
+                  const selected = selectedColumns[columnIndex];
+                  const materialized =
+                    selected === undefined
+                      ? undefined
+                      : materializeCellValue(
+                          dataWindow,
+                          selected.sourceIndex,
+                          row,
+                          false,
+                        );
+                  units += 1;
+                  if (materialized === undefined) {
+                    buffer.beginCell("", columnIndex === 0, rowIndex === 0);
+                    cellPending = true;
+                    continue;
+                  }
+                  const nested = isNestedDataType(materialized.dataType);
+                  const streamingRaw =
+                    isStreamingRawCopyType(materialized.dataType) &&
+                    (materialized.value.kind === "arrow" ||
+                      materialized.dataType.typeId === Type.Dictionary);
+                  if (nested || streamingRaw) {
+                    serializer = createValueCopySerializer(
+                      {
+                        value: materialized.value,
+                        format: nested ? "json" : "raw",
+                      },
+                      buffer.remainingCharacters,
+                    );
+                    continue;
+                  }
+                  buffer.beginCell(
+                    formatTypedScalarCopyData(materialized.value),
+                    columnIndex === 0,
+                    rowIndex === 0,
+                  );
+                  cellPending = true;
+                }
+                if (rowIndex >= rows.length) {
+                  throwIfCopyAborted(abortSignal);
+                  settle({ contents: buffer.finish() });
+                  return true;
+                }
+                return false;
+              } catch (error) {
+                settle({ error });
+                return true;
+              }
+            },
+          });
+        },
+      );
     },
-    [loadCopyWindow, readCell, visibleColumnStates],
+    [loadCopyWindow, materializeCellValue, visibleColumnStates],
   );
 
   const copySelection = useCallback(
@@ -2016,38 +2416,59 @@ export function DataGrid({
       copyAbortRef.current?.abort();
       const abortController = new AbortController();
       copyAbortRef.current = abortController;
+      setCopyingSelection(true);
       setCopyLimit(shape.truncated ? shape.rowLimit : null);
-      const contents = loadCopyCells(
+      const contents = loadCopyContents(
         shape.rows,
         shape.columnIndices,
         abortController.signal,
-      ).then((cells) =>
-        copyBufferContents(
-          cells,
-          shape.columnIndices.map((_, index) => index),
-        ),
       );
       void gridClipboard
         .write(contents)
         .catch((error: unknown) => {
           if (!(error instanceof DOMException && error.name === "AbortError")) {
             failedRequestRef.current = null;
-            setLoadError({ message: "The selection could not be copied." });
+            setLoadError({
+              message:
+                error instanceof ValueCopyLimitError ||
+                error instanceof CopyBufferLimitError
+                  ? error.message
+                  : "The selection could not be copied.",
+            });
           }
         })
         .finally(() => {
           if (copyAbortRef.current === abortController) {
             copyAbortRef.current = null;
+            setCopyingSelection(false);
           }
         });
     },
-    [gridRowCount, loadCopyCells, selection, visibleColumnStates.length],
+    [gridRowCount, loadCopyContents, selection, visibleColumnStates.length],
   );
 
   const updateSelection = useCallback((next: GridSelection) => {
     setSelection(next);
     setCopyLimit(null);
+    const address = next.current?.cell;
+    if (address !== undefined) {
+      setPeek((current) => (current === null ? null : { ...current, address }));
+    }
   }, []);
+
+  const updatePeekBounds = useCallback(
+    (address: GridAddress, bounds: Rectangle) => {
+      setPeek((current) =>
+        current === null ||
+        current.address.row !== address.row ||
+        current.address.column !== address.column ||
+        sameRectangle(current.bounds, bounds)
+          ? current
+          : { ...current, bounds },
+      );
+    },
+    [],
+  );
 
   const resizeColumn = useCallback((visibleIndex: number, width: number) => {
     const sourceIndex =
@@ -2105,13 +2526,17 @@ export function DataGrid({
             row < sampleEnd;
             row += 1
           ) {
-            displayData.push(
-              formatCellValue(
-                windowValue(dataWindow, column.sourceIndex, row),
-                dataType,
-                false,
-              ).displayData,
+            const value = materializeCellValue(
+              dataWindow,
+              column.sourceIndex,
+              row,
+              false,
             );
+            if (value !== undefined) {
+              displayData.push(
+                formatTypedCellValue(value.value, false).displayData,
+              );
+            }
           }
         }
         widths.set(
@@ -2134,7 +2559,7 @@ export function DataGrid({
         }),
       );
     },
-    [],
+    [materializeCellValue],
   );
 
   const setColumnVisibility = useCallback(
@@ -2326,6 +2751,24 @@ export function DataGrid({
       : columnStates.find(
           (column) => column.sourceIndex === headerMenu.sourceIndex,
         );
+  const peekValue = resolvedPeek?.value;
+  const peekLoading =
+    peek !== null &&
+    (resolvedPeek === null ||
+      resolvedPeek.address.row !== peek.address.row ||
+      resolvedPeek.address.column !== peek.address.column);
+
+  useEffect(() => {
+    if (peek === null) {
+      peekValueCacheRef.current = null;
+      setResolvedPeek(null);
+      return;
+    }
+    const value = readPeekValue(peek.address);
+    if (value !== undefined) {
+      setResolvedPeek({ address: peek.address, value });
+    }
+  }, [contentRevision, peek, readPeekValue]);
   const filterEditorField =
     filterEditor === null ? undefined : schema[filterEditor.sourceIndex];
   const exportBusy = exportStarting || exportStatus?.state === "running";
@@ -2629,8 +3072,10 @@ export function DataGrid({
         </button>
       </div>
       {((hiddenCount > 0 && visibleColumnStates.length > 0) ||
-        copyLimit !== null) && (
+        copyLimit !== null ||
+        copyingSelection) && (
         <div className="grid-controls">
+          {copyingSelection && <span role="status">Preparing copy…</span>}
           {copyLimit !== null && (
             <span role="status">
               {`This operation is limited to the first ${copyLimit.toLocaleString()} rows of the selection.`}
@@ -2676,6 +3121,7 @@ export function DataGrid({
           open={sidebarOpen}
           selectedColumn={selectedSchemaColumn}
           source={schemaSource}
+          dataTypes={logicalDataTypes}
           onSelectColumn={selectSchemaColumn}
         />
         {visibleColumnStates.length === 0 ? (
@@ -2708,6 +3154,16 @@ export function DataGrid({
               onSelectionChange={updateSelection}
               getCellContent={getCellContent}
               onCopy={copySelection}
+              onCellPeek={openPeek}
+              onActiveCellBoundsChange={
+                !active || peek === null ? undefined : updatePeekBounds
+              }
+              onPeekFocus={
+                !active || peekValue === undefined
+                  ? undefined
+                  : () => setPeekFocusRequest((current) => current + 1)
+              }
+              onScrollInteraction={() => setPeek(null)}
               onCellContextMenu={(cell, bounds) => {
                 const sourceIndex =
                   visibleColumnStates[cell.column]?.sourceIndex;
@@ -2717,6 +3173,7 @@ export function DataGrid({
                 setHeaderMenu(null);
                 setGridMenu({
                   bounds,
+                  column: cell.column,
                   row: cell.row,
                   sourceIndex,
                   left: Math.max(
@@ -2831,11 +3288,26 @@ export function DataGrid({
                 setHeaderMenu(null);
                 setGridMenu(null);
                 setFilterEditor(null);
+                setPeek(null);
               }}
             />
           </div>
         )}
       </div>
+      {active && peek !== null && peekValue !== undefined && (
+        <ValuePeek
+          value={peekValue.value}
+          label={peekValue.label}
+          anchor={peek.bounds}
+          focusRequest={peekFocusRequest}
+          loading={peekLoading}
+          onClose={() => setPeek(null)}
+          onReturnFocus={() => gridRef.current?.focus()}
+          onCopyIntent={(text) =>
+            gridClipboard.writeText(text).then(() => undefined)
+          }
+        />
+      )}
       {wherePopupOpen && (
         <div
           ref={wherePopupRef}
@@ -2927,9 +3399,23 @@ export function DataGrid({
           ref={gridMenuRef}
           className="grid-menu"
           role="menu"
-          aria-label="Data export"
+          aria-label="Cell actions"
           style={{ left: gridMenu.left, top: gridMenu.top }}
         >
+          <button
+            type="button"
+            role="menuitem"
+            onClick={() => {
+              const address = { column: gridMenu.column, row: gridMenu.row };
+              setSelection(selectCell(selection, address, false, false));
+              setPeek({ address, bounds: gridMenu.bounds });
+              setGridMenu(null);
+              gridRef.current?.focus();
+            }}
+          >
+            Peek
+            <span className="menu-shortcut">Space</span>
+          </button>
           <button
             type="button"
             role="menuitem"
@@ -3141,6 +3627,12 @@ function formatBytes(bytes: number): string {
 
 const EXPORT_CANCELLED_MESSAGE = "Export cancelled · no file written.";
 
+function throwIfCopyAborted(signal: AbortSignal): void {
+  if (signal.aborted) {
+    throw new DOMException("Copy was cancelled.", "AbortError");
+  }
+}
+
 function exportUiErrorMessage(error: ExportUiError): string {
   if (error.action === "status") {
     return "Viewda could not refresh the export status.";
@@ -3246,6 +3738,46 @@ function clearColumnSelection(selection: GridSelection): GridSelection {
     cleared.rowAnchor = selection.rowAnchor;
   }
   return cleared;
+}
+
+function sameRectangle(left: Rectangle, right: Rectangle): boolean {
+  return (
+    left.x === right.x &&
+    left.y === right.y &&
+    left.width === right.width &&
+    left.height === right.height
+  );
+}
+
+function isNestedDataType(dataType: DataType): boolean {
+  if (dataType.typeId === Type.Dictionary) {
+    return isNestedDataType(dataType.dictionary);
+  }
+  const type = dataType;
+  return (
+    type.typeId === Type.List ||
+    type.typeId === Type.LargeList ||
+    type.typeId === Type.FixedSizeList ||
+    type.typeId === Type.ListView ||
+    type.typeId === Type.LargeListView ||
+    type.typeId === Type.Struct ||
+    type.typeId === Type.Map
+  );
+}
+
+function isStreamingRawCopyType(dataType: DataType): boolean {
+  if (dataType.typeId === Type.Dictionary) {
+    return isStreamingRawCopyType(dataType.dictionary);
+  }
+  return (
+    dataType.typeId === Type.Utf8 ||
+    dataType.typeId === Type.LargeUtf8 ||
+    dataType.typeId === Type.Binary ||
+    dataType.typeId === Type.LargeBinary ||
+    dataType.typeId === Type.FixedSizeBinary ||
+    dataType.typeId === Type.Utf8View ||
+    dataType.typeId === Type.BinaryView
+  );
 }
 
 function gridAnchorIsMounted(

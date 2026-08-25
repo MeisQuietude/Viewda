@@ -6,7 +6,18 @@ import {
   waitFor,
   within,
 } from "@testing-library/react";
-import { int32, list, TimeUnit, timestamp, utf8 } from "@uwdata/flechette";
+import {
+  binary,
+  dictionary,
+  int32,
+  list,
+  struct,
+  tableFromArrays,
+  tableToIPC,
+  TimeUnit,
+  timestamp,
+  utf8,
+} from "@uwdata/flechette";
 import { act } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -563,6 +574,108 @@ describe("DataGrid window rendering", () => {
     ]);
   });
 
+  it("formats scalar range cells only through the copy boundary", async () => {
+    const toString = vi.fn(() => "raw");
+    decodeArrowWindow.mockImplementation(
+      (
+        _bytes: ArrayBuffer,
+        rowOffset: number,
+        sourceIndices: readonly number[],
+      ): ArrowDataWindow => ({
+        rowOffset,
+        rowCount: 512,
+        sourceIndices,
+        sourceColumnOffsets: new Map(
+          sourceIndices.map((sourceIndex, offset) => [sourceIndex, offset]),
+        ),
+        table: {
+          schema: {
+            fields: sourceIndices.map(() => ({ type: utf8() })),
+          },
+          getChildAt: () => ({ at: () => ({ toString }) }),
+        } as unknown as ArrowDataWindow["table"],
+      }),
+    );
+    render(<DataGrid source={source} />);
+    await waitFor(() => expect(desktop.getDataWindow).toHaveBeenCalledOnce());
+    act(() => {
+      gridMock.props?.onSelectionChange({
+        columns: CompactSelection.empty(),
+        rows: CompactSelection.empty(),
+        current: {
+          cell: { row: 0, column: 0 },
+          range: { x: 0, y: 0, width: 1, height: 1 },
+          rangeStack: [],
+        },
+      });
+    });
+
+    copyFromGrid();
+
+    await waitFor(() => expect(clipboardWrite).toHaveBeenCalledWith("raw"));
+    expect(toString).toHaveBeenCalledOnce();
+  });
+
+  it("copies cached dictionary strings and binary through multiple scheduler ticks", async () => {
+    const text = `prefix-${"x".repeat(3 * 1024 * 1024)}-tail`;
+    const payload = new Uint8Array(2 * 1024 * 1024);
+    const bytes = tableToIPC(
+      tableFromArrays(
+        { text: [text], payload: [payload] },
+        {
+          types: {
+            text: dictionary(utf8()),
+            payload: dictionary(binary()),
+          },
+        },
+      ),
+      { format: "stream" },
+    );
+    const actualArrowWindow =
+      await vi.importActual<typeof import("./arrow-window")>("./arrow-window");
+    decodeArrowWindow.mockImplementation(actualArrowWindow.decodeArrowWindow);
+    vi.mocked(desktop.getDataWindow).mockResolvedValue(
+      Uint8Array.from(bytes!).buffer,
+    );
+    const dictionarySource: desktop.SourceSummary = {
+      ...source,
+      rowCount: 1,
+      columnCount: 2,
+      schema: source.schema.slice(0, 2),
+      schemaNodeCount: 2,
+    };
+    render(<DataGrid source={dictionarySource} />);
+    await waitFor(() => expect(desktop.getDataWindow).toHaveBeenCalledOnce());
+    act(() => {
+      gridMock.props?.onSelectionChange({
+        columns: CompactSelection.empty(),
+        rows: CompactSelection.empty(),
+        current: {
+          cell: { row: 0, column: 0 },
+          range: { x: 0, y: 0, width: 2, height: 1 },
+          rangeStack: [],
+        },
+      });
+    });
+
+    const schedule = vi.spyOn(globalThis, "setTimeout");
+    try {
+      copyFromGrid();
+      expect(clipboardWrite).not.toHaveBeenCalled();
+      await waitFor(() => expect(clipboardWrite).toHaveBeenCalledOnce(), {
+        timeout: 5_000,
+      });
+
+      expect(
+        schedule.mock.calls.filter(([, delay]) => delay === 0).length,
+      ).toBeGreaterThan(1);
+      const base64 = `${"AAAA".repeat(Math.floor(payload.length / 3))}AAA=`;
+      expect(clipboardWrite).toHaveBeenCalledWith(`${text}\t${base64}`);
+    } finally {
+      schedule.mockRestore();
+    }
+  });
+
   it("loads only selected columns when copying from a prepared view", async () => {
     render(<DataGrid source={source} />);
     await waitFor(() => expect(desktop.getDataWindow).toHaveBeenCalledOnce());
@@ -628,6 +741,32 @@ describe("DataGrid window rendering", () => {
 
     await waitFor(() => expect(clipboardWrite).toHaveBeenCalledOnce());
     expect(desktop.getDataWindow).toHaveBeenCalledOnce();
+  });
+
+  it("lets only the latest copy write after a shared delayed window resolves", async () => {
+    render(<DataGrid source={source} />);
+    await waitFor(() => expect(desktop.getDataWindow).toHaveBeenCalledOnce());
+    vi.mocked(desktop.getDataWindow).mockClear();
+    const copyWindow = deferred<ArrayBuffer>();
+    vi.mocked(desktop.getDataWindow).mockReturnValueOnce(copyWindow.promise);
+    act(() => {
+      gridMock.props?.onSelectionChange({
+        columns: CompactSelection.empty(),
+        rows: CompactSelection.empty(),
+        current: {
+          cell: { row: 1_000, column: 0 },
+          range: { x: 0, y: 1_000, width: 1, height: 1 },
+          rangeStack: [],
+        },
+      });
+    });
+
+    copyFromGrid();
+    await waitFor(() => expect(desktop.getDataWindow).toHaveBeenCalledOnce());
+    copyFromGrid();
+    copyWindow.resolve(new ArrayBuffer(0));
+
+    await waitFor(() => expect(clipboardWrite).toHaveBeenCalledOnce());
   });
 
   it("keeps loaded cells populated without duplicate prefetches", async () => {
@@ -1591,6 +1730,111 @@ describe("DataGrid window rendering", () => {
     expect(unreadTail).not.toHaveBeenCalled();
   });
 
+  it("prepares a multi-megabyte nested grid copy incrementally", async () => {
+    const nestedSource: desktop.SourceSummary = {
+      ...source,
+      rowCount: 1,
+      schema: [source.schema[0]!],
+    };
+    const nestedValue = ["x".repeat(2 * 1024 * 1024)];
+    decodeArrowWindow.mockImplementation(
+      (
+        _bytes: ArrayBuffer,
+        rowOffset: number,
+        sourceIndices: readonly number[],
+      ): ArrowDataWindow => ({
+        rowOffset,
+        rowCount: 1,
+        sourceIndices,
+        sourceColumnOffsets: new Map([[0, 0]]),
+        table: {
+          schema: { fields: [{ type: list(utf8()) }] },
+          getChildAt: () => ({ at: () => nestedValue }),
+        } as unknown as ArrowDataWindow["table"],
+      }),
+    );
+    render(<DataGrid source={nestedSource} />);
+    await waitFor(() => expect(desktop.getDataWindow).toHaveBeenCalledOnce());
+    act(() => {
+      gridMock.props?.onSelectionChange({
+        columns: CompactSelection.empty(),
+        rows: CompactSelection.empty(),
+        current: {
+          cell: { row: 0, column: 0 },
+          range: { x: 0, y: 0, width: 1, height: 1 },
+          rangeStack: [],
+        },
+      });
+    });
+
+    copyFromGrid();
+    expect(screen.getByText("Preparing copy…")).toBeInTheDocument();
+    await waitFor(() => expect(clipboardWrite).toHaveBeenCalledOnce(), {
+      timeout: 5_000,
+    });
+
+    const copied = clipboardWrite.mock.calls[0]?.[0] as string;
+    expect(copied.startsWith('"')).toBe(true);
+    expect(copied.endsWith('"')).toBe(true);
+    expect(JSON.parse(copied.slice(1, -1).replaceAll('""', '"'))).toEqual(
+      nestedValue,
+    );
+    expect(screen.queryByText("Preparing copy…")).not.toBeInTheDocument();
+  });
+
+  it("copies a 10k nested range in bounded shared scheduler ticks", async () => {
+    const nestedSource: desktop.SourceSummary = {
+      ...source,
+      schema: [source.schema[0]!],
+    };
+    decodeArrowWindow.mockImplementation(
+      (
+        _bytes: ArrayBuffer,
+        rowOffset: number,
+        sourceIndices: readonly number[],
+      ): ArrowDataWindow => ({
+        rowOffset,
+        rowCount: Math.min(512, nestedSource.rowCount - rowOffset),
+        sourceIndices,
+        sourceColumnOffsets: new Map([[0, 0]]),
+        table: {
+          schema: { fields: [{ type: list(int32()) }] },
+          getChildAt: () => ({ at: (row: number) => [rowOffset + row] }),
+        } as unknown as ArrowDataWindow["table"],
+      }),
+    );
+    render(<DataGrid source={nestedSource} />);
+    await waitFor(() => expect(desktop.getDataWindow).toHaveBeenCalledOnce());
+    act(() => {
+      gridMock.props?.onSelectionChange({
+        columns: CompactSelection.empty(),
+        rows: CompactSelection.empty(),
+        current: {
+          cell: { row: 0, column: 0 },
+          range: { x: 0, y: 0, width: 1, height: 10_000 },
+          rangeStack: [],
+        },
+      });
+    });
+    let time = 0;
+    vi.spyOn(performance, "now").mockImplementation(() => {
+      time += 0.001;
+      return time;
+    });
+    const timers = vi.spyOn(globalThis, "setTimeout");
+
+    copyFromGrid();
+    await waitFor(() => expect(clipboardWrite).toHaveBeenCalledOnce(), {
+      timeout: 5_000,
+    });
+
+    expect(clipboardWrite).toHaveBeenCalledOnce();
+    const copied = clipboardWrite.mock.calls[0]?.[0] as string;
+    expect(copied.split("\n")).toHaveLength(10_000);
+    expect(timers.mock.calls.length).toBeGreaterThan(1);
+    expect(timers.mock.calls.length).toBeLessThan(100);
+  });
+
   it("maps renderer sort intents to source columns", async () => {
     render(<DataGrid source={source} />);
 
@@ -2158,6 +2402,33 @@ describe("DataGrid window rendering", () => {
   it("does not apply a window returned for a stale view revision", async () => {
     const staleWindow = deferred<ArrayBuffer>();
     const currentWindow = deferred<ArrayBuffer>();
+    decodeArrowWindow.mockImplementation(
+      (
+        bytes: ArrayBuffer,
+        rowOffset: number,
+        sourceIndices: readonly number[],
+      ): ArrowDataWindow => ({
+        rowOffset,
+        rowCount: 3,
+        sourceIndices,
+        sourceColumnOffsets: new Map(
+          sourceIndices.map((sourceIndex, offset) => [sourceIndex, offset]),
+        ),
+        table: {
+          schema: {
+            fields: sourceIndices.map(() => ({
+              type:
+                bytes.byteLength === 2
+                  ? struct({ stale_child: utf8() })
+                  : bytes.byteLength === 3
+                    ? int32()
+                    : utf8(),
+            })),
+          },
+          getChildAt: () => ({ at: (row: number) => `row ${row}` }),
+        } as unknown as ArrowDataWindow["table"],
+      }),
+    );
     vi.mocked(desktop.getDataWindow)
       .mockResolvedValueOnce(new ArrayBuffer(1))
       .mockReturnValueOnce(staleWindow.promise)
@@ -2181,9 +2452,12 @@ describe("DataGrid window rendering", () => {
 
     await waitFor(() => expect(desktop.getDataWindow).toHaveBeenCalledTimes(3));
     expect(gridMock.revisionChanged).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole("button", { name: "Schema" }));
+    expect(screen.queryByText("stale_child")).not.toBeInTheDocument();
 
     await act(async () => currentWindow.resolve(new ArrayBuffer(3)));
     await waitFor(() => expect(gridMock.revisionChanged).toHaveBeenCalled());
+    expect(screen.getAllByTitle("int32").length).toBeGreaterThan(0);
   });
 
   it("defers horizontal projection work and prioritizes the latest row window", async () => {
@@ -3189,6 +3463,765 @@ describe("DataGrid window rendering", () => {
     expect(gridMock.scrollToColumn).toHaveBeenCalledWith(0, 16);
   });
 
+  it("keeps Peek open and updates it as the active cell moves", async () => {
+    const view = render(<DataGrid source={source} />);
+    await waitFor(() => expect(desktop.getDataWindow).toHaveBeenCalledOnce());
+    const first = {
+      columns: CompactSelection.empty(),
+      rows: CompactSelection.empty(),
+      current: {
+        cell: { column: 0, row: 0 },
+        range: { x: 0, y: 0, width: 1, height: 1 },
+        rangeStack: [],
+      },
+    };
+    act(() => {
+      gridMock.props?.onSelectionChange(first);
+      gridMock.props?.onCellPeek?.(first.current.cell, {
+        x: 20,
+        y: 20,
+        width: 120,
+        height: 28,
+      });
+    });
+    expect(
+      screen.getByRole("dialog", { name: "Peek column_0" }),
+    ).toHaveTextContent("row 0");
+    const initialPlacement = screen.getByRole("dialog", {
+      name: "Peek column_0",
+    }).style.cssText;
+
+    act(() => {
+      gridMock.props?.onSelectionChange({
+        ...first,
+        current: {
+          ...first.current,
+          cell: { column: 0, row: 1 },
+          range: { x: 0, y: 1, width: 1, height: 1 },
+        },
+      });
+    });
+    expect(
+      screen.getByRole("dialog", { name: "Peek column_0" }),
+    ).toHaveTextContent("row 1");
+    expect(
+      screen.getByRole("dialog", { name: "Peek column_0" }).style.cssText,
+    ).toBe(initialPlacement);
+    expect(gridMock.focus).not.toHaveBeenCalled();
+
+    act(() => {
+      gridMock.props?.onSelectionChange({
+        ...first,
+        current: {
+          ...first.current,
+          cell: { column: 0, row: 9_999 },
+          range: { x: 0, y: 9_999, width: 1, height: 1 },
+        },
+      });
+    });
+    expect(
+      screen.getByRole("dialog", { name: "Peek column_0" }),
+    ).toHaveTextContent("Loading next cell…");
+    expect(
+      screen.getByRole("dialog", { name: "Peek column_0" }),
+    ).not.toHaveTextContent("row 1");
+
+    act(() => gridMock.props?.onSelectionChange(first));
+
+    act(() => {
+      gridMock.props?.onCellPeek?.(
+        { column: 0, row: 1 },
+        { x: 300, y: 120, width: 120, height: 28 },
+        "open",
+      );
+    });
+    expect(
+      screen.getByRole("dialog", { name: "Peek column_0" }),
+    ).toHaveTextContent("row 1");
+
+    act(() => gridMock.props?.onPeekFocus?.());
+    expect(screen.getByRole("tree")).toHaveFocus();
+    act(() => gridMock.props?.onScrollInteraction?.());
+    expect(
+      screen.queryByRole("dialog", { name: "Peek column_0" }),
+    ).not.toBeInTheDocument();
+
+    act(() => {
+      gridMock.props?.onCellPeek?.(first.current.cell, {
+        x: 20,
+        y: 20,
+        width: 120,
+        height: 28,
+      });
+    });
+    expect(screen.getByRole("dialog", { name: "Peek column_0" })).toBeVisible();
+    view.rerender(<DataGrid source={source} active={false} />);
+    expect(
+      screen.queryByRole("dialog", { name: "Peek column_0" }),
+    ).not.toBeInTheDocument();
+  });
+
+  it("keeps a loading Peek inert until the next Arrow window arrives", async () => {
+    render(<DataGrid source={source} />);
+    await waitFor(() => expect(desktop.getDataWindow).toHaveBeenCalledOnce());
+    const selection = {
+      columns: CompactSelection.empty(),
+      rows: CompactSelection.empty(),
+      current: {
+        cell: { column: 0, row: 0 },
+        range: { x: 0, y: 0, width: 1, height: 1 },
+        rangeStack: [],
+      },
+    };
+    act(() => {
+      gridMock.props?.onSelectionChange(selection);
+      gridMock.props?.onCellPeek?.(selection.current.cell, {
+        x: 20,
+        y: 20,
+        width: 120,
+        height: 28,
+      });
+    });
+    expect(screen.getByRole("tree")).toBeInTheDocument();
+
+    const nextWindow = deferred<ArrayBuffer>();
+    vi.mocked(desktop.getDataWindow).mockReturnValueOnce(nextWindow.promise);
+    act(() => {
+      gridMock.props?.onSelectionChange({
+        ...selection,
+        current: {
+          ...selection.current,
+          cell: { column: 0, row: 9_999 },
+          range: { x: 0, y: 9_999, width: 1, height: 1 },
+        },
+      });
+      reportViewport({
+        rowStart: 9_990,
+        rowCount: 10,
+        columnIndices: [0],
+      });
+    });
+
+    const dialog = screen.getByRole("dialog", { name: "Peek column_0" });
+    expect(dialog).toHaveTextContent("Loading next cell…");
+    expect(screen.queryByRole("tree")).not.toBeInTheDocument();
+    fireEvent.keyDown(dialog, { key: "c", ctrlKey: true });
+    expect(clipboardWrite).not.toHaveBeenCalled();
+    act(() => gridMock.props?.onPeekFocus?.());
+
+    await act(async () => nextWindow.resolve(new ArrayBuffer(0)));
+    const tree = await screen.findByRole("tree");
+    expect(tree).toHaveFocus();
+    fireEvent.keyDown(tree, {
+      key: "c",
+      ctrlKey: true,
+    });
+    await waitFor(() => expect(clipboardWrite).toHaveBeenCalledOnce());
+  });
+
+  it("shows Peek copy failure when the system clipboard rejects the write", async () => {
+    clipboardWrite.mockRejectedValueOnce(new Error("clipboard unavailable"));
+    render(<DataGrid source={source} />);
+    await waitFor(() => expect(desktop.getDataWindow).toHaveBeenCalledOnce());
+    const selection = {
+      columns: CompactSelection.empty(),
+      rows: CompactSelection.empty(),
+      current: {
+        cell: { column: 0, row: 0 },
+        range: { x: 0, y: 0, width: 1, height: 1 },
+        rangeStack: [],
+      },
+    };
+    act(() => {
+      gridMock.props?.onSelectionChange(selection);
+      gridMock.props?.onCellPeek?.(selection.current.cell, {
+        x: 20,
+        y: 20,
+        width: 120,
+        height: 28,
+      });
+    });
+
+    fireEvent.keyDown(screen.getByRole("tree"), {
+      key: "c",
+      ctrlKey: true,
+    });
+
+    expect(
+      await screen.findByText("The JSON value could not be copied."),
+    ).toBeInTheDocument();
+    expect(screen.queryByText("Copied JSON.")).not.toBeInTheDocument();
+  });
+
+  it("uses the source schema JSON hint after visible-column reordering", async () => {
+    const json = '{"wide":1.2300e+400}';
+    decodeArrowWindow.mockImplementation(
+      (
+        _bytes: ArrayBuffer,
+        rowOffset: number,
+        sourceIndices: readonly number[],
+      ): ArrowDataWindow => ({
+        rowOffset,
+        rowCount: 3,
+        sourceIndices,
+        sourceColumnOffsets: new Map(
+          sourceIndices.map((sourceIndex, offset) => [sourceIndex, offset]),
+        ),
+        table: {
+          schema: { fields: sourceIndices.map(() => ({ type: utf8() })) },
+          getChildAt: (offset: number) => ({
+            at: () => (sourceIndices[offset] === 1 ? json : json),
+          }),
+        } as unknown as ArrowDataWindow["table"],
+      }),
+    );
+    render(
+      <DataGrid
+        source={{
+          ...source,
+          rowCount: 3,
+          schema: [
+            {
+              name: "plain",
+              physicalType: "BYTE_ARRAY",
+              logicalType: "String",
+              children: [],
+            },
+            {
+              name: "json_value",
+              physicalType: "BYTE_ARRAY",
+              logicalType: "JSON",
+              children: [],
+            },
+          ],
+        }}
+      />,
+    );
+    await waitFor(() => expect(desktop.getDataWindow).toHaveBeenCalled());
+    openColumnMenu(1);
+    fireEvent.click(screen.getByRole("menuitem", { name: "Pin column" }));
+    await waitFor(() =>
+      expect(gridMock.props?.columns[0]?.title).toBe("json_value"),
+    );
+
+    act(() => {
+      const selection = {
+        columns: CompactSelection.empty(),
+        rows: CompactSelection.empty(),
+        current: {
+          cell: { column: 0, row: 0 },
+          range: { x: 0, y: 0, width: 1, height: 1 },
+          rangeStack: [],
+        },
+      };
+      gridMock.props?.onSelectionChange(selection);
+      gridMock.props?.onCellPeek?.(selection.current.cell, {
+        x: 20,
+        y: 20,
+        width: 120,
+        height: 28,
+      });
+    });
+    expect(
+      await screen.findByText("wide", { selector: ".value-tree-name.is-key" }),
+    ).toBeInTheDocument();
+
+    act(() => {
+      const selection = {
+        columns: CompactSelection.empty(),
+        rows: CompactSelection.empty(),
+        current: {
+          cell: { column: 1, row: 0 },
+          range: { x: 1, y: 0, width: 1, height: 1 },
+          rangeStack: [],
+        },
+      };
+      gridMock.props?.onSelectionChange(selection);
+      gridMock.props?.onCellPeek?.(
+        selection.current.cell,
+        { x: 20, y: 20, width: 120, height: 28 },
+        "open",
+      );
+    });
+    expect(
+      screen.getByRole("dialog", { name: "Peek plain" }),
+    ).toHaveTextContent(json);
+    expect(
+      screen.queryByText("wide", { selector: ".value-tree-name.is-key" }),
+    ).not.toBeInTheDocument();
+  });
+
+  it("uses a lazily loaded JSON hint beyond the truncated schema prefix", async () => {
+    const json = '{"nested":{"answer":42}}';
+    const prefix = Array.from({ length: 256 }, (_value, index) => ({
+      name: `plain_${index}`,
+      physicalType: "BYTE_ARRAY",
+      logicalType: "String",
+      children: [],
+    }));
+    const page = Array.from({ length: 44 }, (_value, index) => ({
+      name: index === 43 ? "json_value" : `plain_${256 + index}`,
+      physicalType: "BYTE_ARRAY",
+      logicalType: index === 43 ? "JSON" : "String",
+      children: [],
+    }));
+    vi.mocked(desktop.getSourceSchemaPage).mockResolvedValue({
+      offset: 256,
+      totalCount: 300,
+      columns: page,
+    });
+    decodeArrowWindow.mockImplementation(
+      (
+        _bytes: ArrayBuffer,
+        rowOffset: number,
+        sourceIndices: readonly number[],
+      ): ArrowDataWindow => ({
+        rowOffset,
+        rowCount: 3,
+        sourceIndices,
+        sourceColumnOffsets: new Map(
+          sourceIndices.map((sourceIndex, offset) => [sourceIndex, offset]),
+        ),
+        table: {
+          schema: { fields: sourceIndices.map(() => ({ type: utf8() })) },
+          getChildAt: (offset: number) => ({
+            at: () => (sourceIndices[offset] === 299 ? json : "plain"),
+          }),
+        } as unknown as ArrowDataWindow["table"],
+      }),
+    );
+    render(
+      <DataGrid
+        source={{
+          ...source,
+          rowCount: 3,
+          columnCount: 300,
+          schema: prefix,
+          schemaNodeCount: 300,
+          schemaIsTruncated: true,
+        }}
+      />,
+    );
+
+    await waitFor(() => expect(gridMock.props?.columns).toHaveLength(300));
+    act(() => {
+      reportViewport({
+        rowStart: 0,
+        rowCount: 3,
+        columnIndices: [299],
+        mountedColumnIndices: [299],
+      });
+    });
+    await waitFor(() =>
+      expect(desktop.getDataWindow).toHaveBeenLastCalledWith(7, 0, 0, 3, [299]),
+    );
+    const selection = {
+      columns: CompactSelection.empty(),
+      rows: CompactSelection.empty(),
+      current: {
+        cell: { column: 299, row: 0 },
+        range: { x: 299, y: 0, width: 1, height: 1 },
+        rangeStack: [],
+      },
+    };
+    act(() => {
+      gridMock.props?.onSelectionChange(selection);
+      gridMock.props?.onCellPeek?.(selection.current.cell, {
+        x: 20,
+        y: 20,
+        width: 120,
+        height: 28,
+      });
+    });
+
+    expect(
+      await screen.findByText("nested", {
+        selector: ".value-tree-name.is-key",
+      }),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByRole("dialog", { name: "Peek json_value" }),
+    ).toBeVisible();
+  });
+
+  it("keeps Peek parse, search, and expansion progress across unrelated rerenders", async () => {
+    const json = JSON.stringify(
+      Array.from({ length: 10_000 }, (_value, index) => ({ value: index })),
+    );
+    const emojiFont = deferred<void>();
+    Object.defineProperty(document, "fonts", {
+      configurable: true,
+      value: {
+        *[Symbol.iterator]() {
+          yield { family: '"Noto Emoji"', load: () => emojiFont.promise };
+        },
+      },
+    });
+    const jsonSource: desktop.SourceSummary = {
+      ...source,
+      rowCount: 1,
+      schema: [
+        {
+          name: "json_value",
+          physicalType: "BYTE_ARRAY",
+          logicalType: "JSON",
+          children: [],
+        },
+      ],
+    };
+    decodeArrowWindow.mockImplementation(
+      (
+        _bytes: ArrayBuffer,
+        rowOffset: number,
+        sourceIndices: readonly number[],
+      ): ArrowDataWindow => ({
+        rowOffset,
+        rowCount: 1,
+        sourceIndices,
+        sourceColumnOffsets: new Map([[0, 0]]),
+        table: {
+          schema: { fields: [{ type: utf8() }] },
+          getChildAt: () => ({ at: () => json }),
+        } as unknown as ArrowDataWindow["table"],
+      }),
+    );
+    const view = render(<DataGrid source={jsonSource} />);
+    await waitFor(() => expect(desktop.getDataWindow).toHaveBeenCalledOnce());
+    const selection = {
+      columns: CompactSelection.empty(),
+      rows: CompactSelection.empty(),
+      current: {
+        cell: { column: 0, row: 0 },
+        range: { x: 0, y: 0, width: 1, height: 1 },
+        rangeStack: [],
+      },
+    };
+    act(() => gridMock.props?.onSelectionChange(selection));
+    gridMock.props?.getCellContent(selection.current.cell);
+    vi.useFakeTimers();
+    try {
+      act(() =>
+        gridMock.props?.onCellPeek?.(selection.current.cell, {
+          x: 20,
+          y: 20,
+          width: 120,
+          height: 28,
+        }),
+      );
+
+      await act(async () => vi.runOnlyPendingTimersAsync());
+      const firstParse = progressNumber(/Parsing JSON · ([\d,]+) of/);
+      view.rerender(
+        <DataGrid
+          source={{
+            ...jsonSource,
+            schema: jsonSource.schema.map((field) => ({ ...field })),
+          }}
+        />,
+      );
+      await act(async () => emojiFont.resolve());
+      await act(async () => vi.runOnlyPendingTimersAsync());
+      expect(progressNumber(/Parsing JSON · ([\d,]+) of/)).toBeGreaterThan(
+        firstParse,
+      );
+      await act(async () => vi.runAllTimersAsync());
+
+      const search = screen.getByRole("searchbox", {
+        name: "Search keys and values",
+      });
+      fireEvent.change(search, { target: { value: "not-present" } });
+      await act(async () => vi.runOnlyPendingTimersAsync());
+      const firstSearch = progressNumber(/([\d,]+) characters/);
+      act(() => gridMock.props?.onColumnResize(0, 240));
+      await act(async () => vi.runOnlyPendingTimersAsync());
+      expect(progressNumber(/([\d,]+) characters/)).toBeGreaterThan(
+        firstSearch,
+      );
+      fireEvent.change(search, { target: { value: "" } });
+
+      fireEvent.click(screen.getByRole("button", { name: "Expand all" }));
+      await act(async () => vi.runOnlyPendingTimersAsync());
+      const firstExpand = progressNumber(/Expanding after ([\d,]+) nodes/);
+      view.rerender(<DataGrid source={jsonSource} />);
+      await act(async () => vi.runOnlyPendingTimersAsync());
+      expect(progressNumber(/Expanding after ([\d,]+) nodes/)).toBeGreaterThan(
+        firstExpand,
+      );
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("shares one active-cell materialization between the grid and Peek", async () => {
+    const emojiFont = deferred<void>();
+    Object.defineProperty(document, "fonts", {
+      configurable: true,
+      value: {
+        *[Symbol.iterator]() {
+          yield { family: '"Noto Emoji"', load: () => emojiFont.promise };
+        },
+      },
+    });
+    const at = vi.fn((row: number) => `row ${row}`);
+    decodeArrowWindow.mockImplementation(
+      (
+        _bytes: ArrayBuffer,
+        rowOffset: number,
+        sourceIndices: readonly number[],
+      ): ArrowDataWindow => ({
+        rowOffset,
+        rowCount: 512,
+        sourceIndices,
+        sourceColumnOffsets: new Map(
+          sourceIndices.map((sourceIndex, offset) => [sourceIndex, offset]),
+        ),
+        table: {
+          schema: {
+            fields: sourceIndices.map(() => ({ type: utf8() })),
+          },
+          getChildAt: () => ({ at }),
+        } as unknown as ArrowDataWindow["table"],
+      }),
+    );
+    const view = render(<DataGrid source={source} />);
+    await waitFor(() => expect(desktop.getDataWindow).toHaveBeenCalledOnce());
+    const selection = {
+      columns: CompactSelection.empty(),
+      rows: CompactSelection.empty(),
+      current: {
+        cell: { column: 0, row: 0 },
+        range: { x: 0, y: 0, width: 1, height: 1 },
+        rangeStack: [],
+      },
+    };
+    act(() => {
+      gridMock.props?.onSelectionChange(selection);
+    });
+    expect(at).not.toHaveBeenCalled();
+
+    expect(
+      gridMock.props?.getCellContent(selection.current.cell),
+    ).toMatchObject({ kind: "text", displayData: "row 0" });
+    expect(at).toHaveBeenCalledOnce();
+
+    act(() => {
+      gridMock.props?.onCellPeek?.(selection.current.cell, {
+        x: 20,
+        y: 20,
+        width: 120,
+        height: 28,
+      });
+    });
+    expect(at).toHaveBeenCalledOnce();
+
+    view.rerender(<DataGrid source={source} />);
+    fireEvent.click(screen.getByRole("button", { name: "Schema" }));
+    gridMock.revisionChanged.mockClear();
+    await act(async () => emojiFont.resolve());
+    await waitFor(() => expect(gridMock.revisionChanged).toHaveBeenCalled());
+    expect(at).toHaveBeenCalledOnce();
+
+    const secondSelection = {
+      ...selection,
+      current: {
+        ...selection.current,
+        cell: { column: 0, row: 1 },
+        range: { x: 0, y: 1, width: 1, height: 1 },
+      },
+    };
+    act(() => {
+      gridMock.props?.onSelectionChange(secondSelection);
+    });
+    expect(at).toHaveBeenCalledTimes(2);
+    expect(
+      gridMock.props?.getCellContent(secondSelection.current.cell),
+    ).toMatchObject({ kind: "text", displayData: "row 1" });
+    expect(at).toHaveBeenCalledTimes(2);
+
+    act(() => gridMock.props?.onSort(0, false));
+    await waitFor(() => expect(desktop.getDataWindow).toHaveBeenCalledTimes(2));
+    act(() => gridMock.props?.onSelectionChange(secondSelection));
+    expect(
+      gridMock.props?.getCellContent(secondSelection.current.cell),
+    ).toMatchObject({ kind: "text", displayData: "row 1" });
+    expect(at).toHaveBeenCalledTimes(3);
+    act(() => {
+      gridMock.props?.onCellPeek?.(secondSelection.current.cell, {
+        x: 20,
+        y: 20,
+        width: 120,
+        height: 28,
+      });
+    });
+    expect(at).toHaveBeenCalledTimes(3);
+  });
+
+  it("releases a cached large value when its selection or window is replaced", async () => {
+    const largeValue = "x".repeat(2 * 1024 * 1024);
+    const firstAt = vi.fn(() => largeValue);
+    const replacementAt = vi.fn((row: number) => `replacement ${row}`);
+    let decodeCount = 0;
+    decodeArrowWindow.mockImplementation(
+      (
+        _bytes: ArrayBuffer,
+        rowOffset: number,
+        sourceIndices: readonly number[],
+      ): ArrowDataWindow => {
+        const at = decodeCount === 0 ? firstAt : replacementAt;
+        decodeCount += 1;
+        return {
+          rowOffset,
+          rowCount: 512,
+          sourceIndices,
+          sourceColumnOffsets: new Map(
+            sourceIndices.map((sourceIndex, offset) => [sourceIndex, offset]),
+          ),
+          table: {
+            schema: {
+              fields: sourceIndices.map(() => ({ type: utf8() })),
+            },
+            getChildAt: () => ({ at }),
+          } as unknown as ArrowDataWindow["table"],
+        };
+      },
+    );
+    render(<DataGrid source={source} />);
+    await waitFor(() => expect(desktop.getDataWindow).toHaveBeenCalledOnce());
+    const activeSelection = {
+      columns: CompactSelection.empty(),
+      rows: CompactSelection.empty(),
+      current: {
+        cell: { column: 0, row: 0 },
+        range: { x: 0, y: 0, width: 1, height: 1 },
+        rangeStack: [],
+      },
+    };
+    act(() => gridMock.props?.onSelectionChange(activeSelection));
+    gridMock.props?.getCellContent(activeSelection.current.cell);
+    expect(firstAt).toHaveBeenCalledOnce();
+
+    act(() =>
+      gridMock.props?.onSelectionChange({
+        columns: CompactSelection.empty(),
+        rows: CompactSelection.empty(),
+      }),
+    );
+    act(() => gridMock.props?.onSelectionChange(activeSelection));
+    gridMock.props?.getCellContent(activeSelection.current.cell);
+    expect(firstAt).toHaveBeenCalledTimes(2);
+
+    act(() => {
+      gridMock.props?.onViewportChange({
+        rowStart: 1_000,
+        rowCount: 5,
+        columnIndices: [0],
+        mountedRowStart: 997,
+        mountedRowCount: 11,
+        mountedColumnIndices: [0],
+      });
+    });
+    await waitFor(() => expect(desktop.getDataWindow).toHaveBeenCalledTimes(2));
+    const replacementSelection = {
+      ...activeSelection,
+      current: {
+        ...activeSelection.current,
+        cell: { column: 0, row: 1_000 },
+        range: { x: 0, y: 1_000, width: 1, height: 1 },
+      },
+    };
+    act(() => gridMock.props?.onSelectionChange(replacementSelection));
+    gridMock.props?.getCellContent(replacementSelection.current.cell);
+    act(() => {
+      gridMock.props?.onCellPeek?.(replacementSelection.current.cell, {
+        x: 20,
+        y: 20,
+        width: 120,
+        height: 28,
+      });
+    });
+    expect(replacementAt).toHaveBeenCalledOnce();
+  });
+
+  it("does not populate or replace the active-cell cache while copying", async () => {
+    const at = vi.fn((row: number) => `row ${row}`);
+    decodeArrowWindow.mockImplementation(
+      (
+        _bytes: ArrayBuffer,
+        rowOffset: number,
+        sourceIndices: readonly number[],
+      ): ArrowDataWindow => ({
+        rowOffset,
+        rowCount: 512,
+        sourceIndices,
+        sourceColumnOffsets: new Map(
+          sourceIndices.map((sourceIndex, offset) => [sourceIndex, offset]),
+        ),
+        table: {
+          schema: {
+            fields: sourceIndices.map(() => ({ type: utf8() })),
+          },
+          getChildAt: () => ({ at }),
+        } as unknown as ArrowDataWindow["table"],
+      }),
+    );
+    render(<DataGrid source={source} />);
+    await waitFor(() => expect(desktop.getDataWindow).toHaveBeenCalledOnce());
+    const selection = {
+      columns: CompactSelection.empty(),
+      rows: CompactSelection.empty(),
+      current: {
+        cell: { column: 0, row: 0 },
+        range: { x: 0, y: 0, width: 1, height: 1 },
+        rangeStack: [],
+      },
+    };
+    act(() => gridMock.props?.onSelectionChange(selection));
+
+    copyFromGrid();
+    await waitFor(() => expect(clipboardWrite).toHaveBeenCalledOnce());
+    expect(at).toHaveBeenCalledOnce();
+    gridMock.props?.getCellContent(selection.current.cell);
+    expect(at).toHaveBeenCalledTimes(2);
+    act(() => {
+      gridMock.props?.onCellPeek?.(selection.current.cell, {
+        x: 20,
+        y: 20,
+        width: 120,
+        height: 28,
+      });
+    });
+    expect(at).toHaveBeenCalledTimes(2);
+
+    clipboardWrite.mockClear();
+    copyFromGrid();
+    await waitFor(() => expect(clipboardWrite).toHaveBeenCalledOnce());
+    expect(at).toHaveBeenCalledTimes(3);
+    gridMock.props?.getCellContent(selection.current.cell);
+    expect(at).toHaveBeenCalledTimes(3);
+  });
+
+  it("opens Peek from the cell context menu and returns focus to the grid", async () => {
+    render(<DataGrid source={source} />);
+    await waitFor(() => expect(desktop.getDataWindow).toHaveBeenCalledOnce());
+    act(() => {
+      gridMock.props?.onCellContextMenu(
+        { column: 0, row: 2 },
+        { x: 20, y: 20, width: 120, height: 28 },
+      );
+    });
+    fireEvent.click(screen.getByRole("menuitem", { name: /Peek/ }));
+
+    expect(
+      screen.getByRole("dialog", { name: "Peek column_0" }),
+    ).toHaveTextContent("row 2");
+    expect(gridMock.focus).toHaveBeenCalledOnce();
+    fireEvent.click(screen.getByRole("button", { name: "Close Peek" }));
+    expect(
+      screen.queryByRole("dialog", { name: "Peek column_0" }),
+    ).not.toBeInTheDocument();
+    expect(gridMock.focus).toHaveBeenCalledTimes(2);
+  });
+
   it("keeps duplicate sibling names as distinct schema nodes", () => {
     const duplicateSource: desktop.SourceSummary = {
       ...source,
@@ -3655,6 +4688,14 @@ function openColumnMenu(visibleIndex: number) {
       height: 32,
     });
   });
+}
+
+function progressNumber(pattern: RegExp): number {
+  const status =
+    document.querySelector(".value-tree-status")?.textContent ?? "";
+  const match = pattern.exec(status)?.[1];
+  if (match === undefined) throw new Error(`Progress did not match: ${status}`);
+  return Number(match.replaceAll(",", ""));
 }
 
 function reportViewport(

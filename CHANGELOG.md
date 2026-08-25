@@ -15,6 +15,12 @@ Backward-incompatible entries start with **Breaking:**.
   leaf numbers for shortened paths; an optional chunk map with compression,
   codec and statistics lenses plus independent Bloom markers; chunk details and
   Bloom probes; and a path-free, value-free Markdown report.
+- Inspect nested cell values with typed grid previews and a resizable,
+  searchable Peek opened with Space, double-click, or the cell menu. Expand
+  structured JSON, inspect long text and binary data, cancel long operations,
+  and copy values without leaving the grid.
+- Read loaded Data columns with their logical Arrow types in the schema
+  sidebar; incomplete or unloaded schemas retain their physical representation.
 
 ### Fixed
 

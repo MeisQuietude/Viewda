@@ -1,5 +1,7 @@
 /** Renderer-independent contracts for the Data view grid. */
 
+import { VALUE_COPY_CHARACTER_LIMIT } from "./value-json-serializer";
+
 export interface Rectangle {
   x: number;
   y: number;
@@ -115,6 +117,13 @@ export interface TextGridCell {
   copyData: string;
   alignment: CellAlignment;
   faded: boolean;
+  segments?: readonly GridCellSegment[];
+}
+
+export interface GridCellSegment {
+  text: string;
+  tone:
+    "key" | "string" | "number" | "boolean" | "null" | "secondary" | "value";
 }
 
 export type GridCell = LoadingGridCell | TextGridCell;
@@ -139,22 +148,160 @@ export interface CopyBufferContents {
   textHtml: string;
 }
 
+export class CopyBufferLimitError extends Error {
+  constructor(readonly limit: number) {
+    super(
+      `The selection copy exceeds the ${limit.toLocaleString("en-US")}-character aggregate copy limit.`,
+    );
+    this.name = "CopyBufferLimitError";
+  }
+}
+
+const COPY_ESCAPE_CHUNK_CHARACTERS = 4_096;
+
+/** Retains only escaped output chunks and the cell currently being appended. */
+export class IncrementalCopyBuffer {
+  readonly #plain: string[] = [];
+  readonly #html: string[] = ["<table><tbody>"];
+  readonly #characterLimit: number;
+  #characters = this.#html[0]!.length;
+  #cell:
+    | {
+        value: string;
+        phase: "scan" | "plain" | "html";
+        offset: number;
+        quoted: boolean;
+      }
+    | undefined;
+  #finished = false;
+
+  constructor(characterLimit = VALUE_COPY_CHARACTER_LIMIT) {
+    this.#characterLimit = characterLimit;
+  }
+
+  get remainingCharacters(): number {
+    return this.#characterLimit - this.#characters;
+  }
+
+  beginCell(value: string, firstColumn: boolean, firstRow: boolean): void {
+    if (this.#cell !== undefined || this.#finished) {
+      throw new Error("The copy buffer is not ready for another cell.");
+    }
+    if (firstColumn) {
+      if (!firstRow) this.#append(this.#plain, "\n");
+      this.#append(this.#html, "<tr>");
+    } else {
+      this.#append(this.#plain, "\t");
+    }
+    this.#cell = {
+      value,
+      phase: "scan",
+      offset: 0,
+      quoted: false,
+    };
+  }
+
+  stepCell(
+    deadline: number,
+    maxUnits: number,
+    now = () => performance.now(),
+  ): { done: boolean; units: number } {
+    let units = 0;
+    while (
+      this.#cell !== undefined &&
+      units < maxUnits &&
+      (units === 0 || now() < deadline)
+    ) {
+      units += 1;
+      const cell = this.#cell;
+      const end = Math.min(
+        cell.value.length,
+        cell.offset + COPY_ESCAPE_CHUNK_CHARACTERS,
+      );
+      const chunk = cell.value.slice(cell.offset, end);
+      if (cell.phase === "scan") {
+        cell.quoted ||= /[\t\r\n"]/.test(chunk);
+        cell.offset = end;
+        if (end >= cell.value.length) {
+          cell.phase = "plain";
+          cell.offset = 0;
+          if (cell.quoted) this.#append(this.#plain, '"');
+        }
+      } else if (cell.phase === "plain") {
+        this.#append(
+          this.#plain,
+          cell.quoted ? chunk.replaceAll('"', '""') : chunk,
+        );
+        cell.offset = end;
+        if (end >= cell.value.length) {
+          if (cell.quoted) this.#append(this.#plain, '"');
+          cell.phase = "html";
+          cell.offset = 0;
+          this.#append(this.#html, '<td style="white-space: pre-wrap">');
+        }
+      } else {
+        this.#append(this.#html, escapeHtmlChunk(chunk));
+        cell.offset = end;
+        if (end >= cell.value.length) {
+          this.#append(this.#html, "</td>");
+          this.#cell = undefined;
+        }
+      }
+    }
+    return { done: this.#cell === undefined, units };
+  }
+
+  endRow(): void {
+    if (this.#cell !== undefined || this.#finished) {
+      throw new Error("The copy buffer row cannot end yet.");
+    }
+    this.#append(this.#html, "</tr>");
+  }
+
+  finish(): CopyBufferContents {
+    if (this.#cell !== undefined || this.#finished) {
+      throw new Error("The copy buffer cannot finish yet.");
+    }
+    this.#finished = true;
+    this.#append(this.#html, "</tbody></table>");
+    return {
+      // Clipboard APIs require contiguous strings. The aggregate cap has
+      // already accounted for both escaped outputs at this boundary.
+      textPlain: this.#plain.join(""),
+      textHtml: this.#html.join(""),
+    };
+  }
+
+  #append(output: string[], text: string): void {
+    this.#characters += text.length;
+    if (this.#characters > this.#characterLimit) {
+      throw new CopyBufferLimitError(this.#characterLimit);
+    }
+    output.push(text);
+  }
+}
+
 export function copyBufferContents(
   rows: readonly (readonly GridCell[])[],
   columnIndices: readonly number[],
 ): CopyBufferContents {
-  const copyRows = rows.map((row) =>
+  const textRows = rows.map((row) =>
     columnIndices.map((column) => {
       const cell = row[column];
       return cell?.kind === "text" ? cell.copyData : "";
     }),
   );
   return {
-    textPlain: copyRows.map((row) => row.map(escapeTsv).join("\t")).join("\n"),
-    textHtml: `<table><tbody>${copyRows
+    textPlain: textRows.map((row) => row.map(escapeTsv).join("\t")).join("\n"),
+    textHtml: `<table><tbody>${textRows
       .map(
         (row) =>
-          `<tr>${row.map((value) => `<td style="white-space: pre-wrap">${escapeHtml(value).replaceAll(/\r\n?|\n/g, "<br>")}</td>`).join("")}</tr>`,
+          `<tr>${row
+            .map(
+              (value) =>
+                `<td style="white-space: pre-wrap">${escapeHtmlChunk(value)}</td>`,
+            )
+            .join("")}</tr>`,
       )
       .join("")}</tbody></table>`,
   };
@@ -164,11 +311,12 @@ function escapeTsv(value: string): string {
   return /[\t\r\n"]/.test(value) ? `"${value.replaceAll('"', '""')}"` : value;
 }
 
-function escapeHtml(value: string): string {
+function escapeHtmlChunk(value: string): string {
   return value
     .replaceAll("&", "&amp;")
     .replaceAll("<", "&lt;")
-    .replaceAll(">", "&gt;");
+    .replaceAll(">", "&gt;")
+    .replaceAll(/\r\n?|\n/g, "<br>");
 }
 
 function normalizeSelectionRanges(

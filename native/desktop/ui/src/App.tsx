@@ -1345,7 +1345,7 @@ function OpenFileDataGrid({
         requestedRow={file.dataTargetRow}
         viewSettings={viewSettings}
         diagnostics={diagnostics}
-        active={file.active}
+        active={file.active && file.mode === "data"}
         onOperationChange={reportOperation}
       />
     </Suspense>
