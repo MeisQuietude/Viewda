@@ -30,6 +30,7 @@ import {
   type DataViewSettings,
   type DataViewResourceDiagnostics,
   type SortColumn,
+  type SchemaField,
   type SourceSummary,
 } from "../desktop";
 import { loadBundledEmojiFont } from "../fonts";
@@ -137,6 +138,7 @@ const PROJECTION_REQUEST_IDLE_MS = 120;
 const SUPPLEMENT_WINDOW_MULTIPLIER = 2;
 const DEFAULT_DATA_VIEW_SETTINGS: DataViewSettings = { memoryLimit: "mb384" };
 const EMPTY_LOGICAL_DATA_TYPES: ReadonlyMap<number, DataType> = new Map();
+const EMPTY_SOURCE_INDICES: ReadonlySet<number> = new Set();
 
 // Detect clipboard support once per webview so copy format stays consistent.
 // There is no user choice here.
@@ -278,6 +280,7 @@ interface PendingView {
 interface ViewErrorState {
   message: string;
   diagnostics?: string;
+  recovery?: "reloadDataset";
 }
 
 function requestSatisfiesWindow(
@@ -290,6 +293,24 @@ function requestSatisfiesWindow(
     candidate.projectionRevision === requested.projectionRevision &&
     requestSatisfiesRequest(candidate.rows, requested.rows) &&
     projectionContains(candidate.sourceIndices, requested.sourceIndices)
+  );
+}
+
+function sameFieldContract(
+  left: SchemaField | undefined,
+  right: SchemaField | undefined,
+): boolean {
+  if (left === undefined || right === undefined) return false;
+  if (
+    left.name !== right.name ||
+    left.physicalType !== right.physicalType ||
+    left.logicalType !== right.logicalType ||
+    left.children.length !== right.children.length
+  ) {
+    return false;
+  }
+  return left.children.every((child, index) =>
+    sameFieldContract(child, right.children[index]),
   );
 }
 
@@ -444,11 +465,13 @@ function ViewErrorAlert({
   error,
   onDismiss,
   onRetry,
+  onReloadDataset,
   dismissLabel = "Dismiss view error",
 }: {
   error: ViewErrorState;
   onDismiss: () => void;
   onRetry?: () => void;
+  onReloadDataset?: () => void;
   dismissLabel?: string;
 }) {
   const [copyState, setCopyState] = useState<"idle" | "copied" | "failed">(
@@ -500,6 +523,11 @@ function ViewErrorAlert({
           Retry window
         </button>
       )}
+      {error.recovery === "reloadDataset" && onReloadDataset !== undefined && (
+        <button type="button" onClick={onReloadDataset}>
+          Reload dataset
+        </button>
+      )}
       <button
         type="button"
         aria-label={dismissLabel}
@@ -514,18 +542,26 @@ function ViewErrorAlert({
 
 export function DataGrid({
   source,
+  contentIdentity,
   requestedRow = null,
   viewSettings = DEFAULT_DATA_VIEW_SETTINGS,
   diagnostics = gridDiagnosticsNoopSink,
   active = true,
+  exportEnabled = true,
+  defaultPinnedSourceIndices = EMPTY_SOURCE_INDICES,
   onOperationChange,
+  onReloadDataset,
 }: {
   source: SourceSummary;
+  contentIdentity?: string;
   requestedRow?: { row: number; request: number } | null;
   viewSettings?: DataViewSettings;
   diagnostics?: GridDiagnosticsSink;
   active?: boolean;
+  exportEnabled?: boolean;
+  defaultPinnedSourceIndices?: ReadonlySet<number>;
   onOperationChange?: (running: boolean) => void;
+  onReloadDataset?: () => void;
 }) {
   const [schema, setSchema] = useState(() => source.schema);
   const [schemaTotal, setSchemaTotal] = useState<number | null>(null);
@@ -542,7 +578,7 @@ export function DataGrid({
         280,
         Math.max(MIN_COLUMN_WIDTH, field.name.length * 8 + 48),
       ),
-      pinned: false,
+      pinned: defaultPinnedSourceIndices.has(sourceIndex),
       hidden: false,
     })),
   );
@@ -647,6 +683,8 @@ export function DataGrid({
   const pendingViewRef = useRef<PendingView | null>(null);
   const nextViewRevisionRef = useRef(0);
   const nextSuggestionRevisionRef = useRef(0);
+  const contentIdentityRef = useRef(contentIdentity);
+  const sourceSchemaRef = useRef(source.schema);
   const projectionRevisionRef = useRef(0);
   const previousProjectionRef = useRef<readonly number[] | null>(null);
   const requestedProjectionRef = useRef<readonly number[]>([]);
@@ -751,7 +789,7 @@ export function DataGrid({
                       280,
                       Math.max(MIN_COLUMN_WIDTH, field.name.length * 8 + 48),
                     ),
-                    pinned: false,
+                    pinned: defaultPinnedSourceIndices.has(sourceIndex),
                     hidden: false,
                   };
                 }),
@@ -769,7 +807,7 @@ export function DataGrid({
         setSchemaPageLoading(false);
       }
     }
-  }, [schema.length, source.generation]);
+  }, [defaultPinnedSourceIndices, schema.length, source.generation]);
 
   useEffect(() => {
     if (active && source.schemaIsTruncated && schemaTotal === null) {
@@ -1733,11 +1771,16 @@ export function DataGrid({
         }
       },
     );
-  }, []);
+  }, [source.generation]);
 
   useEffect(() => {
+    if (!exportEnabled) {
+      setExportStatus(null);
+      setExportError(null);
+      return;
+    }
     refreshExportStatus();
-  }, [refreshExportStatus]);
+  }, [exportEnabled, refreshExportStatus]);
 
   useEffect(() => {
     if (exportStatus?.state !== "running") {
@@ -1768,7 +1811,11 @@ export function DataGrid({
 
   const startExport = useCallback(
     async (scope: DataExportScope) => {
-      if (exportStarting || exportStatus?.state === "running") {
+      if (
+        !exportEnabled ||
+        exportStarting ||
+        exportStatus?.state === "running"
+      ) {
         return;
       }
       const shape = scope === "selection" ? selectedExport : null;
@@ -1816,6 +1863,7 @@ export function DataGrid({
     },
     [
       exportStarting,
+      exportEnabled,
       exportStatus?.state,
       refreshExportStatus,
       selectedExport,
@@ -2004,9 +2052,16 @@ export function DataGrid({
   }, [schemaFocusRequest]);
 
   const applyView = useCallback(
-    (nextFilters: DataFilter[], nextSort: SortColumn[]) => {
+    (
+      nextFilters: DataFilter[],
+      nextSort: SortColumn[],
+      forceSourceRefresh = false,
+    ) => {
       const current = pendingViewRef.current ?? activeViewRef.current;
-      if (viewDefinitionEquals(current, nextFilters, nextSort)) {
+      if (
+        !forceSourceRefresh &&
+        viewDefinitionEquals(current, nextFilters, nextSort)
+      ) {
         setHeaderMenu(null);
         setFilterEditor(null);
         setWherePopupOpen(false);
@@ -2019,7 +2074,7 @@ export function DataGrid({
           () => undefined,
         );
       }
-      if (source.rowCount === 0) {
+      if (!forceSourceRefresh && source.rowCount === 0) {
         promoteView(activeViewRef.current.revision, 0, nextFilters, nextSort);
         setLoadError(null);
         setHeaderMenu(null);
@@ -2126,6 +2181,63 @@ export function DataGrid({
       viewSettings,
     ],
   );
+
+  useEffect(() => {
+    if (contentIdentityRef.current === contentIdentity) return;
+    contentIdentityRef.current = contentIdentity;
+    const previousSchema = sourceSchemaRef.current;
+    sourceSchemaRef.current = source.schema;
+    const current = pendingViewRef.current ?? activeViewRef.current;
+    const columnStillMatches = (sourceIndex: number) =>
+      sameFieldContract(
+        previousSchema[sourceIndex],
+        source.schema[sourceIndex],
+      );
+    const nextFilters = current.filters.filter(({ columnIndex }) =>
+      columnStillMatches(columnIndex),
+    );
+    const nextSort = current.sort.filter(({ sourceIndex }) =>
+      columnStillMatches(sourceIndex),
+    );
+    const viewContractChanged =
+      nextFilters.length !== current.filters.length ||
+      nextSort.length !== current.sort.length;
+
+    setSchema(source.schema);
+    setSchemaTotal(null);
+    setColumnStates((previous) =>
+      source.schema.map((field, sourceIndex) => {
+        const existing = previous[sourceIndex];
+        const preserve = sameFieldContract(
+          previousSchema[sourceIndex],
+          source.schema[sourceIndex],
+        );
+        return {
+          sourceIndex,
+          title: field.name,
+          width:
+            preserve && existing !== undefined
+              ? existing.width
+              : Math.min(
+                  280,
+                  Math.max(MIN_COLUMN_WIDTH, field.name.length * 8 + 48),
+                ),
+          pinned:
+            preserve && existing !== undefined
+              ? existing.pinned
+              : defaultPinnedSourceIndices.has(sourceIndex),
+          hidden: preserve && existing !== undefined ? existing.hidden : false,
+        };
+      }),
+    );
+    applyView(nextFilters, nextSort, true);
+    if (viewContractChanged) {
+      setViewError({
+        message:
+          "Some preview filters or sort columns were reset because the complete schema changed.",
+      });
+    }
+  }, [applyView, contentIdentity, defaultPinnedSourceIndices, source.schema]);
 
   const changeFilters = useCallback(
     (nextFilters: DataFilter[]) =>
@@ -2772,6 +2884,8 @@ export function DataGrid({
   const filterEditorField =
     filterEditor === null ? undefined : schema[filterEditor.sourceIndex];
   const exportBusy = exportStarting || exportStatus?.state === "running";
+  const exportUnavailableLabel =
+    "Export is available after dataset inspection finishes";
   const runningExportLabel =
     exportStatus?.state === "running"
       ? `Exporting ${exportStatus.fileName} (${formatBytes(exportStatus.bytesWritten)})…`
@@ -3096,7 +3210,14 @@ export function DataGrid({
           key={loadError.diagnostics ?? loadError.message}
           error={loadError}
           dismissLabel="Dismiss window error"
-          onRetry={failedRequestRef.current === null ? undefined : retryWindow}
+          onRetry={
+            (loadError.recovery === "reloadDataset" &&
+              onReloadDataset !== undefined) ||
+            failedRequestRef.current === null
+              ? undefined
+              : retryWindow
+          }
+          onReloadDataset={onReloadDataset}
           onDismiss={() => {
             failedRequestRef.current = null;
             setLoadError(null);
@@ -3113,11 +3234,13 @@ export function DataGrid({
         <ViewErrorAlert
           key={viewError.diagnostics ?? viewError.message}
           error={viewError}
+          onReloadDataset={onReloadDataset}
           onDismiss={() => setViewError(null)}
         />
       )}
       <div className="data-grid-layout">
         <SchemaSidebar
+          key={`${source.generation}:${contentIdentity ?? "source"}`}
           open={sidebarOpen}
           selectedColumn={selectedSchemaColumn}
           source={schemaSource}
@@ -3435,15 +3558,17 @@ export function DataGrid({
             <button
               type="button"
               role="menuitem"
-              disabled={exportBusy}
+              disabled={!exportEnabled || exportBusy}
               onClick={() => void startExport("selection")}
             >
               <span>
-                {exportBusy
-                  ? runningExportLabel
-                  : `Export selection (${formatCount(selectedExport.rowCount)} × ${formatCount(selectedExport.columnCount)})…`}
+                {!exportEnabled
+                  ? exportUnavailableLabel
+                  : exportBusy
+                    ? runningExportLabel
+                    : `Export selection (${formatCount(selectedExport.rowCount)} × ${formatCount(selectedExport.columnCount)})…`}
               </span>
-              {!exportBusy && (
+              {exportEnabled && !exportBusy && (
                 <span className="menu-shortcut">{shortcutModifier}Shift+E</span>
               )}
             </button>
@@ -3451,15 +3576,17 @@ export function DataGrid({
           <button
             type="button"
             role="menuitem"
-            disabled={exportBusy}
+            disabled={!exportEnabled || exportBusy}
             onClick={() => void startExport("view")}
           >
             <span>
-              {exportBusy
-                ? runningExportLabel
-                : `Export current view (${formatCount(gridRowCount)} rows)…`}
+              {!exportEnabled
+                ? exportUnavailableLabel
+                : exportBusy
+                  ? runningExportLabel
+                  : `Export current view (${formatCount(gridRowCount)} rows)…`}
             </span>
-            {!exportBusy && selectedExport === null && (
+            {exportEnabled && !exportBusy && selectedExport === null && (
               <span className="menu-shortcut">{shortcutModifier}Shift+E</span>
             )}
           </button>
@@ -3884,7 +4011,9 @@ function copySelectionShape(
 function dataWindowErrorMessage(error: unknown): string {
   if (error instanceof DataWindowCommandError) {
     if (error.code === "sourceChanged") {
-      return "The open file changed before this window finished loading.";
+      return error.detail?.member === undefined
+        ? "The open file changed before this window finished loading."
+        : `Dataset member ${error.detail.member} changed. Reload the dataset.`;
     }
     if (error.code === "notFound" || error.code === "noSourceOpen") {
       return "The open file is no longer available.";
@@ -3894,6 +4023,16 @@ function dataWindowErrorMessage(error: unknown): string {
     }
     if (error.code === "corruptSource" || error.code === "notParquet") {
       return "The open Parquet file is damaged or incomplete.";
+    }
+    if (error.code === "invalidMember") {
+      return error.detail?.member === undefined
+        ? "A dataset member is damaged or unsupported. Reload the dataset."
+        : `Dataset member ${error.detail.member} is damaged or unsupported. Reload the dataset.`;
+    }
+    if (error.code === "memberPermissionDenied") {
+      return error.detail?.member === undefined
+        ? "Fix the dataset member's permissions, then reload the dataset."
+        : `Fix permissions for dataset member ${error.detail.member}, then reload the dataset.`;
     }
     if (error.code === "invalidFilter") {
       return "This condition does not match its column type or exceeds the limits of 32 conditions, 100 list values, and 4 KB per value.";
@@ -3923,6 +4062,14 @@ function dataWindowErrorMessage(error: unknown): string {
 
 function dataViewErrorState(error: unknown): ViewErrorState {
   const message = dataWindowErrorMessage(error);
+  if (
+    error instanceof DataWindowCommandError &&
+    (error.code === "sourceChanged" ||
+      error.code === "invalidMember" ||
+      error.code === "memberPermissionDenied")
+  ) {
+    return { message, recovery: "reloadDataset" };
+  }
   if (
     !(error instanceof DataWindowCommandError) ||
     error.diagnostics === undefined ||

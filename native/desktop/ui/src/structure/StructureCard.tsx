@@ -1,4 +1,5 @@
 import type {
+  DatasetReadySummary,
   SourceSummary,
   StructureByteUnit,
   StructureSummary,
@@ -25,10 +26,74 @@ import { StructureHelp } from "./StructureHelp";
 export function StructureCard({
   source,
   summary,
+  dataset,
+  datasetNavigator,
 }: {
   source: SourceSummary;
   summary: StructureSummary | null;
+  dataset?: DatasetReadySummary;
+  datasetNavigator?: ReactNode;
 }) {
+  if (dataset !== undefined) {
+    return (
+      <div className="dataset-structure-summaries">
+        <dl className="source-summary" aria-label="Dataset facts">
+          <div className="source-summary-row">
+            <dt>Dataset</dt>
+            <dd className="source-summary-inline">
+              <SummaryFact
+                value={formatNumber(dataset.memberCount)}
+                label="Parquet files"
+              />
+              <SummaryFact
+                value={formatNumber(dataset.ignoredFileCount)}
+                label="other files ignored"
+              />
+              {dataset.schemaDriftMemberCount > 0 && (
+                <SummaryFact
+                  value={formatNumber(dataset.schemaDriftMemberCount)}
+                  label="with schema differences"
+                />
+              )}
+            </dd>
+          </div>
+          <div className="source-summary-row">
+            <dt>Shape</dt>
+            <dd className="source-summary-inline">
+              <SummaryFact
+                value={formatNumber(dataset.rowCount)}
+                label="rows"
+              />
+              <SummaryFact
+                value={formatNumber(dataset.columnCount)}
+                label="columns"
+              />
+              <SummaryFact
+                value={formatNumber(dataset.rowGroupCount)}
+                label={
+                  <StructureHelp term="Row groups">row groups</StructureHelp>
+                }
+              />
+            </dd>
+          </div>
+          <div className="source-summary-row">
+            <dt>Storage</dt>
+            <dd className="source-storage-summary">
+              <SummaryFact
+                value={formatFileSize(dataset.sizeBytes)}
+                label="Dataset on disk"
+                title={`${formatNumber(dataset.sizeBytes)} bytes`}
+                valueAfterLabel
+              />
+            </dd>
+          </div>
+        </dl>
+        {datasetNavigator}
+        <SelectedFileFacts summary={summary} />
+      </div>
+    );
+  }
+
   return (
     <dl className="source-summary" aria-label="File facts">
       <div className="source-summary-row">
@@ -134,6 +199,122 @@ export function StructureCard({
             />
           </dd>
         </div>
+      )}
+    </dl>
+  );
+}
+
+function SelectedFileFacts({ summary }: { summary: StructureSummary | null }) {
+  return (
+    <dl className="source-summary" aria-label="Selected file facts">
+      <div className="source-summary-row">
+        <dt>Selected file</dt>
+        <dd className="source-summary-inline">
+          <SummaryFact
+            value={
+              summary === null ? MISSING_FACT : formatNumber(summary.rowCount)
+            }
+            label="rows"
+          />
+          <SummaryFact
+            value={
+              summary === null
+                ? MISSING_FACT
+                : formatNumber(summary.columnCount)
+            }
+            label="columns"
+          />
+          <SummaryFact
+            value={
+              summary === null
+                ? MISSING_FACT
+                : formatNumber(summary.rowGroupCount)
+            }
+            label={<StructureHelp term="Row groups">row groups</StructureHelp>}
+          />
+          <SummaryFact
+            value={formatRowsPerRowGroup(summary?.rowsPerRowGroup ?? null)}
+            label={
+              <StructureHelp term="Rows per group">rows/group</StructureHelp>
+            }
+          />
+        </dd>
+      </div>
+      {summary !== null && (
+        <>
+          <div className="source-summary-row">
+            <dt>
+              <StructureHelp term="Storage" />
+            </dt>
+            <dd className="source-storage-summary">
+              <span className="source-storage-relation">
+                <SummaryFact
+                  value={
+                    summary.chunkAggregatesComplete
+                      ? formatFileSize(summary.uncompressedBytes)
+                      : MISSING_FACT
+                  }
+                  label="Before compression"
+                  title={
+                    summary.chunkAggregatesComplete
+                      ? `${formatNumber(summary.uncompressedBytes)} bytes`
+                      : undefined
+                  }
+                  valueAfterLabel
+                />
+                <span aria-hidden="true">→</span>
+                <span className="visually-hidden">becomes</span>
+                <SummaryFact
+                  value={
+                    summary.chunkAggregatesComplete
+                      ? formatFileSize(summary.compressedBytes)
+                      : MISSING_FACT
+                  }
+                  label="Column data on disk"
+                  title={
+                    summary.chunkAggregatesComplete
+                      ? `${formatNumber(summary.compressedBytes)} bytes`
+                      : undefined
+                  }
+                  valueAfterLabel
+                />
+                <span className="source-storage-context">
+                  ·{" "}
+                  {summary.codecs === null
+                    ? MISSING_FACT
+                    : formatCodecs(summary.codecs)}{" "}
+                  ·{" "}
+                  <StructureHelp term="Compression ratio">
+                    {summary.chunkAggregatesComplete
+                      ? formatRatio(summary.compressionRatio)
+                      : MISSING_FACT}
+                  </StructureHelp>
+                </span>
+              </span>
+              <SummaryFact
+                value={formatFileSize(summary.footerBytes)}
+                label={<StructureHelp term="Footer" />}
+                title={`${formatNumber(summary.footerBytes)} bytes`}
+                valueAfterLabel
+              />
+            </dd>
+          </div>
+          <div className="source-summary-row">
+            <dt>Metadata</dt>
+            <dd className="source-summary-inline">
+              <SummaryFact
+                value={formatNumber(summary.formatVersion)}
+                label={<StructureHelp term="Parquet metadata version" />}
+                valueAfterLabel
+              />
+              <SummaryFact
+                value={summary.createdBy ?? MISSING_FACT}
+                label="Writer"
+                valueAfterLabel
+              />
+            </dd>
+          </div>
+        </>
       )}
     </dl>
   );

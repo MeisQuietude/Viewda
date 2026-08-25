@@ -60,6 +60,8 @@ export function StructureGrid({
   getCell,
   onSort,
   onViewportChange,
+  onSelectRow,
+  onActivateRow,
   heldPage,
   requestedRow,
   measurementPort,
@@ -73,6 +75,8 @@ export function StructureGrid({
   getCell: (row: number, columnId: string) => StructureGridCell | null;
   onSort: (columnId: string) => void;
   onViewportChange: (rowStart: number, rowCount: number) => void;
+  onSelectRow?: (row: number) => void;
+  onActivateRow?: (row: number) => void;
   heldPage: { offset: number; length: number } | null;
   requestedRow?: { row: number; request: number } | null;
   measurementPort?: GridMeasurementPort;
@@ -218,7 +222,7 @@ export function StructureGrid({
   );
 
   return (
-    <section className="structure-grid-shell" aria-label={label}>
+    <section className="structure-grid-shell">
       <div
         className="structure-grid"
         style={
@@ -229,13 +233,23 @@ export function StructureGrid({
       >
         <ViewdaGrid
           ref={gridRef}
+          label={label}
           columns={gridColumns}
           rowCount={rowCount}
           selection={selection}
           contentRevision={contentRevision}
           getCellContent={getCellContent}
           measurementPort={measurementPort}
-          onSelectionChange={setSelection}
+          onSelectionChange={(next) => {
+            setSelection(next);
+            const row = next.current?.cell.row ?? next.rows.first();
+            if (row !== undefined) onSelectRow?.(row);
+          }}
+          onCellActivate={
+            onActivateRow === undefined
+              ? undefined
+              : ({ row }) => onActivateRow(row)
+          }
           onViewportChange={(viewport) =>
             onViewportChange(viewport.rowStart, viewport.rowCount)
           }

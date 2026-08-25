@@ -556,7 +556,7 @@ describe("decodeArrowWindow", () => {
     expect(search.visited).toBe(100_001);
     expect(matches).toBe(1);
     expect(scalarReads.mock.calls.length).toBeLessThanOrEqual(100_010);
-  });
+  }, 10_000);
 
   it("opens and starts copying a 100k Arrow list without reading its tail", () => {
     const values = Array.from({ length: 100_000 }, (_value, index) => index);

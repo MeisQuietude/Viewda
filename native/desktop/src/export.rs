@@ -14,10 +14,13 @@ use serde::{Deserialize, Serialize};
 use tauri_plugin_dialog::DialogExt;
 use viewda_data_engine::{
     DataExportCancellation, DataExportError, DataExportProgress, DataExportReader,
-    DataExportRequest, PreparedDataViewExport,
+    DataExportRequest, DataWindowError, PreparedDataViewExport,
 };
 
-use crate::{OpenedSource, OpenedSourceSession, OpenedSourceState};
+use crate::{
+    DatasetSessionPhase, OpenedSource, OpenedSourceSession, OpenedSourceState, SessionWindowReader,
+    dataset_session::recover_latched_dataset_error,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -67,6 +70,7 @@ pub(crate) enum DataExportCommandError {
     NoSourceOpen,
     SourceChanged,
     ViewChanged,
+    NotReady,
     AlreadyRunning,
     NotFound,
     PermissionDenied,
@@ -479,7 +483,7 @@ impl DataExportJobs {
         ))
     }
 
-    fn cancel_source_and_wait(&self, generation: u64) {
+    pub(crate) fn cancel_source_and_wait(&self, generation: u64) {
         let Ok(mut state) = self.state.lock() else {
             return;
         };
@@ -629,7 +633,8 @@ impl OpenedSource {
         &self,
         generation: u64,
         view_revision: u64,
-    ) -> Result<(PathBuf, Option<PreparedDataViewExport>), DataExportCommandError> {
+    ) -> Result<(Arc<OpenedSourceSession>, Option<PreparedDataViewExport>), DataExportCommandError>
+    {
         let state = self
             .state
             .lock()
@@ -643,16 +648,31 @@ impl OpenedSource {
         if session_state.view_revision != view_revision {
             return Err(DataExportCommandError::ViewChanged);
         }
+        match &session_state.reader {
+            SessionWindowReader::File(_) => {}
+            SessionWindowReader::Dataset(dataset) => match &dataset.phase {
+                DatasetSessionPhase::Ready { .. } => {}
+                DatasetSessionPhase::Discovering(_) | DatasetSessionPhase::Inspecting(_) => {
+                    return Err(DataExportCommandError::NotReady);
+                }
+                DatasetSessionPhase::Failed(_) => {
+                    return Err(DataExportCommandError::SourceChanged);
+                }
+            },
+        }
         session
             .validate_source_identity()
             .map_err(|_| DataExportCommandError::SourceChanged)?;
-        Ok((
-            session.path.clone(),
-            session_state
-                .view
-                .as_ref()
-                .map(|view| view.export_snapshot()),
-        ))
+        let view = session_state.view.as_ref().map(Arc::clone);
+        drop(session_state);
+        let view = view
+            .map(|view| {
+                view.lock()
+                    .map_err(|_| DataExportCommandError::Unsupported)
+                    .map(|view| view.export_snapshot())
+            })
+            .transpose()?;
+        Ok((session, view))
     }
 
     fn reserve_export_start(
@@ -740,15 +760,49 @@ pub(crate) async fn start_data_export(
         Err(_) => return Err(DataExportCommandError::Unsupported),
     };
     let reservation = opened_source.reserve_export_start(generation)?;
-    let (source_path, view) = opened_source.export_source(generation, view_revision)?;
+    let (session, view) = opened_source.export_source(generation, view_revision)?;
+    let dataset_reader = {
+        let state = session
+            .state
+            .lock()
+            .map_err(|_| DataExportCommandError::QueryFailed)?;
+        match &state.reader {
+            SessionWindowReader::File(_) => None,
+            SessionWindowReader::Dataset(dataset) => match &dataset.phase {
+                DatasetSessionPhase::Ready { reader, .. } => Some(Arc::clone(reader)),
+                DatasetSessionPhase::Discovering(_) | DatasetSessionPhase::Inspecting(_) => {
+                    return Err(DataExportCommandError::NotReady);
+                }
+                DatasetSessionPhase::Failed(_) => {
+                    return Err(DataExportCommandError::SourceChanged);
+                }
+            },
+        }
+    };
     let file_name = target_path.file_name().map_or_else(
         || "export.csv".to_owned(),
         |name| name.to_string_lossy().into_owned(),
     );
     let id = jobs.next_id();
+    let start_cancelled = Arc::clone(&reservation.cancelled);
+    let construction_session = Arc::clone(&session);
+    let construction_dataset_reader = dataset_reader.as_ref().map(Arc::clone);
     let reader = match tauri::async_runtime::spawn_blocking({
         let target_path = target_path.clone();
-        move || DataExportReader::new(source_path, target_path, request, view)
+        move || match construction_dataset_reader {
+            None => DataExportReader::new(
+                construction_session.path.clone(),
+                target_path,
+                request,
+                view,
+            ),
+            Some(reader) => {
+                let reader = reader.lock().map_err(|_| DataExportError::QueryFailed)?;
+                DataExportReader::for_dataset_while(&reader, target_path, request, view, || {
+                    !start_cancelled.load(Ordering::Acquire)
+                })
+            }
+        }
     })
     .await
     {
@@ -758,6 +812,10 @@ pub(crate) async fn start_data_export(
     let reader = match reader {
         Ok(reader) => reader,
         Err(error) => {
+            if let Some(category) = data_export_dataset_error(error) {
+                let _ = recover_latched_dataset_error(&session, dataset_reader.as_ref(), category)
+                    .map_err(|_| DataExportCommandError::QueryFailed)?;
+            }
             let Some(failure) = DataExportFailureCode::from_error(error) else {
                 return Err(DataExportCommandError::Cancelled);
             };
@@ -786,12 +844,33 @@ pub(crate) async fn start_data_export(
     ));
     opened_source.install_export_job(&reservation, generation, view_revision, Arc::clone(&job))?;
     drop(reservation);
+    let completion_session = Arc::clone(&session);
+    let completion_dataset_reader = dataset_reader;
     tauri::async_runtime::spawn_blocking(move || {
         let completion = DataExportCompletion::new(job);
-        completion.finish(reader.export());
+        let result = reader.export();
+        if let Err(error) = result
+            && let Some(category) = data_export_dataset_error(error)
+        {
+            let _ = recover_latched_dataset_error(
+                &completion_session,
+                completion_dataset_reader.as_ref(),
+                category,
+            );
+        }
+        completion.finish(result);
     });
 
     get_data_export_status(generation, opened_source)
+}
+
+fn data_export_dataset_error(error: DataExportError) -> Option<DataWindowError> {
+    match error {
+        DataExportError::SourceChanged => Some(DataWindowError::SourceChanged),
+        DataExportError::CorruptSource => Some(DataWindowError::CorruptSource),
+        DataExportError::PermissionDenied => Some(DataWindowError::PermissionDenied),
+        _ => None,
+    }
 }
 
 #[tauri::command]
@@ -911,7 +990,160 @@ mod tests {
     use std::sync::{Arc, Barrier};
 
     use super::*;
+    #[cfg(unix)]
+    use crate::dataset_session::tests::{install_test_dataset, write_test_parquet};
     use crate::tests::open_test_source;
+
+    #[cfg(unix)]
+    fn ready_export_permission_dataset() -> (
+        tempfile::TempDir,
+        PathBuf,
+        Arc<OpenedSourceSession>,
+        Arc<Mutex<viewda_data_engine::DatasetWindowReader>>,
+    ) {
+        let directory = tempfile::tempdir().expect("dataset directory");
+        let member = directory.path().join("private.parquet");
+        write_test_parquet(&member, &[1, 2]);
+        let opened_source = OpenedSource::default();
+        let (session, inspector, _) = install_test_dataset(&opened_source, directory.path());
+        let reader = inspector.into_window_reader().expect("completed reader");
+        let summary = reader.summary().clone();
+        let interrupt = reader.interrupt_handle();
+        let reader = Arc::new(Mutex::new(reader));
+        session
+            .with_open_state(|state| {
+                let SessionWindowReader::Dataset(dataset) = &mut state.reader else {
+                    panic!("dataset session");
+                };
+                dataset.phase = DatasetSessionPhase::Ready {
+                    summary,
+                    reader: Arc::clone(&reader),
+                    interrupt,
+                };
+            })
+            .expect("ready session");
+        (directory, member, session, reader)
+    }
+
+    #[cfg(unix)]
+    fn export_request() -> DataExportRequest {
+        DataExportRequest {
+            column_indices: vec![0],
+            row_ranges: Vec::new(),
+            output: viewda_data_engine::DataExportFormat::Csv {
+                options: viewda_data_engine::CsvExportOptions::default(),
+            },
+        }
+    }
+
+    #[cfg(unix)]
+    fn assert_member_permission_failure(session: &OpenedSourceSession) {
+        let state = session.lock_state().expect("session state");
+        let SessionWindowReader::Dataset(dataset) = &state.reader else {
+            panic!("dataset session");
+        };
+        assert!(matches!(
+            &dataset.phase,
+            DatasetSessionPhase::Failed(
+                viewda_data_engine::DatasetError::MemberPermissionDenied { member }
+            ) if member == "private.parquet"
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn export_construction_recovers_an_existing_exact_dataset_latch() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let (directory, member, session, reader) = ready_export_permission_dataset();
+        fs::set_permissions(&member, fs::Permissions::from_mode(0o000))
+            .expect("remove member access");
+        let latched = reader.lock().expect("dataset reader").fetch(0, 1);
+        fs::set_permissions(&member, fs::Permissions::from_mode(0o600))
+            .expect("restore member access");
+        assert!(matches!(
+            latched,
+            Err(viewda_data_engine::DatasetError::MemberPermissionDenied { .. })
+        ));
+        let result = {
+            let reader = reader.lock().expect("dataset reader");
+            DataExportReader::for_dataset(
+                &reader,
+                directory.path().join("construction.csv"),
+                export_request(),
+                None,
+            )
+        };
+        let error = match result {
+            Ok(_) => panic!("permission failure"),
+            Err(error) => error,
+        };
+        assert_eq!(error, DataExportError::PermissionDenied);
+        let category = data_export_dataset_error(error).expect("recoverable category");
+        assert!(
+            recover_latched_dataset_error(&session, Some(&reader), category)
+                .expect("recover dataset latch")
+                .is_some()
+        );
+        assert_member_permission_failure(&session);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn export_runtime_permission_failure_publishes_the_exact_dataset_latch() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let (directory, member, session, reader) = ready_export_permission_dataset();
+        let export = {
+            let reader = reader.lock().expect("dataset reader");
+            DataExportReader::for_dataset(
+                &reader,
+                directory.path().join("runtime.csv"),
+                export_request(),
+                None,
+            )
+            .expect("export reader")
+        };
+        fs::set_permissions(&member, fs::Permissions::from_mode(0o000))
+            .expect("remove member access");
+        let error = export.export().expect_err("permission failure");
+        fs::set_permissions(&member, fs::Permissions::from_mode(0o600))
+            .expect("restore member access");
+        assert_eq!(error, DataExportError::PermissionDenied);
+        let category = data_export_dataset_error(error).expect("recoverable category");
+        assert!(
+            recover_latched_dataset_error(&session, Some(&reader), category)
+                .expect("recover dataset latch")
+                .is_some()
+        );
+        assert_member_permission_failure(&session);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unrelated_or_unlatched_export_failures_keep_the_dataset_ready() {
+        let (_directory, _member, session, reader) = ready_export_permission_dataset();
+
+        assert_eq!(
+            data_export_dataset_error(DataExportError::QueryFailed),
+            None
+        );
+        assert_eq!(data_export_dataset_error(DataExportError::Cancelled), None);
+        assert_eq!(
+            recover_latched_dataset_error(
+                &session,
+                Some(&reader),
+                DataWindowError::PermissionDenied,
+            )
+            .expect("unlatched permission"),
+            None
+        );
+        let state = session.lock_state().expect("session state");
+        let SessionWindowReader::Dataset(dataset) = &state.reader else {
+            panic!("dataset session");
+        };
+        assert!(matches!(dataset.phase, DatasetSessionPhase::Ready { .. }));
+    }
 
     #[test]
     fn suggests_scope_specific_csv_names_without_exposing_the_directory() {

@@ -6,6 +6,7 @@ import {
   screen,
   waitFor,
 } from "@testing-library/react";
+import { useState } from "react";
 import { afterEach, expect, it, vi } from "vitest";
 
 import * as desktop from "../desktop";
@@ -338,20 +339,26 @@ it("keeps layout payloads bounded and pages the minimap from the keyboard", asyn
     );
   const onHighlightColumn = vi.fn();
 
-  render(
-    <StructureLayoutView
-      generation={7}
-      summary={{ ...summary, columnPathsTruncated: true }}
-      unit="compressed"
-      onUnit={() => {}}
-      rowGroupCount={100_000}
-      highlightedColumn={4}
-      onHighlightColumn={onHighlightColumn}
-      selectedRow={null}
-      onSelectRow={() => {}}
-      onOpenRow={() => {}}
-    />,
-  );
+  function ControlledLayout() {
+    const [lens, setLens] = useState<"ratio" | "codec" | "presence">("ratio");
+    return (
+      <StructureLayoutView
+        generation={7}
+        summary={{ ...summary, columnPathsTruncated: true }}
+        unit="compressed"
+        onUnit={() => {}}
+        lens={lens}
+        onLens={setLens}
+        rowGroupCount={100_000}
+        highlightedColumn={4}
+        onHighlightColumn={onHighlightColumn}
+        selectedRow={null}
+        onSelectRow={() => {}}
+        onOpenRow={() => {}}
+      />
+    );
+  }
+  render(<ControlledLayout />);
 
   expect(layout).not.toHaveBeenCalled();
   const facts = screen.getByLabelText("Chunk facts");
@@ -509,6 +516,8 @@ it("hides a stale map until the latest unit request commits", async () => {
       summary={{ ...summary, rowGroupCount: 1 }}
       unit={unit}
       onUnit={() => {}}
+      lens="ratio"
+      onLens={() => {}}
       rowGroupCount={1}
       highlightedColumn={null}
       onHighlightColumn={() => {}}
@@ -563,6 +572,8 @@ it("uses a singular label for one remaining column", async () => {
       summary={{ ...summary, rowGroupCount: 1, columnCount: 2 }}
       unit="compressed"
       onUnit={() => {}}
+      lens="ratio"
+      onLens={() => {}}
       rowGroupCount={1}
       highlightedColumn={null}
       onHighlightColumn={() => {}}
@@ -597,6 +608,8 @@ it("clears a committed map when a highlighted request fails", async () => {
       summary={{ ...summary, rowGroupCount: 1 }}
       unit="compressed"
       onUnit={() => {}}
+      lens="ratio"
+      onLens={() => {}}
       rowGroupCount={1}
       highlightedColumn={highlightedColumn}
       onHighlightColumn={() => {}}
@@ -667,6 +680,8 @@ it("renders corrupt layout facts as unavailable instead of zero bytes", async ()
       }}
       unit="compressed"
       onUnit={() => {}}
+      lens="ratio"
+      onLens={() => {}}
       rowGroupCount={1}
       highlightedColumn={null}
       onHighlightColumn={() => {}}

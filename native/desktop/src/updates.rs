@@ -13,14 +13,15 @@ use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Manager, State, ipc::Channel};
 use tauri_plugin_updater::{Update, UpdaterExt};
 use thiserror::Error;
-use viewda_data_engine::SourceError;
+use viewda_data_engine::{DatasetError, SourceError};
 
 use crate::{
-    OpenSourceError, OpenedSource, OpenedSourceInfo, SourceOpenIntent, inspect_selected_source,
-    theme::ThemePreference, view_settings::DataViewSettings,
+    OpenSourceError, OpenedSource, OpenedSourceInfo, SourceDescriptor, SourceOpenIntent,
+    inspect_source_descriptor, theme::ThemePreference, view_settings::DataViewSettings,
 };
 
 const UPDATE_STATE_FILE: &str = "updates.json";
+const RESTART_MANIFEST_DIRECTORY: &str = "restart-manifests";
 const STABLE_ENDPOINT: &str = "https://meisquietude.github.io/Viewda/updates/stable.json";
 const LATEST_ENDPOINT: &str = "https://meisquietude.github.io/Viewda/updates/latest.json";
 const AUTOMATIC_CHECK_INTERVAL_SECONDS: u64 = 24 * 60 * 60;
@@ -66,9 +67,18 @@ pub struct PostUpdateState {
     pub version: String,
     /// Restored sources in most-recently-used order, the active one first.
     pub sources: Vec<OpenedSourceInfo>,
-    /// Reported only when nothing could be restored: a window with sources open
-    /// has no surface for a restore failure.
-    pub source_error: Option<SourceError>,
+    /// Reported only when nothing could be restored.
+    pub source_error: Option<PostUpdateSourceError>,
+    /// At least one source could not be saved for, or restored after, restart.
+    pub restore_incomplete: bool,
+}
+
+/// One path-free source failure retained when update recovery restores nothing.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(untagged)]
+pub enum PostUpdateSourceError {
+    Source(SourceError),
+    Dataset(DatasetError),
 }
 
 /// Download progress reported while installing a checked update.
@@ -108,10 +118,15 @@ struct StoredUpdateState {
     pending_restart: Option<PendingRestart>,
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct PendingRestart {
     version: String,
+    #[serde(default)]
+    restore_incomplete: bool,
+    /// Complete native descriptors used by releases that support datasets.
+    #[serde(default)]
+    source_descriptors: Vec<SourceDescriptor>,
     /// Open sources in most-recently-used order, the active one first.
     #[serde(default)]
     source_paths: Vec<PathBuf>,
@@ -124,20 +139,63 @@ struct PendingRestart {
 }
 
 impl PendingRestart {
-    fn new(version: String, source_paths: Vec<PathBuf>) -> Self {
+    fn new(version: String, source_descriptors: Vec<SourceDescriptor>) -> Self {
+        let source_paths = source_descriptors
+            .iter()
+            .filter_map(|descriptor| match descriptor {
+                SourceDescriptor::File(path) => Some(path.clone()),
+                SourceDescriptor::Folder(_) | SourceDescriptor::ExplicitFiles { .. } => None,
+            })
+            .collect::<Vec<_>>();
         Self {
             source_path: source_paths.first().cloned(),
             source_paths,
+            source_descriptors,
             version,
+            restore_incomplete: false,
         }
     }
 
-    /// Sources to reopen, most recently used first, from either marker shape.
-    fn restored_paths(self) -> Vec<PathBuf> {
-        if self.source_paths.is_empty() {
-            self.source_path.into_iter().collect()
+    fn persisted(
+        version: String,
+        source_descriptors: Vec<SourceDescriptor>,
+        manifest_directory: &Path,
+    ) -> Self {
+        let mut persisted = Vec::with_capacity(source_descriptors.len());
+        let mut restore_incomplete = false;
+        for descriptor in &source_descriptors {
+            match descriptor.restart_copy(manifest_directory) {
+                Ok(descriptor) => persisted.push(descriptor),
+                Err(_) => restore_incomplete = true,
+            }
+        }
+        let mut restart = Self::new(version, persisted);
+        restart.restore_incomplete = restore_incomplete;
+        restart
+    }
+
+    fn preserve_restart_manifests(&self) {
+        for descriptor in &self.source_descriptors {
+            if let SourceDescriptor::ExplicitFiles { manifest, .. } = descriptor {
+                manifest.preserve_restart_copy();
+            }
+        }
+    }
+
+    /// Sources to reopen, most recently used first, from every marker shape.
+    fn restored_descriptors(self) -> Vec<SourceDescriptor> {
+        if !self.source_descriptors.is_empty() {
+            self.source_descriptors
+        } else if self.source_paths.is_empty() {
+            self.source_path
+                .into_iter()
+                .map(SourceDescriptor::File)
+                .collect()
         } else {
             self.source_paths
+                .into_iter()
+                .map(SourceDescriptor::File)
+                .collect()
         }
     }
 }
@@ -374,11 +432,19 @@ pub(crate) async fn install_pending_update(
         .map_err(|_| UpdateError::Unavailable)?
         .take()
         .ok_or(UpdateError::NoPendingUpdate)?;
-    let source_paths = opened_source
-        .open_paths()
+    let source_descriptors = opened_source
+        .open_descriptors()
         .map_err(|_| UpdateError::Storage)?;
-    let restart = PendingRestart::new(update.version.clone(), source_paths);
-    store.mutate(&app, |stored| stored.pending_restart = Some(restart))?;
+    let manifest_directory = restart_manifest_directory(&app)?;
+    let restart = PendingRestart::persisted(
+        update.version.clone(),
+        source_descriptors,
+        &manifest_directory,
+    );
+    store.mutate(&app, |stored| {
+        stored.pending_restart = Some(restart.clone())
+    })?;
+    restart.preserve_restart_manifests();
 
     let progress = Mutex::new(UpdateProgressTracker::default());
     let chunk_progress = on_progress.clone();
@@ -408,6 +474,7 @@ pub(crate) async fn install_pending_update(
     {
         *pending.0.lock().map_err(|_| UpdateError::Unavailable)? = Some(update);
         store.mutate(&app, |stored| stored.pending_restart = None)?;
+        cleanup_restart_manifests(&manifest_directory);
         return Err(UpdateError::Unavailable);
     }
 
@@ -420,49 +487,102 @@ pub async fn take_post_update_state(
     app: AppHandle,
     store: State<'_, UpdateStateStore>,
 ) -> Result<Option<PostUpdateState>, UpdateError> {
-    let restart = store.mutate(&app, |stored| {
-        stored
-            .pending_restart
-            .as_ref()
-            .filter(|restart| restart.version == env!("CARGO_PKG_VERSION"))?;
-        stored.pending_restart.take()
+    let (restart, cleanup_orphans) = store.mutate(&app, |stored| {
+        take_pending_restart_for_version(stored, env!("CARGO_PKG_VERSION"))
     })?;
     let Some(restart) = restart else {
+        if cleanup_orphans {
+            cleanup_restart_manifests(&restart_manifest_directory(&app)?);
+        }
         return Ok(None);
     };
+    let manifest_directory = restart_manifest_directory(&app)?;
     let version = restart.version.clone();
-    let paths = restart.restored_paths();
+    let restore_incomplete = restart.restore_incomplete;
+    let descriptors = adopt_restart_descriptors(restart, &manifest_directory);
     let inspected = tauri::async_runtime::spawn_blocking(move || {
         // Reopened least recently used first, so the pre-update active source
         // ends up active again.
-        paths
+        descriptors
             .into_iter()
             .rev()
-            .map(|path| inspect_selected_source(&app, path, SourceOpenIntent::Restore))
+            .map(|descriptor| {
+                descriptor.and_then(|descriptor| {
+                    inspect_source_descriptor(&app, descriptor, SourceOpenIntent::Restore)
+                })
+            })
             .collect::<Vec<_>>()
     })
     .await
     .map_err(|_| UpdateError::Storage)?;
 
+    restored_post_update_state(version, restore_incomplete, inspected).map(Some)
+}
+
+fn restored_post_update_state(
+    version: String,
+    restore_incomplete: bool,
+    inspected: Vec<Result<Option<OpenedSourceInfo>, OpenSourceError>>,
+) -> Result<PostUpdateState, UpdateError> {
+    let (mut sources, source_error) = collect_restored_sources(inspected)?;
+    sources.reverse();
+    Ok(PostUpdateState {
+        version,
+        restore_incomplete: restore_incomplete || source_error.is_some(),
+        source_error: source_error.filter(|_| sources.is_empty()),
+        sources,
+    })
+}
+
+fn adopt_restart_descriptors(
+    restart: PendingRestart,
+    directory: &Path,
+) -> Vec<Result<SourceDescriptor, OpenSourceError>> {
+    restart
+        .restored_descriptors()
+        .into_iter()
+        .map(|descriptor| {
+            descriptor
+                .adopt_restart_manifest(directory)
+                .map_err(Into::into)
+        })
+        .collect()
+}
+
+fn take_pending_restart_for_version(
+    stored: &mut StoredUpdateState,
+    current_version: &str,
+) -> (Option<PendingRestart>, bool) {
+    match stored.pending_restart.as_ref() {
+        Some(restart) if restart.version == current_version => {
+            (stored.pending_restart.take(), false)
+        }
+        Some(_) => (None, false),
+        None => (None, true),
+    }
+}
+
+fn collect_restored_sources(
+    inspected: Vec<Result<Option<OpenedSourceInfo>, OpenSourceError>>,
+) -> Result<(Vec<OpenedSourceInfo>, Option<PostUpdateSourceError>), UpdateError> {
     let mut sources = Vec::new();
     let mut source_error = None;
     for result in inspected {
         match result {
-            Ok(Some((_, source))) => sources.push(source),
+            Ok(Some(source)) => sources.push(source),
             Ok(None) => {}
             // The source meant to become active is inspected last, so its
             // failure is the one an empty window reports.
-            Err(OpenSourceError::Source(error)) => source_error = Some(error),
+            Err(OpenSourceError::Source(error)) => {
+                source_error = Some(PostUpdateSourceError::Source(error));
+            }
+            Err(OpenSourceError::Dataset(error)) => {
+                source_error = Some(PostUpdateSourceError::Dataset(error));
+            }
             Err(OpenSourceError::Recent(_)) => return Err(UpdateError::Storage),
         }
     }
-    sources.reverse();
-
-    Ok(Some(PostUpdateState {
-        version,
-        source_error: source_error.filter(|_| sources.is_empty()),
-        sources,
-    }))
+    Ok((sources, source_error))
 }
 
 /// Opens the immutable GitHub Releases page without accepting a URL from the webview.
@@ -516,6 +636,32 @@ fn state_path(app: &AppHandle) -> Result<PathBuf, UpdateError> {
         .app_config_dir()
         .map(|directory| directory.join(UPDATE_STATE_FILE))
         .map_err(|_| UpdateError::Storage)
+}
+
+fn restart_manifest_directory(app: &AppHandle) -> Result<PathBuf, UpdateError> {
+    app.path()
+        .app_config_dir()
+        .map(|directory| directory.join(RESTART_MANIFEST_DIRECTORY))
+        .map_err(|_| UpdateError::Storage)
+}
+
+fn cleanup_restart_manifests(directory: &Path) {
+    let Ok(entries) = fs::read_dir(directory) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let owned_name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| {
+                name.starts_with("viewda-selection-restart-") && name.ends_with(".manifest")
+            });
+        if owned_name && entry.file_type().is_ok_and(|kind| kind.is_file()) {
+            let _ = fs::remove_file(path);
+        }
+    }
+    let _ = fs::remove_dir(directory);
 }
 
 fn read_state_file(path: &Path) -> Result<StoredUpdateState, UpdateError> {
@@ -689,11 +835,67 @@ mod tests {
     }
 
     #[test]
+    fn an_older_build_leaves_a_newer_restart_marker_and_its_manifests_owned() {
+        let directory = tempfile::tempdir().expect("restart directory");
+        let explicit =
+            SourceDescriptor::explicit_files(vec![PathBuf::from("/data/selection.parquet")])
+                .expect("explicit manifest");
+        let restart =
+            PendingRestart::persisted("0.2.0".to_owned(), vec![explicit], directory.path());
+        let SourceDescriptor::ExplicitFiles { manifest, .. } = &restart.source_descriptors[0]
+        else {
+            unreachable!("explicit descriptor retains its manifest");
+        };
+        let manifest_path = manifest.path().to_path_buf();
+        restart.preserve_restart_manifests();
+        let mut stored = StoredUpdateState {
+            pending_restart: Some(restart),
+            ..StoredUpdateState::default()
+        };
+
+        let (restart, cleanup_orphans) = take_pending_restart_for_version(&mut stored, "0.1.0");
+        if cleanup_orphans {
+            cleanup_restart_manifests(directory.path());
+        }
+
+        assert!(restart.is_none());
+        assert!(!cleanup_orphans);
+        assert!(manifest_path.exists());
+        assert_eq!(
+            stored
+                .pending_restart
+                .as_ref()
+                .map(|restart| restart.version.as_str()),
+            Some("0.2.0")
+        );
+    }
+
+    #[test]
+    fn the_installed_build_consumes_only_its_restart_marker() {
+        let mut stored = StoredUpdateState {
+            pending_restart: Some(PendingRestart::new("0.2.0".to_owned(), Vec::new())),
+            ..StoredUpdateState::default()
+        };
+
+        let (restart, cleanup_orphans) = take_pending_restart_for_version(&mut stored, "0.2.0");
+
+        assert_eq!(
+            restart.as_ref().map(|restart| restart.version.as_str()),
+            Some("0.2.0")
+        );
+        assert!(!cleanup_orphans);
+        assert!(stored.pending_restart.is_none());
+    }
+
+    #[test]
     fn restored_sources_keep_their_frontend_wire_shape() {
         let state = PostUpdateState {
             version: "0.1.0".to_owned(),
             sources: vec![OpenedSourceInfo {
                 generation: 2,
+                kind: crate::OpenedSourceKind::File,
+                dataset_member_count: None,
+                dataset_ignored_file_count: None,
                 summary: viewda_data_engine::SourceSummary {
                     display_name: "trips.parquet".to_owned(),
                     size_bytes: 31,
@@ -707,6 +909,7 @@ mod tests {
                 },
             }],
             source_error: None,
+            restore_incomplete: false,
         };
 
         assert_eq!(
@@ -714,7 +917,10 @@ mod tests {
             serde_json::json!({
                 "version": "0.1.0",
                 "sources": [{
-                    "generation": 2,
+                "generation": 2,
+                "kind": "file",
+                "datasetMemberCount": null,
+                "datasetIgnoredFileCount": null,
                     "displayName": "trips.parquet",
                     "sizeBytes": 31,
                     "rowCount": 7,
@@ -726,6 +932,7 @@ mod tests {
                     "stringsTruncated": false,
                 }],
                 "sourceError": null,
+                "restoreIncomplete": false,
             })
         );
     }
@@ -735,8 +942,8 @@ mod tests {
         let restart = PendingRestart::new(
             "0.1.0".to_owned(),
             vec![
-                PathBuf::from("/data/active.parquet"),
-                PathBuf::from("/data/second.parquet"),
+                SourceDescriptor::File(PathBuf::from("/data/active.parquet")),
+                SourceDescriptor::File(PathBuf::from("/data/second.parquet")),
             ],
         );
 
@@ -744,15 +951,20 @@ mod tests {
             serde_json::to_value(&restart).expect("restart marker JSON"),
             serde_json::json!({
                 "version": "0.1.0",
+                "sourceDescriptors": [
+                    {"kind": "file", "source": "/data/active.parquet"},
+                    {"kind": "file", "source": "/data/second.parquet"},
+                ],
                 "sourcePaths": ["/data/active.parquet", "/data/second.parquet"],
                 "sourcePath": "/data/active.parquet",
+                "restoreIncomplete": false,
             })
         );
         assert_eq!(
-            restart.restored_paths(),
+            restart.restored_descriptors(),
             [
-                PathBuf::from("/data/active.parquet"),
-                PathBuf::from("/data/second.parquet")
+                SourceDescriptor::File(PathBuf::from("/data/active.parquet")),
+                SourceDescriptor::File(PathBuf::from("/data/second.parquet"))
             ]
         );
     }
@@ -765,9 +977,169 @@ mod tests {
         }))
         .expect("single-source restart marker");
 
+        assert!(!restart.restore_incomplete);
         assert_eq!(
-            restart.restored_paths(),
-            [PathBuf::from("/data/only.parquet")]
+            restart.restored_descriptors(),
+            [SourceDescriptor::File(PathBuf::from("/data/only.parquet"))]
+        );
+    }
+
+    #[test]
+    fn a_manifest_copy_failure_keeps_other_restart_sources() {
+        let directory = tempfile::tempdir().expect("restart directory");
+        let explicit =
+            SourceDescriptor::explicit_files(vec![PathBuf::from("/data/selection.parquet")])
+                .expect("explicit manifest");
+        let SourceDescriptor::ExplicitFiles { manifest, .. } = &explicit else {
+            unreachable!("explicit descriptor owns its manifest");
+        };
+        fs::remove_file(manifest.path()).expect("invalidate source manifest");
+
+        let restart = PendingRestart::persisted(
+            "0.1.0".to_owned(),
+            vec![
+                SourceDescriptor::File(PathBuf::from("/data/kept.parquet")),
+                explicit,
+            ],
+            directory.path(),
+        );
+
+        assert!(restart.restore_incomplete);
+        assert_eq!(
+            restart.source_descriptors,
+            [SourceDescriptor::File(PathBuf::from("/data/kept.parquet"))]
+        );
+    }
+
+    #[test]
+    fn restart_marker_retains_folder_and_explicit_dataset_composition() {
+        let descriptors = vec![
+            SourceDescriptor::Folder(PathBuf::from("/data/folder")),
+            SourceDescriptor::explicit_files(vec![
+                PathBuf::from("/data/a.parquet"),
+                PathBuf::from("/data/nested/b.parquet"),
+            ])
+            .expect("explicit manifest"),
+        ];
+        let marker = PendingRestart::new("0.1.0".to_owned(), descriptors.clone());
+        let serialized = serde_json::to_value(&marker).expect("restart marker JSON");
+        let restored: PendingRestart =
+            serde_json::from_value(serialized).expect("restart marker parses");
+
+        assert_eq!(restored.restored_descriptors(), descriptors);
+    }
+
+    #[test]
+    fn one_invalid_restart_manifest_does_not_discard_other_sources() {
+        let directory = tempfile::tempdir().expect("restart directory");
+        let explicit =
+            SourceDescriptor::explicit_files(vec![PathBuf::from("/data/selection.parquet")])
+                .expect("explicit manifest");
+        let restart = PendingRestart::persisted(
+            "0.1.0".to_owned(),
+            vec![
+                SourceDescriptor::File(PathBuf::from("/data/kept.parquet")),
+                explicit,
+            ],
+            directory.path(),
+        );
+        let SourceDescriptor::ExplicitFiles { manifest, .. } = &restart.source_descriptors[1]
+        else {
+            unreachable!("explicit descriptor retains its manifest");
+        };
+        fs::remove_file(manifest.path()).expect("invalidate restart manifest");
+
+        let adopted = adopt_restart_descriptors(restart, directory.path());
+
+        assert!(matches!(
+            &adopted[0],
+            Ok(SourceDescriptor::File(path)) if path == Path::new("/data/kept.parquet")
+        ));
+        assert!(matches!(
+            &adopted[1],
+            Err(OpenSourceError::Source(SourceError::NotFound))
+        ));
+    }
+
+    #[test]
+    fn unpersisted_restart_manifest_is_removed_when_its_owner_drops() {
+        let directory = tempfile::tempdir().expect("restart directory");
+        let descriptor = SourceDescriptor::explicit_files(vec![PathBuf::from("/data/a.parquet")])
+            .expect("explicit manifest");
+        let restart =
+            PendingRestart::persisted("0.1.0".to_owned(), vec![descriptor], directory.path());
+        let SourceDescriptor::ExplicitFiles { manifest, .. } = &restart.source_descriptors[0]
+        else {
+            unreachable!("explicit descriptor retains its manifest");
+        };
+        let manifest_path = manifest.path().to_path_buf();
+        assert!(manifest_path.exists());
+
+        drop(restart);
+
+        assert!(!manifest_path.exists());
+    }
+
+    #[test]
+    fn restart_manifest_cleanup_ignores_unowned_files() {
+        let directory = tempfile::tempdir().expect("restart directory");
+        let owned = directory
+            .path()
+            .join("viewda-selection-restart-1-1.manifest");
+        let unrelated = directory.path().join("notes.txt");
+        fs::write(&owned, b"owned").expect("owned manifest");
+        fs::write(&unrelated, b"unrelated").expect("unrelated file");
+
+        cleanup_restart_manifests(directory.path());
+
+        assert!(!owned.exists());
+        assert!(unrelated.exists());
+    }
+
+    #[test]
+    fn partial_restore_keeps_valid_sources_and_reports_the_warning_flag() {
+        let restored = OpenedSourceInfo {
+            generation: 7,
+            kind: crate::OpenedSourceKind::File,
+            dataset_member_count: None,
+            dataset_ignored_file_count: None,
+            summary: viewda_data_engine::SourceSummary {
+                display_name: "kept.parquet".to_owned(),
+                size_bytes: 1,
+                row_count: 1,
+                row_group_count: 1,
+                column_count: 1,
+                schema: Vec::new(),
+                schema_node_count: 0,
+                schema_is_truncated: false,
+                strings_truncated: false,
+            },
+        };
+        let state = restored_post_update_state(
+            "0.2.0".to_owned(),
+            false,
+            vec![
+                Err(DatasetError::NotFound.into()),
+                Ok(Some(restored.clone())),
+            ],
+        )
+        .expect("partial restore remains reportable");
+
+        assert_eq!(state.sources, [restored]);
+        assert!(state.restore_incomplete);
+        assert_eq!(state.source_error, None);
+
+        let failed = restored_post_update_state(
+            "0.2.0".to_owned(),
+            false,
+            vec![Err(DatasetError::NotFound.into())],
+        )
+        .expect("empty restore retains its exact error");
+        assert!(failed.sources.is_empty());
+        assert!(failed.restore_incomplete);
+        assert_eq!(
+            failed.source_error,
+            Some(PostUpdateSourceError::Dataset(DatasetError::NotFound))
         );
     }
 

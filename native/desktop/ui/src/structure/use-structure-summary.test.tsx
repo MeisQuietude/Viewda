@@ -1,0 +1,76 @@
+import { act, render, renderHook } from "@testing-library/react";
+import { afterEach, expect, it, vi } from "vitest";
+
+import * as desktop from "../desktop";
+import {
+  STRUCTURE_PROGRESS_INTERVAL_MS,
+  useStructureSummary,
+} from "./use-structure-summary";
+
+afterEach(() => {
+  vi.useRealTimers();
+  vi.restoreAllMocks();
+});
+
+it("never exposes the previous member summary under a new revision", async () => {
+  const oldSummary = { columnCount: 1 } as desktop.StructureSummary;
+  vi.spyOn(desktop, "getStructureSummary")
+    .mockResolvedValueOnce(oldSummary)
+    .mockImplementation(() => new Promise(() => {}));
+  const renderedStates: string[] = [];
+
+  function Probe({ revision }: { revision: number }) {
+    const { state } = useStructureSummary(7, true, revision);
+    renderedStates.push(
+      state.kind === "ready"
+        ? `ready:${state.summary.columnCount}`
+        : state.kind,
+    );
+    return null;
+  }
+
+  const view = render(<Probe revision={0} />);
+  await act(async () => {});
+  expect(renderedStates.at(-1)).toBe("ready:1");
+
+  renderedStates.length = 0;
+  view.rerender(<Probe revision={1} />);
+
+  expect(renderedStates[0]).not.toBe("ready:1");
+});
+
+it("ignores progress returned for the previously selected dataset member", async () => {
+  vi.useFakeTimers();
+  vi.spyOn(desktop, "getStructureSummary").mockImplementation(
+    () => new Promise(() => {}),
+  );
+  let resolveOldProgress:
+    ((progress: desktop.StructureLoadProgress | null) => void) | undefined;
+  vi.spyOn(desktop, "getStructureLoadProgress").mockImplementationOnce(
+    () =>
+      new Promise((resolve) => {
+        resolveOldProgress = resolve;
+      }),
+  );
+
+  const { result, rerender } = renderHook(
+    ({ revision }) => useStructureSummary(7, true, revision),
+    { initialProps: { revision: 0 } },
+  );
+  await act(async () => {});
+  act(() => vi.advanceTimersByTime(STRUCTURE_PROGRESS_INTERVAL_MS));
+  expect(desktop.getStructureLoadProgress).toHaveBeenCalledWith(7);
+
+  rerender({ revision: 1 });
+  await act(async () => {});
+  await act(async () => {
+    resolveOldProgress?.({
+      completedRowGroups: 9,
+      totalRowGroups: 10,
+      completedChunks: 90,
+      totalChunks: 100,
+    });
+  });
+
+  expect(result.current.state).toEqual({ kind: "loading", progress: null });
+});

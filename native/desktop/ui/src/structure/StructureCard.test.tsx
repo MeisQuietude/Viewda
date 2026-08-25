@@ -7,7 +7,11 @@ import {
 } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
-import type { SourceSummary, StructureSummary } from "../desktop";
+import type {
+  DatasetReadySummary,
+  SourceSummary,
+  StructureSummary,
+} from "../desktop";
 import {
   StructureCard,
   StructureLoadStatus,
@@ -35,6 +39,23 @@ const source: SourceSummary = {
   schemaNodeCount: 2,
   schemaIsTruncated: false,
   stringsTruncated: false,
+};
+
+const dataset: DatasetReadySummary = {
+  displayName: "orders/",
+  memberCount: 96,
+  ignoredFileCount: 14,
+  sizeBytes: 9_000_000,
+  rowCount: 80_000,
+  rowGroupCount: 800,
+  columnCount: 4,
+  schema: source.schema,
+  schemaNodeCount: 2,
+  schemaIsTruncated: false,
+  stringsTruncated: false,
+  schemaDriftMemberCount: 3,
+  partitionColumnIndices: [],
+  provenanceColumnIndex: 4,
 };
 
 function summaryOf(
@@ -88,6 +109,41 @@ function summaryRow(label: string): HTMLElement {
 }
 
 describe("StructureCard", () => {
+  it("separates dataset totals from the selected file footer", () => {
+    render(
+      <StructureCard
+        source={source}
+        summary={summaryOf()}
+        dataset={dataset}
+        datasetNavigator={<nav aria-label="Dataset navigator" />}
+      />,
+    );
+
+    const datasetFacts = screen.getByLabelText("Dataset facts");
+    expect(datasetFacts).toHaveTextContent("96 Parquet files");
+    expect(datasetFacts).toHaveTextContent("14 other files ignored");
+    expect(datasetFacts).toHaveTextContent("3 with schema differences");
+    expect(datasetFacts).toHaveTextContent("80,000 rows");
+    expect(datasetFacts).toHaveTextContent("800 row groups");
+    expect(datasetFacts).toHaveTextContent("Dataset on disk 9.0 MB");
+    expect(datasetFacts).not.toHaveTextContent("File on disk");
+
+    const selectedFileFacts = screen.getByLabelText("Selected file facts");
+    const navigator = screen.getByLabelText("Dataset navigator");
+    expect(Array.from(datasetFacts.parentElement?.children ?? [])).toEqual([
+      datasetFacts,
+      navigator,
+      selectedFileFacts,
+    ]);
+    expect(selectedFileFacts).toHaveTextContent("1,200 rows");
+    expect(selectedFileFacts).toHaveTextContent("12 row groups");
+    expect(selectedFileFacts).toHaveTextContent("≈ 100 rows/group");
+    expect(selectedFileFacts).toHaveTextContent("Before compression 3.0 MB");
+    expect(selectedFileFacts).toHaveTextContent("Column data on disk 1.0 MB");
+    expect(selectedFileFacts).toHaveTextContent("Footer 4.1 kB");
+    expect(selectedFileFacts).not.toHaveTextContent("80,000 rows");
+  });
+
   it("shows the counts it already has before the footer is parsed", () => {
     render(<StructureCard source={source} summary={null} />);
 

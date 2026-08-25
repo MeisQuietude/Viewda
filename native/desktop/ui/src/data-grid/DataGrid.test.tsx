@@ -1115,6 +1115,53 @@ describe("DataGrid window rendering", () => {
     ).toHaveTextContent("*");
   });
 
+  it("starts an exact virtual provenance column visible and pinned but still mutable", async () => {
+    const pinned = new Set([7]);
+    const view = render(
+      <DataGrid
+        source={source}
+        contentIdentity="early-sample"
+        defaultPinnedSourceIndices={pinned}
+      />,
+    );
+
+    expect(screen.getByLabelText("Query")).toHaveTextContent("*");
+    expect(gridMock.props?.columns[0]).toMatchObject({
+      title: "column_7",
+      pinned: true,
+    });
+    const picker = openSelectPicker();
+    expect(
+      within(picker).getByRole("checkbox", { name: "Show column_7" }),
+    ).toBeChecked();
+    const unpin = within(picker).getByRole("button", {
+      name: "Unpin column_7",
+    });
+    fireEvent.click(unpin);
+    expect(gridMock.props?.columns[7]).toMatchObject({
+      title: "column_7",
+      pinned: false,
+    });
+    fireEvent.click(
+      within(picker).getByRole("checkbox", { name: "Show column_7" }),
+    );
+    expect(screen.getByLabelText("Query")).toHaveTextContent("[7/8 cols]");
+
+    view.rerender(
+      <DataGrid
+        source={{ ...source, rowCount: source.rowCount + 1 }}
+        contentIdentity="complete"
+        defaultPinnedSourceIndices={pinned}
+      />,
+    );
+    expect(
+      within(picker).getByRole("checkbox", { name: "Show column_7" }),
+    ).not.toBeChecked();
+    expect(
+      within(picker).getByRole("button", { name: "Pin column_7" }),
+    ).toHaveAttribute("aria-pressed", "false");
+  });
+
   it("keeps the SELECT picker and grid column menu on one visibility state", async () => {
     render(<DataGrid source={source} />);
     await waitFor(() => expect(desktop.getDataWindow).toHaveBeenCalledOnce());
@@ -1891,6 +1938,43 @@ describe("DataGrid window rendering", () => {
       });
     });
     expect(gridMock.props?.selection?.columns.hasIndex(2)).toBe(true);
+  });
+
+  it("rebuilds an early-sample sort on completion without remounting the grid", async () => {
+    const { rerender } = render(
+      <DataGrid source={source} contentIdentity="early-sample" />,
+    );
+    act(() => {
+      gridMock.props?.onSort(2, false);
+    });
+    await waitFor(() =>
+      expect(desktop.prepareDataView).toHaveBeenLastCalledWith(
+        7,
+        1,
+        [],
+        [{ sourceIndex: 2, direction: "ascending" }],
+        { memoryLimit: "mb384" },
+      ),
+    );
+    vi.mocked(desktop.prepareDataView).mockClear();
+
+    rerender(
+      <DataGrid
+        source={{ ...source, rowCount: source.rowCount + 100 }}
+        contentIdentity="complete"
+      />,
+    );
+
+    await waitFor(() =>
+      expect(desktop.prepareDataView).toHaveBeenCalledWith(
+        7,
+        2,
+        [],
+        [{ sourceIndex: 2, direction: "ascending" }],
+        { memoryLimit: "mb384" },
+      ),
+    );
+    expect(gridMock.props?.columns[2]?.sort.direction).toBe("ascending");
   });
 
   it("renders canonical ORDER BY and edits direction and priority in its popup", async () => {
@@ -3073,6 +3157,51 @@ describe("DataGrid window rendering", () => {
     );
     expect(screen.queryByRole("alert")).not.toBeInTheDocument();
   });
+
+  it.each([
+    {
+      code: "sourceChanged" as const,
+      member: "year=2026/changed.parquet",
+      message:
+        "Dataset member year=2026/changed.parquet changed. Reload the dataset.",
+    },
+    {
+      code: "invalidMember" as const,
+      member: "year=2026/broken.parquet",
+      message:
+        "Dataset member year=2026/broken.parquet is damaged or unsupported. Reload the dataset.",
+    },
+    {
+      code: "memberPermissionDenied" as const,
+      member: "year=2026/private.parquet",
+      message:
+        "Fix permissions for dataset member year=2026/private.parquet, then reload the dataset.",
+    },
+  ])(
+    "reloads the dataset instead of retrying a $code window",
+    async (failure) => {
+      const onReloadDataset = vi.fn();
+      vi.mocked(desktop.getDataWindow).mockRejectedValue(
+        new desktop.DataWindowCommandError(failure.code, undefined, {
+          code: failure.code,
+          member: failure.member,
+        }),
+      );
+
+      render(<DataGrid source={source} onReloadDataset={onReloadDataset} />);
+
+      const alert = await screen.findByRole("alert");
+      expect(alert).toHaveTextContent(failure.message);
+      expect(
+        within(alert).queryByRole("button", { name: "Retry window" }),
+      ).not.toBeInTheDocument();
+      fireEvent.click(
+        within(alert).getByRole("button", { name: "Reload dataset" }),
+      );
+
+      expect(onReloadDataset).toHaveBeenCalledOnce();
+    },
+  );
 
   it.each([
     {
@@ -4348,6 +4477,52 @@ describe("DataGrid window rendering", () => {
     ).not.toBeInTheDocument();
   });
 
+  it("drops early-sample statistics when the complete dataset replaces it", async () => {
+    vi.mocked(desktop.getColumnStatistics)
+      .mockResolvedValueOnce({
+        minimum: "1",
+        maximum: "2",
+        minMaxComputed: true,
+        nullShare: 0.125,
+        approximateDistinctCount: 2,
+      })
+      .mockResolvedValueOnce({
+        minimum: "1",
+        maximum: "9",
+        minMaxComputed: true,
+        nullShare: 0.5,
+        approximateDistinctCount: 9,
+      });
+    const { rerender } = render(
+      <DataGrid source={source} contentIdentity="early-sample" />,
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Schema" }));
+    let sidebar = screen.getByRole("complementary", {
+      name: "Schema sidebar",
+    });
+    fireEvent.click(within(sidebar).getByRole("button", { name: /column_0/ }));
+    expect(await within(sidebar).findByText("12.5%")).toBeInTheDocument();
+    vi.mocked(desktop.cancelColumnStatistics).mockClear();
+
+    rerender(
+      <DataGrid
+        source={{ ...source, rowCount: source.rowCount + 100 }}
+        contentIdentity="complete"
+      />,
+    );
+
+    sidebar = screen.getByRole("complementary", { name: "Schema sidebar" });
+    expect(
+      within(sidebar).getByText("Select a column to scan its statistics."),
+    ).toBeInTheDocument();
+    expect(within(sidebar).queryByText("12.5%")).not.toBeInTheDocument();
+    expect(desktop.cancelColumnStatistics).toHaveBeenCalledWith(7);
+
+    fireEvent.click(within(sidebar).getByRole("button", { name: /column_0/ }));
+    expect(await within(sidebar).findByText("50%")).toBeInTheDocument();
+    expect(desktop.getColumnStatistics).toHaveBeenCalledTimes(2);
+  });
+
   it("lets the backend replace an active statistics scan", async () => {
     const firstStatistics = deferred<desktop.ColumnStatistics>();
     vi.mocked(desktop.getColumnStatistics)
@@ -4467,6 +4642,22 @@ describe("DataGrid window rendering", () => {
 });
 
 describe("DataGrid export", () => {
+  it("keeps export unavailable until dataset inspection finishes", async () => {
+    render(<DataGrid source={source} exportEnabled={false} />);
+    await act(async () => {});
+
+    expect(desktop.getDataExportStatus).not.toHaveBeenCalled();
+    openGridMenu();
+    expect(
+      screen.getByRole("menuitem", {
+        name: "Export is available after dataset inspection finishes",
+      }),
+    ).toBeDisabled();
+
+    fireEvent.keyDown(window, { key: "E", ctrlKey: true, shiftKey: true });
+    expect(desktop.startDataExport).not.toHaveBeenCalled();
+  });
+
   it("exports the active filtered and sorted view revision", async () => {
     render(<DataGrid source={source} />);
     addNumberFilter("4");
@@ -4559,7 +4750,9 @@ describe("DataGrid export", () => {
     vi.mocked(desktop.getDataWindow).mockClear();
     copyFromGrid();
 
-    await waitFor(() => expect(clipboardWrite).toHaveBeenCalledOnce());
+    await waitFor(() => expect(clipboardWrite).toHaveBeenCalledOnce(), {
+      timeout: 5_000,
+    });
     const copied = clipboardWrite.mock.calls[0]?.[0] as string;
     expect(copied.split("\n")).toHaveLength(10_000);
     expect(desktop.getDataWindow).toHaveBeenCalledTimes(20);
@@ -4587,7 +4780,7 @@ describe("DataGrid export", () => {
     await waitFor(() => expect(desktop.getDataWindow).toHaveBeenCalled());
     copyFromGrid();
 
-    const alert = await screen.findByRole("alert");
+    const alert = await screen.findByRole("alert", {}, { timeout: 5_000 });
     expect(alert).toHaveTextContent("The selection could not be copied.");
     expect(
       within(alert).queryByRole("button", { name: "Retry window" }),

@@ -28,20 +28,26 @@ export interface StructureSummaryController {
 }
 
 /**
- * Parses the footer once per opened source, on first activation of the mode.
+ * Parses the selected source or dataset member on first Structure activation.
  *
  * Re-entering asks the backend idempotently so an evicted cache entry can be
- * rebuilt without discarding this component's view state. A cancelled parse
- * leaves a state the caller can retry from.
+ * rebuilt without discarding this component's view state. A revision invalidates
+ * that state after a dataset member switch. A cancelled parse leaves a state the
+ * caller can retry from.
  */
 export function useStructureSummary(
   generation: number,
   active: boolean,
+  revision = 0,
 ): StructureSummaryController {
   const [state, setState] = useState<StructureSummaryState>({ kind: "idle" });
   const requestVersion = useRef(0);
   const aliveRef = useRef(true);
   const wasActive = useRef(false);
+  const renderKey = `${generation}:${revision}`;
+  const stateKey = useRef(renderKey);
+  const visibleState: StructureSummaryState =
+    stateKey.current === renderKey ? state : { kind: "idle" };
 
   useEffect(() => {
     aliveRef.current = true;
@@ -79,7 +85,14 @@ export function useStructureSummary(
         }
       },
     );
-  }, [generation]);
+  }, [generation, revision]);
+
+  useEffect(() => {
+    requestVersion.current += 1;
+    stateKey.current = renderKey;
+    wasActive.current = false;
+    setState({ kind: "idle" });
+  }, [generation, renderKey, revision]);
 
   useEffect(() => {
     const activated = active && !wasActive.current;
@@ -90,13 +103,18 @@ export function useStructureSummary(
   }, [active, load]);
 
   useEffect(() => {
-    if (state.kind !== "loading") {
+    if (visibleState.kind !== "loading") {
       return;
     }
+    const version = requestVersion.current;
     const timer = setInterval(() => {
       void getStructureLoadProgress(generation).then(
         (progress) => {
-          if (progress !== null && aliveRef.current) {
+          if (
+            progress !== null &&
+            aliveRef.current &&
+            requestVersion.current === version
+          ) {
             setState((current) =>
               current.kind === "loading" ? { ...current, progress } : current,
             );
@@ -108,7 +126,7 @@ export function useStructureSummary(
       );
     }, STRUCTURE_PROGRESS_INTERVAL_MS);
     return () => clearInterval(timer);
-  }, [generation, state.kind]);
+  }, [generation, visibleState.kind]);
 
   const cancel = useCallback(() => {
     void cancelStructureLoad(generation).catch(() => {
@@ -116,7 +134,7 @@ export function useStructureSummary(
     });
   }, [generation]);
 
-  return { state, cancel, retry: load };
+  return { state: visibleState, cancel, retry: load };
 }
 
 export function structureErrorMessage(error: unknown): string {

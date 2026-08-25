@@ -10,6 +10,10 @@ Backward-incompatible entries start with **Breaking:**.
 
 ### Added
 
+- Open Parquet folders recursively as datasets. Hive columns become integers
+  only when all non-null values are canonical signed integers; otherwise they
+  stay text. Filter, sort, inspect, and export complete datasets; source
+  modification times stay unchanged and `file` starts pinned.
 - Inspect Parquet storage in Structure view with exact chunk coverage and
   row-group ranges; sortable row-group and physical-column tables with stable
   leaf numbers for shortened paths; an optional chunk map with compression,
