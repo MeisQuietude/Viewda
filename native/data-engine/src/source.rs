@@ -5,6 +5,10 @@ use std::{
     sync::Arc,
 };
 
+#[cfg(feature = "query-engine")]
+use arrow_schema::Schema;
+#[cfg(feature = "query-engine")]
+use parquet::arrow::parquet_to_arrow_schema;
 use parquet::{
     basic::{
         ConvertedType, EdgeInterpolationAlgorithm, LogicalType, TimeUnit,
@@ -134,38 +138,49 @@ pub struct SourceIdentity {
     file_id: [u8; 16],
 }
 
+#[cfg(windows)]
+pub(crate) fn windows_file_identity(file: &File) -> Result<(u64, [u8; 16]), io::Error> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_ID_INFO, FileIdInfo, GetFileInformationByHandleEx,
+    };
+
+    let mut file_id_information = FILE_ID_INFO::default();
+    let file_id_information_bytes = u32::try_from(std::mem::size_of::<FILE_ID_INFO>())
+        .map_err(|_| io::Error::other("FILE_ID_INFO exceeds the Windows API size limit"))?;
+    // SAFETY: `file` keeps this valid OS handle alive for the duration of the call,
+    // and the output pointer and byte count describe writable `FILE_ID_INFO` storage.
+    let succeeded = unsafe {
+        GetFileInformationByHandleEx(
+            file.as_raw_handle(),
+            FileIdInfo,
+            std::ptr::from_mut(&mut file_id_information).cast(),
+            file_id_information_bytes,
+        )
+    };
+    if succeeded == 0 {
+        return Err(io::Error::last_os_error());
+    }
+
+    Ok((
+        file_id_information.VolumeSerialNumber,
+        file_id_information.FileId.Identifier,
+    ))
+}
+
 impl SourceIdentity {
     fn from_file(file: &File) -> Result<Self, SourceError> {
         let metadata = file.metadata().map_err(map_io_error)?;
         #[cfg(windows)]
         {
-            use std::os::windows::io::AsRawHandle;
-            use windows_sys::Win32::Storage::FileSystem::{
-                FILE_ID_INFO, FileIdInfo, GetFileInformationByHandleEx,
-            };
-
-            let mut file_id_information = FILE_ID_INFO::default();
-            let file_id_information_bytes = u32::try_from(std::mem::size_of::<FILE_ID_INFO>())
-                .map_err(|_| SourceError::Unsupported)?;
-            // SAFETY: `file` keeps this valid OS handle alive for the duration of the call,
-            // and the output pointer and byte count describe writable `FILE_ID_INFO` storage.
-            let succeeded = unsafe {
-                GetFileInformationByHandleEx(
-                    file.as_raw_handle(),
-                    FileIdInfo,
-                    std::ptr::from_mut(&mut file_id_information).cast(),
-                    file_id_information_bytes,
-                )
-            };
-            if succeeded == 0 {
-                return Err(map_io_error(io::Error::last_os_error()));
-            }
+            let (volume_serial_number, file_id) =
+                windows_file_identity(file).map_err(map_io_error)?;
 
             Ok(Self {
                 len: metadata.len(),
                 modified_nanos: modified_nanos(&metadata),
-                volume_serial_number: file_id_information.VolumeSerialNumber,
-                file_id: file_id_information.FileId.Identifier,
+                volume_serial_number,
+                file_id,
             })
         }
         #[cfg(not(windows))]
@@ -430,6 +445,21 @@ pub fn inspect_local_source_snapshot_cancellable(
 pub(crate) fn inspect_local_source_for_query(path: &Path) -> Result<SourceSummary, SourceError> {
     let snapshot = SourceSnapshot::open(path)?;
     source_summary(path, &snapshot, usize::MAX, usize::MAX)
+}
+
+#[cfg(feature = "query-engine")]
+pub(crate) fn inspect_local_source_for_dataset(
+    path: &Path,
+) -> Result<(SourceSummary, Schema), SourceError> {
+    let snapshot = SourceSnapshot::open(path)?;
+    let summary = source_summary(path, &snapshot, usize::MAX, usize::MAX)?;
+    let file_metadata = snapshot.metadata().file_metadata();
+    let arrow_schema = parquet_to_arrow_schema(
+        file_metadata.schema_descr(),
+        file_metadata.key_value_metadata(),
+    )
+    .map_err(map_parquet_error)?;
+    Ok((summary, arrow_schema))
 }
 
 fn source_summary(
