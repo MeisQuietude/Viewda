@@ -11,6 +11,16 @@ class TestClipboardItem {
   constructor(readonly data: Record<string, Blob | Promise<Blob>>) {}
 }
 
+function deferred<Value>() {
+  let resolve!: (value: Value | PromiseLike<Value>) => void;
+  let reject!: (reason?: unknown) => void;
+  const promise = new Promise<Value>((accept, decline) => {
+    resolve = accept;
+    reject = decline;
+  });
+  return { promise, resolve, reject };
+}
+
 describe("grid clipboard capability", () => {
   it("writes both formats after detecting rich clipboard support", async () => {
     const write = vi.fn().mockResolvedValue(undefined);
@@ -105,5 +115,100 @@ describe("grid clipboard capability", () => {
 
     await expect(clipboard.write(contents)).resolves.toBe("plain");
     expect(writeText).toHaveBeenCalledWith(contents.textPlain);
+  });
+
+  it("finishes a newer Peek write after an older rich grid write", async () => {
+    const first = deferred<void>();
+    const calls: string[] = [];
+    const write = vi.fn(() => {
+      calls.push("grid");
+      return first.promise;
+    });
+    const writeText = vi.fn(async () => {
+      calls.push("peek");
+    });
+    const clipboard = createGridClipboard({
+      clipboard: () => ({ write, writeText }),
+      clipboardItem: () => TestClipboardItem as unknown as typeof ClipboardItem,
+    });
+
+    const grid = clipboard.write(contents);
+    const peek = clipboard.writeText("newer JSON");
+    expect(calls).toEqual(["grid"]);
+    first.resolve();
+
+    await expect(grid).resolves.toBe("rich");
+    await expect(peek).resolves.toBe("plain");
+    expect(calls).toEqual(["grid", "peek"]);
+    expect(writeText).toHaveBeenCalledWith("newer JSON");
+  });
+
+  it("finishes a newer rich grid write after an older Peek write", async () => {
+    const first = deferred<void>();
+    const calls: string[] = [];
+    const writeText = vi.fn(() => {
+      calls.push("peek");
+      return first.promise;
+    });
+    const write = vi.fn(async () => {
+      calls.push("grid");
+    });
+    const clipboard = createGridClipboard({
+      clipboard: () => ({ write, writeText }),
+      clipboardItem: () => TestClipboardItem as unknown as typeof ClipboardItem,
+    });
+
+    const peek = clipboard.writeText("older JSON");
+    const grid = clipboard.write(contents);
+    expect(calls).toEqual(["peek"]);
+    first.resolve();
+
+    await expect(peek).resolves.toBe("plain");
+    await expect(grid).resolves.toBe("rich");
+    expect(calls).toEqual(["peek", "grid"]);
+  });
+
+  it("registers Peek intent before preparation so a newer grid copy stays last", async () => {
+    const prepared = deferred<string>();
+    const calls: string[] = [];
+    const writeText = vi.fn(async (text: string) => {
+      calls.push(text);
+    });
+    const clipboard = createGridClipboard({
+      clipboard: () => ({ write: undefined, writeText }) as never,
+      clipboardItem: () => undefined,
+    });
+
+    const peek = clipboard.writeText(prepared.promise);
+    const grid = clipboard.write(contents);
+    expect(calls).toEqual([]);
+    prepared.resolve("older JSON");
+
+    await expect(peek).resolves.toBe("plain");
+    await expect(grid).resolves.toBe("plain");
+    expect(calls).toEqual(["older JSON", contents.textPlain]);
+  });
+
+  it("continues the write tail after an older system write rejects", async () => {
+    const first = deferred<void>();
+    const writeText = vi
+      .fn()
+      .mockImplementationOnce(() => first.promise)
+      .mockResolvedValueOnce(undefined);
+    const clipboard = createGridClipboard({
+      clipboard: () => ({ write: undefined, writeText }) as never,
+      clipboardItem: () => undefined,
+    });
+
+    const older = clipboard.writeText("older");
+    const newer = clipboard.writeText("newer");
+    const olderRejected = expect(older).rejects.toMatchObject({
+      name: "NotAllowedError",
+    });
+    first.reject(new DOMException("denied", "NotAllowedError"));
+
+    await olderRejected;
+    await expect(newer).resolves.toBe("plain");
+    expect(writeText).toHaveBeenNthCalledWith(2, "newer");
   });
 });

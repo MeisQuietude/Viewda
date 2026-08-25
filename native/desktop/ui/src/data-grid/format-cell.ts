@@ -1,17 +1,24 @@
-import { TimeUnit, Type, type DataType } from "@uwdata/flechette";
+import { Type, type DataType } from "@uwdata/flechette";
 
-import { decimalToText, timestampToText } from "./filter-query";
-
-const NESTED_PREVIEW_LIMIT = 120;
-// Every full chunk is divisible by three, so independently encoded base64
-// chunks concatenate without padding in the middle of the value.
-const BASE64_INPUT_CHUNK_BYTES = 24 * 1024;
+import {
+  formatCellDisplay,
+  formatDateDecimalText,
+  formatValuePreviewTokens,
+  isNumericType,
+  materializedScalarValue,
+  typedValue,
+  valueToJson,
+  type TypedValue,
+  type PreviewToken,
+} from "./value-format";
+import { arrowValueIsNull } from "./arrow-value";
 
 export interface CellPresentation {
   displayData: string;
   copyData: string;
   align: "left" | "right";
   faded: boolean;
+  segments?: readonly PreviewToken[];
 }
 
 export function formatCellValue(
@@ -19,63 +26,73 @@ export function formatCellValue(
   dataType: DataType,
   includeRawCopy = true,
 ): CellPresentation {
+  return formatTypedCellValue(typedValue(value, dataType), includeRawCopy);
+}
+
+export function formatTypedCellValue(
+  input: TypedValue,
+  includeRawCopy: boolean,
+): CellPresentation {
+  if (input.kind !== "value" && input.kind !== "arrow") {
+    throw new Error("A grid cell requires an Arrow-typed value.");
+  }
+  const value = input.kind === "value" ? input.value : undefined;
+  const dataType = input.dataType;
   const type = unwrapDictionary(dataType);
 
-  if (value === null) {
+  if (
+    (input.kind === "value" && value === null) ||
+    (input.kind === "arrow" && arrowValueIsNull(input))
+  ) {
     return presentation("null", "", false, true);
   }
+  const nested = isNested(type);
+  const segments = nested ? formatValuePreviewTokens(input) : undefined;
+  const displayData =
+    segments === undefined
+      ? formatCellDisplay(input)
+      : segments.map(({ text }) => text).join("");
+  const copyData = includeRawCopy
+    ? nested
+      ? valueToJson(input)
+      : formatTypedScalarCopyData(input)
+    : "";
+  return presentation(
+    displayData,
+    copyData,
+    isNumericType(type),
+    false,
+    segments,
+  );
+}
 
-  if (isBinary(type)) {
-    const bytes = value instanceof Uint8Array ? value : new Uint8Array();
-    return presentation(
-      `binary · ${formatByteSize(bytes.byteLength)}`,
-      includeRawCopy ? bytesToBase64(bytes) : "",
-      false,
-      false,
+/** Formats scalar clipboard data without constructing the grid display preview. */
+export function formatTypedScalarCopyData(input: TypedValue): string {
+  if (input.kind !== "value" && input.kind !== "arrow") {
+    throw new Error("A grid cell requires an Arrow-typed value.");
+  }
+  if (
+    (input.kind === "value" && input.value === null) ||
+    (input.kind === "arrow" && arrowValueIsNull(input))
+  ) {
+    return "";
+  }
+  const type = unwrapDictionary(input.dataType);
+  if (isNested(type)) {
+    throw new Error(
+      "Nested grid cells require incremental copy serialization.",
     );
   }
-
-  if (type.typeId === Type.Timestamp) {
-    // M1 renders timezone-less Arrow timestamps as UTC for deterministic ISO output.
-    // Copying remains lossless because copyData keeps the raw Arrow integer.
-    const iso = timestampToText(value, type.unit);
-    const raw = typeof value === "bigint" ? value.toString() : String(value);
-    return presentation(iso, raw, false, false);
-  }
-
-  if (type.typeId === Type.Date) {
-    const iso = timestampToText(value, TimeUnit.MILLISECOND).slice(0, 10);
-    return presentation(iso, iso, false, false);
-  }
-
-  if (type.typeId === Type.Decimal) {
-    const decimal = decimalToText(value, type.scale);
-    return presentation(decimal, decimal, true, false);
-  }
-
-  if (isNumber(type)) {
-    const raw = typeof value === "bigint" ? value.toString() : String(value);
-    return presentation(raw, raw, true, false);
-  }
-
-  if (isNested(type)) {
-    // Normal rendering needs only the bounded preview. Avoid walking the rest of
-    // a large nested value on the main thread; copy/export explicitly opts into
-    // the complete, lossless representation below.
-    const raw = includeRawCopy ? stringifyNested(value) : "";
-    const preview = includeRawCopy
-      ? truncateNestedPreview(raw)
-      : stringifyNestedPreview(value);
-    return presentation(preview, raw, false, false);
-  }
-
-  const raw = String(value);
-  return presentation(raw, raw, false, false);
+  return scalarCopyData(
+    input.kind === "arrow" ? materializedScalarValue(input) : input.value,
+    type,
+    input,
+  );
 }
 
 export function usesMonospaceCells(dataType: DataType): boolean {
   const type = unwrapDictionary(dataType);
-  return isNumber(type) || isNested(type);
+  return isNumericType(type) || isNested(type);
 }
 
 function presentation(
@@ -83,12 +100,14 @@ function presentation(
   copyData: string,
   alignRight: boolean,
   faded: boolean,
+  segments?: readonly PreviewToken[],
 ): CellPresentation {
   return {
     displayData,
     copyData,
     align: alignRight ? "right" : "left",
     faded,
+    ...(segments === undefined ? {} : { segments }),
   };
 }
 
@@ -96,23 +115,6 @@ function unwrapDictionary(dataType: DataType): DataType {
   return dataType.typeId === Type.Dictionary
     ? unwrapDictionary(dataType.dictionary)
     : dataType;
-}
-
-function isNumber(dataType: DataType): boolean {
-  return (
-    dataType.typeId === Type.Int ||
-    dataType.typeId === Type.Float ||
-    dataType.typeId === Type.Decimal
-  );
-}
-
-function isBinary(dataType: DataType): boolean {
-  return (
-    dataType.typeId === Type.Binary ||
-    dataType.typeId === Type.LargeBinary ||
-    dataType.typeId === Type.FixedSizeBinary ||
-    dataType.typeId === Type.BinaryView
-  );
 }
 
 function isNested(dataType: DataType): boolean {
@@ -127,139 +129,24 @@ function isNested(dataType: DataType): boolean {
   );
 }
 
-function stringifyNested(value: unknown): string {
-  return (
-    JSON.stringify(value, (_key, nestedValue: unknown) => {
-      if (typeof nestedValue === "bigint") {
-        return nestedValue.toString();
-      }
-      if (nestedValue instanceof Map) {
-        return Array.from(nestedValue.entries());
-      }
-      if (nestedValue instanceof Uint8Array) {
-        return `binary · ${formatByteSize(nestedValue.byteLength)}`;
-      }
-      return nestedValue;
-    }) ?? "null"
-  );
-}
-
-function truncateNestedPreview(raw: string): string {
-  return raw.length <= NESTED_PREVIEW_LIMIT
-    ? raw
-    : `${raw.slice(0, NESTED_PREVIEW_LIMIT - 1)}…`;
-}
-
-function stringifyNestedPreview(value: unknown): string {
-  let output = "";
-  let truncated = false;
-
-  const append = (text: string) => {
-    const remaining = NESTED_PREVIEW_LIMIT - 1 - output.length;
-    if (remaining <= 0) {
-      truncated = true;
-      return false;
-    }
-    if (text.length > remaining) {
-      output += text.slice(0, remaining);
-      truncated = true;
-      return false;
-    }
-    output += text;
-    return true;
-  };
-
-  const write = (nestedValue: unknown): boolean => {
-    if (typeof nestedValue === "bigint") {
-      return append(JSON.stringify(nestedValue.toString()));
-    }
-    if (nestedValue instanceof Uint8Array) {
-      return append(
-        JSON.stringify(`binary · ${formatByteSize(nestedValue.byteLength)}`),
-      );
-    }
-    if (typeof nestedValue === "string") {
-      return append(JSON.stringify(nestedValue.slice(0, NESTED_PREVIEW_LIMIT)));
-    }
-    if (nestedValue === null || typeof nestedValue !== "object") {
-      const encoded = JSON.stringify(nestedValue);
-      return append(encoded ?? "null");
-    }
-
-    const objectLike =
-      !Array.isArray(nestedValue) && !(nestedValue instanceof Map);
-    if (!append(objectLike ? "{" : "[")) return false;
-    let first = true;
-    const keys: Iterable<unknown> = objectLike
-      ? ownEnumerableKeys(nestedValue)
-      : nestedValue instanceof Map
-        ? nestedValue.keys()
-        : nestedValue.keys();
-    for (const key of keys) {
-      const item =
-        nestedValue instanceof Map
-          ? nestedValue.get(key)
-          : (nestedValue as Record<PropertyKey, unknown>)[key as PropertyKey];
-      if (!first && !append(",")) return false;
-      first = false;
-      if (objectLike) {
-        if (
-          !append(
-            `${JSON.stringify(String(key).slice(0, NESTED_PREVIEW_LIMIT))}:`,
-          )
-        ) {
-          return false;
-        }
-        if (!write(item)) return false;
-      } else if (nestedValue instanceof Map) {
-        if (!append("[")) return false;
-        if (!write(key) || !append(",") || !write(item)) {
-          return false;
-        }
-        if (!append("]")) return false;
-      } else if (!write(item)) {
-        return false;
-      }
-    }
-    return append(objectLike ? "}" : "]");
-  };
-
-  write(value);
-  return truncated ? `${output}…` : output;
-}
-
-function* ownEnumerableKeys(value: object): Iterable<string> {
-  // Object.keys allocates every field name before the preview writer can stop.
-  // A lazy iterator keeps work proportional to the bounded visible prefix.
-  for (const key in value) {
-    if (Object.hasOwn(value, key)) yield key;
-  }
-}
-
-function bytesToBase64(bytes: Uint8Array): string {
-  const encodedChunks: string[] = [];
-  for (
-    let offset = 0;
-    offset < bytes.length;
-    offset += BASE64_INPUT_CHUNK_BYTES
+function scalarCopyData(
+  value: unknown,
+  dataType: DataType,
+  input: TypedValue,
+): string {
+  if (
+    dataType.typeId === Type.Binary ||
+    dataType.typeId === Type.LargeBinary ||
+    dataType.typeId === Type.FixedSizeBinary ||
+    dataType.typeId === Type.BinaryView
   ) {
-    encodedChunks.push(
-      btoa(
-        String.fromCharCode(
-          ...bytes.subarray(offset, offset + BASE64_INPUT_CHUNK_BYTES),
-        ),
-      ),
-    );
+    return JSON.parse(valueToJson(input)) as string;
   }
-  return encodedChunks.join("");
-}
-
-function formatByteSize(bytes: number): string {
-  if (bytes < 1_000) {
-    return `${bytes} B`;
+  if (dataType.typeId === Type.Date || dataType.typeId === Type.Decimal) {
+    return formatDateDecimalText(value, dataType);
   }
-  if (bytes < 1_000_000) {
-    return `${(bytes / 1_000).toFixed(1)} kB`;
+  if (dataType.typeId === Type.Timestamp || isNumericType(dataType)) {
+    return typeof value === "bigint" ? value.toString() : String(value);
   }
-  return `${(bytes / 1_000_000).toFixed(1)} MB`;
+  return String(value);
 }

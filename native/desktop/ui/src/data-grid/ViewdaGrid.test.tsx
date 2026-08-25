@@ -308,6 +308,39 @@ describe("ViewdaGrid foundation", () => {
     );
   });
 
+  it("renders bounded preview segments without replacing accessible cell text", () => {
+    const getCellContent = vi.fn(() => ({
+      kind: "text" as const,
+      displayData: "{null: null}",
+      copyData: '{"null":null}',
+      alignment: "left" as const,
+      faded: false,
+      segments: [
+        { text: "{", tone: "secondary" as const },
+        { text: "null", tone: "key" as const },
+        { text: ": ", tone: "secondary" as const },
+        { text: "null", tone: "null" as const },
+        { text: "}", tone: "secondary" as const },
+      ],
+    }));
+    const { container } = render(
+      <ViewdaGrid {...props({ rowCount: 100_000_000, getCellContent })} />,
+    );
+
+    const cells = screen.getAllByRole("gridcell", { name: "{null: null}" });
+    expect(getCellContent.mock.calls.length).toBeLessThanOrEqual(
+      cells.length * 2,
+    );
+    expect(cells[0]?.textContent).toBe("{null: null}");
+    expect(cells.length).toBeLessThanOrEqual(60);
+    expect(container.querySelectorAll(".cell-preview-key")).toHaveLength(
+      cells.length,
+    );
+    expect(container.querySelector(".cell-preview-null")).toHaveTextContent(
+      "null",
+    );
+  });
+
   it("keeps the horizontal scrollbar outside sticky columns", () => {
     const columns = [column(0, true), column(1), column(2), column(3)];
     const { container } = render(
@@ -351,6 +384,7 @@ describe("ViewdaGrid foundation", () => {
 
   it("keeps the horizontal thumb visible, clickable, and draggable", () => {
     installPointerCapture();
+    const onScrollInteraction = vi.fn();
     const basePort = measurementPort(420, 84);
     const port: GridMeasurementPort = {
       ...basePort,
@@ -360,7 +394,7 @@ describe("ViewdaGrid foundation", () => {
           : basePort.bounds(element),
     };
     const { container } = render(
-      <ViewdaGrid {...props({ measurementPort: port })} />,
+      <ViewdaGrid {...props({ measurementPort: port, onScrollInteraction })} />,
     );
     const horizontalScrollbar = screen.getByRole("scrollbar", {
       name: "Horizontal grid scroll",
@@ -385,8 +419,10 @@ describe("ViewdaGrid foundation", () => {
       pointerId: 6,
     });
     expect(bodyScrollport.scrollLeft).toBeGreaterThan(0);
+    expect(onScrollInteraction).toHaveBeenCalledOnce();
     fireEvent.pointerUp(horizontalScrollbar, { pointerId: 6 });
     fireEvent.keyDown(horizontalScrollbar, { key: "Home" });
+    expect(onScrollInteraction).toHaveBeenCalledTimes(2);
 
     fireEvent.pointerDown(horizontalScrollbar, {
       button: 0,
@@ -397,6 +433,7 @@ describe("ViewdaGrid foundation", () => {
       clientX: 300,
       pointerId: 7,
     });
+    expect(onScrollInteraction).toHaveBeenCalledTimes(3);
 
     const expectedScrollLeft = (195 / (367 - thumbWidth)) * 833;
     expect(bodyScrollport.scrollLeft).toBeCloseTo(expectedScrollLeft);
@@ -1665,6 +1702,160 @@ describe("ViewdaGrid foundation", () => {
       0,
       expect.objectContaining({ width: 100 }),
     );
+  });
+
+  it("routes Peek keyboard, double-click, focus, and scroll interactions", () => {
+    const onCellPeek = vi.fn();
+    const onPeekFocus = vi.fn();
+    const onScrollInteraction = vi.fn();
+    const selection = selectCell(
+      emptyGridSelection(),
+      { row: 0, column: 0 },
+      false,
+      false,
+    );
+    const gridRef = createRef<ViewdaGridHandle>();
+    const { container } = render(
+      <ViewdaGrid
+        ref={gridRef}
+        {...props({
+          selection,
+          onCellPeek,
+          onPeekFocus,
+          onScrollInteraction,
+        })}
+      />,
+    );
+    const grid = screen.getByRole("grid");
+    const cell = screen.getByRole("gridcell", { name: "0:0" });
+
+    fireEvent.keyDown(grid, { key: " " });
+    fireEvent.doubleClick(cell);
+    expect(onCellPeek).toHaveBeenCalledTimes(2);
+    expect(onCellPeek).toHaveBeenLastCalledWith(
+      { row: 0, column: 0 },
+      { x: 1, y: 2, width: 100, height: 28 },
+      "open",
+    );
+    Object.defineProperty(document, "elementFromPoint", {
+      configurable: true,
+      value: vi.fn(() => cell),
+    });
+    fireEvent.doubleClick(grid, { clientX: 664, clientY: 127 });
+    expect(onCellPeek).toHaveBeenCalledTimes(3);
+    expect(onCellPeek).toHaveBeenLastCalledWith(
+      { row: 0, column: 0 },
+      { x: 1, y: 2, width: 100, height: 28 },
+      "open",
+    );
+    const otherGrid = document.createElement("div");
+    otherGrid.setAttribute("role", "grid");
+    const otherCell = document.createElement("div");
+    otherCell.dataset.gridKind = "cell";
+    otherCell.dataset.column = "7";
+    otherCell.dataset.row = "8";
+    otherGrid.append(otherCell);
+    document.body.append(otherGrid);
+    Object.defineProperty(document, "elementFromPoint", {
+      configurable: true,
+      value: vi.fn(() => otherCell),
+    });
+    fireEvent.doubleClick(grid, { clientX: 664, clientY: 127 });
+    expect(onCellPeek).toHaveBeenCalledTimes(3);
+    otherGrid.remove();
+    fireEvent.doubleClick(cell, { button: 1 });
+    fireEvent.doubleClick(
+      container.querySelector('[data-grid-kind="header"]')!,
+    );
+    expect(onCellPeek).toHaveBeenCalledTimes(3);
+    fireEvent.keyDown(grid, { key: "Tab" });
+    expect(onPeekFocus).toHaveBeenCalledOnce();
+    fireEvent.keyDown(grid, { key: "Tab", shiftKey: true });
+    expect(onPeekFocus).toHaveBeenCalledOnce();
+
+    act(() => gridRef.current?.scrollToRow(20));
+    expect(onScrollInteraction).not.toHaveBeenCalled();
+
+    act(() => grid.dispatchEvent(wheelEvent({ deltaY: 28 }, 1)));
+    expect(onScrollInteraction).toHaveBeenCalledOnce();
+  });
+
+  it("scrolls an unmounted active cell into view before opening Peek with Space", async () => {
+    const onCellPeek = vi.fn();
+    const selection = selectCell(
+      emptyGridSelection(),
+      { row: 80, column: 0 },
+      false,
+      false,
+    );
+    render(<ViewdaGrid {...props({ selection, rowCount: 100, onCellPeek })} />);
+    const grid = screen.getByRole("grid");
+    expect(screen.queryByRole("gridcell", { name: "80:0" })).toBeNull();
+
+    const accepted = fireEvent.keyDown(grid, { key: " " });
+
+    expect(accepted).toBe(false);
+    await waitFor(() =>
+      expect(onCellPeek).toHaveBeenCalledWith(
+        { row: 80, column: 0 },
+        expect.objectContaining({ height: 28 }),
+      ),
+    );
+  });
+
+  it("cancels an offscreen Space request when Escape wins the same input turn", () => {
+    const onCellPeek = vi.fn();
+    const selection = selectCell(
+      emptyGridSelection(),
+      { row: 80, column: 0 },
+      false,
+      false,
+    );
+    render(<ViewdaGrid {...props({ selection, rowCount: 100, onCellPeek })} />);
+    const grid = screen.getByRole("grid");
+
+    act(() => {
+      grid.dispatchEvent(
+        new KeyboardEvent("keydown", { key: " ", bubbles: true }),
+      );
+      grid.dispatchEvent(
+        new KeyboardEvent("keydown", { key: "Escape", bubbles: true }),
+      );
+    });
+
+    expect(onCellPeek).not.toHaveBeenCalled();
+  });
+
+  it("cancels an offscreen Space request when the active cell changes", () => {
+    const onCellPeek = vi.fn();
+    function Harness() {
+      const [selection, setSelection] = useState(() =>
+        selectCell(emptyGridSelection(), { row: 80, column: 0 }, false, false),
+      );
+      return (
+        <ViewdaGrid
+          {...props({
+            selection,
+            rowCount: 100,
+            onCellPeek,
+            onSelectionChange: setSelection,
+          })}
+        />
+      );
+    }
+    render(<Harness />);
+    const grid = screen.getByRole("grid");
+
+    act(() => {
+      grid.dispatchEvent(
+        new KeyboardEvent("keydown", { key: " ", bubbles: true }),
+      );
+      grid.dispatchEvent(
+        new KeyboardEvent("keydown", { key: "ArrowDown", bubbles: true }),
+      );
+    });
+
+    expect(onCellPeek).not.toHaveBeenCalled();
   });
 
   it("extends a cell selection while the pointer is captured", () => {

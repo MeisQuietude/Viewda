@@ -114,6 +114,14 @@ export interface ViewdaGridProps {
   onFilter(column: number, bounds: Rectangle): void;
   onHeaderContextMenu(column: number, bounds: Rectangle): void;
   onCellContextMenu(address: GridAddress, bounds: Rectangle): void;
+  onCellPeek?(
+    address: GridAddress,
+    bounds: Rectangle,
+    behavior?: "toggle" | "open",
+  ): void;
+  onActiveCellBoundsChange?(address: GridAddress, bounds: Rectangle): void;
+  onPeekFocus?(): void;
+  onScrollInteraction?(): void;
   onCopy(event: ClipboardEvent): void;
   onHorizontalExtentChange(
     exceeded: boolean,
@@ -240,6 +248,10 @@ export const ViewdaGrid = forwardRef<ViewdaGridHandle, ViewdaGridProps>(
       onFilter,
       onHeaderContextMenu,
       onCellContextMenu,
+      onCellPeek,
+      onActiveCellBoundsChange,
+      onPeekFocus,
+      onScrollInteraction,
       onCopy,
       onHorizontalExtentChange,
       onEscape,
@@ -310,6 +322,18 @@ export const ViewdaGrid = forwardRef<ViewdaGridHandle, ViewdaGridProps>(
     >(null);
     const columnWindowRef = useRef<ColumnWindow | null>(null);
     const [rowAnchor, setRowAnchor] = useState<number | null>(null);
+    const [pendingPeek, setPendingPeek] = useState<GridAddress | null>(null);
+    useEffect(() => {
+      const active = selection.current?.cell;
+      if (
+        pendingPeek !== null &&
+        (active === undefined ||
+          active.row !== pendingPeek.row ||
+          active.column !== pendingPeek.column)
+      ) {
+        setPendingPeek(null);
+      }
+    }, [pendingPeek, selection.current?.cell]);
     const rowAnchorRef = useRef<number | null>(null);
     const [safeExtent, setSafeExtent] = useState<{
       vertical: number;
@@ -1023,6 +1047,7 @@ export const ViewdaGrid = forwardRef<ViewdaGridHandle, ViewdaGridProps>(
         ) {
           return;
         }
+        onScrollInteraction?.();
         const advance = advanceWheelGesture(
           wheelGestureRef.current,
           horizontalDelta,
@@ -1199,6 +1224,7 @@ export const ViewdaGrid = forwardRef<ViewdaGridHandle, ViewdaGridProps>(
       applyLogicalDelta,
       diagnostics,
       layout.logicalMax,
+      onScrollInteraction,
       geometry.height,
       geometry.width,
       scheduleMeasurement,
@@ -1310,6 +1336,7 @@ export const ViewdaGrid = forwardRef<ViewdaGridHandle, ViewdaGridProps>(
         if (thumb.maximumScrollLeft <= 0 || thumb.travel <= 0) {
           return;
         }
+        onScrollInteraction?.();
         event.preventDefault();
         event.stopPropagation();
         captureTarget.focus();
@@ -1338,7 +1365,12 @@ export const ViewdaGrid = forwardRef<ViewdaGridHandle, ViewdaGridProps>(
           );
         }
       },
-      [measurementPort, scrollFromHorizontalScrollbar, scrollingWidth],
+      [
+        measurementPort,
+        onScrollInteraction,
+        scrollFromHorizontalScrollbar,
+        scrollingWidth,
+      ],
     );
 
     const handleHorizontalScrollbarPointerMove = useCallback(
@@ -1411,9 +1443,15 @@ export const ViewdaGrid = forwardRef<ViewdaGridHandle, ViewdaGridProps>(
         }
         event.preventDefault();
         event.stopPropagation();
+        onScrollInteraction?.();
         scrollFromHorizontalScrollbar(target);
       },
-      [scrollFromHorizontalScrollbar, scrollingViewportWidth, scrollingWidth],
+      [
+        onScrollInteraction,
+        scrollFromHorizontalScrollbar,
+        scrollingViewportWidth,
+        scrollingWidth,
+      ],
     );
 
     const scrollToRow = useCallback(
@@ -1504,6 +1542,32 @@ export const ViewdaGrid = forwardRef<ViewdaGridHandle, ViewdaGridProps>(
       },
       [geometry.height, scrollToColumn, scrollToRow],
     );
+
+    useLayoutEffect(() => {
+      if (pendingPeek === null) return;
+      const active = selection.current?.cell;
+      if (
+        active === undefined ||
+        active.row !== pendingPeek.row ||
+        active.column !== pendingPeek.column
+      ) {
+        setPendingPeek(null);
+        return;
+      }
+      const cell = rootRef.current?.querySelector<HTMLElement>(
+        `[data-grid-kind="cell"][data-row="${pendingPeek.row}"][data-column="${pendingPeek.column}"]`,
+      );
+      if (cell === undefined || cell === null) return;
+      setPendingPeek(null);
+      onCellPeek?.(pendingPeek, measurementPort.bounds(cell));
+    }, [
+      contentRevision,
+      measurementPort,
+      onCellPeek,
+      pendingPeek,
+      selection.current?.cell,
+      scrollState,
+    ]);
 
     const updateCellSelection = useCallback(
       (cell: GridAddress, extend: boolean, additive: boolean) => {
@@ -1607,6 +1671,14 @@ export const ViewdaGrid = forwardRef<ViewdaGridHandle, ViewdaGridProps>(
 
     const handlePointerDown = useCallback(
       (event: ReactPointerEvent<HTMLDivElement>) => {
+        if (
+          event.target === scrollportRef.current ||
+          (event.target as HTMLElement).closest(
+            ".viewda-grid-horizontal-scrollport",
+          ) !== null
+        ) {
+          onScrollInteraction?.();
+        }
         const handle = (event.target as HTMLElement).closest<HTMLElement>(
           '[data-action="resize"]',
         );
@@ -1674,7 +1746,7 @@ export const ViewdaGrid = forwardRef<ViewdaGridHandle, ViewdaGridProps>(
           clientY: event.clientY,
         };
       },
-      [columns, onSelectionChange, selection],
+      [columns, onScrollInteraction, onSelectionChange, selection],
     );
 
     const finishResize = useCallback(
@@ -1864,23 +1936,59 @@ export const ViewdaGrid = forwardRef<ViewdaGridHandle, ViewdaGridProps>(
 
     const handleDoubleClick = useCallback(
       (event: React.MouseEvent<HTMLDivElement>) => {
-        const handle = (event.target as HTMLElement).closest<HTMLElement>(
-          '[data-action="resize"]',
-        );
+        if (event.button !== 0) return;
+        const target = event.target as HTMLElement;
+        const coordinateHit =
+          target.closest("[data-grid-kind], [data-action=resize]") === null
+            ? document.elementFromPoint?.(event.clientX, event.clientY)
+            : null;
+        const coordinateTarget =
+          coordinateHit != null && event.currentTarget.contains(coordinateHit)
+            ? coordinateHit
+            : null;
+        const handle =
+          target.closest<HTMLElement>('[data-action="resize"]') ??
+          coordinateTarget?.closest<HTMLElement>('[data-action="resize"]');
         const column = parseIndex(handle?.dataset.column);
         if (column !== null) {
           event.preventDefault();
           finishResize();
           onColumnAutoFit(column);
+          return;
+        }
+        // Pointer capture can retarget the native dblclick to the grid root.
+        // Hit-test its coordinates so the gesture still resolves the cell.
+        const cell =
+          target.closest<HTMLElement>('[data-grid-kind="cell"]') ??
+          coordinateTarget?.closest<HTMLElement>('[data-grid-kind="cell"]');
+        const cellColumn = parseIndex(cell?.dataset.column);
+        const row = parseIndex(cell?.dataset.row);
+        if (cell != null && cellColumn !== null && row !== null) {
+          event.preventDefault();
+          onCellPeek?.(
+            { column: cellColumn, row },
+            measurementPort.bounds(cell),
+            "open",
+          );
         }
       },
-      [finishResize, onColumnAutoFit],
+      [finishResize, measurementPort, onCellPeek, onColumnAutoFit],
     );
 
     const handleKeyDown = useCallback(
       (event: ReactKeyboardEvent<HTMLDivElement>) => {
         if (event.key === "Escape") {
+          setPendingPeek(null);
           onEscape?.();
+          return;
+        }
+        if (
+          event.key === "Tab" &&
+          !event.shiftKey &&
+          onPeekFocus !== undefined
+        ) {
+          event.preventDefault();
+          onPeekFocus();
           return;
         }
         if (rowCount === 0 || columns.length === 0) {
@@ -1891,6 +1999,19 @@ export const ViewdaGrid = forwardRef<ViewdaGridHandle, ViewdaGridProps>(
           Math.floor(geometry.height / GRID_ROW_HEIGHT),
         );
         const currentCell = selection.current?.cell ?? { row: 0, column: 0 };
+        if (event.key === " " && selection.current?.cell !== undefined) {
+          event.preventDefault();
+          const cell = rootRef.current?.querySelector<HTMLElement>(
+            `[data-grid-kind="cell"][data-row="${currentCell.row}"][data-column="${currentCell.column}"]`,
+          );
+          if (cell !== undefined && cell !== null) {
+            onCellPeek?.(currentCell, measurementPort.bounds(cell));
+          } else {
+            ensureCellVisible(currentCell);
+            setPendingPeek(currentCell);
+          }
+          return;
+        }
         const primaryModifier = event.metaKey || event.ctrlKey;
         const selectDestination = (row: number, column: number) =>
           selectCell(selection, { row, column }, event.shiftKey, false);
@@ -2012,7 +2133,10 @@ export const ViewdaGrid = forwardRef<ViewdaGridHandle, ViewdaGridProps>(
         columns.length,
         ensureCellVisible,
         geometry.height,
+        measurementPort,
+        onCellPeek,
         onEscape,
+        onPeekFocus,
         onSelectionChange,
         rowCount,
         selection,
@@ -2028,6 +2152,27 @@ export const ViewdaGrid = forwardRef<ViewdaGridHandle, ViewdaGridProps>(
     const activeDescendant = activeMounted
       ? cellId(instanceId, activeCell)
       : undefined;
+    useLayoutEffect(() => {
+      if (!activeMounted || activeCell === undefined) return;
+      const cell = document.getElementById(cellId(instanceId, activeCell));
+      if (cell !== null) {
+        onActiveCellBoundsChange?.(activeCell, measurementPort.bounds(cell));
+      }
+    }, [
+      activeCell?.column,
+      activeCell?.row,
+      activeMounted,
+      contentRevision,
+      effectiveScrollState.logicalTop,
+      effectiveScrollState.physicalTop,
+      instanceId,
+      measurementPort,
+      onActiveCellBoundsChange,
+      renderedRows.end,
+      renderedRows.start,
+      renderedScrollingRange.end,
+      renderedScrollingRange.start,
+    ]);
     const pinnedLeftByColumn = useMemo(() => {
       const leftByColumn = new Map<number, number>();
       let left = markerWidth;
@@ -2373,6 +2518,7 @@ const GridCellView = memo(function GridCellView({
       aria-colindex={ariaColumnIndex}
       aria-selected={selected}
       aria-busy={cell.kind === "loading" || undefined}
+      aria-label={cell.kind === "text" ? cell.displayData : undefined}
       data-grid-kind="cell"
       data-row={row}
       data-column={column}
@@ -2387,7 +2533,13 @@ const GridCellView = memo(function GridCellView({
             }
       }
     >
-      {cell.kind === "text" ? cell.displayData : ""}
+      {cell.kind === "text"
+        ? (cell.segments?.map((segment, index) => (
+            <span key={index} className={`cell-preview-${segment.tone}`}>
+              {segment.text}
+            </span>
+          )) ?? cell.displayData)
+        : ""}
     </div>
   );
 });

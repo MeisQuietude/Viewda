@@ -1070,9 +1070,12 @@ mod tests {
     #[cfg(unix)]
     use std::io::{Seek, SeekFrom, Write};
 
-    use arrow_array::{ArrayRef, Int64Array, RecordBatch, StringArray, TimestampMicrosecondArray};
+    use arrow_array::{
+        Array, ArrayRef, BinaryArray, Decimal128Array, Int64Array, RecordBatch, StringArray,
+        StructArray, TimestampMicrosecondArray,
+    };
     use arrow_ipc::reader::StreamReader;
-    use arrow_schema::{DataType, Field, Schema};
+    use arrow_schema::{DataType, Field, Fields, Schema};
     use parquet::arrow::ArrowWriter;
     use tempfile::NamedTempFile;
 
@@ -1223,6 +1226,49 @@ mod tests {
         assert_eq!(direct.schema().field(1).data_type(), &expected);
         assert_eq!(sparse.schema().field(0).data_type(), &expected);
         assert_eq!(fallback.schema().field(0).data_type(), &expected);
+    }
+
+    #[test]
+    fn nested_values_are_stable_across_direct_sparse_and_fallback_windows() {
+        let source = write_nested_value_fixture();
+        let mut direct_reader = crate::DataWindowReader::new(source.path().to_owned());
+        let direct = decode_one_window(
+            direct_reader.fetch(0, 2).expect("direct DuckDB window"),
+            "direct",
+        );
+        let view = DataViewBuilder::new(
+            source.path().to_owned(),
+            &[],
+            &[DataSort {
+                source_index: 0,
+                direction: DataSortDirection::Ascending,
+            }],
+        )
+        .expect("view builder")
+        .build()
+        .expect("prepared view");
+        let sparse = decode_one_window(
+            view.fetch_window_columns(0, 2, &[1])
+                .expect("sparse window"),
+            "sparse",
+        );
+        let fallback = decode_one_window(
+            view.fetch_window_columns_with_duckdb(0, 2, &[1])
+                .expect("DuckDB fallback window"),
+            "fallback",
+        );
+
+        let direct = nested_value_snapshot(&direct, 1);
+        let sparse = nested_value_snapshot(&sparse, 0);
+        let fallback = nested_value_snapshot(&fallback, 0);
+        assert_eq!(sparse, direct);
+        assert_eq!(fallback, direct);
+        assert_eq!(direct.amounts, vec![1_234, -5_678]);
+        assert_eq!(
+            direct.timestamps,
+            vec![1_700_000_000_000_000, 1_700_000_000_000_001]
+        );
+        assert_eq!(direct.binary, vec![b"\0abc".to_vec(), vec![0xff]]);
     }
 
     #[test]
@@ -1692,6 +1738,108 @@ mod tests {
         writer.write(&batch).expect("write timestamp batch");
         writer.close().expect("write timestamp footer");
         source
+    }
+
+    fn write_nested_value_fixture() -> NamedTempFile {
+        let source = NamedTempFile::new().expect("temporary source");
+        let amount = Decimal128Array::from(vec![1_234_i128, -5_678])
+            .with_precision_and_scale(9, 2)
+            .expect("decimal precision");
+        let occurred_at = TimestampMicrosecondArray::from_iter_values([
+            1_700_000_000_000_000,
+            1_700_000_000_000_001,
+        ])
+        .with_timezone("UTC");
+        let payload = StructArray::from(vec![
+            (
+                Arc::new(Field::new("amount", DataType::Decimal128(9, 2), false)),
+                Arc::new(amount) as ArrayRef,
+            ),
+            (
+                Arc::new(Field::new(
+                    "occurred_at",
+                    DataType::Timestamp(
+                        arrow_schema::TimeUnit::Microsecond,
+                        Some(Arc::<str>::from("UTC")),
+                    ),
+                    false,
+                )),
+                Arc::new(occurred_at) as ArrayRef,
+            ),
+            (
+                Arc::new(Field::new("blob", DataType::Binary, false)),
+                Arc::new(BinaryArray::from(vec![b"\0abc".as_slice(), &[0xff]])) as ArrayRef,
+            ),
+        ]);
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new(
+                "payload",
+                DataType::Struct(Fields::from(payload.fields().to_vec())),
+                false,
+            ),
+        ]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int64Array::from(vec![0, 1])) as ArrayRef,
+                Arc::new(payload) as ArrayRef,
+            ],
+        )
+        .expect("nested value batch");
+        let file = source.reopen().expect("nested value fixture file");
+        let mut writer = ArrowWriter::try_new(file, schema, None).expect("Parquet writer");
+        writer.write(&batch).expect("write nested value batch");
+        writer.close().expect("write nested value footer");
+        source
+    }
+
+    fn decode_one_window(bytes: Vec<u8>, label: &str) -> RecordBatch {
+        StreamReader::try_new(Cursor::new(bytes), None)
+            .unwrap_or_else(|_| panic!("{label} Arrow stream"))
+            .next()
+            .unwrap_or_else(|| panic!("{label} Arrow batch"))
+            .unwrap_or_else(|_| panic!("valid {label} Arrow batch"))
+    }
+
+    #[derive(Debug, PartialEq)]
+    struct NestedValueSnapshot {
+        types: Vec<(String, DataType)>,
+        amounts: Vec<i128>,
+        timestamps: Vec<i64>,
+        binary: Vec<Vec<u8>>,
+    }
+
+    fn nested_value_snapshot(batch: &RecordBatch, column: usize) -> NestedValueSnapshot {
+        let payload = batch
+            .column(column)
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .expect("payload struct");
+        let amount = payload
+            .column_by_name("amount")
+            .and_then(|value| value.as_any().downcast_ref::<Decimal128Array>())
+            .expect("payload decimal");
+        let occurred_at = payload
+            .column_by_name("occurred_at")
+            .and_then(|value| value.as_any().downcast_ref::<TimestampMicrosecondArray>())
+            .expect("payload timestamp");
+        let blob = payload
+            .column_by_name("blob")
+            .and_then(|value| value.as_any().downcast_ref::<BinaryArray>())
+            .expect("payload binary");
+        NestedValueSnapshot {
+            types: payload
+                .fields()
+                .iter()
+                .map(|field| (field.name().clone(), field.data_type().clone()))
+                .collect(),
+            amounts: amount.values().to_vec(),
+            timestamps: occurred_at.values().to_vec(),
+            binary: (0..blob.len())
+                .map(|index| blob.value(index).to_vec())
+                .collect(),
+        }
     }
 
     fn write_window_traversal_fixture(row_count: i64) -> NamedTempFile {

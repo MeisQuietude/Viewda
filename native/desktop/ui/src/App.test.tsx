@@ -528,6 +528,9 @@ describe("App", () => {
     expect(dataGrid).toHaveTextContent("Grid data");
     fireEvent.click(screen.getByRole("button", { name: "Structure" }));
     expect(screen.getByLabelText("Data")).toBe(dataGrid);
+    expect(dataGridProps.mock.calls.at(-1)?.[0]).toMatchObject({
+      active: false,
+    });
     expect(container.querySelector(".source-heading")).not.toHaveTextContent(
       "people.parquet",
     );
@@ -603,6 +606,9 @@ describe("App", () => {
       "true",
     );
     expect(screen.getByLabelText("Data")).toBe(dataGrid);
+    expect(dataGridProps.mock.calls.at(-1)?.[0]).toMatchObject({
+      active: true,
+    });
     fireEvent.keyDown(window, { key: "2", metaKey: true });
     expect(screen.getByRole("button", { name: "Structure" })).toHaveAttribute(
       "aria-pressed",
