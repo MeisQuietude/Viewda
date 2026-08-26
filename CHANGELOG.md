@@ -10,56 +10,33 @@ Backward-incompatible entries start with **Breaking:**.
 
 ### Added
 
-- Open Parquet folders recursively as datasets. Hive columns become integers
-  only when all non-null values are canonical signed integers; otherwise they
-  stay text. Filter, sort, inspect, and export complete datasets; source
-  modification times stay unchanged and `file` starts pinned.
-- Inspect Parquet storage in Structure view with exact chunk coverage and
-  row-group ranges; sortable row-group and physical-column tables with stable
-  leaf numbers for shortened paths; an optional chunk map with compression,
-  codec and statistics lenses plus independent Bloom markers; chunk details and
-  Bloom probes; and a path-free, value-free Markdown report.
-- Inspect nested cell values with typed grid previews and a resizable,
-  searchable Peek opened with Space, double-click, or the cell menu. Expand
-  structured JSON, inspect long text and binary data, cancel long operations,
-  and copy values without leaving the grid.
-- Read loaded Data columns with their logical Arrow types in the schema
-  sidebar; incomplete or unloaded schemas retain their physical representation.
+- Open Parquet folders recursively as datasets. Hive columns become integers only when all non-null values are canonical signed integers; otherwise they stay text. Filter, sort, inspect, and export complete datasets; source modification times stay unchanged and `file` starts pinned.
+- Inspect Parquet storage in Structure view with exact chunk coverage and row-group ranges; sortable row-group and physical-column tables with stable leaf numbers for shortened paths; an optional chunk map with compression, codec and statistics lenses plus independent Bloom markers; chunk details and Bloom probes; and a path-free, value-free Markdown report.
+- Inspect nested cell values with typed grid previews and a resizable, searchable Peek opened with Space, double-click, or the cell menu. Expand structured JSON, inspect long text and binary data, cancel long operations, and copy values without leaving the grid.
+- Read loaded Data columns with their logical Arrow types in the schema sidebar; incomplete or unloaded schemas retain their physical representation.
 
 ### Fixed
 
 - Keep the column selector visible above the data grid's column headers.
 - Made the empty WHERE popup shorter, narrower, and consistent in size with the query controls.
-- Keep the Data grid's horizontal scrollbar visible, consistently sized, and
-  draggable across platforms.
+- Keep the Data grid's horizontal scrollbar visible, consistently sized, and draggable across platforms.
 
 ## 0.2.0 — 2026-08-21
 
 ### Added
 
-- Keep several Parquet files open with independent reading state and background
-  operations. Open them from the dialog, recent history, file manager, or drag
-  and drop; use the searchable MRU switcher below the active file name or
-  keyboard shortcuts, and close the active file without losing the others.
+- Keep several Parquet files open with independent reading state and background operations. Open them from the dialog, recent history, file manager, or drag and drop; use the searchable MRU switcher below the active file name or keyboard shortcuts, and close the active file without losing the others.
 
 ## 0.1.0 — 2026-08-20
 
-Viewda's first stable release: a free, fully offline viewer for local
-Apache Parquet files on Linux, macOS, and Windows.
+Viewda's first stable release: a free, fully offline viewer for local Apache Parquet files on Linux, macOS, and Windows.
 
 ### Added
 
-- Open local Parquet files from the app or straight from the file
-  manager; recent files stay a click away.
-- Data view: a virtualized grid with typed values, filters with value
-  suggestions, multi-column sorting, and a searchable column picker
-  with pin, hide, resize, and fit-width controls.
-- Copy selections, or export the filtered and sorted view to CSV with
-  progress and cancellation.
-- Structure view: file information, row groups, the nested schema, and
-  on-demand column statistics.
+- Open local Parquet files from the app or straight from the file manager; recent files stay a click away.
+- Data view: a virtualized grid with typed values, filters with value suggestions, multi-column sorting, and a searchable column picker with pin, hide, resize, and fit-width controls.
+- Copy selections, or export the filtered and sorted view to CSV with progress and cancellation.
+- Structure view: file information, row groups, the nested schema, and on-demand column statistics.
 - System, Light, or Dark theme.
-- Signed in-app updates on the Stable or Latest channel — the app's
-  only network request, at most once per 24 hours, can be disabled.
-- Installers: Linux x64 AppImage (recommended) and Debian package,
-  macOS DMG or Homebrew cask, Windows x64.
+- Signed in-app updates on the Stable or Latest channel — the app's only network request, at most once per 24 hours, can be disabled.
+- Installers: Linux x64 AppImage (recommended) and Debian package, macOS DMG or Homebrew cask, Windows x64.
