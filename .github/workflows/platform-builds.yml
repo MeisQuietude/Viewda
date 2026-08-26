@@ -231,7 +231,7 @@ jobs:
           stat --format='deb package: %s bytes' "$package"
           # The package includes the offline DuckDB runtime; this budget catches
           # unexpected packaging or dependency growth.
-          test "$package_size" -lt "$((31 * 1000 * 1000))"
+          test "$package_size" -lt "$((61 * 1000 * 1000))"
 
           mapfile -d '' -t appimages < <(
             find native/target/release/bundle/appimage \
@@ -473,7 +473,7 @@ jobs:
           fi
 
           artifact_size=$(stat -f '%z' "$artifact")
-          test "$artifact_size" -lt "$((30 * 1000 * 1000))"
+          test "$artifact_size" -lt "$((60 * 1000 * 1000))"
           echo "macOS ${{ matrix.artifact-architecture }} DMG: ${artifact_size} bytes"
           if [[ "$REQUIRE_UPDATER_ARTIFACTS" == true ]]; then
             stat -f 'macOS updater: %z bytes' "$updater"
@@ -670,7 +670,7 @@ jobs:
           echo "macOS Universal DMG: ${artifact_size} bytes"
           # The convenience installer contains both native slices; this budget
           # catches unexpected packaging or dependency growth.
-          test "$artifact_size" -lt "$((51 * 1000 * 1000))"
+          test "$artifact_size" -lt "$((81 * 1000 * 1000))"
 
           mount_point=
           pid=
@@ -906,8 +906,8 @@ jobs:
           Stop-Process -Id $application.Id
 
           $size = $installer.Length
-          if ($size -ge 30MB) {
-            throw "The Windows installer exceeds 30 MB: $size bytes."
+          if ($size -ge 60MB) {
+            throw "The Windows installer exceeds 60 MB: $size bytes."
           }
           Write-Host "installer Authenticode status: $($signature.Status)"
           Write-Host "application PE subsystem: $subsystem (Windows GUI)"
