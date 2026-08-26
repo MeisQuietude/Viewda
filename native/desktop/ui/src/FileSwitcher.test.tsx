@@ -8,8 +8,8 @@ import {
 } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
-import { FileSwitcher, middleTruncate } from "./FileSwitcher";
-import { shortcutModifier } from "./desktop";
+import { FileContextMenu, FileSwitcher, middleTruncate } from "./FileSwitcher";
+import { shortcutModifier, type RecentSource } from "./desktop";
 import type { OpenFile } from "./open-files";
 
 afterEach(cleanup);
@@ -22,6 +22,9 @@ function file(
 ): OpenFile {
   return {
     generation,
+    kind: "file",
+    datasetMemberCount: null,
+    datasetIgnoredFileCount: null,
     name,
     directory,
     path: `/data/${directory}/${name}`,
@@ -45,28 +48,33 @@ function file(
 }
 
 function props(files: OpenFile[] = []) {
+  const recentSources: RecentSource[] = [
+    {
+      id: "recent-open",
+      kind: "file",
+      name: "open.parquet",
+      directory: "current",
+      path: "/data/current/open.parquet",
+    },
+    {
+      id: "recent-only",
+      kind: "file",
+      name: "archive.parquet",
+      directory: "old",
+      path: "/archive/full/path/old/archive.parquet",
+    },
+  ];
   return {
     files,
-    recentSources: [
-      {
-        id: "recent-open",
-        name: "open.parquet",
-        directory: "current",
-        path: "/data/current/open.parquet",
-      },
-      {
-        id: "recent-only",
-        name: "archive.parquet",
-        directory: "old",
-        path: "/archive/full/path/old/archive.parquet",
-      },
-    ],
+    recentSources,
     opening: false,
     onActivate: vi.fn().mockResolvedValue(undefined),
     onClose: vi.fn().mockResolvedValue(true),
     onDismiss: vi.fn(),
     onContextMenu: vi.fn(),
     onOpenFile: vi.fn().mockResolvedValue(undefined),
+    onOpenFolder: vi.fn().mockResolvedValue(undefined),
+    onCancelOpen: vi.fn(),
     onOpenRecent: vi.fn().mockResolvedValue(undefined),
     onRemoveRecent: vi.fn().mockResolvedValue(undefined),
   };
@@ -95,7 +103,7 @@ describe("FileSwitcher", () => {
     ]);
     render(<FileSwitcher {...input} />);
 
-    const open = within(screen.getByRole("group", { name: "Open files" }));
+    const open = within(screen.getByRole("group", { name: "Open sources" }));
     expect(open.getAllByRole("option").map((row) => row.textContent)).toEqual([
       "✓second.parquetcurrent",
       "open.parquetcurrent",
@@ -105,10 +113,75 @@ describe("FileSwitcher", () => {
     expect(recent.getByText("archive.parquet")).toBeInTheDocument();
   });
 
+  it("shows dataset facts without expanding members into source rows", () => {
+    const dataset: OpenFile = {
+      ...file(3, "events/", "~/Data", true),
+      path: "/data/~/Data/events",
+      kind: "folderDataset",
+      datasetMemberCount: 12,
+      datasetIgnoredFileCount: 2,
+    };
+    render(<FileSwitcher {...props([dataset])} />);
+
+    const open = within(screen.getByRole("group", { name: "Open sources" }));
+    expect(open.getAllByRole("option")).toHaveLength(1);
+    expect(open.getByRole("option")).toHaveTextContent(
+      "Folder dataset · 12 files · 2 ignored · /data/~/Data/events",
+    );
+    expect(open.getByRole("option")).toHaveAccessibleName(
+      "events/ — Folder dataset · 12 files · 2 ignored · /data/~/Data/events",
+    );
+  });
+
+  it("distinguishes folder and exact-selection recents at the same path", () => {
+    const input = props();
+    input.recentSources = [
+      {
+        id: "recent-folder",
+        kind: "folderDataset",
+        name: "events/",
+        directory: "~/Data",
+        path: "/data/events",
+      },
+      {
+        id: "recent-selection-a",
+        kind: "fileDataset",
+        name: "events/",
+        directory: "~/Data",
+        path: "/data/events",
+      },
+      {
+        id: "recent-selection-b",
+        kind: "fileDataset",
+        name: "events/",
+        directory: "~/Data",
+        path: "/data/events",
+      },
+    ];
+
+    render(<FileSwitcher {...input} />);
+
+    const recent = within(screen.getByRole("group", { name: "Recent" }));
+    expect(recent.getAllByRole("option")).toHaveLength(3);
+    expect(recent.getByText("Folder dataset · /data/events")).toBeVisible();
+    expect(recent.getAllByText("Selected files · /data/events")).toHaveLength(
+      2,
+    );
+  });
+
+  it("keeps an in-progress batch open cancellable", () => {
+    const input = { ...props([]), opening: true };
+    render(<FileSwitcher {...input} />);
+
+    fireEvent.click(screen.getByRole("button", { name: "Cancel opening" }));
+    expect(input.onCancelOpen).toHaveBeenCalledOnce();
+    expect(input.onOpenFile).not.toHaveBeenCalled();
+  });
+
   it("filters names and paths and opens the keyboard-highlighted result", () => {
     const input = props([file(1, "trips.parquet", "2026/07", true)]);
     render(<FileSwitcher {...input} />);
-    const search = screen.getByRole("combobox", { name: "Search files" });
+    const search = screen.getByRole("combobox", { name: "Search sources" });
 
     fireEvent.change(search, { target: { value: "archive/full" } });
     expect(screen.queryByText("trips.parquet")).not.toBeInTheDocument();
@@ -120,7 +193,7 @@ describe("FileSwitcher", () => {
   it("cycles the highlight and removes a recent entry with the platform shortcut", () => {
     const input = props([file(1, "open.parquet", "current", true)]);
     render(<FileSwitcher {...input} />);
-    const search = screen.getByRole("combobox", { name: "Search files" });
+    const search = screen.getByRole("combobox", { name: "Search sources" });
 
     fireEvent.keyDown(search, { key: "ArrowDown" });
     fireEvent.keyDown(search, { key: "Backspace", ctrlKey: true });
@@ -131,7 +204,7 @@ describe("FileSwitcher", () => {
   it("clamps selection when the last highlighted row is deleted", () => {
     const input = props([file(1, "other.parquet", "/data/current", true)]);
     const { rerender } = render(<FileSwitcher {...input} />);
-    const search = screen.getByRole("combobox", { name: "Search files" });
+    const search = screen.getByRole("combobox", { name: "Search sources" });
     fireEvent.keyDown(search, { key: "ArrowDown" });
     fireEvent.keyDown(search, { key: "ArrowDown" });
     expect(search).toHaveAttribute(
@@ -158,16 +231,32 @@ describe("FileSwitcher", () => {
     render(<FileSwitcher {...input} />);
     const row = screen.getByRole("option", { name: /open\.parquet/ });
     const close = screen.getByRole("button", { name: "Close open.parquet" });
-    const open = screen.getByRole("button", { name: /Open File/ });
+    const open = screen.getByRole("button", { name: /Open file/ });
+    const openFolder = screen.getByRole("button", {
+      name: /Open folder as dataset/,
+    });
+    const actions = open.closest<HTMLElement>(".file-switcher-actions");
+    if (actions === null) throw new Error("source actions were not rendered");
 
     expect(fireEvent.keyDown(close, { key: "Enter" })).toBe(true);
+    expect(within(actions).getAllByRole("button")).toEqual([open, openFolder]);
+    expect(within(open).getByText(`${shortcutModifier}O`)).toBeVisible();
+    expect(within(openFolder).getByText(`⇧${shortcutModifier}O`)).toBeVisible();
+    expect(openFolder).toHaveAttribute(
+      "title",
+      "Open every Parquet file in the selected folder and its subfolders as one dataset. Hive-style key=value folders become columns.",
+    );
+    openFolder.focus();
+    expect(openFolder).toHaveFocus();
     fireEvent.click(close);
     expect(fireEvent.keyDown(open, { key: "Enter" })).toBe(true);
     fireEvent.click(open);
+    fireEvent.click(openFolder);
     fireEvent.contextMenu(row);
 
     expect(input.onClose).toHaveBeenCalledWith(1);
     expect(input.onOpenFile).toHaveBeenCalledOnce();
+    expect(input.onOpenFolder).toHaveBeenCalledOnce();
     expect(input.onContextMenu).toHaveBeenCalledWith(1, 0, 0);
     expect(input.onActivate).not.toHaveBeenCalled();
   });
@@ -187,14 +276,14 @@ describe("FileSwitcher", () => {
 
     await waitFor(() =>
       expect(
-        screen.getByRole("combobox", { name: "Search files" }),
+        screen.getByRole("combobox", { name: "Search sources" }),
       ).toHaveFocus(),
     );
   });
 
   it("shows the platform shortcut until the user starts searching", () => {
     render(<FileSwitcher {...props()} />);
-    const search = screen.getByRole("combobox", { name: "Search files" });
+    const search = screen.getByRole("combobox", { name: "Search sources" });
 
     expect(
       screen.getByText(`${shortcutModifier}P`, { selector: "kbd" }),
@@ -295,4 +384,36 @@ describe("FileSwitcher", () => {
     expect(Array.from(truncated)).toHaveLength(7);
     expect(truncated).not.toContain("�");
   });
+});
+
+it("offers explicit reload only for a dataset source", () => {
+  const onReload = vi.fn();
+  const dataset: OpenFile = {
+    ...file(9, "events", "~/Data", true),
+    kind: "folderDataset",
+    datasetMemberCount: 12,
+    datasetIgnoredFileCount: 2,
+  };
+  const callbacks = {
+    x: 10,
+    y: 10,
+    onClose: vi.fn(),
+    onDismiss: vi.fn(),
+    onCloseOthers: vi.fn(),
+    onReload,
+  };
+  const view = render(<FileContextMenu file={dataset} {...callbacks} />);
+
+  fireEvent.click(screen.getByRole("menuitem", { name: "Reload dataset" }));
+  expect(onReload).toHaveBeenCalledOnce();
+
+  view.rerender(
+    <FileContextMenu
+      file={file(1, "events.parquet", "~/Data")}
+      {...callbacks}
+    />,
+  );
+  expect(
+    screen.queryByRole("menuitem", { name: "Reload dataset" }),
+  ).not.toBeInTheDocument();
 });

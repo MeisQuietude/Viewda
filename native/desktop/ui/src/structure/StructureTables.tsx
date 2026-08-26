@@ -261,6 +261,7 @@ export function RowGroupTable({
 
 export function ColumnsSection({
   generation,
+  structureRevision = 0,
   unit,
   columnCount,
   columnPathsTruncated = false,
@@ -269,6 +270,7 @@ export function ColumnsSection({
   measurementPort,
 }: {
   generation: number;
+  structureRevision?: number;
   unit: StructureByteUnit;
   columnCount: number;
   columnPathsTruncated?: boolean;
@@ -300,8 +302,15 @@ export function ColumnsSection({
           totalCount: page.totalCount,
           rows: page.columns,
         })),
-      [effectiveDirection, effectiveSortColumnId, generation, unit],
+      [
+        effectiveDirection,
+        effectiveSortColumnId,
+        generation,
+        structureRevision,
+        unit,
+      ],
     ),
+    ready,
   );
 
   const getCell = useCallback(
@@ -438,6 +447,7 @@ function StructureTableCard({
 function useStructurePage<Row>(
   totalCount: number,
   fetchPage: (offset: number, limit: number) => Promise<HeldPage<Row>>,
+  enabled = true,
 ): {
   state: TableState<Row>;
   requestViewport: (rowStart: number, rowCount: number) => void;
@@ -462,6 +472,9 @@ function useStructurePage<Row>(
 
   const load = useCallback(
     (rowStart: number, rowCount: number) => {
+      if (!enabled) {
+        return;
+      }
       const request = pageRequestFor(
         rowStart,
         rowCount,
@@ -510,27 +523,36 @@ function useStructurePage<Row>(
         },
       );
     },
-    [fetchPage, totalCount],
+    [enabled, fetchPage, totalCount],
   );
 
   // The grid publishes its first viewport before this effect runs, so the first
-  // page is already on its way; only a later ordering change invalidates it.
+  // page may already be on its way. Whichever path observes a later ordering
+  // first invalidates it once and starts the remembered viewport.
   const orderingRef = useRef(load);
-  useEffect(() => {
+  const resetOrdering = useCallback(() => {
     if (orderingRef.current === load) {
-      return;
+      return false;
     }
     orderingRef.current = load;
     requestVersionRef.current += 1;
     activeRef.current = null;
     pageRef.current = null;
     setState((current) => ({ ...current, page: null, error: null }));
+    return true;
+  }, [load]);
+
+  useEffect(() => {
+    if (!resetOrdering()) {
+      return;
+    }
     const { rowStart, rowCount } = viewportRef.current;
     load(rowStart, rowCount);
-  }, [load]);
+  }, [load, resetOrdering]);
 
   const requestViewport = useCallback(
     (rowStart: number, rowCount: number) => {
+      const orderingChanged = resetOrdering();
       const rows = Math.max(rowCount, 1);
       viewportRef.current = { rowStart, rowCount: rows };
       const page = pageRef.current;
@@ -545,11 +567,11 @@ function useStructurePage<Row>(
           rowStart,
           rows,
         );
-      if (!covered) {
+      if (orderingChanged || !covered) {
         load(rowStart, rows);
       }
     },
-    [load],
+    [load, resetOrdering],
   );
 
   return { state, requestViewport };

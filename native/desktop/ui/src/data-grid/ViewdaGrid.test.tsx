@@ -718,7 +718,7 @@ describe("ViewdaGrid foundation", () => {
   });
 
   it("names the grid, headers, and header actions", () => {
-    render(
+    const { rerender } = render(
       <ViewdaGrid
         {...props({ columns: [column(0), column(1)], rowCount: 1 })}
       />,
@@ -737,6 +737,19 @@ describe("ViewdaGrid foundation", () => {
     expect(sort.textContent).toBe("");
     expect(
       screen.getByRole("button", { name: "Filter Column 0" }),
+    ).toBeInTheDocument();
+
+    rerender(
+      <ViewdaGrid
+        {...props({
+          label: "Dataset members",
+          columns: [column(0), column(1)],
+          rowCount: 1,
+        })}
+      />,
+    );
+    expect(
+      screen.getByRole("grid", { name: "Dataset members" }),
     ).toBeInTheDocument();
   });
 
@@ -2786,6 +2799,56 @@ describe("ViewdaGrid foundation", () => {
         current: expect.objectContaining({ cell: { row: 1, column: 0 } }),
       }),
     );
+  });
+
+  it("returns focus after schema-drift-style keyboard and pointer activation", () => {
+    const onCellActivate = vi.fn();
+    const selection = selectCell(
+      emptyGridSelection(),
+      { row: 2, column: 0 },
+      false,
+      false,
+    );
+    installPointerCapture();
+    render(
+      <ViewdaGrid
+        {...props({
+          selection,
+          onCellActivate,
+          label: "Schema drift members",
+        })}
+      />,
+    );
+
+    const grid = screen.getByRole("grid");
+    fireEvent.keyDown(grid, { key: "ArrowDown" });
+    expect(onCellActivate).not.toHaveBeenCalled();
+
+    fireEvent.keyDown(grid, { key: "Enter" });
+    expect(onCellActivate).toHaveBeenCalledWith({ row: 2, column: 0 });
+    expect(grid).toHaveFocus();
+
+    onCellActivate.mockClear();
+    const cell = screen.getByRole("gridcell", { name: "0:0" });
+    fireEvent.pointerDown(cell, { button: 0, pointerId: 41 });
+    fireEvent.pointerUp(grid, { pointerId: 41 });
+    fireEvent.click(cell);
+    expect(onCellActivate).toHaveBeenCalledOnce();
+    expect(onCellActivate).toHaveBeenCalledWith({ row: 0, column: 0 });
+    expect(grid).toHaveFocus();
+  });
+
+  it("keeps a valid focus destination chosen by cell activation", () => {
+    const destination = document.createElement("button");
+    document.body.append(destination);
+    const onCellActivate = vi.fn(() => destination.focus());
+    render(<ViewdaGrid {...props({ onCellActivate })} />);
+
+    fireEvent.click(screen.getByRole("gridcell", { name: "0:0" }));
+
+    expect(onCellActivate).toHaveBeenCalledWith({ row: 0, column: 0 });
+    expect(destination).toHaveFocus();
+    destination.remove();
   });
 
   it("routes column commands and keyboard visibility through the body scrollport", () => {

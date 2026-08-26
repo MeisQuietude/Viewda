@@ -11,10 +11,11 @@ use std::{
 };
 
 use arrow_array::{Array, StringArray};
-use duckdb::{Config, Connection, Error as DuckDbError, InterruptHandle, params};
+use duckdb::{Config, Connection, Error as DuckDbError, InterruptHandle};
 use serde::Serialize;
 
 use crate::{
+    dataset::{DatasetError, DatasetQuerySource, DatasetSetupError, DatasetWindowReader},
     filter::{ColumnFilterKind, DataFilterOperator, column_filter_kind, quote_identifier},
     source::{SchemaField, open_local_source},
     window::{DataWindowError, classify_query_error},
@@ -59,24 +60,74 @@ impl TextValueSuggestionsInterruptHandle {
 
 /// Reuses one isolated DuckDB connection for suggestions from an opened source.
 pub struct TextValueSuggestionsReader {
-    source_path: PathBuf,
+    source: TextValueSuggestionsSource,
     connection: Mutex<Connection>,
     interrupt: Arc<InterruptHandle>,
+}
+
+enum TextValueSuggestionsSource {
+    File(PathBuf),
+    Dataset(Box<DatasetQuerySource>),
 }
 
 impl TextValueSuggestionsReader {
     /// Creates a reader whose isolated connection cannot block grid windows.
     pub fn new(source_path: PathBuf) -> Result<Self, DataWindowError> {
+        Self::with_source(TextValueSuggestionsSource::File(source_path))
+    }
+
+    /// Creates a suggestion reader for one completed fixed dataset.
+    pub fn for_dataset(reader: &DatasetWindowReader) -> Result<Self, DataWindowError> {
+        Self::for_dataset_while(reader, || true)
+    }
+
+    /// Creates a dataset suggestion reader while its source session remains active.
+    pub fn for_dataset_while(
+        reader: &DatasetWindowReader,
+        mut keep_going: impl FnMut() -> bool,
+    ) -> Result<Self, DataWindowError> {
+        let source = reader
+            .query_source_while(&mut keep_going)
+            .map_err(dataset_suggestion_error)?;
+        let suggestion_reader =
+            Self::with_source(TextValueSuggestionsSource::Dataset(Box::new(source)))?;
+        {
+            let connection = suggestion_reader
+                .connection
+                .lock()
+                .map_err(|_| DataWindowError::QueryEngineUnavailable)?;
+            let TextValueSuggestionsSource::Dataset(dataset) = &suggestion_reader.source else {
+                unreachable!("dataset constructor always retains a dataset source");
+            };
+            dataset
+                .install_while(&connection, &mut keep_going)
+                .map_err(dataset_setup_suggestion_error)?;
+        }
+        if !keep_going() {
+            return Err(DataWindowError::Cancelled);
+        }
+        Ok(suggestion_reader)
+    }
+
+    fn with_source(source: TextValueSuggestionsSource) -> Result<Self, DataWindowError> {
+        let is_dataset = matches!(source, TextValueSuggestionsSource::Dataset(_));
         let config = Config::default()
-            .enable_object_cache(true)
+            .enable_object_cache(!is_dataset)
             .and_then(|config| config.max_memory(SUGGESTION_MEMORY_LIMIT))
             .and_then(|config| config.with("threads", "1"))
             .map_err(|_| DataWindowError::QueryEngineUnavailable)?;
         let connection = Connection::open_in_memory_with_flags(config)
             .map_err(|_| DataWindowError::QueryEngineUnavailable)?;
+        connection
+            .execute_batch(if is_dataset {
+                "SET parquet_metadata_cache = false"
+            } else {
+                "SET parquet_metadata_cache = true"
+            })
+            .map_err(|_| DataWindowError::QueryEngineUnavailable)?;
         let interrupt = connection.interrupt_handle();
         Ok(Self {
-            source_path,
+            source,
             connection: Mutex::new(connection),
             interrupt,
         })
@@ -107,12 +158,21 @@ impl TextValueSuggestionsReader {
         operator: DataFilterOperator,
         interrupt: &TextValueSuggestionsInterruptHandle,
     ) -> Result<TextValueSuggestions, DataWindowError> {
+        self.fetch_checked(input, column, operator, interrupt, || {})
+    }
+
+    fn fetch_checked(
+        &self,
+        input: &str,
+        column: &SchemaField,
+        operator: DataFilterOperator,
+        interrupt: &TextValueSuggestionsInterruptHandle,
+        before_prepare: impl FnOnce(),
+    ) -> Result<TextValueSuggestions, DataWindowError> {
         if input.len() > MAX_SUGGESTION_INPUT_BYTES {
             return Err(DataWindowError::InvalidFilter);
         }
         debug_assert!(Arc::ptr_eq(&self.interrupt, &interrupt.inner));
-        let (source, _) = open_local_source(&self.source_path).map_err(DataWindowError::from)?;
-        drop(source);
         Self::require_active(interrupt)?;
         if column_filter_kind(column) != ColumnFilterKind::Text {
             return Err(DataWindowError::InvalidFilter);
@@ -126,22 +186,45 @@ impl TextValueSuggestionsReader {
             DataFilterOperator::EndsWith => "ends_with",
             _ => return Err(DataWindowError::InvalidFilter),
         };
-        let path = self
-            .source_path
-            .to_str()
-            .ok_or(DataWindowError::Unsupported)?;
-        let query = suggestion_query(&column.name, match_function);
         let connection = self
             .connection
             .lock()
             .map_err(|_| DataWindowError::QueryEngineUnavailable)?;
         Self::require_active(interrupt)?;
+        if let TextValueSuggestionsSource::Dataset(dataset) = &self.source {
+            before_prepare();
+            return self.fetch_dataset_batches(
+                &connection,
+                dataset,
+                input,
+                column,
+                match_function,
+                interrupt,
+            );
+        }
+        let (relation, mut parameters) = match &self.source {
+            TextValueSuggestionsSource::File(source_path) => {
+                let (source, _) = open_local_source(source_path).map_err(DataWindowError::from)?;
+                drop(source);
+                let path = source_path.to_str().ok_or(DataWindowError::Unsupported)?;
+                (
+                    "read_parquet(?)".to_owned(),
+                    vec![duckdb::types::Value::Text(path.to_owned())],
+                )
+            }
+            TextValueSuggestionsSource::Dataset(_) => unreachable!("dataset handled above"),
+        };
+        before_prepare();
+        Self::require_active(interrupt)?;
+        parameters.push(duckdb::types::Value::Text(input.to_owned()));
+        let query = suggestion_query(&column.name, match_function, &relation);
         let mut statement = connection
             .prepare_cached(&query)
-            .map_err(|error| Self::classify_error(error, interrupt))?;
+            .map_err(|error| self.classify_error(error, interrupt))?;
+        Self::require_active(interrupt)?;
         let batches = statement
-            .stream_arrow(params![path, input])
-            .map_err(|error| Self::classify_error(error, interrupt))?;
+            .stream_arrow(duckdb::params_from_iter(parameters.iter()))
+            .map_err(|error| self.classify_error(error, interrupt))?;
         let values = catch_unwind(AssertUnwindSafe(
             || -> Result<TextValueSuggestions, DataWindowError> {
                 let mut seen = HashSet::with_capacity(MAX_TEXT_VALUE_SUGGESTIONS);
@@ -175,10 +258,99 @@ impl TextValueSuggestionsReader {
             Err(_) if interrupt.cancelled.load(Ordering::Acquire) => {
                 return Err(DataWindowError::Cancelled);
             }
-            Err(_) => return Err(DataWindowError::QueryFailed),
+            Err(panic) => match &self.source {
+                TextValueSuggestionsSource::File(_) => return Err(DataWindowError::QueryFailed),
+                TextValueSuggestionsSource::Dataset(dataset) => {
+                    return Err(dataset_suggestion_error(
+                        dataset.classify_lazy_query_failure(panic.as_ref()),
+                    ));
+                }
+            },
         };
         Self::require_active(interrupt)?;
         Ok(values)
+    }
+
+    fn fetch_dataset_batches(
+        &self,
+        connection: &Connection,
+        dataset: &DatasetQuerySource,
+        input: &str,
+        column: &SchemaField,
+        match_function: &str,
+        interrupt: &TextValueSuggestionsInterruptHandle,
+    ) -> Result<TextValueSuggestions, DataWindowError> {
+        if !dataset.schema().contains(column) {
+            return Err(DataWindowError::InvalidFilter);
+        }
+        dataset
+            .require_active_while(|| !interrupt.cancelled.load(Ordering::Acquire))
+            .map_err(dataset_suggestion_error)?;
+        let mut cursor = dataset.candidate_batches(&[]);
+        let query = suggestion_query(&column.name, match_function, &dataset.relation_sql());
+        let parameters = [duckdb::types::Value::Text(input.to_owned())];
+        let mut seen = HashSet::with_capacity(MAX_TEXT_VALUE_SUGGESTIONS);
+        let mut values = Vec::with_capacity(MAX_TEXT_VALUE_SUGGESTIONS);
+        while dataset
+            .bind_next_candidate_batch(connection, &mut cursor, || {
+                !interrupt.cancelled.load(Ordering::Acquire)
+            })
+            .map_err(dataset_setup_suggestion_error)?
+        {
+            dataset
+                .validate_bound_members_while(|| !interrupt.cancelled.load(Ordering::Acquire))
+                .map_err(dataset_suggestion_error)?;
+            Self::require_active(interrupt)?;
+            let mut statement = connection
+                .prepare(&query)
+                .map_err(|error| self.classify_error(error, interrupt))?;
+            let batches = statement
+                .stream_arrow(duckdb::params_from_iter(parameters.iter()))
+                .map_err(|error| self.classify_error(error, interrupt))?;
+            let partial = catch_unwind(AssertUnwindSafe(|| {
+                for batch in batches {
+                    let strings = batch
+                        .column(0)
+                        .as_any()
+                        .downcast_ref::<StringArray>()
+                        .ok_or(DataWindowError::QueryFailed)?;
+                    for value in strings.iter().flatten() {
+                        if seen.insert(value.to_owned()) {
+                            values.push(value.to_owned());
+                            if values.len() == MAX_TEXT_VALUE_SUGGESTIONS {
+                                return Ok(true);
+                            }
+                        }
+                    }
+                }
+                Ok::<_, DataWindowError>(false)
+            }))
+            .map_err(|panic| {
+                if interrupt.cancelled.load(Ordering::Acquire) {
+                    DataWindowError::Cancelled
+                } else {
+                    dataset_suggestion_error(dataset.classify_lazy_query_failure(panic.as_ref()))
+                }
+            })??;
+            dataset
+                .validate_bound_members_while(|| !interrupt.cancelled.load(Ordering::Acquire))
+                .map_err(dataset_suggestion_error)?;
+            if partial {
+                Self::require_active(interrupt)?;
+                return Ok(TextValueSuggestions {
+                    values,
+                    is_partial: true,
+                });
+            }
+        }
+        dataset
+            .require_active_while(|| !interrupt.cancelled.load(Ordering::Acquire))
+            .map_err(dataset_suggestion_error)?;
+        Self::require_active(interrupt)?;
+        Ok(TextValueSuggestions {
+            values,
+            is_partial: false,
+        })
     }
 
     fn require_active(
@@ -192,28 +364,55 @@ impl TextValueSuggestionsReader {
     }
 
     fn classify_error(
+        &self,
         error: DuckDbError,
         interrupt: &TextValueSuggestionsInterruptHandle,
     ) -> DataWindowError {
         if interrupt.cancelled.load(Ordering::Acquire) {
             DataWindowError::Cancelled
         } else {
-            classify_query_error(error, false)
+            match &self.source {
+                TextValueSuggestionsSource::File(_) => classify_query_error(error, false),
+                TextValueSuggestionsSource::Dataset(dataset) => {
+                    dataset_suggestion_error(dataset.classify_query_failure(error, false))
+                }
+            }
         }
     }
 }
 
-fn suggestion_query(column_name: &str, match_function: &str) -> String {
+fn suggestion_query(column_name: &str, match_function: &str, relation: &str) -> String {
     let identifier = quote_identifier(column_name);
     format!(
         "SELECT value \
          FROM (\
              SELECT CAST({identifier} AS VARCHAR) AS value \
-             FROM read_parquet(?) \
+             FROM {relation} \
              WHERE {identifier} IS NOT NULL\
          ) candidates \
          WHERE {match_function}(lower(value), lower(?))"
     )
+}
+
+fn dataset_setup_suggestion_error(error: DatasetSetupError) -> DataWindowError {
+    match error {
+        DatasetSetupError::Dataset(error) => dataset_suggestion_error(error),
+        DatasetSetupError::Query(error) => classify_query_error(error, false),
+    }
+}
+
+fn dataset_suggestion_error(error: DatasetError) -> DataWindowError {
+    match error {
+        DatasetError::NotFound => DataWindowError::NotFound,
+        DatasetError::PermissionDenied | DatasetError::MemberPermissionDenied { .. } => {
+            DataWindowError::PermissionDenied
+        }
+        DatasetError::SourceChanged { .. } => DataWindowError::SourceChanged,
+        DatasetError::InvalidMember { .. } => DataWindowError::CorruptSource,
+        DatasetError::Cancelled => DataWindowError::Cancelled,
+        DatasetError::Window { error } => error,
+        _ => DataWindowError::Unsupported,
+    }
 }
 
 #[cfg(test)]
@@ -228,6 +427,7 @@ mod tests {
     use tempfile::tempdir;
 
     use super::*;
+    use crate::DatasetSource;
 
     #[test]
     fn suggestion_scan_projects_only_the_requested_column() {
@@ -245,7 +445,10 @@ mod tests {
                 [],
             )
             .expect("projection fixture");
-        let explain = format!("EXPLAIN {}", suggestion_query("label", "contains"));
+        let explain = format!(
+            "EXPLAIN {}",
+            suggestion_query("label", "contains", "read_parquet(?)")
+        );
         let plan = connection
             .prepare(&explain)
             .expect("explain statement")
@@ -257,6 +460,99 @@ mod tests {
 
         assert!(plan.contains("Projections: label"), "{plan}");
         assert!(!plan.contains("ignored"), "{plan}");
+    }
+
+    #[test]
+    fn dataset_suggestions_reuse_static_member_metadata_across_fetches() {
+        let directory = tempdir().expect("dataset directory");
+        let fixture = Connection::open_in_memory().expect("fixture connection");
+        for (name, value) in [("a.parquet", "alpha"), ("b.parquet", "beta")] {
+            let path = directory.path().join(name);
+            fixture
+                .execute(
+                    "SET VARIABLE __test_path = ?",
+                    params![path.to_str().expect("UTF-8 fixture path")],
+                )
+                .expect("fixture path");
+            fixture
+                .execute(
+                    "COPY (SELECT ?::VARCHAR AS label) \
+                     TO (getvariable('__test_path')) (FORMAT PARQUET)",
+                    params![value],
+                )
+                .expect("dataset member fixture");
+        }
+        let source = DatasetSource::open_folder(directory.path()).expect("dataset source");
+        let mut inspector = source.inspector();
+        inspector.advance(2).expect("dataset inspection");
+        let dataset = inspector.into_window_reader().expect("dataset reader");
+        let label = dataset.summary().schema[0].clone();
+        let identity_checks = source.identity_check_count();
+        let reader =
+            TextValueSuggestionsReader::for_dataset(&dataset).expect("dataset suggestions reader");
+        assert_eq!(source.identity_check_count(), identity_checks);
+
+        let first = reader.interrupt_handle();
+        assert_eq!(
+            reader
+                .fetch("alp", &label, DataFilterOperator::Equals, &first)
+                .expect("first suggestions")
+                .values,
+            ["alpha"]
+        );
+        assert_eq!(source.identity_check_count() - identity_checks, 4);
+        reader
+            .connection
+            .lock()
+            .expect("suggestions connection")
+            .execute(
+                "INSERT INTO __viewda_members VALUES (999, 'marker', 'marker', 0)",
+                [],
+            )
+            .expect("metadata initialization marker");
+
+        let second = reader.interrupt_handle();
+        assert_eq!(
+            reader
+                .fetch("bet", &label, DataFilterOperator::Equals, &second)
+                .expect("second suggestions")
+                .values,
+            ["beta"]
+        );
+        assert_eq!(
+            source.identity_check_count() - identity_checks,
+            8,
+            "each fetch brackets the two-member candidate batch once"
+        );
+        let member_metadata_rows = reader
+            .connection
+            .lock()
+            .expect("suggestions connection")
+            .query_row("SELECT count(*) FROM __viewda_members", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .expect("static member metadata count");
+        assert_eq!(member_metadata_rows, 2);
+
+        let cancelled = reader.interrupt_handle();
+        assert_eq!(
+            reader.fetch_checked(
+                "alp",
+                &label,
+                DataFilterOperator::Equals,
+                &cancelled,
+                || cancelled.interrupt(),
+            ),
+            Err(DataWindowError::Cancelled)
+        );
+        let retry = reader.interrupt_handle();
+        assert_eq!(
+            reader
+                .fetch("alp", &label, DataFilterOperator::Equals, &retry)
+                .expect("retry after setup-boundary cancellation")
+                .values,
+            ["alpha"]
+        );
     }
 
     #[test]

@@ -124,3 +124,44 @@ it("copies only exact held rows from a 100k-row column selection", () => {
   act(() => vi.advanceTimersByTime(1_000));
   expect(screen.queryByRole("status")).not.toBeInTheDocument();
 });
+
+it("reports selection and activation independently with the table label", () => {
+  const onSelectRow = vi.fn();
+  const onActivateRow = vi.fn();
+  render(
+    <StructureGrid
+      label="Members"
+      columns={columns}
+      rowCount={100_000}
+      sortColumnId="name"
+      sortDirection="ascending"
+      contentRevision={1}
+      heldPage={{ offset: 400, length: 200 }}
+      getCell={() => ({ text: "member", faded: false })}
+      onSort={() => {}}
+      onViewportChange={() => {}}
+      onSelectRow={onSelectRow}
+      onActivateRow={onActivateRow}
+    />,
+  );
+
+  act(() => {
+    grid.props?.onSelectionChange({
+      columns: CompactSelection.empty(),
+      rows: CompactSelection.empty(),
+      current: {
+        cell: { row: 450, column: 0 },
+        range: { x: 0, y: 450, width: 1, height: 1 },
+        rangeStack: [],
+      },
+    });
+  });
+
+  expect(onSelectRow).toHaveBeenCalledWith(450);
+  expect(onActivateRow).not.toHaveBeenCalled();
+  expect(grid.props?.label).toBe("Members");
+
+  act(() => grid.props?.onCellActivate?.({ row: 451, column: 0 }));
+
+  expect(onActivateRow).toHaveBeenCalledWith(451);
+});

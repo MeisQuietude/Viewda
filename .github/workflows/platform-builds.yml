@@ -227,9 +227,11 @@ jobs:
           test "$(realpath "$resolved_library")" \
             = "$(realpath "$extracted/usr/lib/viewda/libduckdb.so")"
           package_size=$(stat --format='%s' "$package")
-          test "$package_size" -lt "$((30 * 1000 * 1000))"
           stat --format='release binary: %s bytes' native/target/release/viewda
           stat --format='deb package: %s bytes' "$package"
+          # The package includes the offline DuckDB runtime; this budget catches
+          # unexpected packaging or dependency growth.
+          test "$package_size" -lt "$((31 * 1000 * 1000))"
 
           mapfile -d '' -t appimages < <(
             find native/target/release/bundle/appimage \
@@ -665,10 +667,10 @@ jobs:
             "$artifact"
 
           artifact_size=$(stat -f '%z' "$artifact")
-          # The convenience installer contains both native slices; the 30 MB
-          # single-architecture budget does not apply to it.
-          test "$artifact_size" -lt "$((50 * 1000 * 1000))"
           echo "macOS Universal DMG: ${artifact_size} bytes"
+          # The convenience installer contains both native slices; this budget
+          # catches unexpected packaging or dependency growth.
+          test "$artifact_size" -lt "$((51 * 1000 * 1000))"
 
           mount_point=
           pid=

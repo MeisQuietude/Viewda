@@ -101,6 +101,7 @@ export interface ViewdaGridHandle {
 }
 
 export interface ViewdaGridProps {
+  label?: string;
   columns: readonly GridColumn[];
   rowCount: number;
   selection: GridSelection;
@@ -122,6 +123,7 @@ export interface ViewdaGridProps {
   onActiveCellBoundsChange?(address: GridAddress, bounds: Rectangle): void;
   onPeekFocus?(): void;
   onScrollInteraction?(): void;
+  onCellActivate?(address: GridAddress): void;
   onCopy(event: ClipboardEvent): void;
   onHorizontalExtentChange(
     exceeded: boolean,
@@ -149,6 +151,7 @@ interface SelectionDrag {
   selection: GridSelection;
   lastRow: number;
   lastColumn: number;
+  moved: boolean;
   additive: boolean;
   clientX: number;
   clientY: number;
@@ -235,6 +238,7 @@ const cachedScrollExtents = new WeakMap<
 export const ViewdaGrid = forwardRef<ViewdaGridHandle, ViewdaGridProps>(
   function ViewdaGrid(
     {
+      label = "Data grid",
       columns,
       rowCount,
       selection,
@@ -252,6 +256,7 @@ export const ViewdaGrid = forwardRef<ViewdaGridHandle, ViewdaGridProps>(
       onActiveCellBoundsChange,
       onPeekFocus,
       onScrollInteraction,
+      onCellActivate,
       onCopy,
       onHorizontalExtentChange,
       onEscape,
@@ -1578,6 +1583,21 @@ export const ViewdaGrid = forwardRef<ViewdaGridHandle, ViewdaGridProps>(
       [ensureCellVisible, onSelectionChange, selection],
     );
 
+    const activateCell = useCallback(
+      (address: GridAddress) => {
+        const focusBeforeActivation = document.activeElement;
+        onCellActivate?.(address);
+        const focusAfterActivation = document.activeElement;
+        const callbackMovedFocus =
+          focusAfterActivation !== focusBeforeActivation &&
+          focusAfterActivation !== document.body &&
+          focusAfterActivation !== document.documentElement &&
+          focusAfterActivation?.isConnected === true;
+        if (!callbackMovedFocus) rootRef.current?.focus();
+      },
+      [onCellActivate],
+    );
+
     const handleClick = useCallback(
       (event: React.MouseEvent<HTMLDivElement>) => {
         if (suppressClickRef.current) {
@@ -1621,6 +1641,10 @@ export const ViewdaGrid = forwardRef<ViewdaGridHandle, ViewdaGridProps>(
           row !== null
         ) {
           updateCellSelection({ column, row }, event.shiftKey, additive);
+          if (onCellActivate !== undefined) {
+            activateCell({ column, row });
+            return;
+          }
         } else if (target.dataset.gridKind === "row" && row !== null) {
           onSelectionChange(
             selectRow(selection, row, event.shiftKey, additive),
@@ -1633,9 +1657,11 @@ export const ViewdaGrid = forwardRef<ViewdaGridHandle, ViewdaGridProps>(
         rootRef.current?.focus();
       },
       [
+        activateCell,
         columns,
         measurementPort,
         onFilter,
+        onCellActivate,
         onSelectionChange,
         onSort,
         selection,
@@ -1741,6 +1767,7 @@ export const ViewdaGrid = forwardRef<ViewdaGridHandle, ViewdaGridProps>(
           selection: next,
           lastRow: row,
           lastColumn: cellColumn ?? 0,
+          moved: false,
           additive,
           clientX: event.clientX,
           clientY: event.clientY,
@@ -1774,6 +1801,11 @@ export const ViewdaGrid = forwardRef<ViewdaGridHandle, ViewdaGridProps>(
         selectionDragRef.current = null;
         if (drag !== null) {
           suppressClickRef.current = suppressFollowingClick;
+          if (suppressFollowingClick && !drag.moved && drag.kind === "cell") {
+            if (onCellActivate !== undefined) {
+              activateCell({ row: drag.lastRow, column: drag.lastColumn });
+            }
+          }
         }
         if (autoScrollFrameRef.current !== null) {
           window.cancelAnimationFrame(autoScrollFrameRef.current);
@@ -1788,7 +1820,7 @@ export const ViewdaGrid = forwardRef<ViewdaGridHandle, ViewdaGridProps>(
           captureTarget.releasePointerCapture(capturedPointerId);
         }
       },
-      [],
+      [activateCell, onCellActivate],
     );
 
     const extendSelectionDrag = useCallback(
@@ -1806,6 +1838,7 @@ export const ViewdaGrid = forwardRef<ViewdaGridHandle, ViewdaGridProps>(
         }
         drag.lastRow = clampedRow;
         drag.lastColumn = clampedColumn;
+        drag.moved = true;
         onSelectionChange(
           drag.kind === "cell"
             ? selectCell(
@@ -1994,6 +2027,14 @@ export const ViewdaGrid = forwardRef<ViewdaGridHandle, ViewdaGridProps>(
         if (rowCount === 0 || columns.length === 0) {
           return;
         }
+        if (event.key === "Enter") {
+          const active = selection.current?.cell;
+          if (active !== undefined && onCellActivate !== undefined) {
+            event.preventDefault();
+            activateCell(active);
+          }
+          return;
+        }
         const pageRows = Math.max(
           1,
           Math.floor(geometry.height / GRID_ROW_HEIGHT),
@@ -2137,6 +2178,8 @@ export const ViewdaGrid = forwardRef<ViewdaGridHandle, ViewdaGridProps>(
         onCellPeek,
         onEscape,
         onPeekFocus,
+        activateCell,
+        onCellActivate,
         onSelectionChange,
         rowCount,
         selection,
@@ -2229,7 +2272,7 @@ export const ViewdaGrid = forwardRef<ViewdaGridHandle, ViewdaGridProps>(
         ref={rootRef}
         className="viewda-grid"
         role="grid"
-        aria-label="Data grid"
+        aria-label={label}
         tabIndex={0}
         aria-rowcount={rowCount + 1}
         aria-colcount={columns.length + 1}

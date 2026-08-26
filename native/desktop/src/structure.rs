@@ -11,14 +11,18 @@ use std::{
 
 use serde::Serialize;
 use viewda_data_engine::{
-    MAX_BLOOM_PROBE_VALUE_BYTES, SourceIdentity, SourceSnapshot, StructureBloomProbe,
-    StructureByteUnit, StructureCancellation, StructureChunkDetails, StructureColumnPage,
-    StructureColumnSort, StructureError, StructureKeyValue, StructureLayout, StructureLensTotals,
-    StructureLoadProgress, StructureLoadSnapshot, StructureReader, StructureRowGroupPage,
-    StructureRowGroupSort, StructureSortDirection, StructureSummary,
+    DataWindowError, DatasetError, DatasetMemberSummary, MAX_BLOOM_PROBE_VALUE_BYTES,
+    SourceIdentity, SourceSnapshot, StructureBloomProbe, StructureByteUnit, StructureCancellation,
+    StructureChunkDetails, StructureColumnPage, StructureColumnSort, StructureError,
+    StructureKeyValue, StructureLayout, StructureLensTotals, StructureLoadProgress,
+    StructureLoadSnapshot, StructureReader, StructureRowGroupPage, StructureRowGroupSort,
+    StructureSortDirection, StructureSummary,
 };
 
-use crate::{OpenedSource, OpenedSourceSession, SessionWork};
+use crate::{
+    DatasetSessionPhase, OpenedSource, OpenedSourceSession, SessionWindowReader, SessionWork,
+    publish_dataset_failure,
+};
 
 // Each entry owns a file handle and decoded metadata; bound both dimensions.
 const STRUCTURE_CACHE_MAX_ENTRIES: usize = 8;
@@ -27,7 +31,10 @@ const STRUCTURE_CACHE_MAX_FOOTER_BYTES: u64 = 256 * 1024 * 1024;
 #[derive(Clone)]
 enum CachedStructure {
     Snapshot(Arc<SourceSnapshot>),
-    Reader(Arc<StructureReader>),
+    Reader {
+        reader: Arc<StructureReader>,
+        dataset_member_ordinal: Option<u64>,
+    },
     #[cfg(test)]
     Placeholder,
 }
@@ -80,11 +87,19 @@ impl StructureCache {
         true
     }
 
-    fn replace_with_reader(&mut self, generation: u64, reader: Arc<StructureReader>) {
+    fn replace_with_reader(
+        &mut self,
+        generation: u64,
+        reader: Arc<StructureReader>,
+        dataset_member_ordinal: Option<u64>,
+    ) {
         self.insert(
             generation,
             reader.summary().footer_bytes,
-            CachedStructure::Reader(reader),
+            CachedStructure::Reader {
+                reader,
+                dataset_member_ordinal,
+            },
         );
     }
 
@@ -102,12 +117,6 @@ impl StructureCache {
                 .checked_sub(entry.footer_bytes)
                 .expect("Structure cache byte accounting stays balanced");
         }
-    }
-
-    #[cfg(target_os = "macos")]
-    pub(crate) fn clear(&mut self) {
-        self.entries.clear();
-        self.footer_bytes = 0;
     }
 
     fn insert(&mut self, generation: u64, footer_bytes: u64, value: CachedStructure) {
@@ -159,6 +168,7 @@ impl StructureCache {
 pub(crate) enum StructureCommandError {
     NoSourceOpen,
     SourceChanged,
+    NotReady,
     NotLoaded,
     Cancelled,
     NotFound,
@@ -330,15 +340,72 @@ fn cached_structure(
 enum StructureLoadRequest {
     Cached(Arc<StructureReader>),
     Start {
-        snapshot: Option<Arc<SourceSnapshot>>,
+        plan: StructureSnapshotPlan,
         job: ActiveStructureJob,
     },
+}
+
+enum StructureSnapshotPlan {
+    File(Option<Arc<SourceSnapshot>>),
+    Dataset {
+        reader: Arc<Mutex<viewda_data_engine::DatasetWindowReader>>,
+        ordinal: u64,
+    },
+}
+
+fn map_dataset_error(error: DatasetError) -> StructureCommandError {
+    match error {
+        DatasetError::SourceChanged { .. } => StructureCommandError::SourceChanged,
+        DatasetError::InvalidMember { .. } => StructureCommandError::CorruptFooter,
+        DatasetError::Cancelled => StructureCommandError::Cancelled,
+        DatasetError::NotFound => StructureCommandError::NotFound,
+        DatasetError::PermissionDenied | DatasetError::MemberPermissionDenied { .. } => {
+            StructureCommandError::PermissionDenied
+        }
+        _ => StructureCommandError::Unsupported,
+    }
+}
+
+fn map_dataset_boundary_error(
+    session: &OpenedSourceSession,
+    error: DatasetError,
+) -> StructureCommandError {
+    if matches!(
+        error,
+        DatasetError::SourceChanged { .. }
+            | DatasetError::InvalidMember { .. }
+            | DatasetError::MemberPermissionDenied { .. }
+    ) {
+        let _ = publish_dataset_failure(session, error.clone());
+    }
+    map_dataset_error(error)
+}
+
+fn map_session_error(error: DataWindowError) -> StructureCommandError {
+    match error {
+        DataWindowError::Cancelled => StructureCommandError::Cancelled,
+        _ => StructureCommandError::Unsupported,
+    }
 }
 
 fn register_structure_load(
     opened_source: &OpenedSource,
     session: &OpenedSourceSession,
 ) -> Result<StructureLoadRequest, StructureCommandError> {
+    let dataset_plan = session
+        .with_open_state(|state| match &state.reader {
+            SessionWindowReader::File(_) => Ok(None),
+            SessionWindowReader::Dataset(dataset) => match &dataset.phase {
+                DatasetSessionPhase::Ready { reader, .. } => {
+                    Ok(Some((Arc::clone(reader), state.structure_member_ordinal)))
+                }
+                DatasetSessionPhase::Discovering(_) | DatasetSessionPhase::Inspecting(_) => {
+                    Err(StructureCommandError::NotReady)
+                }
+                DatasetSessionPhase::Failed(error) => Err(map_dataset_error(error.clone())),
+            },
+        })
+        .map_err(map_session_error)??;
     let cached = {
         let mut cache = opened_source
             .structure_cache
@@ -353,20 +420,45 @@ fn register_structure_load(
             cache.remove(session.generation);
             return Err(StructureCommandError::SourceChanged);
         }
-        cached
+        if matches!(
+            (&cached, &dataset_plan),
+            (
+                Some(CachedStructure::Reader {
+                    dataset_member_ordinal: Some(cached_ordinal),
+                    ..
+                }),
+                Some((_, selected_ordinal))
+            ) if cached_ordinal != selected_ordinal
+        ) {
+            cache.remove(session.generation);
+            None
+        } else {
+            cached
+        }
     };
     match cached {
-        Some(CachedStructure::Reader(reader)) => Ok(StructureLoadRequest::Cached(reader)),
-        cached => Ok(StructureLoadRequest::Start {
-            snapshot: match cached {
-                Some(CachedStructure::Snapshot(snapshot)) => Some(snapshot),
-                None => None,
-                #[cfg(test)]
-                Some(CachedStructure::Placeholder) => None,
-                Some(CachedStructure::Reader(_)) => unreachable!("reader handled above"),
-            },
-            job: start_session_job(session, &session.structure_jobs.load, None)?,
-        }),
+        Some(CachedStructure::Reader {
+            reader,
+            dataset_member_ordinal,
+        }) if dataset_member_ordinal == dataset_plan.as_ref().map(|(_, ordinal)| *ordinal) => {
+            Ok(StructureLoadRequest::Cached(reader))
+        }
+        cached => {
+            let plan = match dataset_plan {
+                Some((reader, ordinal)) => StructureSnapshotPlan::Dataset { reader, ordinal },
+                None => StructureSnapshotPlan::File(match cached {
+                    Some(CachedStructure::Snapshot(snapshot)) => Some(snapshot),
+                    None => None,
+                    #[cfg(test)]
+                    Some(CachedStructure::Placeholder) => None,
+                    Some(CachedStructure::Reader { .. }) => None,
+                }),
+            };
+            Ok(StructureLoadRequest::Start {
+                plan,
+                job: start_session_job(session, &session.structure_jobs.load, None)?,
+            })
+        }
     }
 }
 
@@ -386,11 +478,39 @@ fn structure_reader(
     generation: u64,
 ) -> Result<Arc<StructureReader>, StructureCommandError> {
     match cached_structure(opened_source, generation)? {
-        Some(CachedStructure::Reader(reader)) => Ok(reader),
+        Some(CachedStructure::Reader { reader, .. }) => Ok(reader),
         Some(CachedStructure::Snapshot(_)) | None => Err(StructureCommandError::NotLoaded),
         #[cfg(test)]
         Some(CachedStructure::Placeholder) => Err(StructureCommandError::NotLoaded),
     }
+}
+
+#[derive(Clone, Copy)]
+struct DatasetReportScope {
+    selected_member: u64,
+    member_count: u64,
+    row_count: u64,
+    row_group_count: u64,
+    size_bytes: u64,
+    ignored_file_count: u64,
+    schema_drift_member_count: u64,
+}
+
+fn add_dataset_report_scope(report: String, scope: DatasetReportScope) -> String {
+    const HEADING: &str = "# Parquet structure report\n\n";
+    let Some(body) = report.strip_prefix(HEADING) else {
+        return report;
+    };
+    format!(
+        "{HEADING}## Dataset scope\n\n- Report scope: selected member {} of {}; the file metadata and layout below describe only this member\n- Dataset rows: {}\n- Dataset row groups: {}\n- Dataset bytes: {}\n- Ignored files: {}\n- Members with schema drift: {}\n\n{body}",
+        scope.selected_member,
+        scope.member_count,
+        scope.row_count,
+        scope.row_group_count,
+        scope.size_bytes,
+        scope.ignored_file_count,
+        scope.schema_drift_member_count,
+    )
 }
 
 fn install_structure(
@@ -398,6 +518,7 @@ fn install_structure(
     session: &OpenedSourceSession,
     reader: StructureReader,
     validate_reopened_source: bool,
+    dataset_member_ordinal: Option<u64>,
 ) -> Result<Arc<StructureReader>, StructureCommandError> {
     if validate_reopened_source {
         validate_structure_source(session)?;
@@ -409,12 +530,22 @@ fn install_structure(
     if state.session(session.generation).is_none() {
         return Err(StructureCommandError::Cancelled);
     }
+    let session_state = session.lock_state().map_err(map_session_error)?;
+    if dataset_member_ordinal
+        .is_some_and(|ordinal| ordinal != session_state.structure_member_ordinal)
+    {
+        return Err(StructureCommandError::Cancelled);
+    }
     let reader = Arc::new(reader);
     opened_source
         .structure_cache
         .lock()
         .map_err(|_| StructureCommandError::Unsupported)?
-        .replace_with_reader(session.generation, Arc::clone(&reader));
+        .replace_with_reader(
+            session.generation,
+            Arc::clone(&reader),
+            dataset_member_ordinal,
+        );
     Ok(reader)
 }
 
@@ -540,16 +671,55 @@ pub(crate) async fn get_structure_summary(
     opened_source: tauri::State<'_, OpenedSource>,
 ) -> Result<StructureSummary, StructureCommandError> {
     let (session, _work) = capture_session(&opened_source, generation)?;
-    let (snapshot, job) = match register_structure_load(&opened_source, &session)? {
+    let (plan, job) = match register_structure_load(&opened_source, &session)? {
         StructureLoadRequest::Cached(reader) => return Ok(reader.summary().clone()),
-        StructureLoadRequest::Start { snapshot, job } => (snapshot, job),
+        StructureLoadRequest::Start { plan, job } => (plan, job),
+    };
+    let member_ordinal = match &plan {
+        StructureSnapshotPlan::File(_) => None,
+        StructureSnapshotPlan::Dataset { ordinal, .. } => Some(*ordinal),
     };
     let progress = job.progress.clone();
     let cancellation = job.cancellation.clone();
-    let fallback_snapshot = snapshot.clone();
+    let fallback_snapshot = match &plan {
+        StructureSnapshotPlan::File(snapshot) => snapshot.clone(),
+        StructureSnapshotPlan::Dataset { .. } => None,
+    };
     let worker_session = Arc::clone(&session);
-    let result = tauri::async_runtime::spawn_blocking(move || {
-        build_structure_reader(&worker_session, snapshot, &progress, &cancellation)
+    let lifecycle = Arc::clone(&session.lifecycle);
+    let result = tauri::async_runtime::spawn_blocking(move || match plan {
+        StructureSnapshotPlan::File(snapshot) => {
+            build_structure_reader(&worker_session, snapshot, &progress, &cancellation)
+        }
+        StructureSnapshotPlan::Dataset { reader, ordinal } => {
+            let result = (|| {
+                if cancellation.is_cancelled() {
+                    return Err(StructureCommandError::Cancelled);
+                }
+                let snapshot = reader
+                    .lock()
+                    .map_err(|_| StructureCommandError::Unsupported)?
+                    .member_snapshot_while(ordinal, || {
+                        !cancellation.is_cancelled() && lifecycle.wants_work()
+                    })
+                    .map_err(|error| map_dataset_boundary_error(&worker_session, error))?;
+                if cancellation.is_cancelled() {
+                    return Err(StructureCommandError::Cancelled);
+                }
+                let structure =
+                    StructureReader::from_snapshot(snapshot.snapshot(), &progress, &cancellation)
+                        .map_err(StructureCommandError::from)?;
+                snapshot
+                    .validate_while(|| !cancellation.is_cancelled() && lifecycle.wants_work())
+                    .map_err(|error| map_dataset_boundary_error(&worker_session, error))?;
+                Ok(structure)
+            })();
+            StructureLoadOutcome {
+                snapshot: None,
+                reader: result,
+                reopened: false,
+            }
+        }
     })
     .await;
     StructureJobs::finish(&session.structure_jobs.load, &job);
@@ -583,10 +753,105 @@ pub(crate) async fn get_structure_summary(
         }
     };
     Ok(
-        install_structure(&opened_source, &session, reader, reopened)?
+        install_structure(&opened_source, &session, reader, reopened, member_ordinal)?
             .summary()
             .clone(),
     )
+}
+
+/// Selects one fixed dataset member and clears its generation from the Structure cache.
+#[tauri::command]
+pub(crate) async fn select_dataset_structure_member(
+    generation: u64,
+    ordinal: u64,
+    opened_source: tauri::State<'_, OpenedSource>,
+) -> Result<DatasetMemberSummary, StructureCommandError> {
+    let (session, _work) = capture_session(&opened_source, generation)?;
+    let (source, request) = begin_dataset_member_selection(&session)?;
+    let member = tauri::async_runtime::spawn_blocking(move || {
+        source
+            .member_page(ordinal, 1)
+            .map_err(map_dataset_error)?
+            .members
+            .into_iter()
+            .next()
+            .ok_or(StructureCommandError::Unsupported)
+    })
+    .await
+    .map_err(|_| StructureCommandError::Unsupported)??;
+    let changed = finish_dataset_member_selection(&session, request, ordinal)?;
+    if changed {
+        opened_source
+            .structure_cache
+            .lock()
+            .map_err(|_| StructureCommandError::Unsupported)?
+            .remove(generation);
+    }
+    Ok(member)
+}
+
+fn begin_dataset_member_selection(
+    session: &OpenedSourceSession,
+) -> Result<(viewda_data_engine::DatasetSource, u64), StructureCommandError> {
+    session
+        .with_open_state(|state| {
+            let source = {
+                let SessionWindowReader::Dataset(dataset) = &state.reader else {
+                    return Err(StructureCommandError::Unsupported);
+                };
+                match &dataset.phase {
+                    DatasetSessionPhase::Discovering(_) | DatasetSessionPhase::Inspecting(_) => {
+                        return Err(StructureCommandError::NotReady);
+                    }
+                    DatasetSessionPhase::Failed(error) => {
+                        return Err(map_dataset_error(error.clone()));
+                    }
+                    DatasetSessionPhase::Ready { .. } => dataset
+                        .source
+                        .as_ref()
+                        .cloned()
+                        .ok_or(StructureCommandError::NotReady)?,
+                }
+            };
+            state.structure_member_request = state
+                .structure_member_request
+                .checked_add(1)
+                .ok_or(StructureCommandError::Unsupported)?;
+            Ok((source, state.structure_member_request))
+        })
+        .map_err(map_session_error)?
+}
+
+fn finish_dataset_member_selection(
+    session: &OpenedSourceSession,
+    request: u64,
+    ordinal: u64,
+) -> Result<bool, StructureCommandError> {
+    session
+        .with_open_state(|state| {
+            let SessionWindowReader::Dataset(dataset) = &state.reader else {
+                return Err(StructureCommandError::Unsupported);
+            };
+            match &dataset.phase {
+                DatasetSessionPhase::Discovering(_) | DatasetSessionPhase::Inspecting(_) => {
+                    return Err(StructureCommandError::NotReady);
+                }
+                DatasetSessionPhase::Failed(error) => {
+                    return Err(map_dataset_error(error.clone()));
+                }
+                DatasetSessionPhase::Ready { .. } => {}
+            }
+            if state.structure_member_request != request {
+                return Err(StructureCommandError::Cancelled);
+            }
+            if state.structure_member_ordinal == ordinal {
+                return Ok(false);
+            }
+            session.structure_jobs.cancel_all();
+            state.structure_member_ordinal = ordinal;
+            Ok(true)
+        })
+        .map_err(map_session_error)?
 }
 
 /// Reports how far the running footer parse has come.
@@ -726,18 +991,156 @@ pub(crate) fn get_structure_key_value(
 
 /// Returns the source row a row group starts at, for opening Data there.
 #[tauri::command]
-pub(crate) fn get_structure_row_offset(
+pub(crate) async fn get_structure_row_offset(
     generation: u64,
     row_group_index: usize,
     opened_source: tauri::State<'_, OpenedSource>,
 ) -> Result<u64, StructureCommandError> {
-    let (session, _work) = capture_session(&opened_source, generation)?;
+    let (session, work) = capture_session(&opened_source, generation)?;
     session
         .validate_source_identity()
         .map_err(|_| StructureCommandError::SourceChanged)?;
-    structure_reader(&opened_source, generation)?
-        .first_row_offset(row_group_index)
-        .map_err(StructureCommandError::from)
+    let request = capture_structure_row_offset(&opened_source, &session, generation)?;
+    let lifecycle = Arc::clone(&session.lifecycle);
+    let worker_session = Arc::clone(&session);
+    let (request, offset) = tauri::async_runtime::spawn_blocking(move || {
+        let _work = work;
+        let local_offset = request
+            .structure
+            .first_row_offset(row_group_index)
+            .map_err(StructureCommandError::from)?;
+        let offset = match &request.dataset {
+            Some(dataset) => dataset
+                .reader
+                .lock()
+                .map_err(|_| StructureCommandError::Unsupported)?
+                .member_row_offset_while(dataset.ordinal, || lifecycle.wants_work())
+                .map_err(|error| map_dataset_boundary_error(&worker_session, error))?
+                .checked_add(local_offset)
+                .ok_or(StructureCommandError::Unsupported)?,
+            None => local_offset,
+        };
+        Ok::<_, StructureCommandError>((request, offset))
+    })
+    .await
+    .map_err(|_| StructureCommandError::Unsupported)??;
+    validate_structure_row_offset(&opened_source, &session, generation, &request)?;
+    Ok(offset)
+}
+
+struct DatasetStructureRowOffset {
+    reader: Arc<Mutex<viewda_data_engine::DatasetWindowReader>>,
+    ordinal: u64,
+}
+
+struct StructureRowOffsetRequest {
+    structure: Arc<StructureReader>,
+    dataset: Option<DatasetStructureRowOffset>,
+    member_request: u64,
+}
+
+fn capture_structure_row_offset(
+    opened_source: &OpenedSource,
+    session: &OpenedSourceSession,
+    generation: u64,
+) -> Result<StructureRowOffsetRequest, StructureCommandError> {
+    let (dataset, member_request) = {
+        let state = session.lock_state().map_err(map_session_error)?;
+        let dataset = match &state.reader {
+            SessionWindowReader::File(_) => None,
+            SessionWindowReader::Dataset(dataset) => match &dataset.phase {
+                DatasetSessionPhase::Ready { reader, .. } => Some(DatasetStructureRowOffset {
+                    reader: Arc::clone(reader),
+                    ordinal: state.structure_member_ordinal,
+                }),
+                DatasetSessionPhase::Discovering(_) | DatasetSessionPhase::Inspecting(_) => {
+                    return Err(StructureCommandError::NotReady);
+                }
+                DatasetSessionPhase::Failed(error) => {
+                    return Err(map_dataset_error(error.clone()));
+                }
+            },
+        };
+        (dataset, state.structure_member_request)
+    };
+    let (structure, cached_ordinal) = match cached_structure(opened_source, generation)? {
+        Some(CachedStructure::Reader {
+            reader,
+            dataset_member_ordinal,
+        }) => (reader, dataset_member_ordinal),
+        _ => return Err(StructureCommandError::NotLoaded),
+    };
+    if cached_ordinal != dataset.as_ref().map(|dataset| dataset.ordinal) {
+        return Err(StructureCommandError::Cancelled);
+    }
+    Ok(StructureRowOffsetRequest {
+        structure,
+        dataset,
+        member_request,
+    })
+}
+
+fn validate_structure_row_offset(
+    opened_source: &OpenedSource,
+    session: &OpenedSourceSession,
+    generation: u64,
+    request: &StructureRowOffsetRequest,
+) -> Result<(), StructureCommandError> {
+    let current = opened_source
+        .state
+        .lock()
+        .map_err(|_| StructureCommandError::Unsupported)?
+        .session(generation)
+        .ok_or(StructureCommandError::Cancelled)?;
+    if !std::ptr::eq(Arc::as_ptr(&current), session) {
+        return Err(StructureCommandError::Cancelled);
+    }
+    session
+        .with_open_state(|state| {
+            if state.structure_member_request != request.member_request {
+                return Err(StructureCommandError::Cancelled);
+            }
+            match (&state.reader, &request.dataset) {
+                (SessionWindowReader::File(_), None) => {}
+                (
+                    SessionWindowReader::Dataset(dataset),
+                    Some(DatasetStructureRowOffset { reader, ordinal }),
+                ) => match &dataset.phase {
+                    DatasetSessionPhase::Ready {
+                        reader: current_reader,
+                        ..
+                    } if state.structure_member_ordinal == *ordinal
+                        && Arc::ptr_eq(current_reader, reader) => {}
+                    DatasetSessionPhase::Ready { .. } => {
+                        return Err(StructureCommandError::Cancelled);
+                    }
+                    DatasetSessionPhase::Discovering(_) | DatasetSessionPhase::Inspecting(_) => {
+                        return Err(StructureCommandError::NotReady);
+                    }
+                    DatasetSessionPhase::Failed(error) => {
+                        return Err(map_dataset_error(error.clone()));
+                    }
+                },
+                _ => return Err(StructureCommandError::Cancelled),
+            }
+            let cached = opened_source
+                .structure_cache
+                .lock()
+                .map_err(|_| StructureCommandError::Unsupported)?
+                .get(generation);
+            if !matches!(
+                cached,
+                Some(CachedStructure::Reader {
+                    reader,
+                    dataset_member_ordinal,
+                }) if dataset_member_ordinal == request.dataset.as_ref().map(|dataset| dataset.ordinal)
+                    && Arc::ptr_eq(&reader, &request.structure)
+            ) {
+                return Err(StructureCommandError::Cancelled);
+            }
+            Ok(())
+        })
+        .map_err(map_session_error)?
 }
 
 /// Builds the bounded, path-free Markdown digest copied from Structure mode.
@@ -747,11 +1150,59 @@ pub(crate) async fn get_structure_report(
     unit: StructureByteUnit,
     opened_source: tauri::State<'_, OpenedSource>,
 ) -> Result<String, StructureCommandError> {
-    let (_session, work) = capture_session(&opened_source, generation)?;
-    let reader = structure_reader(&opened_source, generation)?;
+    let (session, work) = capture_session(&opened_source, generation)?;
+    let (reader, cached_member_ordinal) = match cached_structure(&opened_source, generation)? {
+        Some(CachedStructure::Reader {
+            reader,
+            dataset_member_ordinal,
+        }) => (reader, dataset_member_ordinal),
+        Some(CachedStructure::Snapshot(_)) | None => {
+            return Err(StructureCommandError::NotLoaded);
+        }
+        #[cfg(test)]
+        Some(CachedStructure::Placeholder) => return Err(StructureCommandError::NotLoaded),
+    };
+    let dataset_scope = {
+        let state = session.lock_state().map_err(map_session_error)?;
+        match &state.reader {
+            SessionWindowReader::File(_) if cached_member_ordinal.is_none() => None,
+            SessionWindowReader::File(_) => return Err(StructureCommandError::Cancelled),
+            SessionWindowReader::Dataset(dataset) => match &dataset.phase {
+                DatasetSessionPhase::Ready { summary, .. }
+                    if cached_member_ordinal == Some(state.structure_member_ordinal) =>
+                {
+                    Some(DatasetReportScope {
+                        selected_member: state
+                            .structure_member_ordinal
+                            .checked_add(1)
+                            .ok_or(StructureCommandError::Unsupported)?,
+                        member_count: summary.member_count,
+                        row_count: summary.row_count,
+                        row_group_count: summary.row_group_count,
+                        size_bytes: summary.size_bytes,
+                        ignored_file_count: summary.ignored_file_count,
+                        schema_drift_member_count: summary.schema_drift_member_count,
+                    })
+                }
+                DatasetSessionPhase::Ready { .. } => {
+                    return Err(StructureCommandError::Cancelled);
+                }
+                DatasetSessionPhase::Discovering(_) | DatasetSessionPhase::Inspecting(_) => {
+                    return Err(StructureCommandError::NotReady);
+                }
+                DatasetSessionPhase::Failed(error) => {
+                    return Err(map_dataset_error(error.clone()));
+                }
+            },
+        }
+    };
     tauri::async_runtime::spawn_blocking(move || {
         let _work = work;
-        reader.report(unit)
+        let report = reader.report(unit);
+        match dataset_scope {
+            Some(scope) => add_dataset_report_scope(report, scope),
+            None => report,
+        }
     })
     .await
     .map_err(|_| StructureCommandError::Unsupported)
@@ -824,13 +1275,311 @@ mod tests {
     };
 
     use super::*;
-    use crate::SourceOpenIntent;
+    use crate::{
+        DatasetNativeNotifier, SourceOpenIntent,
+        dataset_session::tests::{install_test_dataset, install_test_dataset_with_notifier},
+    };
+
+    fn ready_dataset_session() -> Arc<OpenedSourceSession> {
+        let directory = tempfile::tempdir().expect("dataset directory");
+        write_empty_parquet(&directory.path().join("part.parquet"));
+        let opened_source = OpenedSource::default();
+        let (session, inspector, _) = install_test_dataset(&opened_source, directory.path());
+        let reader = inspector.into_window_reader().expect("completed reader");
+        let summary = reader.summary().clone();
+        let interrupt = reader.interrupt_handle();
+        session
+            .with_open_state(|state| {
+                let SessionWindowReader::Dataset(dataset) = &mut state.reader else {
+                    panic!("dataset session");
+                };
+                dataset.phase = DatasetSessionPhase::Ready {
+                    summary,
+                    reader: Arc::new(Mutex::new(reader)),
+                    interrupt,
+                };
+            })
+            .expect("open session");
+        session
+    }
+
+    fn ready_dataset_row_offset_request() -> (
+        tempfile::TempDir,
+        OpenedSource,
+        Arc<OpenedSourceSession>,
+        u64,
+        StructureRowOffsetRequest,
+    ) {
+        ready_dataset_row_offset_request_with_notifier(None)
+    }
+
+    fn ready_dataset_row_offset_request_with_notifier(
+        notifier: Option<DatasetNativeNotifier>,
+    ) -> (
+        tempfile::TempDir,
+        OpenedSource,
+        Arc<OpenedSourceSession>,
+        u64,
+        StructureRowOffsetRequest,
+    ) {
+        let directory = tempfile::tempdir().expect("dataset directory");
+        let member = directory.path().join("part.parquet");
+        write_empty_parquet(&member);
+        let opened_source = OpenedSource::default();
+        let (session, inspector, info) =
+            install_test_dataset_with_notifier(&opened_source, directory.path(), notifier);
+        let reader = inspector.into_window_reader().expect("completed reader");
+        let summary = reader.summary().clone();
+        let interrupt = reader.interrupt_handle();
+        session
+            .with_open_state(|state| {
+                let SessionWindowReader::Dataset(dataset) = &mut state.reader else {
+                    panic!("dataset session");
+                };
+                dataset.phase = DatasetSessionPhase::Ready {
+                    summary,
+                    reader: Arc::new(Mutex::new(reader)),
+                    interrupt,
+                };
+            })
+            .expect("open session");
+        let (_, snapshot) = inspect_local_source_snapshot(&member).expect("member snapshot");
+        let structure = Arc::new(
+            StructureReader::from_snapshot(
+                &snapshot,
+                &StructureLoadProgress::default(),
+                &StructureCancellation::default(),
+            )
+            .expect("member structure"),
+        );
+        opened_source
+            .structure_cache
+            .lock()
+            .expect("structure cache")
+            .replace_with_reader(info.generation, structure, Some(0));
+        let request = capture_structure_row_offset(&opened_source, &session, info.generation)
+            .expect("row-offset request");
+        (directory, opened_source, session, info.generation, request)
+    }
+
+    fn dataset_failure(session: &OpenedSourceSession) -> Option<DatasetError> {
+        session
+            .with_open_state(|state| {
+                let SessionWindowReader::Dataset(dataset) = &state.reader else {
+                    panic!("dataset session");
+                };
+                match &dataset.phase {
+                    DatasetSessionPhase::Failed(error) => Some(error.clone()),
+                    _ => None,
+                }
+            })
+            .expect("open session")
+    }
+
+    #[test]
+    fn latest_member_selection_wins_when_workers_finish_out_of_order() {
+        let session = ready_dataset_session();
+        let (_, first_request) = begin_dataset_member_selection(&session).expect("first selection");
+        let (_, second_request) =
+            begin_dataset_member_selection(&session).expect("second selection");
+
+        assert!(
+            finish_dataset_member_selection(&session, second_request, 2).expect("latest selection")
+        );
+        assert_eq!(
+            finish_dataset_member_selection(&session, first_request, 1),
+            Err(StructureCommandError::Cancelled)
+        );
+        assert_eq!(
+            session
+                .lock_state()
+                .expect("session state")
+                .structure_member_ordinal,
+            2
+        );
+    }
+
+    #[test]
+    fn closing_a_session_cancels_a_pending_member_selection() {
+        let session = ready_dataset_session();
+        let (_, request) = begin_dataset_member_selection(&session).expect("selection");
+        session.lifecycle.start_closing();
+
+        assert_eq!(
+            finish_dataset_member_selection(&session, request, 1),
+            Err(StructureCommandError::Cancelled)
+        );
+    }
+
+    #[test]
+    fn a_newer_member_selection_cancels_an_in_flight_row_offset() {
+        let (_directory, opened_source, session, generation, request) =
+            ready_dataset_row_offset_request();
+        let _ = begin_dataset_member_selection(&session).expect("newer selection");
+
+        assert_eq!(
+            validate_structure_row_offset(&opened_source, &session, generation, &request),
+            Err(StructureCommandError::Cancelled)
+        );
+    }
+
+    #[test]
+    fn closing_a_session_cancels_an_in_flight_row_offset() {
+        let (_directory, opened_source, session, generation, request) =
+            ready_dataset_row_offset_request();
+        session.lifecycle.start_closing();
+
+        assert_eq!(
+            validate_structure_row_offset(&opened_source, &session, generation, &request),
+            Err(StructureCommandError::Cancelled)
+        );
+    }
+
+    #[test]
+    fn selected_member_snapshot_failure_publishes_dataset_failure_once() {
+        let notifications = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (directory, _opened_source, session, _generation, request) =
+            ready_dataset_row_offset_request_with_notifier(Some(DatasetNativeNotifier::Counter(
+                Arc::clone(&notifications),
+            )));
+        fs::remove_file(directory.path().join("part.parquet")).expect("remove selected member");
+        let dataset = request.dataset.as_ref().expect("dataset request");
+        let result = dataset
+            .reader
+            .lock()
+            .expect("dataset reader")
+            .member_snapshot_while(dataset.ordinal, || true);
+        let error = match result {
+            Ok(_) => panic!("selected member changed"),
+            Err(error) => error,
+        };
+        let command_error = map_dataset_error(error.clone());
+
+        assert_eq!(
+            map_dataset_boundary_error(&session, error.clone()),
+            command_error
+        );
+        assert_eq!(dataset_failure(&session), Some(error.clone()));
+        assert_eq!(notifications.load(std::sync::atomic::Ordering::Acquire), 1);
+
+        assert_eq!(map_dataset_boundary_error(&session, error), command_error);
+        assert_eq!(notifications.load(std::sync::atomic::Ordering::Acquire), 1);
+    }
+
+    #[test]
+    fn selected_member_snapshot_validation_publishes_dataset_failure() {
+        let notifications = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (directory, _opened_source, session, _generation, request) =
+            ready_dataset_row_offset_request_with_notifier(Some(DatasetNativeNotifier::Counter(
+                Arc::clone(&notifications),
+            )));
+        let dataset = request.dataset.as_ref().expect("dataset request");
+        let snapshot = dataset
+            .reader
+            .lock()
+            .expect("dataset reader")
+            .member_snapshot_while(dataset.ordinal, || true)
+            .expect("selected member snapshot");
+        fs::remove_file(directory.path().join("part.parquet")).expect("remove selected member");
+        let error = snapshot
+            .validate_while(|| true)
+            .expect_err("selected member changed");
+        let command_error = map_dataset_error(error.clone());
+
+        assert_eq!(
+            map_dataset_boundary_error(&session, error.clone()),
+            command_error
+        );
+        assert_eq!(dataset_failure(&session), Some(error));
+        assert_eq!(notifications.load(std::sync::atomic::Ordering::Acquire), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn selected_member_snapshot_permission_failure_publishes_dataset_failure() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let notifications = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (directory, _opened_source, session, _generation, request) =
+            ready_dataset_row_offset_request_with_notifier(Some(DatasetNativeNotifier::Counter(
+                Arc::clone(&notifications),
+            )));
+        let member = directory.path().join("part.parquet");
+        fs::set_permissions(&member, fs::Permissions::from_mode(0o000))
+            .expect("remove member permissions");
+        let dataset = request.dataset.as_ref().expect("dataset request");
+        let result = dataset
+            .reader
+            .lock()
+            .expect("dataset reader")
+            .member_snapshot_while(dataset.ordinal, || true);
+        fs::set_permissions(&member, fs::Permissions::from_mode(0o600))
+            .expect("restore member permissions");
+        let error = match result {
+            Ok(_) => panic!("selected member permission denied"),
+            Err(error) => error,
+        };
+
+        assert_eq!(
+            map_dataset_boundary_error(&session, error.clone()),
+            StructureCommandError::PermissionDenied
+        );
+        assert!(matches!(
+            error,
+            DatasetError::MemberPermissionDenied { ref member } if member == "part.parquet"
+        ));
+        assert_eq!(dataset_failure(&session), Some(error));
+        assert_eq!(notifications.load(std::sync::atomic::Ordering::Acquire), 1);
+    }
+
+    #[test]
+    fn non_source_structure_errors_leave_dataset_ready() {
+        let notifications = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (_directory, _opened_source, session, _generation, _request) =
+            ready_dataset_row_offset_request_with_notifier(Some(DatasetNativeNotifier::Counter(
+                Arc::clone(&notifications),
+            )));
+
+        assert_eq!(
+            map_dataset_boundary_error(&session, DatasetError::Cancelled),
+            StructureCommandError::Cancelled
+        );
+        assert_eq!(
+            map_dataset_boundary_error(&session, DatasetError::Unsupported),
+            StructureCommandError::Unsupported
+        );
+        assert_eq!(dataset_failure(&session), None);
+        assert_eq!(notifications.load(std::sync::atomic::Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn dataset_report_identifies_the_selected_member_and_dataset_facts_without_a_path() {
+        let report = add_dataset_report_scope(
+            "# Parquet structure report\n\n## File metadata\n\n- Writer: test\n".to_owned(),
+            DatasetReportScope {
+                selected_member: 3,
+                member_count: 12,
+                row_count: 420,
+                row_group_count: 24,
+                size_bytes: 8_192,
+                ignored_file_count: 2,
+                schema_drift_member_count: 1,
+            },
+        );
+
+        assert_eq!(
+            report,
+            "# Parquet structure report\n\n## Dataset scope\n\n- Report scope: selected member 3 of 12; the file metadata and layout below describe only this member\n- Dataset rows: 420\n- Dataset row groups: 24\n- Dataset bytes: 8192\n- Ignored files: 2\n- Members with schema drift: 1\n\n## File metadata\n\n- Writer: test\n"
+        );
+        assert!(!report.contains('/'));
+    }
 
     #[test]
     fn command_errors_keep_stable_wire_codes() {
         let codes = [
             StructureCommandError::NoSourceOpen,
             StructureCommandError::SourceChanged,
+            StructureCommandError::NotReady,
             StructureCommandError::NotLoaded,
             StructureCommandError::Cancelled,
             StructureCommandError::NotFound,
@@ -850,6 +1599,7 @@ mod tests {
             serde_json::json!([
                 { "code": "noSourceOpen" },
                 { "code": "sourceChanged" },
+                { "code": "notReady" },
                 { "code": "notLoaded" },
                 { "code": "cancelled" },
                 { "code": "notFound" },
@@ -864,6 +1614,31 @@ mod tests {
                 { "code": "unsupportedProbeColumn" }
             ])
         );
+    }
+
+    #[test]
+    fn selected_member_row_offset_failure_publishes_dataset_failure() {
+        let notifications = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (directory, _opened_source, session, _generation, request) =
+            ready_dataset_row_offset_request_with_notifier(Some(DatasetNativeNotifier::Counter(
+                Arc::clone(&notifications),
+            )));
+        fs::remove_file(directory.path().join("part.parquet")).expect("remove selected member");
+        let dataset = request.dataset.as_ref().expect("dataset request");
+        let error = dataset
+            .reader
+            .lock()
+            .expect("dataset reader")
+            .member_row_offset_while(dataset.ordinal, || true)
+            .expect_err("selected member changed");
+        let command_error = map_dataset_error(error.clone());
+
+        assert_eq!(
+            map_dataset_boundary_error(&session, error.clone()),
+            command_error
+        );
+        assert_eq!(dataset_failure(&session), Some(error));
+        assert_eq!(notifications.load(std::sync::atomic::Ordering::Acquire), 1);
     }
 
     #[test]
@@ -1635,7 +2410,7 @@ mod tests {
         )
         .reader
         .expect("an evicted source reopens transparently");
-        install_structure(&opened_source, &session, reader, true)
+        install_structure(&opened_source, &session, reader, true, None)
             .expect("reopened reader installs");
         assert!(matches!(
             opened_source
@@ -1643,7 +2418,7 @@ mod tests {
                 .lock()
                 .expect("Structure cache")
                 .get(opened.generation),
-            Some(CachedStructure::Reader(_))
+            Some(CachedStructure::Reader { .. })
         ));
 
         let replacement = directory.path().join("replacement.parquet");

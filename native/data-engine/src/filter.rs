@@ -66,18 +66,6 @@ pub(crate) enum ColumnFilterKind {
     NullOnly,
 }
 
-#[cfg(test)]
-pub(crate) fn build_filter_predicate(
-    schema: &[SchemaField],
-    filters: &[DataFilter],
-) -> Result<FilterPredicate, FilterBuildError> {
-    let column_names = schema
-        .iter()
-        .map(|column| column.name.as_str())
-        .collect::<Vec<_>>();
-    build_filter_predicate_with_names(schema, filters, &column_names)
-}
-
 pub(crate) fn build_filter_predicate_with_names(
     schema: &[SchemaField],
     filters: &[DataFilter],
@@ -305,6 +293,17 @@ pub(crate) fn quote_identifier(identifier: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn build_filter_predicate(
+        schema: &[SchemaField],
+        filters: &[DataFilter],
+    ) -> Result<FilterPredicate, FilterBuildError> {
+        let column_names = schema
+            .iter()
+            .map(|column| column.name.as_str())
+            .collect::<Vec<_>>();
+        build_filter_predicate_with_names(schema, filters, &column_names)
+    }
 
     fn field(name: &str, filter_kind: ColumnFilterKind) -> SchemaField {
         let (physical_type, logical_type) = match filter_kind {

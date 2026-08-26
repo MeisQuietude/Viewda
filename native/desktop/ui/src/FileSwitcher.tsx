@@ -16,6 +16,8 @@ export function FileSwitcher({
   onDismiss,
   onContextMenu,
   onOpenFile,
+  onOpenFolder,
+  onCancelOpen,
   onOpenRecent,
   onRemoveRecent,
 }: {
@@ -27,6 +29,8 @@ export function FileSwitcher({
   onDismiss: () => void;
   onContextMenu: (generation: number, x: number, y: number) => void;
   onOpenFile: () => Promise<void>;
+  onOpenFolder: () => Promise<void>;
+  onCancelOpen: () => void;
   onOpenRecent: (id: string) => Promise<void>;
   onRemoveRecent: (id: string) => Promise<void>;
 }) {
@@ -39,10 +43,13 @@ export function FileSwitcher({
     search.length === 0 ||
     `${name}\n${path}`.toLocaleLowerCase().includes(search);
   const visibleFiles = files.filter((file) => matches(file.name, file.path));
-  const openLocations = new Set(files.map((file) => file.path));
+  const openLocations = new Set(
+    files.filter((file) => file.kind === "file").map((file) => file.path),
+  );
   const visibleRecents = recentSources.filter(
     (entry) =>
-      !openLocations.has(entry.path) && matches(entry.name, entry.path),
+      (entry.kind !== "file" || !openLocations.has(entry.path)) &&
+      matches(entry.name, entry.path),
   );
   const rows = [
     ...visibleFiles.map((file) => ({ kind: "open" as const, file })),
@@ -83,7 +90,7 @@ export function FileSwitcher({
     <div className="file-switcher-backdrop" onPointerDown={onDismiss}>
       <section
         className="file-switcher"
-        aria-label="File switcher"
+        aria-label="Source switcher"
         onPointerDown={(event) => event.stopPropagation()}
         onKeyDown={(event) => {
           if (event.key === "Escape") {
@@ -117,12 +124,12 @@ export function FileSwitcher({
             autoFocus
             className="file-switcher-search"
             type="search"
-            aria-label="Search files"
+            aria-label="Search sources"
             aria-activedescendant={selectedId}
             aria-controls="file-switcher-results"
             aria-expanded="true"
             role="combobox"
-            placeholder="Search files"
+            placeholder="Search sources"
             value={query}
             onChange={(event) => setQuery(event.currentTarget.value)}
           />
@@ -136,10 +143,10 @@ export function FileSwitcher({
           className="file-switcher-results"
           id="file-switcher-results"
           role="listbox"
-          aria-label="Files"
+          aria-label="Sources"
         >
           {visibleFiles.length > 0 && (
-            <Section label="Open files">
+            <Section label="Open sources">
               {visibleFiles.map((file, index) => (
                 <Row
                   key={file.generation}
@@ -147,8 +154,13 @@ export function FileSwitcher({
                   active={file.active}
                   highlighted={index === selectedIndex}
                   name={file.name}
-                  directory={directoryLabels[index] ?? file.directory}
+                  directory={
+                    file.kind === "file"
+                      ? (directoryLabels[index] ?? file.directory)
+                      : `${datasetKindLabel(file.kind)} · ${file.datasetMemberCount?.toLocaleString("en-US") ?? "…"} files${file.datasetIgnoredFileCount ? ` · ${file.datasetIgnoredFileCount.toLocaleString("en-US")} ignored` : ""} · ${middleTruncate(file.path)}`
+                  }
                   path={file.path}
+                  includePathInAccessibleName={file.kind === "file"}
                   busy={file.busy}
                   onChoose={() =>
                     void onActivate(file.generation).then(onDismiss)
@@ -168,8 +180,10 @@ export function FileSwitcher({
                   highlighted={visibleFiles.length + index === selectedIndex}
                   name={entry.name}
                   directory={
-                    directoryLabels[visibleFiles.length + index] ??
-                    entry.directory
+                    entry.kind === "file"
+                      ? (directoryLabels[visibleFiles.length + index] ??
+                        entry.directory)
+                      : `${datasetKindLabel(entry.kind)} · ${middleTruncate(entry.path)}`
                   }
                   path={entry.path}
                   onChoose={() => void onOpenRecent(entry.id)}
@@ -178,17 +192,35 @@ export function FileSwitcher({
             </Section>
           )}
           {rows.length === 0 && (
-            <p className="file-switcher-empty">No matching files</p>
+            <p className="file-switcher-empty">No matching sources</p>
           )}
         </div>
-        <button
-          className="file-switcher-footer"
-          type="button"
-          disabled={opening}
-          onClick={() => void onOpenFile()}
-        >
-          Open File… <kbd>{shortcutModifier}O</kbd>
-        </button>
+        <div className="file-switcher-actions">
+          <button
+            className="file-switcher-footer"
+            type="button"
+            onClick={() => (opening ? onCancelOpen() : void onOpenFile())}
+          >
+            {opening ? (
+              <span>Cancel opening</span>
+            ) : (
+              <>
+                <span>Open file…</span>
+                <kbd aria-hidden="true">{shortcutModifier}O</kbd>
+              </>
+            )}
+          </button>
+          <button
+            className="file-switcher-footer"
+            type="button"
+            title="Open every Parquet file in the selected folder and its subfolders as one dataset. Hive-style key=value folders become columns."
+            disabled={opening}
+            onClick={() => void onOpenFolder()}
+          >
+            <span>Open folder as dataset…</span>
+            <kbd aria-hidden="true">⇧{shortcutModifier}O</kbd>
+          </button>
+        </div>
       </section>
     </div>
   );
@@ -210,6 +242,7 @@ function Row({
   name,
   directory,
   path,
+  includePathInAccessibleName = true,
   busy = false,
   onChoose,
   onClose,
@@ -221,6 +254,7 @@ function Row({
   name: string;
   directory: string;
   path?: string;
+  includePathInAccessibleName?: boolean;
   busy?: boolean;
   onChoose: () => void;
   onClose?: () => void;
@@ -241,7 +275,7 @@ function Row({
         id={id}
         type="button"
         role="option"
-        aria-label={`${name} — ${path ?? directory}`}
+        aria-label={`${name} — ${directory}${path === undefined || !includePathInAccessibleName ? "" : ` — ${path}`}`}
         aria-selected={highlighted}
         onClick={onChoose}
       >
@@ -357,15 +391,11 @@ function distinguishDirectories(
     });
   });
 
-  if (collidingLabelGroups(entries, labels).length > 0) {
-    throw new Error("File switcher paths must be unique");
-  }
-
   return labels;
 }
 
 function collidingLabelGroups(
-  entries: readonly { name: string }[],
+  entries: readonly { name: string; path: string }[],
   labels: readonly string[],
 ): number[][] {
   const groups = new Map<string, number[]>();
@@ -373,7 +403,15 @@ function collidingLabelGroups(
     const key = JSON.stringify([entry.name, labels[index]]);
     groups.set(key, [...(groups.get(key) ?? []), index]);
   });
-  return [...groups.values()].filter((indices) => indices.length > 1);
+  return [...groups.values()].filter(
+    (indices) =>
+      indices.length > 1 &&
+      new Set(indices.map((index) => entries[index]!.path)).size > 1,
+  );
+}
+
+function datasetKindLabel(kind: "folderDataset" | "fileDataset"): string {
+  return kind === "folderDataset" ? "Folder dataset" : "Selected files";
 }
 
 function uniquePathFragment(value: string, rivals: readonly string[]): string {
@@ -475,6 +513,7 @@ export function FileContextMenu({
   onClose,
   onDismiss,
   onCloseOthers,
+  onReload,
 }: {
   file: OpenFile | null;
   x: number;
@@ -482,6 +521,7 @@ export function FileContextMenu({
   onClose: () => void;
   onDismiss: () => void;
   onCloseOthers: () => void;
+  onReload?: () => void;
 }) {
   useEffect(() => {
     window.addEventListener("pointerdown", onDismiss, { once: true });
@@ -503,6 +543,11 @@ export function FileContextMenu({
       }}
       onPointerDown={(event) => event.stopPropagation()}
     >
+      {file.kind !== "file" && onReload !== undefined && (
+        <button type="button" role="menuitem" onClick={onReload}>
+          Reload dataset
+        </button>
+      )}
       <button type="button" role="menuitem" onClick={onClose}>
         Close
       </button>

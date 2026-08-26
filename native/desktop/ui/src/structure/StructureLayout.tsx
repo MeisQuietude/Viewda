@@ -57,6 +57,8 @@ export function StructureLayoutView({
   summary,
   unit,
   onUnit,
+  lens,
+  onLens,
   rowGroupCount,
   dataAvailable = true,
   highlightedColumn,
@@ -69,6 +71,8 @@ export function StructureLayoutView({
   summary: StructureSummary;
   unit: StructureByteUnit;
   onUnit: (unit: StructureByteUnit) => void;
+  lens: StructureLens;
+  onLens: (lens: StructureLens) => void;
   rowGroupCount: number;
   dataAvailable?: boolean;
   highlightedColumn: number | null;
@@ -77,7 +81,6 @@ export function StructureLayoutView({
   onSelectRow: (rowGroupIndex: number) => void;
   onOpenRow: (rowGroupIndex: number) => void;
 }) {
-  const [lens, setLens] = useState<StructureLens>("ratio");
   const [offset, setOffset] = useState(0);
   const [layoutState, setLayoutState] = useState<LayoutRequestState>({
     kind: "idle",
@@ -305,7 +308,7 @@ export function StructureLayoutView({
                     term="Ratio"
                     button={{
                       pressed: lens === "ratio",
-                      onClick: () => setLens("ratio"),
+                      onClick: () => onLens("ratio"),
                     }}
                   >
                     Compression
@@ -314,14 +317,14 @@ export function StructureLayoutView({
                     term="Codec"
                     button={{
                       pressed: lens === "codec",
-                      onClick: () => setLens("codec"),
+                      onClick: () => onLens("codec"),
                     }}
                   />
                   <StructureHelp
                     term="Stats & bloom"
                     button={{
                       pressed: lens === "presence",
-                      onClick: () => setLens("presence"),
+                      onClick: () => onLens("presence"),
                     }}
                   >
                     Statistics

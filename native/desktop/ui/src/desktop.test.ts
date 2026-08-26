@@ -15,6 +15,12 @@ import {
   getDataViewSettings,
   getDataWindow,
   getDataViewStatus,
+  DatasetCommandError,
+  getDatasetMembers,
+  getDatasetPartitions,
+  getDatasetPreview,
+  getDatasetStatus,
+  getOpenedSourceSummary,
   getSourceOpenProgress,
   getStructureColumns,
   getStructureLoadProgress,
@@ -22,10 +28,12 @@ import {
   getTextValueSuggestions,
   installPendingUpdate,
   listOpenedSources,
+  openLocalFolder,
   prepareDataView,
   probeStructureBloomFilter,
   revealDataExport,
   revealOpenedSource,
+  reloadOpenedSource,
   closeOpenedSource,
   removeRecentSource,
   clearRecentSources,
@@ -36,11 +44,15 @@ import {
   takePostUpdateState,
   openLocalSource,
   openRecentSource,
+  onDatasetStatusChanged,
+  onSourceDragState,
+  type DatasetStatus,
 } from "./desktop";
 
-const { channelHandlers, invokeMock } = vi.hoisted(() => ({
+const { channelHandlers, invokeMock, listenMock } = vi.hoisted(() => ({
   channelHandlers: [] as Array<(message: unknown) => void>,
   invokeMock: vi.fn(),
+  listenMock: vi.fn(),
 }));
 
 vi.mock("@tauri-apps/api/core", () => ({
@@ -51,7 +63,7 @@ vi.mock("@tauri-apps/api/core", () => ({
   },
   invoke: invokeMock,
 }));
-vi.mock("@tauri-apps/api/event", () => ({ listen: vi.fn() }));
+vi.mock("@tauri-apps/api/event", () => ({ listen: listenMock }));
 vi.mock("@tauri-apps/api/window", () => ({
   getCurrentWindow: vi.fn(() => ({ show: vi.fn() })),
 }));
@@ -73,6 +85,46 @@ describe("desktop seam", () => {
     expect(invokeMock).toHaveBeenCalledWith("install_pending_update", {
       onProgress: expect.anything(),
     });
+  });
+
+  it("forwards the typed native file-drop state and returns its unlisten handle", async () => {
+    const unlisten = vi.fn();
+    const handler = vi.fn();
+    listenMock.mockResolvedValue(unlisten);
+
+    await expect(onSourceDragState(handler)).resolves.toBe(unlisten);
+    expect(listenMock).toHaveBeenCalledWith(
+      "source-drag-state",
+      expect.any(Function),
+    );
+    const nativeHandler = listenMock.mock.calls[0]?.[1] as
+      | ((event: {
+          payload: {
+            state: "enter" | "leave" | "drop";
+            kind: "folder" | "files" | "mixed";
+          };
+        }) => void)
+      | undefined;
+    nativeHandler?.({ payload: { state: "enter", kind: "folder" } });
+
+    expect(handler).toHaveBeenCalledWith({ state: "enter", kind: "folder" });
+  });
+
+  it("forwards the dataset generation from lifecycle notifications", async () => {
+    const unlisten = vi.fn();
+    const handler = vi.fn();
+    listenMock.mockResolvedValue(unlisten);
+
+    await expect(onDatasetStatusChanged(handler)).resolves.toBe(unlisten);
+    expect(listenMock).toHaveBeenCalledWith(
+      "dataset-status-changed",
+      expect.any(Function),
+    );
+    const nativeHandler = listenMock.mock.calls[0]?.[1] as
+      ((event: { payload: { generation: number } }) => void) | undefined;
+    nativeHandler?.({ payload: { generation: 17 } });
+
+    expect(handler).toHaveBeenCalledWith({ generation: 17 });
   });
 
   it("reads and persists the preparation memory setting", async () => {
@@ -138,15 +190,21 @@ describe("desktop seam", () => {
     invokeMock
       .mockResolvedValueOnce(null)
       .mockResolvedValueOnce({ generation: 4 })
+      .mockResolvedValueOnce({ generation: 5 })
       .mockResolvedValueOnce("published");
 
     await openLocalSource("app-session:9");
     await openRecentSource("recent-4", "app-session:10");
+    await reloadOpenedSource(4, "app-session:11");
     await expect(cancelSourceOpen("app-session:10")).resolves.toBe("published");
 
     expect(invokeMock.mock.calls).toEqual([
-      ["open_local_source", { attempt: "app-session:9" }],
+      [
+        "open_local_source",
+        { attempt: "app-session:9", groupAsDataset: false },
+      ],
       ["open_recent_source", { id: "recent-4", attempt: "app-session:10" }],
+      ["reload_opened_source", { generation: 4, attempt: "app-session:11" }],
       ["cancel_source_open", { attempt: "app-session:10" }],
     ]);
   });
@@ -179,12 +237,14 @@ describe("desktop seam", () => {
   it("uses generation-scoped commands for open file sessions", async () => {
     invokeMock
       .mockResolvedValueOnce([])
+      .mockResolvedValueOnce(null)
       .mockResolvedValueOnce(undefined)
       .mockResolvedValueOnce(true)
       .mockResolvedValueOnce(undefined)
       .mockResolvedValueOnce(4);
 
     await expect(listOpenedSources()).resolves.toEqual([]);
+    await expect(getOpenedSourceSummary(7)).resolves.toBeNull();
     await expect(activateOpenedSource(7)).resolves.toBeUndefined();
     await expect(closeOpenedSource(7)).resolves.toBe(true);
     await expect(revealOpenedSource(7)).resolves.toBeUndefined();
@@ -192,6 +252,7 @@ describe("desktop seam", () => {
 
     expect(invokeMock.mock.calls).toEqual([
       ["list_opened_sources"],
+      ["get_opened_source_summary", { generation: 7 }],
       ["activate_opened_source", { generation: 7 }],
       ["close_opened_source", { generation: 7 }],
       ["reveal_opened_source", { generation: 7 }],
@@ -209,6 +270,262 @@ describe("desktop seam", () => {
       ["remove_recent_source", { id: "recent-4" }],
       ["clear_recent_sources"],
     ]);
+  });
+
+  it("keeps dataset paging and grouping arguments path-free", async () => {
+    invokeMock
+      .mockResolvedValueOnce(null)
+      .mockResolvedValueOnce(null)
+      .mockResolvedValueOnce({ state: "inspecting" })
+      .mockResolvedValueOnce({ members: [], offset: 100, total: 100 })
+      .mockResolvedValueOnce({ nodes: [], nextAfter: null });
+
+    await openLocalSource("files", true);
+    await openLocalFolder("folder");
+    await getDatasetStatus(9);
+    await getDatasetMembers(9, 100, 50);
+    await getDatasetPartitions(
+      9,
+      [{ key: "year", value: "2026" }],
+      { key: "month", value: "08" },
+      50,
+    );
+
+    expect(invokeMock.mock.calls).toEqual([
+      ["open_local_source", { attempt: "files", groupAsDataset: true }],
+      ["open_local_folder", { attempt: "folder" }],
+      ["get_dataset_status", { generation: 9 }],
+      ["get_dataset_members", { generation: 9, offset: 100, limit: 50 }],
+      [
+        "get_dataset_partitions",
+        {
+          generation: 9,
+          parent: [{ key: "year", value: "2026" }],
+          after: { key: "month", value: "08" },
+          limit: 50,
+        },
+      ],
+    ]);
+  });
+
+  it("keeps the discovering dataset status wire shape", async () => {
+    const status = {
+      state: "discovering" as const,
+      progress: {
+        scannedEntryCount: 4_096,
+        discoveredMemberCount: 37,
+        ignoredFileCount: 12,
+      },
+      sampleSummary: null,
+    };
+    invokeMock.mockResolvedValue(status);
+
+    await expect(getDatasetStatus(9)).resolves.toEqual(status);
+    expect(invokeMock).toHaveBeenCalledWith("get_dataset_status", {
+      generation: 9,
+    });
+  });
+
+  it("keeps the inspecting sample summary separate from growing progress", async () => {
+    const status: DatasetStatus = {
+      state: "inspecting",
+      progress: {
+        completedMemberCount: 37,
+        totalMemberCount: 100,
+        rowCount: 8_000,
+        rowGroupCount: 50,
+      },
+      sampleSummary: {
+        displayName: "events/",
+        memberCount: 8,
+        ignoredFileCount: 2,
+        sizeBytes: 4_096,
+        rowCount: 320,
+        rowGroupCount: 8,
+        columnCount: 2,
+        schema: [
+          {
+            name: "event_id",
+            physicalType: "INT64",
+            logicalType: null,
+            children: [],
+          },
+          {
+            name: "file",
+            physicalType: "BYTE_ARRAY",
+            logicalType: "String",
+            children: [],
+          },
+        ],
+        schemaNodeCount: 2,
+        schemaIsTruncated: false,
+        stringsTruncated: false,
+        schemaDriftMemberCount: 0,
+        partitionColumnIndices: [],
+        provenanceColumnIndex: 1,
+      },
+    };
+    invokeMock.mockResolvedValue(status);
+
+    await expect(getDatasetStatus(9)).resolves.toEqual(status);
+    expect(invokeMock).toHaveBeenCalledWith("get_dataset_status", {
+      generation: 9,
+    });
+  });
+
+  it("preserves the relative dataset member in typed errors", async () => {
+    invokeMock.mockRejectedValue({
+      code: "sourceChanged",
+      member: "year=2026/part-01.parquet",
+    });
+
+    const error = await getDatasetStatus(3).catch((caught) => caught);
+
+    expect(error).toBeInstanceOf(DatasetCommandError);
+    expect(error).toMatchObject({
+      detail: {
+        code: "sourceChanged",
+        member: "year=2026/part-01.parquet",
+      },
+    });
+  });
+
+  it("preserves a dataset member permission failure", async () => {
+    invokeMock.mockRejectedValue({
+      code: "memberPermissionDenied",
+      member: "year=2026/private.parquet",
+    });
+
+    const error = await getDatasetStatus(3).catch((caught) => caught);
+
+    expect(error).toBeInstanceOf(DatasetCommandError);
+    expect(error).toMatchObject({
+      detail: {
+        code: "memberPermissionDenied",
+        member: "year=2026/private.parquet",
+      },
+    });
+  });
+
+  it("preserves a duplicate Hive partition key and its relative member", async () => {
+    invokeMock.mockRejectedValue({
+      code: "duplicatePartitionKey",
+      key: "year",
+      member: "year=2026/year=2025/part.parquet",
+    });
+
+    const error = await getDatasetStatus(3).catch((caught) => caught);
+
+    expect(error).toBeInstanceOf(DatasetCommandError);
+    expect(error).toMatchObject({
+      detail: {
+        code: "duplicatePartitionKey",
+        key: "year",
+        member: "year=2026/year=2025/part.parquet",
+      },
+    });
+  });
+
+  it("preserves session and nested dataset window errors", async () => {
+    invokeMock
+      .mockRejectedValueOnce({ code: "noSourceOpen" })
+      .mockRejectedValueOnce({
+        code: "window",
+        error: { code: "resourceExhausted" },
+      })
+      .mockRejectedValueOnce({
+        code: "window",
+        error: { code: "queryFailed" },
+      });
+
+    await expect(getDatasetStatus(3)).rejects.toMatchObject({
+      detail: { code: "noSourceOpen" },
+    });
+    await expect(getDatasetPreview(3)).rejects.toMatchObject({
+      detail: {
+        code: "window",
+        error: { code: "resourceExhausted" },
+      },
+    });
+    await expect(getDataWindow(3, 0, 0, 10, [0])).rejects.toMatchObject({
+      code: "queryFailed",
+    });
+  });
+
+  it("preserves relative members from direct and prepared data errors", async () => {
+    invokeMock
+      .mockRejectedValueOnce({ code: "sourceChanged" })
+      .mockRejectedValueOnce({
+        code: "sourceChanged",
+        member: "year=2026/changed.parquet",
+      })
+      .mockRejectedValueOnce({
+        code: "invalidMember",
+        member: "year=2026/broken.parquet",
+      })
+      .mockRejectedValueOnce({
+        code: "memberPermissionDenied",
+        member: "year=2026/private.parquet",
+      });
+
+    const session = await getDataWindow(3, 0, 0, 10, [0]).catch(
+      (error) => error,
+    );
+    const direct = await getDataWindow(3, 0, 0, 10, [0]).catch(
+      (error) => error,
+    );
+    const prepared = await prepareDataView(3, 1, [], [], {
+      memoryLimit: "mb384",
+    }).catch((error) => error);
+    const permission = await getDataViewStatus(3).catch((error) => error);
+
+    expect(session).toMatchObject({
+      code: "sourceChanged",
+      detail: { code: "sourceChanged" },
+    });
+    expect(session.detail).not.toHaveProperty("member");
+    expect(direct).toMatchObject({
+      code: "sourceChanged",
+      detail: {
+        code: "sourceChanged",
+        member: "year=2026/changed.parquet",
+      },
+    });
+    expect(prepared).toMatchObject({
+      code: "invalidMember",
+      detail: {
+        code: "invalidMember",
+        member: "year=2026/broken.parquet",
+      },
+    });
+    expect(permission).toMatchObject({
+      code: "memberPermissionDenied",
+      detail: {
+        code: "memberPermissionDenied",
+        member: "year=2026/private.parquet",
+      },
+    });
+  });
+
+  it("narrows structure failures to their closed code set", async () => {
+    invokeMock
+      .mockRejectedValueOnce({ code: "notReady" })
+      .mockRejectedValueOnce({ code: "notLoaded" })
+      .mockRejectedValueOnce({ code: "a code this build does not know" });
+
+    const notReady = await getStructureSummary(1).catch(
+      (error: unknown) => error,
+    );
+    expect(notReady).toBeInstanceOf(StructureCommandError);
+    expect(notReady).toMatchObject({ code: "notReady" });
+
+    await expect(getStructureSummary(1)).rejects.toMatchObject({
+      code: "notLoaded",
+    });
+
+    await expect(getStructureSummary(1)).rejects.toMatchObject({
+      code: "unsupported",
+    });
   });
 
   it("passes text suggestion revisions through the desktop seam", async () => {
@@ -253,12 +570,14 @@ describe("desktop seam", () => {
       version: "0.1.0",
       sources: [],
       sourceError: { code: "notFound" },
+      restoreIncomplete: true,
     });
 
     await expect(takePostUpdateState()).resolves.toEqual({
       version: "0.1.0",
       sources: [],
-      sourceError: "notFound",
+      sourceError: { code: "notFound" },
+      restoreIncomplete: true,
     });
     expect(invokeMock).toHaveBeenCalledWith("take_post_update_state");
   });

@@ -75,18 +75,30 @@ function column(
 }
 
 function cellTexts(label: string): string[] {
-  return within(screen.getByLabelText(label))
+  return within(structureGrid(label))
     .getAllByRole("gridcell")
     .map((cell) => cell.textContent ?? "");
 }
 
 function renderedTableWidth(label: string): number {
-  return within(screen.getByLabelText(label))
+  return within(structureGrid(label))
     .getAllByRole("columnheader")
     .reduce(
       (total, header) => total + Number.parseFloat(header.style.width),
       0,
     );
+}
+
+function structureGrid(label: string): HTMLElement {
+  return screen.getByRole("grid", { name: label });
+}
+
+function structureTableCard(label: string): HTMLElement {
+  const card = structureGrid(label).closest<HTMLElement>(
+    ".structure-table-card",
+  );
+  if (card === null) throw new Error(`${label} table card was not rendered`);
+  return card;
 }
 
 describe("RowGroupTable", () => {
@@ -187,7 +199,7 @@ describe("RowGroupTable", () => {
     );
     await waitFor(() => expect(cellTexts("Row groups")).toContain("1.5 MB"));
     expect(
-      within(screen.getByLabelText("Row groups").parentElement!).getByText(
+      within(structureTableCard("Row groups")).getByText(
         "Before compression bytes",
       ),
     ).toBeInTheDocument();
@@ -342,9 +354,7 @@ describe("RowGroupTable", () => {
         "—",
       ]),
     );
-    const cells = within(screen.getByLabelText("Row groups")).getAllByRole(
-      "gridcell",
-    );
+    const cells = within(structureGrid("Row groups")).getAllByRole("gridcell");
     expect(cells[5]).toHaveClass("is-faded");
     expect(cells[0]).not.toHaveClass("is-faded");
   });
@@ -374,9 +384,7 @@ describe("RowGroupTable", () => {
         "1 of 4",
       ]),
     );
-    const cells = within(screen.getByLabelText("Row groups")).getAllByRole(
-      "gridcell",
-    );
+    const cells = within(structureGrid("Row groups")).getAllByRole("gridcell");
     expect(cells.every((cell) => cell.classList.contains("is-faded"))).toBe(
       true,
     );
@@ -403,6 +411,77 @@ describe("RowGroupTable", () => {
 });
 
 describe("ColumnsSection", () => {
+  it("waits for the new Structure reader before refetching a revised page", async () => {
+    const fetchPage = vi
+      .spyOn(desktop, "getStructureColumns")
+      .mockResolvedValueOnce({
+        offset: 0,
+        totalCount: 1,
+        columns: [column(0, { name: "first-file" })],
+      })
+      .mockResolvedValueOnce({
+        offset: 0,
+        totalCount: 1,
+        columns: [column(0, { name: "second-file" })],
+      });
+    const view = (structureRevision: number, ready: boolean) => (
+      <ColumnsSection
+        generation={2}
+        structureRevision={structureRevision}
+        unit="compressed"
+        columnCount={1}
+        ready={ready}
+        measurementPort={measurementPort}
+      />
+    );
+    const { rerender } = render(view(0, true));
+    expect(await screen.findByText("first-file")).toBeInTheDocument();
+
+    rerender(view(1, false));
+
+    expect(screen.getByText("Reading column sizes…")).toBeInTheDocument();
+    expect(fetchPage).toHaveBeenCalledTimes(1);
+
+    rerender(view(1, true));
+
+    expect(await screen.findByText("second-file")).toBeInTheDocument();
+    expect(screen.queryByText("first-file")).not.toBeInTheDocument();
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+    expect(fetchPage).toHaveBeenCalledTimes(2);
+  });
+
+  it("invalidates a same-sized column page when the selected file changes", async () => {
+    const fetchPage = vi
+      .spyOn(desktop, "getStructureColumns")
+      .mockResolvedValueOnce({
+        offset: 0,
+        totalCount: 1,
+        columns: [column(0, { name: "first-file" })],
+      })
+      .mockResolvedValueOnce({
+        offset: 0,
+        totalCount: 1,
+        columns: [column(0, { name: "second-file" })],
+      });
+    const view = (structureRevision: number) => (
+      <ColumnsSection
+        generation={2}
+        structureRevision={structureRevision}
+        unit="compressed"
+        columnCount={1}
+        measurementPort={measurementPort}
+      />
+    );
+    const { rerender } = render(view(0));
+    expect(await screen.findByText("first-file")).toBeInTheDocument();
+
+    rerender(view(1));
+
+    expect(await screen.findByText("second-file")).toBeInTheDocument();
+    expect(screen.queryByText("first-file")).not.toBeInTheDocument();
+    expect(fetchPage).toHaveBeenCalledTimes(2);
+  });
+
   it("ignores a stale page that resolves after the unit changes", async () => {
     let resolveCompressed:
       ((page: desktop.StructureColumnPage) => void) | undefined;
@@ -666,7 +745,7 @@ describe("ColumnsSection", () => {
         />
       </div>,
     );
-    await waitFor(() => expect(screen.getByLabelText("Columns")).toBeVisible());
+    await waitFor(() => expect(structureGrid("Columns")).toBeVisible());
     const outer = screen.getByTestId("structure-scroll-owner");
     outer.style.overflowY = "auto";
     Object.defineProperties(outer, {

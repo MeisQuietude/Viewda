@@ -1,6 +1,8 @@
 //! Shell-independent data inspection and query operations for Viewda.
 
 #[cfg(feature = "query-engine")]
+mod dataset;
+#[cfg(feature = "query-engine")]
 mod export;
 #[cfg(feature = "query-engine")]
 mod filter;
@@ -22,6 +24,14 @@ use serde::Serialize;
 #[cfg(feature = "query-engine")]
 use thiserror::Error;
 
+#[cfg(feature = "query-engine")]
+pub use dataset::{
+    DatasetDiscovery, DatasetDiscoveryProgress, DatasetError, DatasetInspectionInterruptHandle,
+    DatasetInspectionProgress, DatasetInspector, DatasetMemberPage, DatasetMemberSnapshot,
+    DatasetMemberSummary, DatasetPartitionNode, DatasetPartitionPage, DatasetPreview,
+    DatasetSource, DatasetSummary, DatasetWindowInterruptHandle, DatasetWindowReader,
+    PartitionValue,
+};
 #[cfg(feature = "query-engine")]
 pub use export::{
     CsvExportOptions, DataExportCancellation, DataExportError, DataExportFormat,
