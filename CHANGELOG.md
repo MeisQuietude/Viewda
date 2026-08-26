@@ -8,6 +8,8 @@ Backward-incompatible entries start with **Breaking:**.
 
 ## Unreleased
 
+## 0.3.0 — 2026-08-26
+
 ### Added
 
 - Open Parquet folders recursively as datasets. Hive columns become integers only when all non-null values are canonical signed integers; otherwise they stay text. Filter, sort, inspect, and export complete datasets; source modification times stay unchanged and `file` starts pinned.
