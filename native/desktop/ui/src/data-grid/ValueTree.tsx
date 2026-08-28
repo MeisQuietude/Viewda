@@ -81,6 +81,7 @@ const MATCH_CACHE_SIZE = 256;
 const MATCH_CACHE_PREFIX = 64;
 const RAW_PREVIEW_CHARACTERS = 8_192;
 const MAX_TREE_INDENT = 32;
+const COPY_PATH_OUTPUT_CHARACTER_LIMIT = 65_536;
 
 interface TreeNode {
   id: string;
@@ -1684,31 +1685,37 @@ function valueNodePath(
   fieldPath: FieldPath,
   node: TreeNode,
 ): string | undefined {
+  let path: string;
   if (node.value.kind === "json") {
-    if (node.parent === null) return formatFieldPath(fieldPath);
-    const jsonPath = jsonPathForNode(node);
-    return jsonPath === undefined
-      ? undefined
-      : formatJsonFieldTarget(fieldPath, jsonPath);
-  }
-  const descendants: TreeNode[] = [];
-  for (let current: TreeNode | null = node; current?.parent !== null;) {
-    descendants.push(current);
-    current = current.parent;
-  }
-  let path = formatFieldPath(fieldPath);
-  for (const descendant of descendants.reverse()) {
-    if (descendant.objectKey !== undefined) {
-      path += `.${formatFieldPathSegment(descendant.objectKey)}`;
-    } else if (/^\[\d+\]$/.test(descendant.label)) {
-      path += descendant.label;
-    } else if (descendant.key) {
-      path += `[${JSON.stringify(descendant.label)}]`;
-    } else {
-      path += `[${descendant.ordinal}]`;
+    if (node.parent === null) path = formatFieldPath(fieldPath);
+    else {
+      const jsonPath = exactJsonPathForNode(
+        node,
+        COPY_PATH_OUTPUT_CHARACTER_LIMIT,
+      );
+      if (jsonPath === undefined) return undefined;
+      path = formatJsonFieldTarget(fieldPath, jsonPath);
+    }
+  } else {
+    const descendants: TreeNode[] = [];
+    for (let current: TreeNode | null = node; current?.parent !== null;) {
+      descendants.push(current);
+      current = current.parent;
+    }
+    path = formatFieldPath(fieldPath);
+    for (const descendant of descendants.reverse()) {
+      if (descendant.objectKey !== undefined) {
+        path += `.${formatFieldPathSegment(descendant.objectKey)}`;
+      } else if (/^\[\d+\]$/.test(descendant.label)) {
+        path += descendant.label;
+      } else if (descendant.key) {
+        path += `[${JSON.stringify(descendant.label)}]`;
+      } else {
+        path += `[${descendant.ordinal}]`;
+      }
     }
   }
-  return path;
+  return path.length <= COPY_PATH_OUTPUT_CHARACTER_LIMIT ? path : undefined;
 }
 
 function jsonFieldTargetForNode(
@@ -1724,13 +1731,24 @@ function jsonFieldTargetForNode(
 }
 
 function jsonPathForNode(node: TreeNode): JsonPath | undefined {
+  const path = exactJsonPathForNode(node, JSON_PATH_BYTE_LIMIT + 1);
+  return path === undefined || !jsonPathIsValid(path) ? undefined : path;
+}
+
+function exactJsonPathForNode(
+  node: TreeNode,
+  characterLimit: number,
+): JsonPath | undefined {
   if (node.parent === null) return undefined;
   const reversed: JsonPath = [];
+  let remainingCharacters = characterLimit;
   for (let current = node; current.parent !== null; current = current.parent) {
     const parent = current.parent;
     if (parent.value.kind !== "json") return undefined;
     if (parent.value.node.kind === "array") {
       reversed.push({ index: current.ordinal });
+      remainingCharacters -= String(current.ordinal).length + 2;
+      if (remainingCharacters < 0) return undefined;
       continue;
     }
     if (parent.value.node.kind !== "object") return undefined;
@@ -1740,13 +1758,14 @@ function jsonPathForNode(node: TreeNode): JsonPath | undefined {
       source.source,
       source.start,
       source.end,
-      JSON_PATH_BYTE_LIMIT + 1,
+      remainingCharacters + 1,
     );
     if (decoded.truncated) return undefined;
+    remainingCharacters -= decoded.text.length;
+    if (remainingCharacters < 0) return undefined;
     reversed.push({ field: decoded.text });
   }
-  const path = reversed.reverse();
-  return jsonPathIsValid(path) ? path : undefined;
+  return reversed.reverse();
 }
 
 function jsonNodeValueType(kind: string): JsonValueType | undefined {

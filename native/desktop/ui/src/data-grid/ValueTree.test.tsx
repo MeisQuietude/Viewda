@@ -197,11 +197,11 @@ describe("ValueTree", () => {
     vi.useRealTimers();
   });
 
-  it("does not expose an address for a JSON key beyond the wire limit", async () => {
+  it("copies a safe exact path beyond the wire limit without invisible bidi controls", async () => {
     vi.useFakeTimers();
     const onFilterJsonField = vi.fn();
     const onCopy = vi.fn();
-    const oversizedKey = "x".repeat(JSON_PATH_BYTE_LIMIT + 1);
+    const oversizedKey = `${"x".repeat(JSON_PATH_BYTE_LIMIT + 1)}\u202etrail`;
     render(
       <ValueTree
         label="payload"
@@ -225,10 +225,59 @@ describe("ValueTree", () => {
       screen.queryByRole("button", { name: "Filter by this field" }),
     ).toBeNull();
     const copyPath = screen.getByRole("button", { name: "Copy path" });
-    expect(copyPath).toBeDisabled();
+    expect(copyPath).toBeEnabled();
     fireEvent.click(copyPath);
+    await act(async () => Promise.resolve());
     expect(onFilterJsonField).not.toHaveBeenCalled();
-    expect(onCopy).not.toHaveBeenCalled();
+    expect(onCopy).toHaveBeenCalledOnce();
+    const copied = onCopy.mock.calls[0]?.[0] as string;
+    expect(copied).not.toContain("\u202e");
+    expect(copied).toContain("\\u202e");
+    expect(copied).toBe(
+      formatJsonFieldTarget(["payload"], [{ field: oversizedKey }]),
+    );
+  });
+
+  it("caps the final copied path after escaping expands object keys", async () => {
+    vi.useFakeTimers();
+    const renderKey = async (key: string, onCopy: (text: string) => void) => {
+      render(
+        <ValueTree
+          label="payload"
+          fieldPath={["payload"]}
+          value={typedValue(JSON.stringify({ [key]: 12 }), utf8(), "JSON")}
+          onCopy={onCopy}
+        />,
+      );
+      await act(async () => vi.runAllTimersAsync());
+      fireEvent.keyDown(screen.getByRole("tree", { name: "payload value" }), {
+        key: "ArrowDown",
+      });
+      return screen.getByRole("button", { name: "Copy path" });
+    };
+
+    const fittingKey = "\\\u202e".repeat(8_190);
+    const fittingCopy = vi.fn();
+    const fittingButton = await renderKey(fittingKey, fittingCopy);
+    expect(fittingButton).toBeEnabled();
+    fireEvent.click(fittingButton);
+    await act(async () => Promise.resolve());
+    const copied = fittingCopy.mock.calls[0]?.[0] as string;
+    expect(copied).toHaveLength(65_530);
+    expect(copied).not.toContain("\u202e");
+    expect(copied).toBe(
+      formatJsonFieldTarget(["payload"], [{ field: fittingKey }]),
+    );
+
+    cleanup();
+    const oversizedCopy = vi.fn();
+    const oversizedButton = await renderKey(
+      "\\\u202e".repeat(8_191),
+      oversizedCopy,
+    );
+    expect(oversizedButton).toBeDisabled();
+    fireEvent.click(oversizedButton);
+    expect(oversizedCopy).not.toHaveBeenCalled();
   });
 
   it("renders an empty field name explicitly", () => {

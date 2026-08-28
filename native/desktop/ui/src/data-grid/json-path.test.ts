@@ -66,6 +66,22 @@ describe("JSON path grammar", () => {
     expect(parseJsonPath("[4294967296]").path).toBeNull();
   });
 
+  it("explains the extra dot before an array index", () => {
+    expect(parseJsonPath("a.[0]")).toEqual({
+      path: null,
+      error: "Do not put a dot before an array index; use items[0].",
+    });
+  });
+
+  it("round-trips backslashes and renders bidi controls visibly", () => {
+    const path = [{ field: "folder\\name\u202efile" }] as const;
+    const formatted = formatJsonPath(path);
+
+    expect(formatted).toBe('"folder\\\\name\\u202efile"');
+    expect(formatted).not.toContain("\u202e");
+    expect(parseJsonPath(formatted)).toEqual({ path, error: null });
+  });
+
   it.each([
     "",
     "items.",

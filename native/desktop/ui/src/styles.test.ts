@@ -267,6 +267,15 @@ describe("color theme", () => {
     expect(declaration(".column-picker-leaf", "flex")).toBe("0 0 auto");
   });
 
+  it("keeps column-picker rows compact while reserving the reason line", () => {
+    expect(declaration(".column-picker-row", "gap")).toBe("6px");
+    expectDeclarations(".column-picker-pin", {
+      width: "20px",
+      height: "20px",
+    });
+    expect(declaration(".column-picker-reason", "line-height")).toBe("1.2");
+  });
+
   it("does not let pinned positioning hide selection colors", () => {
     expect(() =>
       declaration(".viewda-grid-cell.is-pinned", "background"),

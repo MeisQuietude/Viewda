@@ -4,9 +4,11 @@ import type {
   JsonPath,
   JsonPathSegment,
 } from "../desktop";
-import { formatFieldPath, formatFieldPathSegment } from "./field-path";
+import { formatFieldPath } from "./field-path";
 
 const SIMPLE_FIELD_CHARACTER = /[A-Za-z0-9_]/;
+const SIMPLE_FIELD = /^[A-Za-z0-9_]+$/;
+const BIDI_CONTROL = /[\u061c\u200e\u200f\u202a-\u202e\u2066-\u2069]/;
 const MAX_PATH_SEGMENTS = 64;
 export const JSON_PATH_BYTE_LIMIT = 4_096;
 const MAX_ARRAY_INDEX = 4_294_967_295;
@@ -16,8 +18,10 @@ export type JsonPathParseResult =
 
 /**
  * Parses the JSON path grammar shown by Peek and the filter/sort editors.
- * Object keys use dot-separated identifiers or doubled-quote strings; array
- * indices use brackets. Examples: items[0].price and "unit.price"[2].value.
+ * Object keys use dot-separated identifiers or quoted strings. Quoted keys
+ * double quotes, double backslashes, and use four-digit Unicode escapes for
+ * bidi controls. Array indices use brackets. Examples: items[0].price and
+ * "unit.price"[2].value.
  */
 export function parseJsonPath(input: string): JsonPathParseResult {
   const text = input.trim();
@@ -54,6 +58,9 @@ export function parseJsonPath(input: string): JsonPathParseResult {
       if (offset === text.length) {
         return invalid("Enter an object key after the final dot.");
       }
+      if (text[offset] === "[") {
+        return invalid("Do not put a dot before an array index; use items[0].");
+      }
     }
 
     if (text[offset] === '"') {
@@ -88,7 +95,7 @@ export function formatJsonPath(path: readonly JsonPathSegment[]): string {
     if ("index" in segment) {
       output += `[${segment.index}]`;
     } else {
-      const field = formatFieldPathSegment(segment.field);
+      const field = formatJsonObjectKey(segment.field);
       output += output.length === 0 ? field : `.${field}`;
     }
   }
@@ -158,6 +165,20 @@ function parseQuotedField(
   let field = "";
   let offset = start + 1;
   while (offset < text.length) {
+    if (text[offset] === "\\") {
+      if (text[offset + 1] === "\\") {
+        field += "\\";
+        offset += 2;
+        continue;
+      }
+      const unicode = text.slice(offset + 2, offset + 6);
+      if (text[offset + 1] === "u" && /^[0-9A-Fa-f]{4}$/.test(unicode)) {
+        field += String.fromCharCode(Number.parseInt(unicode, 16));
+        offset += 6;
+        continue;
+      }
+      return "Inside a quoted object key, escape a backslash as \\\\ or use \\u followed by four hexadecimal digits.";
+    }
     if (text[offset] !== '"') {
       field += text[offset];
       offset += 1;
@@ -171,6 +192,19 @@ function parseQuotedField(
     return { field, offset: offset + 1 };
   }
   return "Close the quoted object key with a double quote.";
+}
+
+function formatJsonObjectKey(field: string): string {
+  if (SIMPLE_FIELD.test(field)) return field;
+  let quoted = '"';
+  for (const character of field) {
+    if (character === '"') quoted += '""';
+    else if (character === "\\") quoted += "\\\\";
+    else if (BIDI_CONTROL.test(character)) {
+      quoted += `\\u${character.charCodeAt(0).toString(16).padStart(4, "0")}`;
+    } else quoted += character;
+  }
+  return `${quoted}"`;
 }
 
 function invalid(error: string): JsonPathParseResult {

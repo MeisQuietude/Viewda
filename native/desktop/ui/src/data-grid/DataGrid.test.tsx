@@ -1999,11 +1999,16 @@ describe("DataGrid window rendering", () => {
     separators.forEach((separator) =>
       expect(separator).toHaveClass("grid-menu-separator"),
     );
-    fireEvent.click(
-      screen.getByRole("menuitem", {
-        name: "Unflatten profile",
-      }),
+    const unflatten = screen.getByRole("menuitem", {
+      name: "Unflatten profile",
+    });
+    expect(unflatten).toHaveTextContent("3 columns → 1");
+    expect(unflatten).toHaveTextContent("removes 1 filter");
+    expect(unflatten).toHaveTextContent("removes 1 sort");
+    expect(unflatten).toHaveAccessibleDescription(
+      "3 columns → 1 · removes 1 filter · removes 1 sort",
     );
+    fireEvent.click(unflatten);
 
     await waitFor(() =>
       expect(desktop.prepareDataView).toHaveBeenLastCalledWith(7, 3, [], [], {
@@ -2095,6 +2100,13 @@ describe("DataGrid window rendering", () => {
 
     fireEvent.click(profile);
     expect(gridMock.props?.columns.map((column) => column.id)).toEqual([
+      '["account","score"]',
+    ]);
+    expect(profile).not.toBeChecked();
+    expect(profile.indeterminate).toBe(false);
+
+    fireEvent.click(profile);
+    expect(gridMock.props?.columns.map((column) => column.id)).toEqual([
       '["profile","first"]',
       '["profile","last"]',
       '["account","score"]',
@@ -2110,7 +2122,7 @@ describe("DataGrid window rendering", () => {
     );
   });
 
-  it("shows an exact struct as partial until its leaves are projected", () => {
+  it("removes an exact struct in one click and projects its leaves on the next", () => {
     render(<DataGrid source={nestedSource} />);
     const picker = openSelectPicker();
     const profile = within(picker).getByRole("checkbox", {
@@ -2123,10 +2135,18 @@ describe("DataGrid window rendering", () => {
       name: 'Project profile.address."postal""code"',
     });
 
-    expect(profile).not.toBeChecked();
-    expect(profile.indeterminate).toBe(true);
+    expect(profile).toBeChecked();
+    expect(profile.indeterminate).toBe(false);
     expect(city).not.toBeChecked();
     expect(postal).not.toBeChecked();
+
+    fireEvent.click(profile);
+    expect(profile).not.toBeChecked();
+    expect(profile.indeterminate).toBe(false);
+    expect(gridMock.props?.columns.map((column) => column.id)).toEqual([
+      '["id"]',
+      '["tail"]',
+    ]);
 
     fireEvent.click(profile);
     expect(profile).toBeChecked();
@@ -2189,6 +2209,283 @@ describe("DataGrid window rendering", () => {
       '["group"]',
       '["tail"]',
     ]);
+  });
+
+  it("drops only structural dependencies when the picker removes a projected subtree", async () => {
+    vi.mocked(desktop.prepareDataView).mockImplementation(
+      async (_generation, revision) => ({ revision, rowCount: 4 }),
+    );
+    const pickerSource: desktop.SourceSummary = {
+      ...source,
+      rowCount: 4,
+      columnCount: 2,
+      schemaNodeCount: 4,
+      schema: [
+        {
+          name: "group",
+          physicalType: "GROUP",
+          logicalType: null,
+          children: [
+            { ...source.schema[0]!, name: "left" },
+            { ...source.schema[0]!, name: "right" },
+          ],
+        },
+        { ...source.schema[0]!, name: "tail" },
+      ],
+    };
+    render(<DataGrid source={pickerSource} />);
+    openColumnMenu(0);
+    fireEvent.click(screen.getByRole("menuitem", { name: "Flatten" }));
+
+    for (const column of [0, 2]) {
+      openFilterEditor(column);
+      const editor = screen.getByRole("form", {
+        name: column === 0 ? "Filter group.left" : "Filter tail",
+      });
+      fireEvent.change(within(editor).getByLabelText("Condition"), {
+        target: { value: "isNull" },
+      });
+      fireEvent.click(
+        within(editor).getByRole("button", { name: "Add condition" }),
+      );
+      await waitFor(() =>
+        expect(desktop.prepareDataView).toHaveBeenCalledTimes(
+          column === 0 ? 1 : 2,
+        ),
+      );
+    }
+    act(() => gridMock.props?.onSort(0, false));
+    await waitFor(() =>
+      expect(desktop.prepareDataView).toHaveBeenCalledTimes(3),
+    );
+    act(() => gridMock.props?.onSort(2, true));
+    await waitFor(() =>
+      expect(desktop.prepareDataView).toHaveBeenCalledTimes(4),
+    );
+
+    const picker = openSelectPicker();
+    vi.mocked(desktop.getDataWindow).mockClear();
+    fireEvent.click(
+      within(picker).getByRole("checkbox", { name: "Project group" }),
+    );
+
+    await waitFor(() =>
+      expect(desktop.prepareDataView).toHaveBeenLastCalledWith(
+        7,
+        5,
+        [{ fieldPath: ["tail"], operator: "isNull", values: [] }],
+        [{ fieldPath: ["tail"], direction: "ascending" }],
+        { memoryLimit: "mb384" },
+      ),
+    );
+    expect(gridMock.props?.columns.map((column) => column.id)).toEqual([
+      '["tail"]',
+    ]);
+    expect(screen.getByRole("alert")).toHaveTextContent(
+      "Updated projected columns; removed filters: group.left; sorts: group.left.",
+    );
+    await waitFor(() =>
+      expect(desktop.getDataWindow).toHaveBeenLastCalledWith(7, 5, 0, 4, [
+        ["tail"],
+      ]),
+    );
+    expect(
+      vi
+        .mocked(desktop.getDataWindow)
+        .mock.calls.every(
+          (call) => call[4].length === 1 && call[4][0]?.[0] === "tail",
+        ),
+    ).toBe(true);
+  });
+
+  it("drops only disappearing dependencies when Flatten replaces a struct", async () => {
+    vi.mocked(desktop.prepareDataView).mockImplementation(
+      async (_generation, revision) => ({ revision, rowCount: 4 }),
+    );
+    const flattenSource: desktop.SourceSummary = {
+      ...source,
+      rowCount: 4,
+      columnCount: 2,
+      schemaNodeCount: 4,
+      schema: [
+        {
+          name: "group",
+          physicalType: "GROUP",
+          logicalType: null,
+          children: [
+            { ...source.schema[0]!, name: "left" },
+            { ...source.schema[0]!, name: "right" },
+          ],
+        },
+        { ...source.schema[0]!, name: "tail" },
+      ],
+    };
+    render(<DataGrid source={flattenSource} />);
+    for (const column of [0, 1]) {
+      openFilterEditor(column);
+      const editor = screen.getByRole("form", {
+        name: column === 0 ? "Filter group" : "Filter tail",
+      });
+      fireEvent.change(within(editor).getByLabelText("Condition"), {
+        target: { value: "isNull" },
+      });
+      fireEvent.click(
+        within(editor).getByRole("button", { name: "Add condition" }),
+      );
+      await waitFor(() =>
+        expect(desktop.prepareDataView).toHaveBeenCalledTimes(column + 1),
+      );
+    }
+    act(() => gridMock.props?.onSort(0, false));
+    await waitFor(() =>
+      expect(desktop.prepareDataView).toHaveBeenCalledTimes(3),
+    );
+    act(() => gridMock.props?.onSort(1, true));
+    await waitFor(() =>
+      expect(desktop.prepareDataView).toHaveBeenCalledTimes(4),
+    );
+
+    openColumnMenu(1);
+    fireEvent.click(screen.getByRole("menuitem", { name: "Hide column" }));
+    expect(desktop.prepareDataView).toHaveBeenCalledTimes(4);
+    fireEvent.click(screen.getByRole("button", { name: "Show all columns" }));
+
+    openColumnMenu(0);
+    fireEvent.click(screen.getByRole("menuitem", { name: "Flatten" }));
+
+    await waitFor(() =>
+      expect(desktop.prepareDataView).toHaveBeenLastCalledWith(
+        7,
+        5,
+        [{ fieldPath: ["tail"], operator: "isNull", values: [] }],
+        [{ fieldPath: ["tail"], direction: "ascending" }],
+        { memoryLimit: "mb384" },
+      ),
+    );
+    expect(gridMock.props?.columns.map((column) => column.id)).toEqual([
+      '["group","left"]',
+      '["group","right"]',
+      '["tail"]',
+    ]);
+    expect(screen.getByRole("alert")).toHaveTextContent(
+      "Flattened group into 2 columns; removed filters: group; sorts: group.",
+    );
+  });
+
+  it("promotes a Peek struct through the shared structural replacement contract", async () => {
+    vi.mocked(desktop.prepareDataView).mockImplementation(
+      async (_generation, revision) => ({ revision, rowCount: 4 }),
+    );
+    const profileType = struct({
+      address: struct({ city: utf8() }),
+      name: utf8(),
+    });
+    const promoteSource: desktop.SourceSummary = {
+      ...source,
+      rowCount: 4,
+      columnCount: 2,
+      schemaNodeCount: 5,
+      schema: [
+        {
+          name: "profile",
+          physicalType: "GROUP",
+          logicalType: null,
+          children: [
+            {
+              name: "address",
+              physicalType: "GROUP",
+              logicalType: null,
+              children: [{ ...source.schema[0]!, name: "city" }],
+            },
+            { ...source.schema[0]!, name: "name" },
+          ],
+        },
+        { ...source.schema[0]!, name: "tail" },
+      ],
+    };
+    decodeArrowWindow.mockImplementation(
+      (
+        _bytes: ArrayBuffer,
+        rowOffset: number,
+        fieldPaths: readonly desktop.FieldPath[],
+      ): ArrowDataWindow => ({
+        rowOffset,
+        rowCount: 4,
+        fieldPaths,
+        fieldColumnOffsets: fieldColumnOffsets(fieldPaths),
+        table: {
+          schema: {
+            fields: fieldPaths.map((fieldPath) => ({
+              type:
+                fieldPath.length === 1 && fieldPath[0] === "profile"
+                  ? profileType
+                  : fieldPath.at(-1) === "address"
+                    ? struct({ city: utf8() })
+                    : utf8(),
+            })),
+          },
+          getChildAt: (offset: number) => ({
+            at: () =>
+              fieldPaths[offset]?.[0] === "profile"
+                ? { address: { city: "Utrecht" }, name: "Ada" }
+                : "tail",
+          }),
+        } as unknown as ArrowDataWindow["table"],
+      }),
+    );
+    render(<DataGrid source={promoteSource} />);
+    await waitFor(() => expect(desktop.getDataWindow).toHaveBeenCalled());
+
+    for (const column of [0, 1]) {
+      openFilterEditor(column);
+      const editor = screen.getByRole("form", {
+        name: column === 0 ? "Filter profile" : "Filter tail",
+      });
+      fireEvent.change(within(editor).getByLabelText("Condition"), {
+        target: { value: "isNull" },
+      });
+      fireEvent.click(
+        within(editor).getByRole("button", { name: "Add condition" }),
+      );
+      await waitFor(() =>
+        expect(desktop.prepareDataView).toHaveBeenCalledTimes(column + 1),
+      );
+    }
+    act(() => gridMock.props?.onSort(0, false));
+    await waitFor(() =>
+      expect(desktop.prepareDataView).toHaveBeenCalledTimes(3),
+    );
+    act(() => gridMock.props?.onSort(1, true));
+    await waitFor(() =>
+      expect(desktop.prepareDataView).toHaveBeenCalledTimes(4),
+    );
+
+    act(() =>
+      gridMock.props?.onCellPeek?.(
+        { column: 0, row: 0 },
+        { x: 20, y: 20, width: 120, height: 28 },
+      ),
+    );
+    const tree = await screen.findByRole("tree", { name: "profile value" });
+    fireEvent.keyDown(tree, { key: "ArrowDown" });
+    fireEvent.click(screen.getByRole("button", { name: "Promote to column" }));
+
+    await waitFor(() =>
+      expect(desktop.prepareDataView).toHaveBeenLastCalledWith(
+        7,
+        5,
+        [{ fieldPath: ["tail"], operator: "isNull", values: [] }],
+        [{ fieldPath: ["tail"], direction: "ascending" }],
+        { memoryLimit: "mb384" },
+      ),
+    );
+    expect(gridMock.props?.columns.map((column) => column.id)).toEqual([
+      '["profile","address"]',
+      '["tail"]',
+    ]);
+    expect(screen.getByRole("alert")).toHaveTextContent(
+      "Promoted profile.address to one column; removed filters: profile; sorts: profile.",
+    );
   });
 
   it("keeps the requested struct selected when Sidebar Flatten needs its parent first", () => {
@@ -2436,6 +2733,45 @@ describe("DataGrid window rendering", () => {
     ]);
   });
 
+  it("breaks an adjacent group rail at the pinned boundary", () => {
+    const oneStructSource: desktop.SourceSummary = {
+      ...nestedSource,
+      columnCount: 1,
+      schemaNodeCount: 3,
+      schema: [
+        {
+          name: "profile",
+          physicalType: "GROUP",
+          logicalType: null,
+          children: [
+            { ...source.schema[0]!, name: "city" },
+            { ...source.schema[0]!, name: "country" },
+          ],
+        },
+      ],
+    };
+    render(<DataGrid source={oneStructSource} />);
+    openColumnMenu(0);
+    fireEvent.click(screen.getByRole("menuitem", { name: "Pin column" }));
+    openColumnMenu(0);
+    fireEvent.click(screen.getByRole("menuitem", { name: "Flatten" }));
+    openColumnMenu(0);
+    fireEvent.click(screen.getByRole("menuitem", { name: "Unpin column" }));
+
+    expect(gridMock.props?.columns).toMatchObject([
+      {
+        id: '["profile","country"]',
+        pinned: true,
+        groupRail: { start: true, end: true },
+      },
+      {
+        id: '["profile","city"]',
+        pinned: false,
+        groupRail: { start: true, end: true },
+      },
+    ]);
+  });
+
   it("keeps one outer rail when every child of an unpinned parent is pinned", () => {
     render(<DataGrid source={nestedSource} />);
     openColumnMenu(1);
@@ -2632,6 +2968,52 @@ describe("DataGrid window rendering", () => {
     ).toBeChecked();
   });
 
+  it("does not traverse a wide schema for column-state updates while the picker is closed", () => {
+    let childNameReads = 0;
+    const children = Array.from({ length: 100 }, (_, index) => {
+      const field = {
+        physicalType: "INT32",
+        logicalType: null,
+        children: [],
+      } as unknown as desktop.SchemaField;
+      Object.defineProperty(field, "name", {
+        enumerable: true,
+        get: () => {
+          childNameReads += 1;
+          return `child_${index}`;
+        },
+      });
+      return field;
+    });
+    render(
+      <DataGrid
+        source={{
+          ...source,
+          columnCount: 1,
+          schemaNodeCount: 101,
+          schema: [
+            {
+              name: "wide",
+              physicalType: "GROUP",
+              logicalType: null,
+              children,
+            },
+          ],
+        }}
+      />,
+    );
+    childNameReads = 0;
+
+    act(() => gridMock.props?.onColumnResize(0, 220));
+    expect(childNameReads).toBe(0);
+
+    const picker = openSelectPicker();
+    expect(childNameReads).toBeGreaterThan(0);
+    expect(
+      within(picker).getByRole("checkbox", { name: "Project wide" }),
+    ).toBeChecked();
+  });
+
   it("indexes one 10k-wide projection macro instead of rescanning the schema", () => {
     let childNameReads = 0;
     const children = Array.from({ length: 10_000 }, (_, index) => {
@@ -2667,6 +3049,9 @@ describe("DataGrid window rendering", () => {
     };
     render(<DataGrid source={wideSource} />);
     const picker = openSelectPicker();
+    fireEvent.click(
+      within(picker).getByRole("checkbox", { name: "Project wide" }),
+    );
     childNameReads = 0;
 
     fireEvent.click(
@@ -2837,6 +3222,72 @@ describe("DataGrid window rendering", () => {
       '["group"]',
       '["tail"]',
     ]);
+  });
+
+  it("recomputes the Unflatten price when a pending view fails", async () => {
+    const pricedSource: desktop.SourceSummary = {
+      ...source,
+      rowCount: 4,
+      columnCount: 2,
+      schemaNodeCount: 4,
+      schema: [
+        {
+          name: "group",
+          physicalType: "GROUP",
+          logicalType: null,
+          children: [
+            { ...source.schema[0]!, name: "left" },
+            { ...source.schema[0]!, name: "right" },
+          ],
+        },
+        { ...source.schema[0]!, name: "tail" },
+      ],
+    };
+    render(<DataGrid source={pricedSource} />);
+    openColumnMenu(0);
+    fireEvent.click(screen.getByRole("menuitem", { name: "Flatten" }));
+    openFilterEditor(0);
+    const editor = screen.getByRole("form", { name: "Filter group.left" });
+    fireEvent.change(within(editor).getByLabelText("Condition"), {
+      target: { value: "isNull" },
+    });
+    fireEvent.click(
+      within(editor).getByRole("button", { name: "Add condition" }),
+    );
+    await waitFor(() =>
+      expect(desktop.prepareDataView).toHaveBeenCalledTimes(1),
+    );
+    act(() => gridMock.props?.onSort(0, false));
+    await waitFor(() =>
+      expect(desktop.prepareDataView).toHaveBeenCalledTimes(2),
+    );
+
+    const pending = deferred<desktop.DataViewStatus>();
+    vi.mocked(desktop.prepareDataView).mockReturnValueOnce(pending.promise);
+    vi.mocked(desktop.getDataViewStatus).mockResolvedValue({
+      revision: 2,
+      rowCount: 4,
+    });
+    fireEvent.click(
+      screen.getByRole("button", { name: "Clear WHERE and ORDER BY" }),
+    );
+    openColumnMenu(0);
+    let unflatten = screen.getByRole("menuitem", {
+      name: "Unflatten group",
+    });
+    expect(unflatten).toHaveAccessibleDescription("2 columns → 1");
+
+    await act(async () =>
+      pending.reject(new desktop.DataWindowCommandError("queryFailed")),
+    );
+    await waitFor(() => {
+      unflatten = screen.getByRole("menuitem", {
+        name: "Unflatten group",
+      });
+      expect(unflatten).toHaveAccessibleDescription(
+        "2 columns → 1 · removes 1 filter · removes 1 sort",
+      );
+    });
   });
 
   it("keeps flattened columns when an early dataset sample becomes complete", async () => {
@@ -4101,6 +4552,16 @@ describe("DataGrid window rendering", () => {
 
     fireEvent.change(paths[1]!, { target: { value: "items[0].name" } });
     expect(apply).toBeEnabled();
+    fireEvent.click(
+      within(popup).getByRole("button", {
+        name: "Move payload.items[0].name earlier",
+      }),
+    );
+    expect(
+      within(popup)
+        .getAllByLabelText("Manual JSON path")
+        .map((input) => (input as HTMLInputElement).value),
+    ).toEqual(["items[0].name", "items[0].rank"]);
     fireEvent.click(apply);
 
     await waitFor(() =>
@@ -4113,16 +4574,16 @@ describe("DataGrid window rendering", () => {
             fieldPath: ["payload"],
             direction: "ascending",
             jsonTarget: {
-              path: [{ field: "items" }, { index: 0 }, { field: "rank" }],
-              valueType: "number",
+              path: [{ field: "items" }, { index: 0 }, { field: "name" }],
+              valueType: "text",
             },
           },
           {
             fieldPath: ["payload"],
             direction: "ascending",
             jsonTarget: {
-              path: [{ field: "items" }, { index: 0 }, { field: "name" }],
-              valueType: "text",
+              path: [{ field: "items" }, { index: 0 }, { field: "rank" }],
+              valueType: "number",
             },
           },
         ],
@@ -4143,16 +4604,16 @@ describe("DataGrid window rendering", () => {
             fieldPath: ["payload"],
             direction: "ascending",
             jsonTarget: {
-              path: [{ field: "items" }, { index: 0 }, { field: "rank" }],
-              valueType: "number",
+              path: [{ field: "items" }, { index: 0 }, { field: "name" }],
+              valueType: "text",
             },
           },
           {
             fieldPath: ["payload"],
             direction: "ascending",
             jsonTarget: {
-              path: [{ field: "items" }, { index: 0 }, { field: "name" }],
-              valueType: "text",
+              path: [{ field: "items" }, { index: 0 }, { field: "rank" }],
+              valueType: "number",
             },
           },
         ],
@@ -6552,6 +7013,124 @@ describe("DataGrid window rendering", () => {
     expect(desktop.prepareDataView).not.toHaveBeenCalled();
   });
 
+  it("retains duplicate source identities across sample schema transitions", async () => {
+    const duplicateSource: desktop.SourceSummary = {
+      ...source,
+      columnCount: 2,
+      rowCount: 1,
+      schemaNodeCount: 2,
+      schema: [
+        { ...source.schema[0]!, name: "duplicate" },
+        { ...source.schema[1]!, name: "duplicate" },
+      ],
+    };
+    const view = render(
+      <DataGrid source={duplicateSource} contentIdentity="early-sample" />,
+    );
+    act(() => gridMock.props?.onColumnResize(0, 231));
+    openColumnMenu(0);
+    fireEvent.click(screen.getByRole("menuitem", { name: "Pin column" }));
+
+    view.rerender(
+      <DataGrid
+        source={{
+          ...duplicateSource,
+          rowCount: 2,
+          schema: structuredClone(duplicateSource.schema),
+        }}
+        contentIdentity="complete"
+      />,
+    );
+
+    await waitFor(() =>
+      expect(gridMock.props?.columns).toMatchObject([
+        { id: "source:0", width: 231, pinned: true },
+        { id: "source:1", pinned: false },
+      ]),
+    );
+    openColumnMenu(1);
+    fireEvent.click(screen.getByRole("menuitem", { name: "Hide column" }));
+    view.rerender(
+      <DataGrid
+        source={{
+          ...duplicateSource,
+          rowCount: 3,
+          schema: structuredClone(duplicateSource.schema),
+        }}
+        contentIdentity="refreshed"
+      />,
+    );
+    await waitFor(() =>
+      expect(gridMock.props?.columns.map((column) => column.id)).toEqual([
+        "source:0",
+      ]),
+    );
+  });
+
+  it("does not share runtime types between heterogeneous duplicate columns", async () => {
+    const duplicateSource: desktop.SourceSummary = {
+      ...source,
+      columnCount: 2,
+      rowCount: 1,
+      schemaNodeCount: 3,
+      schema: [
+        {
+          name: "duplicate",
+          physicalType: "BYTE_ARRAY",
+          logicalType: "String",
+          children: [],
+        },
+        {
+          name: "duplicate",
+          physicalType: "GROUP",
+          logicalType: null,
+          children: [{ ...source.schema[0]!, name: "physical_child" }],
+        },
+      ],
+    };
+    decodeArrowWindow.mockImplementation(
+      (
+        _bytes: ArrayBuffer,
+        rowOffset: number,
+        fieldPaths: readonly desktop.FieldPath[],
+      ): ArrowDataWindow => ({
+        rowOffset,
+        rowCount: 1,
+        fieldPaths,
+        fieldColumnOffsets: new Map([[JSON.stringify(["duplicate"]), 0]]),
+        table: {
+          schema: {
+            fields: [
+              { type: utf8() },
+              { type: struct({ runtime_child: utf8() }) },
+            ],
+          },
+          getChildAt: (offset: number) => ({
+            at: () =>
+              offset === 0 ? "scalar value" : { runtime_child: "nested" },
+          }),
+        } as unknown as ArrowDataWindow["table"],
+      }),
+    );
+    render(<DataGrid source={duplicateSource} />);
+    await waitFor(() =>
+      expect(
+        gridMock.props?.getCellContent({ column: 0, row: 0 }),
+      ).toMatchObject({ displayData: "scalar value" }),
+    );
+    expect(gridMock.props?.getCellContent({ column: 1, row: 0 })).toMatchObject(
+      { displayData: expect.stringContaining("runtime_child") },
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "Schema" }));
+    const sidebar = screen.getByRole("complementary", {
+      name: "Schema sidebar",
+    });
+    expect(within(sidebar).getByText("physical_child")).toBeVisible();
+    expect(within(sidebar).queryByText("runtime_child")).toBeNull();
+    expect(within(sidebar).getAllByText("duplicate")).toHaveLength(2);
+  });
+
   it("keeps a struct readable but disables flatten for duplicate child names", async () => {
     const nestedDuplicateSource: desktop.SourceSummary = {
       ...source,
@@ -6563,13 +7142,40 @@ describe("DataGrid window rendering", () => {
           physicalType: "GROUP",
           logicalType: null,
           children: [
-            { ...source.schema[0]!, name: "city" },
-            { ...source.schema[0]!, name: "city" },
+            {
+              name: "city",
+              physicalType: "GROUP",
+              logicalType: null,
+              children: [{ ...source.schema[0]!, name: "name" }],
+            },
+            {
+              name: "city",
+              physicalType: "GROUP",
+              logicalType: null,
+              children: [{ ...source.schema[0]!, name: "name" }],
+            },
           ],
         },
       ],
-      schemaNodeCount: 3,
+      schemaNodeCount: 5,
     };
+    const profileType = struct({ city: struct({ name: utf8() }) });
+    decodeArrowWindow.mockImplementation(
+      (
+        _bytes: ArrayBuffer,
+        rowOffset: number,
+        fieldPaths: readonly desktop.FieldPath[],
+      ): ArrowDataWindow => ({
+        rowOffset,
+        rowCount: 1,
+        fieldPaths,
+        fieldColumnOffsets: fieldColumnOffsets(fieldPaths),
+        table: {
+          schema: { fields: fieldPaths.map(() => ({ type: profileType })) },
+          getChildAt: () => ({ at: () => ({ city: { name: "Utrecht" } }) }),
+        } as unknown as ArrowDataWindow["table"],
+      }),
+    );
 
     const consoleError = vi
       .spyOn(console, "error")
@@ -6578,7 +7184,7 @@ describe("DataGrid window rendering", () => {
     await waitFor(() =>
       expect(
         gridMock.props?.getCellContent({ column: 0, row: 0 }),
-      ).toMatchObject({ displayData: "row 0" }),
+      ).toBeDefined(),
     );
 
     openColumnMenu(0);
@@ -6600,15 +7206,50 @@ describe("DataGrid window rendering", () => {
     expect(gridMock.props?.columns).toHaveLength(1);
     expect(gridMock.props?.columns[0]?.id).toBe('["profile"]');
 
+    act(() =>
+      gridMock.props?.onCellPeek?.(
+        { column: 0, row: 0 },
+        { x: 20, y: 20, width: 120, height: 28 },
+      ),
+    );
+    const tree = await screen.findByRole("tree", { name: "profile value" });
+    fireEvent.keyDown(tree, { key: "ArrowDown" });
+    fireEvent.click(screen.getByRole("button", { name: "Promote to column" }));
+    expect(gridMock.props?.columns.map((column) => column.id)).toEqual([
+      '["profile"]',
+    ]);
+    expect(
+      screen.getByText(
+        "profile.city cannot be promoted because its field path is ambiguous.",
+      ),
+    ).toHaveTextContent(
+      "profile.city cannot be promoted because its field path is ambiguous.",
+    );
+    expect(desktop.prepareDataView).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole("button", { name: "Close Peek" }));
+
     const picker = openSelectPicker();
+    const profile = within(picker).getByRole("checkbox", {
+      name: "Project profile",
+    });
+    expect(profile).toBeChecked();
+    fireEvent.click(profile);
+    expect(profile).not.toBeChecked();
+    expect(
+      screen.getByLabelText("Query").querySelector(".query-select"),
+    ).toHaveTextContent("[0 cols]");
+    expect(screen.queryByTestId("viewda-grid")).not.toBeInTheDocument();
+    expect(desktop.prepareDataView).not.toHaveBeenCalled();
     const duplicateChildren = within(picker).getAllByRole("checkbox", {
       name: "Project profile.city",
     });
     expect(duplicateChildren).toHaveLength(2);
-    duplicateChildren.forEach((child) => expect(child).toBeDisabled());
-    expect(
-      within(picker).getAllByText(/contains duplicate child names/),
-    ).toHaveLength(2);
+    duplicateChildren.forEach((child) => {
+      expect(child).toBeDisabled();
+      expect(child.closest(".column-picker-row")).toHaveTextContent(
+        /contains duplicate child names/,
+      );
+    });
     expect(consoleError.mock.calls.flat().join(" ")).not.toContain("same key");
     consoleError.mockRestore();
   });

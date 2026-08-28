@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 
-const ROW_HEIGHT = 48;
+const ROW_HEIGHT = 36;
 const VIEWPORT_HEIGHT = 336;
 const OVERSCAN_ROWS = 3;
 const MAX_TREE_INDENT = 12;
@@ -154,6 +154,7 @@ export function ColumnPicker({
             {renderedColumns.map((column, renderedIndex) => {
               const filteredIndex = firstRow + renderedIndex;
               const selected = column.selection === "all";
+              const nextSelected = column.selection === "none";
               return (
                 <div
                   className={`column-picker-row${column.disabledReason === undefined ? "" : " is-disabled"}`}
@@ -176,7 +177,7 @@ export function ColumnPicker({
                     ) {
                       return;
                     }
-                    onToggle(column.id, !selected);
+                    onToggle(column.id, nextSelected);
                   }}
                 >
                   <input
@@ -192,9 +193,7 @@ export function ColumnPicker({
                     aria-label={`Project ${column.name}`}
                     checked={selected}
                     disabled={column.disabledReason !== undefined}
-                    onChange={(event) =>
-                      onToggle(column.id, event.target.checked)
-                    }
+                    onChange={() => onToggle(column.id, nextSelected)}
                     onKeyDown={(event) => {
                       if (event.key === "ArrowDown") {
                         event.preventDefault();
@@ -204,7 +203,7 @@ export function ColumnPicker({
                         focusOption(filteredIndex - 1, -1);
                       } else if (event.key === " ") {
                         event.preventDefault();
-                        onToggle(column.id, !selected);
+                        onToggle(column.id, nextSelected);
                       }
                     }}
                   />

@@ -313,6 +313,7 @@ interface PendingView {
 }
 
 interface SortDraftColumn extends SortColumn {
+  draftKey: number;
   jsonPathMode: boolean;
 }
 
@@ -688,6 +689,7 @@ export function DataGrid({
     top: WHERE_POPUP_MARGIN,
   });
   const [sortPopupOpen, setSortPopupOpen] = useState(false);
+  const nextSortDraftKeyRef = useRef(0);
   const [sortDraft, setSortDraft] = useState<SortDraftColumn[]>([]);
   const sortDraftHasDuplicateIdentity = useMemo(
     () =>
@@ -907,8 +909,11 @@ export function DataGrid({
     return formatSelectClause(visibleFieldPaths, schema);
   }, [pathActionsAvailable, schema, selectIsIdentity, visibleFieldPaths]);
   const pickerColumns = useMemo(
-    () => projectionPickerColumns(schema, columnStates, pathActionsAvailable),
-    [columnStates, pathActionsAvailable, schema],
+    () =>
+      selectPopupOpen
+        ? projectionPickerColumns(schema, columnStates, pathActionsAvailable)
+        : [],
+    [columnStates, pathActionsAvailable, schema, selectPopupOpen],
   );
   const selectedExport = useMemo(
     () => exportSelectionShape(selection, visibleFieldPaths, gridRowCount),
@@ -1485,9 +1490,18 @@ export function DataGrid({
               ? current.dataTypes
               : EMPTY_LOGICAL_DATA_TYPES,
           );
+          for (const name of ambiguousTopLevelNames) {
+            next.delete(fieldPathKey([name]));
+          }
           decoded.table.schema.fields.forEach((field, columnOffset) => {
             const fieldPath = decoded.fieldPaths[columnOffset];
-            if (fieldPath !== undefined) {
+            if (
+              fieldPath !== undefined &&
+              !(
+                fieldPath.length === 1 &&
+                ambiguousTopLevelNames.has(fieldPath[0]!)
+              )
+            ) {
               next.set(fieldPathKey(fieldPath), field.type);
             }
           });
@@ -1614,6 +1628,7 @@ export function DataGrid({
       }
     }
   }, [
+    ambiguousTopLevelNames,
     clearDeferredProjection,
     diagnostics,
     promoteView,
@@ -2454,6 +2469,8 @@ export function DataGrid({
     const previousSchema = sourceSchemaRef.current;
     sourceSchemaRef.current = source.schema;
     const current = pendingViewRef.current ?? activeViewRef.current;
+    const previousDuplicateNames = duplicateTopLevelNames(previousSchema);
+    const nextDuplicateNames = duplicateTopLevelNames(source.schema);
     const fieldStillMatches = (fieldPath: FieldPath) =>
       sameFieldContract(
         resolveSchemaField(previousSchema, fieldPath),
@@ -2468,7 +2485,6 @@ export function DataGrid({
     const viewContractChanged =
       nextFilters.length !== current.filters.length ||
       nextSort.length !== current.sort.length;
-    const nextDuplicateNames = duplicateTopLevelNames(source.schema);
 
     setSchema(source.schema);
     setSelectedSchemaPath((selected) =>
@@ -2476,12 +2492,29 @@ export function DataGrid({
     );
     setColumnStates((previous) => {
       const retained = previous.flatMap((existing) => {
-        const field = resolveSchemaField(source.schema, existing.fieldPath);
-        if (field === undefined || !fieldStillMatches(existing.fieldPath)) {
+        const topLevelSourceIdentity =
+          existing.fieldPath.length === 1 &&
+          (previousDuplicateNames.has(existing.fieldPath[0]!) ||
+            nextDuplicateNames.has(existing.fieldPath[0]!));
+        const previousField = topLevelSourceIdentity
+          ? previousSchema[existing.sourceIndex]
+          : resolveSchemaField(previousSchema, existing.fieldPath);
+        const field = topLevelSourceIdentity
+          ? source.schema[existing.sourceIndex]
+          : resolveSchemaField(source.schema, existing.fieldPath);
+        if (field === undefined || !sameFieldContract(previousField, field)) {
           return [];
         }
         return {
           ...existing,
+          key:
+            existing.fieldPath.length === 1
+              ? sourceColumnKey(
+                  source.schema,
+                  nextDuplicateNames,
+                  existing.sourceIndex,
+                )
+              : existing.key,
           field,
         };
       });
@@ -2544,66 +2577,112 @@ export function DataGrid({
     [applyView],
   );
 
+  const applyStructuralProjection = useCallback(
+    (
+      nextColumns: ColumnState[],
+      operationPath: FieldPath,
+      noticeSummary?: string,
+    ) => {
+      const currentView = pendingViewRef.current ?? activeViewRef.current;
+      const { removedFilters, removedSortColumns } =
+        droppedStructuralViewTargets(
+          columnStates,
+          nextColumns,
+          operationPath,
+          currentView.filters,
+          currentView.sort,
+        );
+      setColumnStates(nextColumns);
+      if (removedFilters.length + removedSortColumns.length > 0) {
+        applyView(
+          currentView.filters.filter(
+            (filter) => !removedFilters.includes(filter),
+          ),
+          currentView.sort.filter(
+            (column) => !removedSortColumns.includes(column),
+          ),
+        );
+      }
+      if (
+        noticeSummary !== undefined ||
+        removedFilters.length + removedSortColumns.length > 0
+      ) {
+        const summary = noticeSummary ?? "Updated projected columns";
+        setColumnNotice({
+          message:
+            removedFilters.length + removedSortColumns.length === 0
+              ? `${summary}.`
+              : `${summary}; removed ${formatDroppedTargetNotice(removedFilters, removedSortColumns)}.`,
+          kind:
+            removedFilters.length + removedSortColumns.length === 0
+              ? "status"
+              : "alert",
+        });
+      }
+      setSelection(clearColumnSelection);
+      setCopyLimit(null);
+    },
+    [applyView, columnStates],
+  );
+
   const flattenPath = useCallback(
     (fieldPath: FieldPath) => {
-      setColumnStates((current) => {
-        const index = current.findIndex((column) =>
-          sameFieldPath(column.fieldPath, fieldPath),
-        );
-        const parent = current[index];
-        if (parent === undefined || !isStructField(parent.field)) {
-          const parentPath = fieldPath.slice(0, -1);
-          setColumnNotice({
-            message:
-              parent === undefined
-                ? current.some(
-                    (column) =>
-                      column.fieldPath.length > fieldPath.length &&
-                      fieldPathStartsWith(column.fieldPath, fieldPath),
-                  )
-                  ? `${formatFieldPath(fieldPath)} is already flattened.`
-                  : `Flatten ${formatFieldPath(parentPath) || "the parent struct"} first.`
-                : `${formatFieldPath(fieldPath)} is not a struct field.`,
-            kind: "status",
-          });
-          return current;
-        }
-        const duplicateChild = duplicateChildName(parent.field);
-        if (duplicateChild !== undefined) {
-          setColumnNotice({
-            message: `${formatFieldPath(fieldPath)} cannot be flattened because it contains multiple fields named ${formatFieldPathSegment(duplicateChild)}.`,
-            kind: "status",
-          });
-          return current;
-        }
-        const children = parent.field.children.map((field) => {
-          const childPath = [...parent.fieldPath, field.name];
-          return projectedColumnState(
-            schema,
-            schemaPathIndex,
-            ambiguousTopLevelNames,
-            childPath,
-            defaultPinnedSourceIndices.has(parent.sourceIndex),
-            columnMemoryRef.current,
-            parent,
-          )!;
-        });
+      setHeaderMenu(null);
+      const index = columnStates.findIndex((column) =>
+        sameFieldPath(column.fieldPath, fieldPath),
+      );
+      const parent = columnStates[index];
+      if (parent === undefined || !isStructField(parent.field)) {
+        const parentPath = fieldPath.slice(0, -1);
         setColumnNotice({
-          message: `Flattened ${formatFieldPath(fieldPath)} into ${children.length.toLocaleString("en-US")} ${children.length === 1 ? "column" : "columns"}.`,
+          message:
+            parent === undefined
+              ? columnStates.some(
+                  (column) =>
+                    column.fieldPath.length > fieldPath.length &&
+                    fieldPathStartsWith(column.fieldPath, fieldPath),
+                )
+                ? `${formatFieldPath(fieldPath)} is already flattened.`
+                : `Flatten ${formatFieldPath(parentPath) || "the parent struct"} first.`
+              : `${formatFieldPath(fieldPath)} is not a struct field.`,
           kind: "status",
         });
-        setSelection(clearColumnSelection);
-        setCopyLimit(null);
-        return [
-          ...current.slice(0, index),
-          ...children,
-          ...current.slice(index + 1),
-        ];
+        return;
+      }
+      const duplicateChild = duplicateChildName(parent.field);
+      if (duplicateChild !== undefined) {
+        setColumnNotice({
+          message: `${formatFieldPath(fieldPath)} cannot be flattened because it contains multiple fields named ${formatFieldPathSegment(duplicateChild)}.`,
+          kind: "status",
+        });
+        return;
+      }
+      const children = parent.field.children.map((field) => {
+        const childPath = [...parent.fieldPath, field.name];
+        return projectedColumnState(
+          schema,
+          schemaPathIndex,
+          ambiguousTopLevelNames,
+          childPath,
+          defaultPinnedSourceIndices.has(parent.sourceIndex),
+          columnMemoryRef.current,
+          parent,
+        )!;
       });
-      setHeaderMenu(null);
+      applyStructuralProjection(
+        [
+          ...columnStates.slice(0, index),
+          ...children,
+          ...columnStates.slice(index + 1),
+        ],
+        fieldPath,
+        `Flattened ${formatFieldPath(fieldPath)} into ${children.length.toLocaleString("en-US")} ${children.length === 1 ? "column" : "columns"}`,
+      );
     },
     [
       ambiguousTopLevelNames,
+      applyStructuralProjection,
+      columnStates,
       defaultPinnedSourceIndices,
       schema,
       schemaPathIndex,
@@ -2615,70 +2694,42 @@ export function DataGrid({
       const entry = schemaPathIndex.get(fieldPathKey(fieldPath));
       if (entry === undefined) return;
       const { sourceIndex } = entry;
-      setColumnStates((current) => {
-        const descendantIndices = current.flatMap((column, index) =>
-          fieldPathStartsWith(column.fieldPath, fieldPath) &&
-          column.fieldPath.length > fieldPath.length
-            ? [index]
-            : [],
-        );
-        if (descendantIndices.length === 0) return current;
-        const insertion = descendantIndices[0] ?? current.length;
-        const retained = current.filter(
-          (column) =>
-            !(
-              fieldPathStartsWith(column.fieldPath, fieldPath) &&
-              column.fieldPath.length > fieldPath.length
-            ),
-        );
-        const parent = projectedColumnState(
-          schema,
-          schemaPathIndex,
-          ambiguousTopLevelNames,
-          fieldPath,
-          defaultPinnedSourceIndices.has(sourceIndex),
-          columnMemoryRef.current,
-          current[descendantIndices[0]!],
-        );
-        if (parent === undefined) return current;
-        return [
-          ...retained.slice(0, insertion),
-          parent,
-          ...retained.slice(insertion),
-        ];
-      });
-      const current = pendingViewRef.current ?? activeViewRef.current;
-      const dependentFilter = (filter: DataFilter) =>
-        filter.fieldPath.length > fieldPath.length &&
-        fieldPathStartsWith(filter.fieldPath, fieldPath);
-      const dependentSort = (column: SortColumn) =>
-        column.fieldPath.length > fieldPath.length &&
-        fieldPathStartsWith(column.fieldPath, fieldPath);
-      const removedFilters = current.filters.filter(dependentFilter);
-      const removedSortColumns = current.sort.filter(dependentSort);
-      if (removedFilters.length + removedSortColumns.length > 0) {
-        applyView(
-          current.filters.filter((filter) => !dependentFilter(filter)),
-          current.sort.filter((column) => !dependentSort(column)),
-        );
-      }
-      setColumnNotice({
-        message:
-          removedFilters.length + removedSortColumns.length === 0
-            ? `Unflattened ${formatFieldPath(fieldPath)} into one column.`
-            : `Unflattened ${formatFieldPath(fieldPath)} into one column; removed ${formatDroppedTargetNotice(removedFilters, removedSortColumns)}.`,
-        kind:
-          removedFilters.length + removedSortColumns.length === 0
-            ? "status"
-            : "alert",
-      });
-      setSelection(clearColumnSelection);
-      setCopyLimit(null);
+      const descendantIndices = columnStates.flatMap((column, index) =>
+        fieldPathStartsWith(column.fieldPath, fieldPath) &&
+        column.fieldPath.length > fieldPath.length
+          ? [index]
+          : [],
+      );
+      if (descendantIndices.length === 0) return;
+      const insertion = descendantIndices[0] ?? columnStates.length;
+      const retained = columnStates.filter(
+        (column) =>
+          !(
+            fieldPathStartsWith(column.fieldPath, fieldPath) &&
+            column.fieldPath.length > fieldPath.length
+          ),
+      );
+      const parent = projectedColumnState(
+        schema,
+        schemaPathIndex,
+        ambiguousTopLevelNames,
+        fieldPath,
+        defaultPinnedSourceIndices.has(sourceIndex),
+        columnMemoryRef.current,
+        columnStates[descendantIndices[0]!],
+      );
+      if (parent === undefined) return;
+      applyStructuralProjection(
+        [...retained.slice(0, insertion), parent, ...retained.slice(insertion)],
+        fieldPath,
+        `Unflattened ${formatFieldPath(fieldPath)} into one column`,
+      );
       setHeaderMenu(null);
     },
     [
       ambiguousTopLevelNames,
-      applyView,
+      applyStructuralProjection,
+      columnStates,
       defaultPinnedSourceIndices,
       schema,
       schemaPathIndex,
@@ -3114,15 +3165,11 @@ export function DataGrid({
     (id: string, selected: boolean) => {
       const option = pickerColumns.find((column) => column.id === id);
       if (option === undefined || option.disabledReason !== undefined) return;
-      setColumnStates((current) => {
-        if (!selected) {
-          return current.filter((column) =>
-            pathActionsAvailable
-              ? !fieldPathStartsWith(column.fieldPath, option.fieldPath)
-              : column.key !== option.id,
-          );
-        }
-        if (!pathActionsAvailable) {
+      if (!pathActionsAvailable) {
+        setColumnStates((current) => {
+          if (!selected) {
+            return current.filter((column) => column.key !== option.id);
+          }
           if (current.some((column) => column.key === option.id))
             return current;
           const field = schema[option.sourceIndex];
@@ -3139,16 +3186,29 @@ export function DataGrid({
                   columnMemoryRef.current.get(option.id),
                 ),
               ].sort((left, right) => left.sourceIndex - right.sourceIndex);
-        }
-        const field = schemaPathIndex.get(
-          fieldPathKey(option.fieldPath),
-        )?.field;
-        if (field === undefined) return current;
-        const targetPaths = isStructField(field)
-          ? addressableLeafPaths(field, option.fieldPath)
-          : [option.fieldPath];
-        return replaceProjectedSubtree(
-          current,
+        });
+        setSelection(clearColumnSelection);
+        setCopyLimit(null);
+        return;
+      }
+      if (!selected) {
+        applyStructuralProjection(
+          columnStates.filter(
+            (column) =>
+              !fieldPathStartsWith(column.fieldPath, option.fieldPath),
+          ),
+          option.fieldPath,
+        );
+        return;
+      }
+      const field = schemaPathIndex.get(fieldPathKey(option.fieldPath))?.field;
+      if (field === undefined) return;
+      const targetPaths = isStructField(field)
+        ? addressableLeafPaths(field, option.fieldPath)
+        : [option.fieldPath];
+      applyStructuralProjection(
+        replaceProjectedSubtree(
+          columnStates,
           schema,
           schemaPathIndex,
           ambiguousTopLevelNames,
@@ -3156,13 +3216,14 @@ export function DataGrid({
           targetPaths,
           defaultPinnedSourceIndices,
           columnMemoryRef.current,
-        );
-      });
-      setSelection(clearColumnSelection);
-      setCopyLimit(null);
+        ),
+        option.fieldPath,
+      );
     },
     [
       ambiguousTopLevelNames,
+      applyStructuralProjection,
+      columnStates,
       defaultPinnedSourceIndices,
       pathActionsAvailable,
       pickerColumns,
@@ -3337,10 +3398,16 @@ export function DataGrid({
   const promoteFieldToColumn = useCallback(
     (fieldPath: FieldPath) => {
       const field = schemaPathIndex.get(fieldPathKey(fieldPath))?.field;
-      if (field === undefined || !isStructField(field)) return;
-      setColumnStates((current) =>
+      if (field === undefined || !isStructField(field)) {
+        setColumnNotice({
+          message: `${formatFieldPath(fieldPath)} cannot be promoted because its field path is ambiguous.`,
+          kind: "status",
+        });
+        return;
+      }
+      applyStructuralProjection(
         replaceProjectedSubtree(
-          current,
+          columnStates,
           schema,
           schemaPathIndex,
           ambiguousTopLevelNames,
@@ -3349,9 +3416,9 @@ export function DataGrid({
           defaultPinnedSourceIndices,
           columnMemoryRef.current,
         ),
+        fieldPath,
+        `Promoted ${formatFieldPath(fieldPath)} to one column`,
       );
-      setSelection(clearColumnSelection);
-      setCopyLimit(null);
       setPeek(null);
       schemaFocusPathRef.current = fieldPath;
       setSelectedSchemaPath(fieldPath);
@@ -3359,6 +3426,8 @@ export function DataGrid({
     },
     [
       ambiguousTopLevelNames,
+      applyStructuralProjection,
+      columnStates,
       defaultPinnedSourceIndices,
       schema,
       schemaPathIndex,
@@ -3444,8 +3513,41 @@ export function DataGrid({
       return undefined;
     }
     const path = [menuColumn.fieldPath[0]!];
-    return { path };
-  }, [menuColumn]);
+    const nextColumns = replaceProjectedSubtree(
+      columnStates,
+      schema,
+      schemaPathIndex,
+      ambiguousTopLevelNames,
+      path,
+      [path],
+      defaultPinnedSourceIndices,
+      columnMemoryRef.current,
+    );
+    const removals = droppedStructuralViewTargets(
+      columnStates,
+      nextColumns,
+      path,
+      pendingView?.filters ?? filters,
+      pendingView?.sort ?? sort,
+    );
+    return {
+      path,
+      columnCount: columnStates.filter((column) =>
+        fieldPathStartsWith(column.fieldPath, path),
+      ).length,
+      ...removals,
+    };
+  }, [
+    ambiguousTopLevelNames,
+    columnStates,
+    defaultPinnedSourceIndices,
+    menuColumn,
+    filters,
+    pendingView,
+    schema,
+    schemaPathIndex,
+    sort,
+  ]);
   const peekValue = resolvedPeek?.value;
   const peekLoading =
     peek !== null &&
@@ -3630,6 +3732,7 @@ export function DataGrid({
                     pendingViewRef.current?.sort ?? activeViewRef.current.sort
                   ).map((column) => ({
                     ...column,
+                    draftKey: nextSortDraftKeyRef.current++,
                     jsonPathMode: column.jsonTarget !== undefined,
                   })),
                 );
@@ -3664,7 +3767,7 @@ export function DataGrid({
                             );
                       return (
                         <li
-                          key={fieldPathKey(column.fieldPath) + ":" + index}
+                          key={column.draftKey}
                           className={
                             column.jsonPathMode ? "has-json-path" : undefined
                           }
@@ -3749,8 +3852,8 @@ export function DataGrid({
                                         : jsonPathMode
                                           ? { ...item, jsonPathMode: true }
                                           : {
-                                              fieldPath: item.fieldPath,
-                                              direction: item.direction,
+                                              ...item,
+                                              jsonTarget: undefined,
                                               jsonPathMode: false,
                                             },
                                     ),
@@ -3777,8 +3880,8 @@ export function DataGrid({
                                       ? item
                                       : jsonTarget === null
                                         ? {
-                                            fieldPath: item.fieldPath,
-                                            direction: item.direction,
+                                            ...item,
+                                            jsonTarget: undefined,
                                             jsonPathMode: true,
                                           }
                                         : { ...item, jsonTarget },
@@ -3810,6 +3913,7 @@ export function DataGrid({
                           return [
                             ...current,
                             {
+                              draftKey: nextSortDraftKeyRef.current++,
                               fieldPath: column.fieldPath,
                               direction: "ascending",
                               jsonPathMode,
@@ -4330,9 +4434,20 @@ export function DataGrid({
             <button
               type="button"
               role="menuitem"
+              aria-label={formatUnflattenActionLabel(menuUnflattenAction)}
+              aria-describedby={
+                formatUnflattenActionDetail(menuUnflattenAction) === ""
+                  ? undefined
+                  : "unflatten-action-detail"
+              }
               onClick={() => unflattenPath(menuUnflattenAction.path)}
             >
-              {formatUnflattenActionLabel(menuUnflattenAction)}
+              <span>{formatUnflattenActionLabel(menuUnflattenAction)}</span>
+              {formatUnflattenActionDetail(menuUnflattenAction) !== "" && (
+                <span id="unflatten-action-detail" className="menu-shortcut">
+                  {formatUnflattenActionDetail(menuUnflattenAction)}
+                </span>
+              )}
             </button>
           )}
           {menuUnflattenAction !== undefined && (
@@ -5023,9 +5138,7 @@ function projectionPickerColumns(
         if (childReason === undefined) childStates.push(childState);
       }
     }
-    if (projected !== undefined && isStructField(field)) {
-      row.selection = "partial";
-    } else if (childStates.length > 0) {
+    if (projected === undefined && childStates.length > 0) {
       row.selection = childStates.every((state) => state === "all")
         ? "all"
         : childStates.some((state) => state !== "none")
@@ -5096,6 +5209,77 @@ const NOTICE_PATH_CHARACTER_LIMIT = 56;
 
 function formatUnflattenActionLabel({ path }: { path: FieldPath }): string {
   return `Unflatten ${formatFieldPath(path)}`;
+}
+
+function formatUnflattenActionDetail({
+  columnCount,
+  removedFilters,
+  removedSortColumns,
+}: {
+  columnCount: number;
+  removedFilters: readonly DataFilter[];
+  removedSortColumns: readonly SortColumn[];
+}): string {
+  const details = [
+    ...(columnCount === 1
+      ? []
+      : [`${columnCount.toLocaleString("en-US")} columns → 1`]),
+    ...(removedFilters.length === 0
+      ? []
+      : [
+          `removes ${removedFilters.length.toLocaleString("en-US")} ${removedFilters.length === 1 ? "filter" : "filters"}`,
+        ]),
+    ...(removedSortColumns.length === 0
+      ? []
+      : [
+          `removes ${removedSortColumns.length.toLocaleString("en-US")} ${removedSortColumns.length === 1 ? "sort" : "sorts"}`,
+        ]),
+  ];
+  return details.join(" · ");
+}
+
+function droppedStructuralViewTargets(
+  currentProjection: readonly ColumnState[],
+  nextProjection: readonly ColumnState[],
+  operationPath: FieldPath,
+  filters: readonly DataFilter[],
+  sort: readonly SortColumn[],
+): {
+  removedFilters: DataFilter[];
+  removedSortColumns: SortColumn[];
+} {
+  const currentKeys = new Set(
+    currentProjection.map((column) => fieldPathKey(column.fieldPath)),
+  );
+  const nextKeys = new Set(
+    nextProjection.map((column) => fieldPathKey(column.fieldPath)),
+  );
+  const removedPaths = currentProjection.flatMap((column) =>
+    nextKeys.has(fieldPathKey(column.fieldPath)) ? [] : [column.fieldPath],
+  );
+  const addedPaths = nextProjection.flatMap((column) =>
+    currentKeys.has(fieldPathKey(column.fieldPath)) ? [] : [column.fieldPath],
+  );
+  const structuralReplacement =
+    operationPath.length > 1 ||
+    removedPaths.some((path) => path.length > 1) ||
+    addedPaths.some((path) => path.length > 1);
+  if (!structuralReplacement) {
+    return { removedFilters: [], removedSortColumns: [] };
+  }
+
+  const scopes = [operationPath, ...removedPaths];
+  const wasRemoved = (target: DataFilter | SortColumn) =>
+    !nextKeys.has(fieldPathKey(target.fieldPath)) &&
+    scopes.some(
+      (scope) =>
+        fieldPathStartsWith(target.fieldPath, scope) ||
+        fieldPathStartsWith(scope, target.fieldPath),
+    );
+  return {
+    removedFilters: filters.filter(wasRemoved),
+    removedSortColumns: sort.filter(wasRemoved),
+  };
 }
 
 function formatDroppedTargetNotice(
@@ -5175,7 +5359,13 @@ function flattenedRailMetadata(
   }
   const groupByColumn = columns.map((column) => {
     if (column.fieldPath.length < 2) return undefined;
-    return groupsByRoot.get(column.fieldPath[0]!);
+    const group = groupsByRoot.get(column.fieldPath[0]!);
+    return group === undefined
+      ? undefined
+      : {
+          ...group,
+          segmentKey: `${group.key}:${column.pinned ? "pinned" : "scrolling"}`,
+        };
   });
   const metadata = new Map<string, NonNullable<GridColumn["groupRail"]>>();
   columns.forEach((column, index) => {
@@ -5183,8 +5373,8 @@ function flattenedRailMetadata(
     if (group === undefined) return;
     metadata.set(column.key, {
       title: group.title,
-      start: groupByColumn[index - 1]?.key !== group.key,
-      end: groupByColumn[index + 1]?.key !== group.key,
+      start: groupByColumn[index - 1]?.segmentKey !== group.segmentKey,
+      end: groupByColumn[index + 1]?.segmentKey !== group.segmentKey,
     });
   });
   return metadata;

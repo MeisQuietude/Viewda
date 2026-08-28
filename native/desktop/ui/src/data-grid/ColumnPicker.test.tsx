@@ -94,6 +94,44 @@ describe("ColumnPicker", () => {
     );
   });
 
+  it("removes non-empty subtrees and adds empty subtrees in one click", () => {
+    const onToggle = vi.fn();
+    renderPicker(columns, onToggle);
+
+    fireEvent.click(screen.getByRole("checkbox", { name: "Project profile" }));
+    expect(onToggle).toHaveBeenLastCalledWith("profile", false);
+
+    fireEvent.click(
+      screen.getByRole("checkbox", { name: "Project profile.address" }),
+    );
+    expect(onToggle).toHaveBeenLastCalledWith("address", true);
+
+    fireEvent.click(
+      screen.getByRole("checkbox", { name: "Project profile.city" }),
+    );
+    expect(onToggle).toHaveBeenLastCalledWith("city", false);
+  });
+
+  it("uses compact virtual rows without hiding disabled reasons", () => {
+    renderPicker();
+
+    const firstRow = screen
+      .getByRole("checkbox", { name: "Project profile" })
+      .closest(".column-picker-row");
+    const secondRow = screen
+      .getByRole("checkbox", { name: "Project profile.city" })
+      .closest(".column-picker-row");
+    expect(firstRow).toHaveStyle({ height: "36px" });
+    expect(secondRow).toHaveStyle({ transform: "translateY(36px)" });
+    expect(
+      screen
+        .getByRole("checkbox", { name: "Project items.element.sku" })
+        .closest(".column-picker-row"),
+    ).toHaveTextContent(
+      "Fields inside a list or map cannot be used as columns.",
+    );
+  });
+
   it("keeps matching ancestors while filtering the schema tree", () => {
     renderPicker();
 
@@ -162,14 +200,14 @@ describe("ColumnPicker", () => {
   });
 });
 
-function renderPicker(pickerColumns = columns) {
+function renderPicker(pickerColumns = columns, onToggle = vi.fn()) {
   return render(
     <ColumnPicker
       columns={pickerColumns}
       projectedCount={1}
       onHideAll={vi.fn()}
       onShowAll={vi.fn()}
-      onToggle={vi.fn()}
+      onToggle={onToggle}
       onTogglePinned={vi.fn()}
     />,
   );
