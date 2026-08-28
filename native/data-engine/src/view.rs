@@ -104,7 +104,7 @@ impl DataViewMemoryLimit {
 }
 
 /// One addressable field in the view's canonical sort order.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DataSort {
     /// Field-name segments from the top-level column through struct fields.
@@ -2776,6 +2776,43 @@ mod tests {
                 "\"label\" DESC NULLS LAST, \"value\"\"quoted\" ASC NULLS LAST, \"file_row_number\" ASC"
                     .to_owned()
             )
+        );
+    }
+
+    #[test]
+    fn data_sort_json_target_keeps_its_exact_bidirectional_wire_shape() {
+        let sort = DataSort {
+            field_path: crate::FieldPath::new(["payload"]),
+            json_target: Some(crate::JsonFieldTarget {
+                path: crate::JsonPath::new([
+                    crate::JsonPathSegment::Field("items".to_owned()),
+                    crate::JsonPathSegment::Index(2),
+                    crate::JsonPathSegment::Field("enabled".to_owned()),
+                ]),
+                value_type: crate::JsonValueType::Boolean,
+            }),
+            direction: DataSortDirection::Descending,
+        };
+        let wire = serde_json::json!({
+            "fieldPath": ["payload"],
+            "jsonTarget": {
+                "path": [
+                    { "field": "items" },
+                    { "index": 2 },
+                    { "field": "enabled" }
+                ],
+                "valueType": "boolean"
+            },
+            "direction": "descending"
+        });
+
+        assert_eq!(
+            serde_json::to_value(&sort).expect("serialize JSON-target sort"),
+            wire
+        );
+        assert_eq!(
+            serde_json::from_value::<DataSort>(wire).expect("deserialize JSON-target sort"),
+            sort
         );
     }
 

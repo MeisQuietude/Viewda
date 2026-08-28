@@ -106,7 +106,7 @@ pub(crate) struct JsonNumberExpression {
 }
 
 /// JSON types observed for one path in the bounded sample.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub enum JsonObservedType {
     Null,
@@ -118,7 +118,7 @@ pub enum JsonObservedType {
 }
 
 /// One node in a sampled JSON path tree.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct JsonSchemaNode {
     pub segment: JsonPathSegment,
@@ -128,7 +128,7 @@ pub struct JsonSchemaNode {
 }
 
 /// Bounded discovery result for one Parquet JSON column.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct JsonSchemaInference {
     /// Always true: paths come from source values, not a declared JSON schema.
@@ -640,6 +640,80 @@ mod tests {
     }
 
     #[test]
+    fn json_schema_inference_keeps_its_exact_bidirectional_wire_shape() {
+        let inference = JsonSchemaInference {
+            is_sample_derived: true,
+            sample_row_limit: 512,
+            sample_value_byte_limit: 8_192,
+            sample_value_character_limit: 2_048,
+            sample_total_byte_limit: 4_194_304,
+            sample_arrow_byte_limit: 5_243_392,
+            sampled_row_count: 3,
+            sampled_value_bytes: 42,
+            has_more_rows: true,
+            is_truncated: false,
+            invalid_value_count: 1,
+            oversized_value_count: 2,
+            nodes: vec![JsonSchemaNode {
+                segment: JsonPathSegment::Field("items".to_owned()),
+                observed_types: vec![JsonObservedType::Array],
+                effective_type: None,
+                children: vec![JsonSchemaNode {
+                    segment: JsonPathSegment::Index(0),
+                    observed_types: vec![JsonObservedType::Object],
+                    effective_type: None,
+                    children: vec![JsonSchemaNode {
+                        segment: JsonPathSegment::Field("enabled".to_owned()),
+                        observed_types: vec![JsonObservedType::Null, JsonObservedType::Boolean],
+                        effective_type: Some(JsonValueType::Boolean),
+                        children: Vec::new(),
+                    }],
+                }],
+            }],
+        };
+        let wire = json!({
+            "isSampleDerived": true,
+            "sampleRowLimit": 512,
+            "sampleValueByteLimit": 8192,
+            "sampleValueCharacterLimit": 2048,
+            "sampleTotalByteLimit": 4194304,
+            "sampleArrowByteLimit": 5243392,
+            "sampledRowCount": 3,
+            "sampledValueBytes": 42,
+            "hasMoreRows": true,
+            "isTruncated": false,
+            "invalidValueCount": 1,
+            "oversizedValueCount": 2,
+            "nodes": [{
+                "segment": { "field": "items" },
+                "observedTypes": ["array"],
+                "effectiveType": null,
+                "children": [{
+                    "segment": { "index": 0 },
+                    "observedTypes": ["object"],
+                    "effectiveType": null,
+                    "children": [{
+                        "segment": { "field": "enabled" },
+                        "observedTypes": ["null", "boolean"],
+                        "effectiveType": "boolean",
+                        "children": []
+                    }]
+                }]
+            }]
+        });
+
+        assert_eq!(
+            serde_json::to_value(&inference).expect("serialize JSON inference"),
+            wire
+        );
+        assert_eq!(
+            serde_json::from_value::<JsonSchemaInference>(wire)
+                .expect("deserialize JSON inference"),
+            inference
+        );
+    }
+
+    #[test]
     fn extraction_preserves_typed_segments_and_escapes_jsonpath_fields() {
         let target = JsonFieldTarget {
             path: JsonPath::new([
@@ -857,6 +931,14 @@ mod tests {
         assert_eq!(
             inferred.nodes[0].segment,
             JsonPathSegment::Field("ok".to_owned())
+        );
+        assert_eq!(
+            inferred.nodes[0].observed_types,
+            [JsonObservedType::Boolean]
+        );
+        assert_eq!(
+            inferred.nodes[0].effective_type,
+            Some(JsonValueType::Boolean)
         );
 
         let text_field = SchemaField {

@@ -658,6 +658,78 @@ mod tests {
     }
 
     #[test]
+    fn builds_json_boolean_filters_with_the_boolean_operator_family() {
+        let schema = [schema_field("payload", "BYTE_ARRAY", Some("JSON"))];
+        let target = JsonFieldTarget {
+            path: JsonPath::new([
+                JsonPathSegment::Field("flags".to_owned()),
+                JsonPathSegment::Field("enabled".to_owned()),
+            ]),
+            value_type: JsonValueType::Boolean,
+        };
+        let expression = "TRY_CAST(json_extract(TRY_CAST(\"payload\" AS JSON), '$.\"flags\".\"enabled\"') AS BOOLEAN)";
+
+        for (operator, value, sql_operator) in [
+            (DataFilterOperator::Equals, "true", "="),
+            (DataFilterOperator::NotEquals, "false", "<>"),
+        ] {
+            let predicate = build_filter_predicate(
+                &schema,
+                &[DataFilter {
+                    field_path: FieldPath::from("payload"),
+                    json_target: Some(target.clone()),
+                    operator,
+                    values: vec![value.to_owned()],
+                    match_case: false,
+                }],
+            )
+            .expect("JSON boolean predicate");
+
+            assert_eq!(
+                predicate.sql,
+                format!("{expression} {sql_operator} cast_to_type(?, {expression})")
+            );
+            assert_eq!(predicate.parameters, [Value::Text(value.to_owned())]);
+        }
+
+        let null_predicate = build_filter_predicate(
+            &schema,
+            &[DataFilter {
+                field_path: FieldPath::from("payload"),
+                json_target: Some(target.clone()),
+                operator: DataFilterOperator::IsNull,
+                values: Vec::new(),
+                match_case: false,
+            }],
+        )
+        .expect("JSON boolean null predicate");
+        assert_eq!(null_predicate.sql, format!("{expression} IS NULL"));
+        assert!(null_predicate.parameters.is_empty());
+
+        for filter in [
+            DataFilter {
+                field_path: FieldPath::from("payload"),
+                json_target: Some(target.clone()),
+                operator: DataFilterOperator::Equals,
+                values: vec!["TRUE".to_owned()],
+                match_case: false,
+            },
+            DataFilter {
+                field_path: FieldPath::from("payload"),
+                json_target: Some(target),
+                operator: DataFilterOperator::GreaterThan,
+                values: vec!["true".to_owned()],
+                match_case: false,
+            },
+        ] {
+            assert_eq!(
+                build_filter_predicate(&schema, &[filter]).err(),
+                Some(FilterBuildError::Invalid)
+            );
+        }
+    }
+
+    #[test]
     fn rejects_empty_json_paths_and_operators_outside_the_requested_type() {
         let json_field = schema_field("payload", "BYTE_ARRAY", Some("JSON"));
         let filter = |path: JsonPath, value_type, operator| DataFilter {

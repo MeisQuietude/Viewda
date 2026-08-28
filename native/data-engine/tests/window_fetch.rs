@@ -1158,6 +1158,88 @@ fn filters_a_json_number_through_a_nested_array_index() {
 }
 
 #[test]
+fn filters_and_sorts_a_nested_json_boolean_with_nulls_last() {
+    let source = write_nullable_json_path_parquet(&[
+        Some(r#"{"nested":{"enabled":true}}"#),
+        Some(r#"{"nested":{"enabled":false}}"#),
+        Some(r#"{"nested":{"enabled":true}}"#),
+        Some(r#"{"nested":{"enabled":null}}"#),
+        Some(r#"{"nested":{}}"#),
+        None,
+    ]);
+    let json_path = || {
+        JsonPath::new([
+            JsonPathSegment::Field("nested".to_owned()),
+            JsonPathSegment::Field("enabled".to_owned()),
+        ])
+    };
+
+    for (operator, value, expected) in [
+        (DataFilterOperator::Equals, "true", vec![0, 2]),
+        (DataFilterOperator::Equals, "false", vec![1]),
+        (DataFilterOperator::NotEquals, "false", vec![0, 2]),
+    ] {
+        let filtered = prepare_view(
+            source.path(),
+            &[json_filter(
+                json_path(),
+                JsonValueType::Boolean,
+                operator,
+                &[value],
+            )],
+            &[],
+        )
+        .expect("nested JSON boolean filter");
+        let rows = decode(
+            filtered
+                .fetch_window_fields(0, 8, &[path("id")])
+                .expect("nested JSON boolean rows"),
+        );
+
+        assert_eq!(int64_values(&rows[0], 0), expected);
+    }
+
+    let nulls = prepare_view(
+        source.path(),
+        &[json_filter(
+            json_path(),
+            JsonValueType::Boolean,
+            DataFilterOperator::IsNull,
+            &[],
+        )],
+        &[],
+    )
+    .expect("nested JSON boolean null filter");
+    let rows = decode(
+        nulls
+            .fetch_window_fields(0, 8, &[path("id")])
+            .expect("nested JSON boolean null rows"),
+    );
+    assert_eq!(int64_values(&rows[0], 0), [3, 4, 5]);
+
+    let sorted = prepare_view(
+        source.path(),
+        &[],
+        &[DataSort {
+            field_path: path("payload"),
+            json_target: Some(JsonFieldTarget {
+                path: json_path(),
+                value_type: JsonValueType::Boolean,
+            }),
+            direction: DataSortDirection::Ascending,
+        }],
+    )
+    .expect("nested JSON boolean sort");
+    let rows = decode(
+        sorted
+            .fetch_window_fields(0, 8, &[path("id")])
+            .expect("nested JSON boolean sorted rows"),
+    );
+
+    assert_eq!(int64_values(&rows[0], 0), [1, 0, 2, 3, 4, 5]);
+}
+
+#[test]
 fn json_path_execution_keeps_numeric_object_keys_distinct_from_array_indices() {
     let key = "a.b\"\\[]'";
     let source = write_json_path_parquet(&[
