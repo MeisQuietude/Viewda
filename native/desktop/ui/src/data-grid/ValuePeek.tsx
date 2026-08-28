@@ -50,6 +50,7 @@ export function ValuePeek({
   showCopyPath = true,
   onClose,
   onReturnFocus,
+  onPromoteField,
   onCopy,
   onCopyIntent,
 }: {
@@ -62,6 +63,7 @@ export function ValuePeek({
   showCopyPath?: boolean;
   onClose: () => void;
   onReturnFocus: () => void;
+  onPromoteField?: (fieldPath: FieldPath) => void;
 } & ValueCopyHandlers) {
   const popoverRef = useRef<HTMLDivElement>(null);
   const treeRef = useRef<ValueTreeHandle>(null);
@@ -322,6 +324,7 @@ export function ValuePeek({
             value={value}
             label={label}
             fieldPath={showCopyPath ? fieldPath : undefined}
+            onPromoteField={onPromoteField}
             {...(onCopyIntent === undefined
               ? { onCopy: onCopy! }
               : { onCopyIntent })}

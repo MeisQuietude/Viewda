@@ -35,6 +35,7 @@ import {
   type SourceSummary,
 } from "../desktop";
 import { loadBundledEmojiFont } from "../fonts";
+import { LIST_MAP_COLUMN_REASON } from "../SchemaTree";
 import {
   decodeArrowWindow,
   windowArrowValueAt,
@@ -110,7 +111,7 @@ import {
   resolveSchemaField,
   sameFieldPath,
 } from "./field-path";
-import { ColumnPicker } from "./ColumnPicker";
+import { ColumnPicker, type ColumnPickerColumn } from "./ColumnPicker";
 import { ValuePeek } from "./ValuePeek";
 import { arrowTypedValue, typedValue, type TypedValue } from "./value-format";
 import {
@@ -202,7 +203,12 @@ interface ColumnState {
   title: string;
   width: number;
   pinned: boolean;
-  hidden: boolean;
+}
+
+interface SchemaPathEntry {
+  field: SchemaField;
+  sourceIndex: number;
+  rank: number;
 }
 
 interface ColumnNotice {
@@ -603,9 +609,14 @@ export function DataGrid({
       ),
     );
   });
-  const [flattenedParents, setFlattenedParents] = useState<
-    ReadonlyMap<string, ColumnState>
-  >(() => new Map());
+  const columnMemoryRef = useRef(
+    new Map(columnStates.map((column) => [column.key, column])),
+  );
+  useEffect(() => {
+    for (const column of columnStates) {
+      columnMemoryRef.current.set(column.key, column);
+    }
+  }, [columnStates]);
   const [columnNotice, setColumnNotice] = useState<ColumnNotice | null>(null);
   const [monospaceColumns, setMonospaceColumns] = useState<ReadonlySet<string>>(
     () => new Set(),
@@ -763,8 +774,8 @@ export function DataGrid({
 
   const visibleColumnStates = useMemo(
     () => [
-      ...columnStates.filter((column) => column.pinned && !column.hidden),
-      ...columnStates.filter((column) => !column.pinned && !column.hidden),
+      ...columnStates.filter((column) => column.pinned),
+      ...columnStates.filter((column) => !column.pinned),
     ],
     [columnStates],
   );
@@ -772,6 +783,7 @@ export function DataGrid({
     () => duplicateTopLevelNames(schema),
     [schema],
   );
+  const schemaPathIndex = useMemo(() => indexSchemaPaths(schema), [schema]);
   const pathActionsAvailable = ambiguousTopLevelNames.size === 0;
   const identitySchemaPending =
     !pathActionsAvailable &&
@@ -792,9 +804,7 @@ export function DataGrid({
     }
     activeCellRef.current = activeCell;
   }, [activeCell, activeCellRef]);
-  const hiddenCount = columnStates.length - visibleColumnStates.length;
   const selectIsIdentity =
-    hiddenCount === 0 &&
     visibleColumnStates.length === schema.length &&
     visibleColumnStates.every(
       (column, index) =>
@@ -802,6 +812,16 @@ export function DataGrid({
         column.fieldPath.length === 1 &&
         column.fieldPath[0] === schema[index]?.name,
     );
+  const omittedRootCount = useMemo(() => {
+    const projectedSourceIndices = new Set(
+      columnStates.map((column) => column.sourceIndex),
+    );
+    return schema.reduce(
+      (count, _field, sourceIndex) =>
+        count + (projectedSourceIndices.has(sourceIndex) ? 0 : 1),
+      0,
+    );
+  }, [columnStates, schema]);
   activeViewRef.current = activeView;
 
   const nextSuggestionRevision = useCallback(() => {
@@ -848,30 +868,13 @@ export function DataGrid({
       return "All source columns in file order";
     }
     if (visibleFieldPaths.length > SELECT_TOOLTIP_COLUMN_LIMIT) {
-      return `${visibleFieldPaths.length.toLocaleString("en-US")} of ${columnStates.length.toLocaleString("en-US")} columns visible`;
+      return `${visibleFieldPaths.length.toLocaleString("en-US")} projected columns`;
     }
     return formatSelectClause(visibleFieldPaths, schema);
-  }, [
-    columnStates.length,
-    pathActionsAvailable,
-    schema,
-    selectIsIdentity,
-    visibleFieldPaths,
-  ]);
+  }, [pathActionsAvailable, schema, selectIsIdentity, visibleFieldPaths]);
   const pickerColumns = useMemo(
-    () =>
-      columnStates.map((column) => {
-        const titleParts = fieldPathTitleParts(column.fieldPath);
-        return {
-          id: column.key,
-          name: column.title,
-          ...titleParts,
-          type: column.field.logicalType ?? column.field.physicalType,
-          visible: !column.hidden,
-          pinned: column.pinned,
-        };
-      }),
-    [columnStates],
+    () => projectionPickerColumns(schema, columnStates, pathActionsAvailable),
+    [columnStates, pathActionsAvailable, schema],
   );
   const selectedExport = useMemo(
     () => exportSelectionShape(selection, visibleFieldPaths, gridRowCount),
@@ -886,17 +889,12 @@ export function DataGrid({
     [sort, schema],
   );
   const railMetadataByColumnKey = useMemo(
-    () =>
-      flattenedRailMetadata(
-        visibleColumnStates,
-        flattenedParents,
-        logicalDataTypes,
-      ),
-    [flattenedParents, logicalDataTypes, visibleColumnStates],
+    () => flattenedRailMetadata(visibleColumnStates, schema, logicalDataTypes),
+    [logicalDataTypes, schema, visibleColumnStates],
   );
   const flattenedPathKeys = useMemo(
-    () => new Set(flattenedParents.keys()),
-    [flattenedParents],
+    () => projectedStructPathKeys(columnStates),
+    [columnStates],
   );
 
   useEffect(() => {
@@ -1264,7 +1262,6 @@ export function DataGrid({
           }
           projectionRevisionRef.current += 1;
           promoteView(0, source.rowCount, [], []);
-          setFlattenedParents(new Map());
           setColumnNotice(null);
           setColumnStates((current) =>
             completeSchema.map((field, sourceIndex) => {
@@ -1274,7 +1271,12 @@ export function DataGrid({
                     column.sourceIndex === sourceIndex &&
                     column.fieldPath.length === 1,
                 ) ??
-                current.find((column) => column.sourceIndex === sourceIndex);
+                current.find((column) => column.sourceIndex === sourceIndex) ??
+                [...columnMemoryRef.current.values()].find(
+                  (column) =>
+                    column.sourceIndex === sourceIndex &&
+                    column.fieldPath.length === 1,
+                );
               const restored = sourceColumnState(
                 completeSchema,
                 duplicateNames,
@@ -1288,7 +1290,6 @@ export function DataGrid({
                     ...restored,
                     width: previous.width,
                     pinned: previous.pinned,
-                    hidden: previous.hidden,
                   };
             }),
           );
@@ -1310,7 +1311,13 @@ export function DataGrid({
             }));
             const added = page.columns.flatMap((field, pageIndex) => {
               const sourceIndex = page.offset + pageIndex;
-              return loadedSourceIndices.has(sourceIndex)
+              const key = sourceColumnKey(
+                completeSchema,
+                duplicateNames,
+                sourceIndex,
+              );
+              return loadedSourceIndices.has(sourceIndex) ||
+                columnMemoryRef.current.has(key)
                 ? []
                 : [
                     sourceColumnState(
@@ -2425,47 +2432,16 @@ export function DataGrid({
     const viewContractChanged =
       nextFilters.length !== current.filters.length ||
       nextSort.length !== current.sort.length;
-    const matchingFlattenedParents = new Map<string, ColumnState>();
-    for (const [key, parent] of flattenedParents) {
-      const field = resolveSchemaField(source.schema, parent.fieldPath);
-      if (field !== undefined && fieldStillMatches(parent.fieldPath)) {
-        matchingFlattenedParents.set(key, { ...parent, field });
-      }
-    }
-    const retainedFlattenedParents = new Map(
-      [...matchingFlattenedParents].filter(([, parent]) =>
-        parent.fieldPath
-          .slice(0, -1)
-          .every((_, index) =>
-            matchingFlattenedParents.has(
-              fieldPathKey(parent.fieldPath.slice(0, index + 1)),
-            ),
-          ),
-      ),
-    );
-    const retainedFlattenedKeys = new Set(retainedFlattenedParents.keys());
     const nextDuplicateNames = duplicateTopLevelNames(source.schema);
 
     setSchema(source.schema);
-    setFlattenedParents(retainedFlattenedParents);
     setSelectedSchemaPath((selected) =>
       selected !== null && fieldStillMatches(selected) ? selected : null,
     );
     setColumnStates((previous) => {
       const retained = previous.flatMap((existing) => {
         const field = resolveSchemaField(source.schema, existing.fieldPath);
-        const ancestorsRemainFlattened = existing.fieldPath
-          .slice(0, -1)
-          .every((_, index) =>
-            retainedFlattenedKeys.has(
-              fieldPathKey(existing.fieldPath.slice(0, index + 1)),
-            ),
-          );
-        if (
-          field === undefined ||
-          !fieldStillMatches(existing.fieldPath) ||
-          !ancestorsRemainFlattened
-        ) {
+        if (field === undefined || !fieldStillMatches(existing.fieldPath)) {
           return [];
         }
         return {
@@ -2481,7 +2457,12 @@ export function DataGrid({
           nextDuplicateNames,
           sourceIndex,
         );
-        return retainedKeys.has(key) || retainedFlattenedKeys.has(key)
+        const rootRepresented = retained.some(
+          (column) => column.sourceIndex === sourceIndex,
+        );
+        return retainedKeys.has(key) ||
+          rootRepresented ||
+          columnMemoryRef.current.has(key)
           ? []
           : [
               {
@@ -2495,7 +2476,6 @@ export function DataGrid({
                   Math.max(MIN_COLUMN_WIDTH, field.name.length * 8 + 48),
                 ),
                 pinned: defaultPinnedSourceIndices.has(sourceIndex),
-                hidden: false,
               },
             ];
       });
@@ -2508,13 +2488,7 @@ export function DataGrid({
           "Some preview filters or sort columns were reset because the complete schema changed.",
       });
     }
-  }, [
-    applyView,
-    contentIdentity,
-    defaultPinnedSourceIndices,
-    flattenedParents,
-    source.schema,
-  ]);
+  }, [applyView, contentIdentity, defaultPinnedSourceIndices, source.schema]);
 
   const changeFilters = useCallback(
     (nextFilters: DataFilter[]) =>
@@ -2546,7 +2520,11 @@ export function DataGrid({
           setColumnNotice({
             message:
               parent === undefined
-                ? flattenedParents.has(fieldPathKey(fieldPath))
+                ? current.some(
+                    (column) =>
+                      column.fieldPath.length > fieldPath.length &&
+                      fieldPathStartsWith(column.fieldPath, fieldPath),
+                  )
                   ? `${formatFieldPath(fieldPath)} is already flattened.`
                   : `Flatten ${formatFieldPath(parentPath) || "the parent struct"} first.`
                 : `${formatFieldPath(fieldPath)} is not a struct field.`,
@@ -2564,21 +2542,18 @@ export function DataGrid({
         }
         const children = parent.field.children.map((field) => {
           const childPath = [...parent.fieldPath, field.name];
-          return {
-            ...parent,
-            key: fieldPathKey(childPath),
-            fieldPath: childPath,
-            field,
-            title: formatFieldPath(childPath),
-          };
-        });
-        setFlattenedParents((parents) => {
-          const next = new Map(parents);
-          next.set(fieldPathKey(parent.fieldPath), parent);
-          return next;
+          return projectedColumnState(
+            schema,
+            schemaPathIndex,
+            ambiguousTopLevelNames,
+            childPath,
+            defaultPinnedSourceIndices.has(parent.sourceIndex),
+            columnMemoryRef.current,
+            parent,
+          )!;
         });
         setColumnNotice({
-          message: `Flattened ${formatFieldPath(fieldPath)} into ${children.length.toLocaleString("en-US")} columns.`,
+          message: `Flattened ${formatFieldPath(fieldPath)} into ${children.length.toLocaleString("en-US")} ${children.length === 1 ? "column" : "columns"}.`,
           kind: "status",
         });
         setSelection(clearColumnSelection);
@@ -2591,13 +2566,19 @@ export function DataGrid({
       });
       setHeaderMenu(null);
     },
-    [flattenedParents],
+    [
+      ambiguousTopLevelNames,
+      defaultPinnedSourceIndices,
+      schema,
+      schemaPathIndex,
+    ],
   );
 
   const unflattenPath = useCallback(
     (fieldPath: FieldPath) => {
-      const parent = flattenedParents.get(fieldPathKey(fieldPath));
-      if (parent === undefined) return;
+      const entry = schemaPathIndex.get(fieldPathKey(fieldPath));
+      if (entry === undefined) return;
+      const { sourceIndex } = entry;
       setColumnStates((current) => {
         const descendantIndices = current.flatMap((column, index) =>
           fieldPathStartsWith(column.fieldPath, fieldPath) &&
@@ -2605,6 +2586,7 @@ export function DataGrid({
             ? [index]
             : [],
         );
+        if (descendantIndices.length === 0) return current;
         const insertion = descendantIndices[0] ?? current.length;
         const retained = current.filter(
           (column) =>
@@ -2613,20 +2595,21 @@ export function DataGrid({
               column.fieldPath.length > fieldPath.length
             ),
         );
+        const parent = projectedColumnState(
+          schema,
+          schemaPathIndex,
+          ambiguousTopLevelNames,
+          fieldPath,
+          defaultPinnedSourceIndices.has(sourceIndex),
+          columnMemoryRef.current,
+          current[descendantIndices[0]!],
+        );
+        if (parent === undefined) return current;
         return [
           ...retained.slice(0, insertion),
           parent,
           ...retained.slice(insertion),
         ];
-      });
-      setFlattenedParents((parents) => {
-        const next = new Map(parents);
-        for (const [key, flattened] of next) {
-          if (fieldPathStartsWith(flattened.fieldPath, fieldPath)) {
-            next.delete(key);
-          }
-        }
-        return next;
       });
       const current = pendingViewRef.current ?? activeViewRef.current;
       const dependentFilter = (filter: DataFilter) =>
@@ -2661,7 +2644,13 @@ export function DataGrid({
       setCopyLimit(null);
       setHeaderMenu(null);
     },
-    [applyView, flattenedParents],
+    [
+      ambiguousTopLevelNames,
+      applyView,
+      defaultPinnedSourceIndices,
+      schema,
+      schemaPathIndex,
+    ],
   );
 
   const cancelPendingView = useCallback(() => {
@@ -3089,19 +3078,66 @@ export function DataGrid({
     [materializeCellValue, pathActionsAvailable],
   );
 
-  const setColumnVisibility = useCallback((id: string, visible: boolean) => {
-    setColumnStates((current) =>
-      current.map((column) =>
-        column.key === id
-          ? {
-              ...column,
-              hidden: !visible,
-              pinned: visible ? column.pinned : false,
-            }
-          : column,
-      ),
-    );
-  }, []);
+  const setColumnProjection = useCallback(
+    (id: string, selected: boolean) => {
+      const option = pickerColumns.find((column) => column.id === id);
+      if (option === undefined || option.disabledReason !== undefined) return;
+      setColumnStates((current) => {
+        if (!selected) {
+          return current.filter((column) =>
+            pathActionsAvailable
+              ? !fieldPathStartsWith(column.fieldPath, option.fieldPath)
+              : column.key !== option.id,
+          );
+        }
+        if (!pathActionsAvailable) {
+          if (current.some((column) => column.key === option.id))
+            return current;
+          const field = schema[option.sourceIndex];
+          return field === undefined
+            ? current
+            : [
+                ...current,
+                sourceColumnState(
+                  schema,
+                  ambiguousTopLevelNames,
+                  field,
+                  option.sourceIndex,
+                  defaultPinnedSourceIndices.has(option.sourceIndex),
+                  columnMemoryRef.current.get(option.id),
+                ),
+              ].sort((left, right) => left.sourceIndex - right.sourceIndex);
+        }
+        const field = schemaPathIndex.get(
+          fieldPathKey(option.fieldPath),
+        )?.field;
+        if (field === undefined) return current;
+        const targetPaths = isStructField(field)
+          ? addressableLeafPaths(field, option.fieldPath)
+          : [option.fieldPath];
+        return replaceProjectedSubtree(
+          current,
+          schema,
+          schemaPathIndex,
+          ambiguousTopLevelNames,
+          option.fieldPath,
+          targetPaths,
+          defaultPinnedSourceIndices,
+          columnMemoryRef.current,
+        );
+      });
+      setSelection(clearColumnSelection);
+      setCopyLimit(null);
+    },
+    [
+      ambiguousTopLevelNames,
+      defaultPinnedSourceIndices,
+      pathActionsAvailable,
+      pickerColumns,
+      schema,
+      schemaPathIndex,
+    ],
+  );
 
   const fitColumnWidths = useCallback(
     (visibleColumns: readonly ColumnState[]) => {
@@ -3195,19 +3231,26 @@ export function DataGrid({
   );
 
   const showAllColumns = useCallback(() => {
-    setColumnStates((current) =>
-      current.map((column) => ({ ...column, hidden: false })),
+    setColumnStates(() =>
+      schema.map((field, sourceIndex) =>
+        sourceColumnState(
+          schema,
+          ambiguousTopLevelNames,
+          field,
+          sourceIndex,
+          defaultPinnedSourceIndices.has(sourceIndex),
+          columnMemoryRef.current.get(
+            sourceColumnKey(schema, ambiguousTopLevelNames, sourceIndex),
+          ),
+        ),
+      ),
     );
-  }, []);
+  }, [ambiguousTopLevelNames, defaultPinnedSourceIndices, schema]);
 
   const hideAllColumns = useCallback(() => {
-    setColumnStates((current) =>
-      current.map((column) => ({
-        ...column,
-        hidden: true,
-        pinned: false,
-      })),
-    );
+    setColumnStates([]);
+    setSelection(clearColumnSelection);
+    setCopyLimit(null);
   }, []);
 
   const updateColumn = useCallback(
@@ -3226,13 +3269,6 @@ export function DataGrid({
   const selectSchemaPath = useCallback((fieldPath: FieldPath) => {
     schemaFocusPathRef.current = fieldPath;
     setSelectedSchemaPath(fieldPath);
-    setColumnStates((current) =>
-      current.map((column) =>
-        sameFieldPath(column.fieldPath, fieldPath)
-          ? { ...column, hidden: false }
-          : column,
-      ),
-    );
     setSchemaFocusRequest((request) => request + 1);
   }, []);
 
@@ -3264,6 +3300,37 @@ export function DataGrid({
       selectSchemaPath(fieldPath);
     },
     [selectSchemaPath, unflattenPath],
+  );
+
+  const promoteFieldToColumn = useCallback(
+    (fieldPath: FieldPath) => {
+      const field = schemaPathIndex.get(fieldPathKey(fieldPath))?.field;
+      if (field === undefined || !isStructField(field)) return;
+      setColumnStates((current) =>
+        replaceProjectedSubtree(
+          current,
+          schema,
+          schemaPathIndex,
+          ambiguousTopLevelNames,
+          fieldPath,
+          [fieldPath],
+          defaultPinnedSourceIndices,
+          columnMemoryRef.current,
+        ),
+      );
+      setSelection(clearColumnSelection);
+      setCopyLimit(null);
+      setPeek(null);
+      schemaFocusPathRef.current = fieldPath;
+      setSelectedSchemaPath(fieldPath);
+      setSchemaFocusRequest((request) => request + 1);
+    },
+    [
+      ambiguousTopLevelNames,
+      defaultPinnedSourceIndices,
+      schema,
+      schemaPathIndex,
+    ],
   );
 
   const openFilterForCell = useCallback(
@@ -3318,33 +3385,13 @@ export function DataGrid({
       : columnStates.find((column) => column.key === headerMenu.columnKey);
   const menuColumnDuplicateChild =
     menuColumn === undefined ? undefined : duplicateChildName(menuColumn.field);
-  const menuView = pendingView ?? activeView;
-  const menuUnflattenActions =
-    menuColumn === undefined
-      ? []
-      : menuColumn.fieldPath
-          .slice(0, -1)
-          .map((_, index) => menuColumn.fieldPath.slice(0, index + 1))
-          .filter((path) => flattenedParents.has(fieldPathKey(path)))
-          .reverse()
-          .map((path) => ({
-            path,
-            columnCount: columnStates.filter(
-              (column) =>
-                column.fieldPath.length > path.length &&
-                fieldPathStartsWith(column.fieldPath, path),
-            ).length,
-            filterCount: menuView.filters.filter(
-              (filter) =>
-                filter.fieldPath.length > path.length &&
-                fieldPathStartsWith(filter.fieldPath, path),
-            ).length,
-            sortCount: menuView.sort.filter(
-              (sortColumn) =>
-                sortColumn.fieldPath.length > path.length &&
-                fieldPathStartsWith(sortColumn.fieldPath, path),
-            ).length,
-          }));
+  const menuUnflattenAction = useMemo(() => {
+    if (menuColumn === undefined || menuColumn.fieldPath.length < 2) {
+      return undefined;
+    }
+    const path = [menuColumn.fieldPath[0]!];
+    return { path };
+  }, [menuColumn]);
   const peekValue = resolvedPeek?.value;
   const peekLoading =
     peek !== null &&
@@ -3467,17 +3514,16 @@ export function DataGrid({
             >
               {selectIsIdentity
                 ? "*"
-                : `[${visibleColumnStates.length}/${columnStates.length} cols]`}
+                : `[${visibleColumnStates.length.toLocaleString("en-US")} cols]`}
             </button>
             {selectPopupOpen && (
               <ColumnPicker
                 columns={pickerColumns}
+                projectedCount={columnStates.length}
                 onHideAll={hideAllColumns}
                 onShowAll={showAllColumns}
-                onToggle={setColumnVisibility}
-                onTogglePinned={(id, pinned) =>
-                  updateColumn(id, { pinned, hidden: false })
-                }
+                onToggle={setColumnProjection}
+                onTogglePinned={(id, pinned) => updateColumn(id, { pinned })}
               />
             )}
           </div>
@@ -3710,7 +3756,7 @@ export function DataGrid({
           ×
         </button>
       </div>
-      {((hiddenCount > 0 && visibleColumnStates.length > 0) ||
+      {(omittedRootCount > 0 ||
         !pathActionsAvailable ||
         columnNotice?.kind === "status" ||
         copyLimit !== null ||
@@ -3739,9 +3785,11 @@ export function DataGrid({
               {`This operation is limited to the first ${copyLimit.toLocaleString()} rows of the selection.`}
             </span>
           )}
-          {hiddenCount > 0 && visibleColumnStates.length > 0 && (
+          {omittedRootCount > 0 && visibleColumnStates.length > 0 && (
             <>
-              <span>{hiddenCount} hidden</span>
+              <span>
+                {omittedRootCount.toLocaleString("en-US")} unprojected
+              </span>
               <button type="button" onClick={showAllColumns}>
                 Show all columns
               </button>
@@ -3991,6 +4039,9 @@ export function DataGrid({
           focusRequest={peekFocusRequest}
           loading={peekLoading}
           showCopyPath={pathActionsAvailable}
+          onPromoteField={
+            pathActionsAvailable ? promoteFieldToColumn : undefined
+          }
           onClose={() => setPeek(null)}
           onReturnFocus={() => gridRef.current?.focus()}
           onCopyIntent={(text) =>
@@ -4092,32 +4143,31 @@ export function DataGrid({
               )}
             </button>
           )}
-          {menuUnflattenActions.length > 0 && (
+          {menuUnflattenAction !== undefined && (
             <div className="grid-menu-separator" role="separator" />
           )}
-          {menuUnflattenActions.map((action) => (
+          {menuUnflattenAction !== undefined && (
             <button
-              key={fieldPathKey(action.path)}
               type="button"
               role="menuitem"
-              onClick={() => unflattenPath(action.path)}
+              onClick={() => unflattenPath(menuUnflattenAction.path)}
             >
-              {formatUnflattenActionLabel(action)}
+              {formatUnflattenActionLabel(menuUnflattenAction)}
             </button>
-          ))}
-          {menuUnflattenActions.length > 0 && (
+          )}
+          {menuUnflattenAction !== undefined && (
             <div className="grid-menu-separator" role="separator" />
           )}
           <button
             type="button"
             role="menuitem"
             disabled={visibleColumnStates.length === 1}
-            onClick={() =>
-              updateColumn(menuColumn.key, {
-                hidden: true,
-                pinned: false,
-              })
-            }
+            onClick={() => {
+              setColumnStates((current) =>
+                current.filter((column) => column.key !== menuColumn.key),
+              );
+              setHeaderMenu(null);
+            }}
           >
             Hide column
           </button>
@@ -4549,6 +4599,7 @@ function sourceColumnState(
   field: SchemaField,
   sourceIndex: number,
   pinned: boolean,
+  remembered?: ColumnState,
 ): ColumnState {
   const fieldPath = [field.name];
   return {
@@ -4557,13 +4608,284 @@ function sourceColumnState(
     fieldPath,
     field,
     title: formatFieldPath(fieldPath),
-    width: Math.min(
-      280,
-      Math.max(MIN_COLUMN_WIDTH, field.name.length * 8 + 48),
-    ),
-    pinned,
-    hidden: false,
+    width:
+      remembered?.width ??
+      Math.min(280, Math.max(MIN_COLUMN_WIDTH, field.name.length * 8 + 48)),
+    pinned: remembered?.pinned ?? pinned,
   };
+}
+
+function projectedColumnState(
+  schema: readonly SchemaField[],
+  schemaPathIndex: ReadonlyMap<string, SchemaPathEntry>,
+  duplicateNames: ReadonlySet<string>,
+  fieldPath: FieldPath,
+  pinned: boolean,
+  memory: ReadonlyMap<string, ColumnState>,
+  inherited?: ColumnState,
+): ColumnState | undefined {
+  const entry = schemaPathIndex.get(fieldPathKey(fieldPath));
+  if (entry === undefined) return undefined;
+  const { field, sourceIndex } = entry;
+  const key =
+    fieldPath.length === 1
+      ? sourceColumnKey(schema, duplicateNames, sourceIndex)
+      : fieldPathKey(fieldPath);
+  const remembered = memory.get(key);
+  const title = formatFieldPath(fieldPath);
+  return {
+    key,
+    sourceIndex,
+    fieldPath,
+    field,
+    title,
+    width:
+      remembered?.width ??
+      inherited?.width ??
+      Math.min(280, Math.max(MIN_COLUMN_WIDTH, title.length * 8 + 48)),
+    pinned: remembered?.pinned ?? inherited?.pinned ?? pinned,
+  };
+}
+
+function addressableLeafPaths(
+  field: SchemaField,
+  fieldPath: FieldPath,
+): FieldPath[] {
+  if (!isStructField(field) || duplicateChildName(field) !== undefined) {
+    return [fieldPath];
+  }
+  return field.children.flatMap((child) => {
+    const childPath = [...fieldPath, child.name];
+    return isStructField(child)
+      ? addressableLeafPaths(child, childPath)
+      : [childPath];
+  });
+}
+
+function replaceProjectedSubtree(
+  current: readonly ColumnState[],
+  schema: readonly SchemaField[],
+  schemaPathIndex: ReadonlyMap<string, SchemaPathEntry>,
+  duplicateNames: ReadonlySet<string>,
+  fieldPath: FieldPath,
+  targetPaths: readonly FieldPath[],
+  defaultPinnedSourceIndices: ReadonlySet<number>,
+  memory: ReadonlyMap<string, ColumnState>,
+): ColumnState[] {
+  const replaced: ColumnState[] = [];
+  const retained: ColumnState[] = [];
+  for (const column of current) {
+    if (
+      fieldPathStartsWith(column.fieldPath, fieldPath) ||
+      fieldPathStartsWith(fieldPath, column.fieldPath)
+    ) {
+      replaced.push(column);
+    } else {
+      retained.push(column);
+    }
+  }
+  const inherited = replaced.find((column) =>
+    fieldPathStartsWith(fieldPath, column.fieldPath),
+  );
+  const added = targetPaths.flatMap((path) => {
+    const sourceIndex = schemaPathIndex.get(fieldPathKey(path))?.sourceIndex;
+    const state = projectedColumnState(
+      schema,
+      schemaPathIndex,
+      duplicateNames,
+      path,
+      sourceIndex !== undefined && defaultPinnedSourceIndices.has(sourceIndex),
+      memory,
+      inherited,
+    );
+    return state === undefined ? [] : [state];
+  });
+  return [...retained, ...added].sort((left, right) => {
+    const rank =
+      (schemaPathIndex.get(fieldPathKey(left.fieldPath))?.rank ??
+        Number.MAX_SAFE_INTEGER) -
+      (schemaPathIndex.get(fieldPathKey(right.fieldPath))?.rank ??
+        Number.MAX_SAFE_INTEGER);
+    return rank === 0 ? left.sourceIndex - right.sourceIndex : rank;
+  });
+}
+
+function indexSchemaPaths(
+  schema: readonly SchemaField[],
+): ReadonlyMap<string, SchemaPathEntry> {
+  const entries = new Map<string, SchemaPathEntry>();
+  const duplicateKeys = new Set<string>();
+  let rank = 0;
+  const visit = (
+    field: SchemaField,
+    fieldPath: FieldPath,
+    sourceIndex: number,
+  ) => {
+    const key = fieldPathKey(fieldPath);
+    if (entries.has(key)) {
+      entries.delete(key);
+      duplicateKeys.add(key);
+    } else if (!duplicateKeys.has(key)) {
+      entries.set(key, { field, sourceIndex, rank });
+    }
+    rank += 1;
+    if (!isStructField(field)) return;
+    for (const child of field.children) {
+      visit(child, [...fieldPath, child.name], sourceIndex);
+    }
+  };
+  schema.forEach((field, sourceIndex) =>
+    visit(field, [field.name], sourceIndex),
+  );
+  return entries;
+}
+
+interface ProjectionPickerColumn extends ColumnPickerColumn {
+  fieldPath: FieldPath;
+  sourceIndex: number;
+}
+
+function projectionPickerColumns(
+  schema: readonly SchemaField[],
+  projection: readonly ColumnState[],
+  pathActionsAvailable: boolean,
+): ProjectionPickerColumn[] {
+  if (!pathActionsAvailable) {
+    const projectedByKey = new Map(
+      projection.map((column) => [column.key, column]),
+    );
+    const duplicateNames = duplicateTopLevelNames(schema);
+    return schema.map((field, sourceIndex) => {
+      const id = sourceColumnKey(schema, duplicateNames, sourceIndex);
+      const projected = projectedByKey.get(id);
+      return {
+        id,
+        fieldPath: [field.name],
+        sourceIndex,
+        name: field.name,
+        type: field.logicalType ?? field.physicalType,
+        depth: 0,
+        selection: projected === undefined ? "none" : "all",
+        exact: projected !== undefined,
+        pinned: projected?.pinned ?? false,
+        ancestorIds: [],
+      };
+    });
+  }
+
+  const projectedByKey = new Map(
+    projection.map((column) => [column.key, column]),
+  );
+  const rowIdCounts = new Map<string, number>();
+  const rows: ProjectionPickerColumn[] = [];
+  const visit = (
+    field: SchemaField,
+    fieldPath: FieldPath,
+    sourceIndex: number,
+    depth: number,
+    ancestorIds: readonly string[],
+    disabledReason?: string,
+  ): "none" | "partial" | "all" => {
+    const pathKey = fieldPathKey(fieldPath);
+    const occurrence = rowIdCounts.get(pathKey) ?? 0;
+    rowIdCounts.set(pathKey, occurrence + 1);
+    const id =
+      occurrence === 0 ? pathKey : `${pathKey}:duplicate:${occurrence}`;
+    const projected =
+      disabledReason === undefined ? projectedByKey.get(pathKey) : undefined;
+    const nameParts = fieldPathTitleParts(fieldPath);
+    const rowIndex = rows.length;
+    const row: ProjectionPickerColumn = {
+      id,
+      fieldPath,
+      sourceIndex,
+      name: formatFieldPath(fieldPath),
+      ...(nameParts.titlePrefix === undefined
+        ? {}
+        : {
+            namePrefix: nameParts.titlePrefix,
+            nameLeaf: nameParts.titleLeaf,
+          }),
+      type: field.logicalType ?? field.physicalType,
+      depth,
+      selection: projected === undefined ? "none" : "all",
+      exact: projected !== undefined,
+      pinned: projected?.pinned ?? false,
+      ancestorIds,
+      ...(disabledReason === undefined ? {} : { disabledReason }),
+    };
+    rows.push(row);
+
+    const childStates: Array<"none" | "partial" | "all"> = [];
+    if (field.children.length > 0) {
+      const duplicateNames = duplicateFieldNames(field.children);
+      for (const child of field.children) {
+        const childReason =
+          disabledReason ??
+          (isListOrMapField(field)
+            ? LIST_MAP_COLUMN_REASON
+            : duplicateNames.has(child.name)
+              ? `This field is unavailable because ${formatFieldPath(fieldPath)} contains duplicate child names.`
+              : undefined);
+        const childState = visit(
+          child,
+          [...fieldPath, child.name],
+          sourceIndex,
+          depth + 1,
+          [...ancestorIds, id],
+          childReason,
+        );
+        if (childReason === undefined) childStates.push(childState);
+      }
+    }
+    if (projected !== undefined && isStructField(field)) {
+      row.selection = "partial";
+    } else if (childStates.length > 0) {
+      row.selection = childStates.every((state) => state === "all")
+        ? "all"
+        : childStates.some((state) => state !== "none")
+          ? "partial"
+          : "none";
+    }
+    rows[rowIndex] = row;
+    return row.selection;
+  };
+
+  schema.forEach((field, sourceIndex) =>
+    visit(field, [field.name], sourceIndex, 0, []),
+  );
+  return rows;
+}
+
+function projectedStructPathKeys(
+  projection: readonly ColumnState[],
+): ReadonlySet<string> {
+  const keys = new Set<string>();
+  for (const column of projection) {
+    for (let length = 1; length < column.fieldPath.length; length += 1) {
+      keys.add(fieldPathKey(column.fieldPath.slice(0, length)));
+    }
+  }
+  return keys;
+}
+
+function duplicateFieldNames(
+  fields: readonly SchemaField[],
+): ReadonlySet<string> {
+  const seen = new Set<string>();
+  const duplicates = new Set<string>();
+  for (const field of fields) {
+    if (seen.has(field.name)) duplicates.add(field.name);
+    else seen.add(field.name);
+  }
+  return duplicates;
+}
+
+function isListOrMapField(field: SchemaField): boolean {
+  return (
+    field.logicalType?.startsWith("List") === true ||
+    field.logicalType?.startsWith("Map") === true
+  );
 }
 
 function isStructField(field: SchemaField): boolean {
@@ -4587,30 +4909,8 @@ function duplicateChildName(field: SchemaField): string | undefined {
 const NOTICE_PATH_LIMIT = 3;
 const NOTICE_PATH_CHARACTER_LIMIT = 56;
 
-function formatUnflattenActionLabel({
-  path,
-  columnCount,
-  filterCount,
-  sortCount,
-}: {
-  path: FieldPath;
-  columnCount: number;
-  filterCount: number;
-  sortCount: number;
-}): string {
-  const removed = [
-    ...(filterCount === 0
-      ? []
-      : [
-          `${filterCount.toLocaleString("en-US")} ${filterCount === 1 ? "filter" : "filters"}`,
-        ]),
-    ...(sortCount === 0
-      ? []
-      : [
-          `${sortCount.toLocaleString("en-US")} ${sortCount === 1 ? "sort" : "sorts"}`,
-        ]),
-  ];
-  return `Unflatten ${formatFieldPath(path)} (${columnCount.toLocaleString("en-US")} ${columnCount === 1 ? "column" : "columns"} → 1${removed.length === 0 ? "" : `; removes ${removed.join(", ")}`})`;
+function formatUnflattenActionLabel({ path }: { path: FieldPath }): string {
+  return `Unflatten ${formatFieldPath(path)}`;
 }
 
 function formatDroppedPathNotice(
@@ -4643,46 +4943,36 @@ function boundedNoticePath(path: FieldPath): string {
 
 function flattenedRailMetadata(
   columns: readonly ColumnState[],
-  flattenedParents: ReadonlyMap<string, ColumnState>,
+  schema: readonly SchemaField[],
   logicalDataTypes: ReadonlyMap<string, DataType>,
 ): ReadonlyMap<string, NonNullable<GridColumn["groupRail"]>> {
   const groupsByRoot = new Map<
     string,
     {
       key: string;
-      parentPinned: boolean;
-      railPinned: boolean | undefined;
       title: string;
     }
   >();
-  for (const [key, parent] of flattenedParents) {
-    if (parent.fieldPath.length !== 1) continue;
+  for (const column of columns) {
+    if (column.fieldPath.length < 2) continue;
+    const rootName = column.fieldPath[0]!;
+    if (groupsByRoot.has(rootName)) continue;
+    const field = schema[column.sourceIndex];
+    if (field === undefined) continue;
+    const key = fieldPathKey([rootName]);
     const logicalType = logicalDataTypes.get(key);
-    groupsByRoot.set(parent.fieldPath[0]!, {
+    groupsByRoot.set(rootName, {
       key,
-      parentPinned: parent.pinned,
-      railPinned: undefined,
-      title: `${parent.title} · ${
+      title: `${formatFieldPath([rootName])} · ${
         logicalType === undefined
-          ? schemaRailType(parent.field)
+          ? schemaRailType(field)
           : formatDataTypeLabel(logicalType)
       }`,
     });
   }
-  for (const column of columns) {
-    if (column.fieldPath.length < 2) continue;
-    const group = groupsByRoot.get(column.fieldPath[0]!);
-    if (
-      group !== undefined &&
-      (group.railPinned === undefined || column.pinned === group.parentPinned)
-    ) {
-      group.railPinned = column.pinned;
-    }
-  }
   const groupByColumn = columns.map((column) => {
     if (column.fieldPath.length < 2) return undefined;
-    const group = groupsByRoot.get(column.fieldPath[0]!);
-    return group?.railPinned === column.pinned ? group : undefined;
+    return groupsByRoot.get(column.fieldPath[0]!);
   });
   const metadata = new Map<string, NonNullable<GridColumn["groupRail"]>>();
   columns.forEach((column, index) => {

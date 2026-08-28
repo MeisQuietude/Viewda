@@ -10,6 +10,7 @@ import {
   useState,
   type KeyboardEvent,
 } from "react";
+import { Type, type DataType } from "@uwdata/flechette";
 
 import { ChunkScheduler } from "./chunk-scheduler";
 import {
@@ -157,9 +158,10 @@ export const ValueTree = forwardRef<
     value: TypedValue;
     label: string;
     fieldPath?: FieldPath;
+    onPromoteField?: (fieldPath: FieldPath) => void;
   } & ValueCopyHandlers
 >(function ValueTree(
-  { value, label, fieldPath, onCopy, onCopyIntent },
+  { value, label, fieldPath, onPromoteField, onCopy, onCopyIntent },
   forwardedRef,
 ) {
   const treeRef = useRef<HTMLDivElement>(null);
@@ -1020,6 +1022,10 @@ export const ValueTree = forwardRef<
     parseStatus?.phase === "running" ||
     operation?.phase === "running" ||
     operation?.phase === "locating";
+  const promoteFieldPath =
+    fieldPath === undefined || onPromoteField === undefined
+      ? undefined
+      : structNodeFieldPath(fieldPath, activeNode);
 
   return (
     <div className={`value-tree-wrap${hasDetail ? " has-detail" : ""}`}>
@@ -1050,6 +1056,14 @@ export const ValueTree = forwardRef<
             />
           )}
           <div className="value-tree-toolbar-actions">
+            {promoteFieldPath !== undefined && (
+              <button
+                type="button"
+                onClick={() => onPromoteField?.(promoteFieldPath)}
+              >
+                Promote to column
+              </button>
+            )}
             {fieldPath !== undefined && (
               <button
                 type="button"
@@ -1648,6 +1662,38 @@ function valueNodePath(fieldPath: FieldPath, node: TreeNode): string {
     }
   }
   return path;
+}
+
+function structNodeFieldPath(
+  fieldPath: FieldPath,
+  node: TreeNode | undefined,
+): FieldPath | undefined {
+  if (
+    node === undefined ||
+    node.parent === null ||
+    !isStructValue(node.value)
+  ) {
+    return undefined;
+  }
+  const segments: string[] = [];
+  for (let current: TreeNode = node; current.parent !== null;) {
+    if (current.objectKey === undefined) return undefined;
+    segments.push(current.objectKey);
+    current = current.parent;
+  }
+  return [...fieldPath, ...segments.reverse()];
+}
+
+function isStructValue(value: TypedValue | undefined): boolean {
+  if (
+    value === undefined ||
+    (value.kind !== "arrow" && value.kind !== "value")
+  ) {
+    return false;
+  }
+  let dataType: DataType = value.dataType;
+  while (dataType.typeId === Type.Dictionary) dataType = dataType.dictionary;
+  return dataType.typeId === Type.Struct;
 }
 
 function createRootNode(label: string, value: TypedValue): TreeNode {

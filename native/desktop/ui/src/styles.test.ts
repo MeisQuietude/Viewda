@@ -245,15 +245,26 @@ describe("color theme", () => {
     }
   });
 
-  it("keeps picker path leaves visible and plain names tail-truncated", () => {
-    expectDeclarations(".column-picker-name", {
+  it("truncates schema-tree prefixes while preserving the distinguishing leaf", () => {
+    expectDeclarations(".column-picker-name.is-path", {
       display: "flex",
-      overflow: "hidden",
     });
-    expectDeclarations(".column-picker-name.is-plain", {
-      display: "block",
+    expect(declaration(".column-picker-name", "overflow")).toBe("hidden");
+    expectDeclarations(".column-picker-prefix-text", {
+      overflow: "hidden",
+      direction: "rtl",
       "text-overflow": "ellipsis",
     });
+    expectDeclarations(".column-picker-prefix-content", {
+      direction: "ltr",
+      "unicode-bidi": "isolate",
+    });
+    expectDeclarations(".column-picker-prefix-separator", {
+      direction: "ltr",
+      "unicode-bidi": "isolate",
+      flex: "0 0 auto",
+    });
+    expect(declaration(".column-picker-leaf", "flex")).toBe("0 0 auto");
   });
 
   it("does not let pinned positioning hide selection colors", () => {

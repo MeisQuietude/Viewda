@@ -10,7 +10,7 @@ Backward-incompatible entries start with **Breaking:**.
 
 ### Added
 
-- Flatten and Unflatten struct fields at any depth to work with nested values as regular Data columns. Flattened columns can be filtered, sorted, pinned, hidden, resized, inspected, copied, and exported; the schema sidebar exposes the same actions. Nested list and map statistics report container sizes, Grid Copy and CSV use matching JSON text, and sources with duplicate names remain readable while ambiguous actions explain why they are unavailable.
+- Select nested struct leaves as regular Data columns from a searchable schema tree, or use Flatten, Unflatten, and Peek's Promote to column shortcuts. Nested columns can be filtered, sorted, pinned, resized, inspected, copied, and exported; list and map fields stay intact, their statistics report container sizes, and Grid Copy and CSV use matching JSON text. Sources with duplicate names remain readable while ambiguous actions explain why they are unavailable.
 
 ## 0.3.0 — 2026-08-26
 

@@ -916,8 +916,13 @@ button {
   cursor: pointer;
 }
 
-.column-picker-row:hover {
+.column-picker-row:hover:not(.is-disabled) {
   background: var(--grid-selection);
+}
+
+.column-picker-row.is-disabled {
+  color: var(--grid-text-faint);
+  cursor: default;
 }
 
 .column-picker-row input {
@@ -933,6 +938,12 @@ button {
   white-space: nowrap;
 }
 
+.column-picker-label {
+  display: grid;
+  min-width: 0;
+  gap: 1px;
+}
+
 .column-picker-pin {
   display: grid;
   width: 24px;
@@ -944,6 +955,10 @@ button {
   background: transparent;
   cursor: pointer;
   place-items: center;
+}
+
+.column-picker-pin-spacer {
+  width: 24px;
 }
 
 .column-picker-pin:hover {
@@ -966,7 +981,6 @@ button {
 }
 
 .column-picker-name {
-  display: flex;
   overflow: hidden;
   color: var(--grid-text);
 }
@@ -974,6 +988,54 @@ button {
 .column-picker-name.is-plain {
   display: block;
   text-overflow: ellipsis;
+}
+
+.column-picker-name.is-path {
+  display: flex;
+}
+
+.column-picker-prefix {
+  display: flex;
+  min-width: 0;
+  overflow: hidden;
+  color: var(--grid-text-faint);
+}
+
+.column-picker-prefix-text {
+  min-width: 0;
+  overflow: hidden;
+  direction: rtl;
+  text-align: left;
+  text-overflow: ellipsis;
+}
+
+.column-picker-prefix-content {
+  direction: ltr;
+  unicode-bidi: isolate;
+}
+
+.column-picker-prefix-separator {
+  direction: ltr;
+  unicode-bidi: isolate;
+  flex: 0 0 auto;
+}
+
+.column-picker-leaf {
+  flex: 0 0 auto;
+}
+
+.column-picker-row.is-disabled .column-picker-name,
+.column-picker-row.is-disabled .column-picker-type {
+  color: inherit;
+}
+
+.column-picker-reason {
+  overflow: hidden;
+  color: var(--grid-text-faint);
+  font-size: 9px;
+  line-height: 1.2;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .column-picker-type,

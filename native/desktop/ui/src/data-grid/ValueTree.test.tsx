@@ -118,6 +118,32 @@ describe("ValueTree", () => {
     );
   });
 
+  it("promotes an active struct field with its column-address path", () => {
+    const onPromoteField = vi.fn();
+    render(
+      <ValueTree
+        label="profile"
+        fieldPath={["profile"]}
+        value={typedValue(
+          { address: { city: "Utrecht" }, name: "Ada" },
+          struct({ address: struct({ city: utf8() }), name: utf8() }),
+        )}
+        onPromoteField={onPromoteField}
+        onCopy={vi.fn()}
+      />,
+    );
+    expect(
+      screen.queryByRole("button", { name: "Promote to column" }),
+    ).toBeNull();
+
+    fireEvent.keyDown(screen.getByRole("tree", { name: "profile value" }), {
+      key: "ArrowDown",
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Promote to column" }));
+
+    expect(onPromoteField).toHaveBeenCalledWith(["profile", "address"]);
+  });
+
   it("renders an empty field name explicitly", () => {
     render(
       <ValueTree

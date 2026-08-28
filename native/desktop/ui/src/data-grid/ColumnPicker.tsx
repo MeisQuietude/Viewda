@@ -1,32 +1,41 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 
-const ROW_HEIGHT = 36;
-const VIEWPORT_HEIGHT = 288;
+const ROW_HEIGHT = 48;
+const VIEWPORT_HEIGHT = 336;
 const OVERSCAN_ROWS = 3;
+const MAX_TREE_INDENT = 12;
 const BIDI_CONTROL_CHARACTER =
   /([\u061c\u200e\u200f\u202a-\u202e\u2066-\u2069])/u;
+
+export type ColumnPickerSelection = "none" | "partial" | "all";
 
 export interface ColumnPickerColumn {
   id: string;
   name: string;
-  titlePrefix?: string;
-  titleLeaf?: string;
+  namePrefix?: string;
+  nameLeaf?: string;
   type: string;
-  visible: boolean;
+  depth: number;
+  selection: ColumnPickerSelection;
+  exact: boolean;
   pinned: boolean;
+  ancestorIds: readonly string[];
+  disabledReason?: string;
 }
 
 export function ColumnPicker({
   columns,
+  projectedCount,
   onHideAll,
   onShowAll,
   onToggle,
   onTogglePinned,
 }: {
   columns: readonly ColumnPickerColumn[];
+  projectedCount: number;
   onHideAll: () => void;
   onShowAll: () => void;
-  onToggle: (id: string, visible: boolean) => void;
+  onToggle: (id: string, selected: boolean) => void;
   onTogglePinned: (id: string, pinned: boolean) => void;
 }) {
   const [query, setQuery] = useState("");
@@ -35,19 +44,16 @@ export function ColumnPicker({
   const listRef = useRef<HTMLDivElement>(null);
   const optionRefs = useRef(new Map<string, HTMLInputElement>());
   const normalizedQuery = query.trim().toLocaleLowerCase();
-  const filteredColumns = useMemo(
-    () =>
-      normalizedQuery.length === 0
-        ? columns
-        : columns.filter((column) =>
-            column.name.toLocaleLowerCase().includes(normalizedQuery),
-          ),
-    [columns, normalizedQuery],
-  );
-  const visibleCount = columns.reduce(
-    (count, column) => count + Number(column.visible),
-    0,
-  );
+  const filteredColumns = useMemo(() => {
+    if (normalizedQuery.length === 0) return columns;
+    const included = new Set<string>();
+    for (const column of columns) {
+      if (!column.name.toLocaleLowerCase().includes(normalizedQuery)) continue;
+      included.add(column.id);
+      column.ancestorIds.forEach((id) => included.add(id));
+    }
+    return columns.filter((column) => included.has(column.id));
+  }, [columns, normalizedQuery]);
   const firstRow = Math.max(
     0,
     Math.floor(scrollTop / ROW_HEIGHT) - OVERSCAN_ROWS,
@@ -65,16 +71,20 @@ export function ColumnPicker({
 
   useEffect(() => {
     setScrollTop(0);
-    if (listRef.current !== null) {
-      listRef.current.scrollTop = 0;
-    }
+    if (listRef.current !== null) listRef.current.scrollTop = 0;
   }, [normalizedQuery]);
 
-  const focusOption = (index: number) => {
-    const column = filteredColumns[index];
-    if (column === undefined) {
-      return;
+  const focusOption = (start: number, direction: -1 | 1) => {
+    let index = start;
+    while (
+      index >= 0 &&
+      index < filteredColumns.length &&
+      filteredColumns[index]?.disabledReason !== undefined
+    ) {
+      index += direction;
     }
+    const column = filteredColumns[index];
+    if (column === undefined) return;
     const rowTop = index * ROW_HEIGHT;
     const rowBottom = rowTop + ROW_HEIGHT;
     const nextScrollTop =
@@ -84,9 +94,7 @@ export function ColumnPicker({
           ? rowBottom - VIEWPORT_HEIGHT
           : scrollTop;
     if (nextScrollTop !== scrollTop) {
-      if (listRef.current !== null) {
-        listRef.current.scrollTop = nextScrollTop;
-      }
+      if (listRef.current !== null) listRef.current.scrollTop = nextScrollTop;
       setScrollTop(nextScrollTop);
     }
     const current = optionRefs.current.get(column.id);
@@ -110,28 +118,28 @@ export function ColumnPicker({
           onKeyDown={(event) => {
             if (event.key === "ArrowDown") {
               event.preventDefault();
-              focusOption(0);
+              focusOption(0, 1);
             } else if (event.key === "ArrowUp") {
               event.preventDefault();
-              focusOption(filteredColumns.length - 1);
+              focusOption(filteredColumns.length - 1, -1);
             }
           }}
         />
-        <button
-          type="button"
-          disabled={visibleCount === columns.length}
-          onClick={onShowAll}
-        >
+        <button type="button" onClick={onShowAll}>
           Show all
         </button>
-        <button type="button" disabled={visibleCount === 0} onClick={onHideAll}>
+        <button
+          type="button"
+          disabled={projectedCount === 0}
+          onClick={onHideAll}
+        >
           Hide all
         </button>
       </div>
       <div
         ref={listRef}
         className="column-picker-list"
-        role="list"
+        role="tree"
         aria-label="Columns"
         style={{ maxHeight: VIEWPORT_HEIGHT }}
         onScroll={(event) => setScrollTop(event.currentTarget.scrollTop)}
@@ -145,16 +153,21 @@ export function ColumnPicker({
           >
             {renderedColumns.map((column, renderedIndex) => {
               const filteredIndex = firstRow + renderedIndex;
+              const selected = column.selection === "all";
               return (
                 <div
-                  className="column-picker-row"
+                  className={`column-picker-row${column.disabledReason === undefined ? "" : " is-disabled"}`}
                   key={column.id}
-                  role="listitem"
+                  role="treeitem"
+                  aria-level={column.depth + 1}
+                  aria-selected={column.selection !== "none"}
                   style={{
                     height: ROW_HEIGHT,
+                    paddingLeft: `${8 + Math.min(column.depth, MAX_TREE_INDENT) * 14}px`,
                     transform: `translateY(${filteredIndex * ROW_HEIGHT}px)`,
                   }}
                   onClick={(event) => {
+                    if (column.disabledReason !== undefined) return;
                     const target = event.target;
                     if (
                       target instanceof HTMLInputElement ||
@@ -163,7 +176,7 @@ export function ColumnPicker({
                     ) {
                       return;
                     }
-                    onToggle(column.id, !column.visible);
+                    onToggle(column.id, !selected);
                   }}
                 >
                   <input
@@ -171,42 +184,90 @@ export function ColumnPicker({
                       if (input === null) {
                         optionRefs.current.delete(column.id);
                       } else {
+                        input.indeterminate = column.selection === "partial";
                         optionRefs.current.set(column.id, input);
                       }
                     }}
                     type="checkbox"
-                    aria-label={`Show ${column.name}`}
-                    checked={column.visible}
+                    aria-label={`Project ${column.name}`}
+                    checked={selected}
+                    disabled={column.disabledReason !== undefined}
                     onChange={(event) =>
                       onToggle(column.id, event.target.checked)
                     }
                     onKeyDown={(event) => {
                       if (event.key === "ArrowDown") {
                         event.preventDefault();
-                        focusOption(filteredIndex + 1);
+                        focusOption(filteredIndex + 1, 1);
                       } else if (event.key === "ArrowUp") {
                         event.preventDefault();
-                        focusOption(filteredIndex - 1);
+                        focusOption(filteredIndex - 1, -1);
                       } else if (event.key === " ") {
                         event.preventDefault();
-                        onToggle(column.id, !column.visible);
+                        onToggle(column.id, !selected);
                       }
                     }}
                   />
-                  <button
-                    className="column-picker-pin"
-                    type="button"
-                    aria-label={`${column.pinned ? "Unpin" : "Pin"} ${column.name}`}
-                    aria-pressed={column.pinned}
-                    title={`${column.pinned ? "Unpin" : "Pin"} column`}
-                    onClick={(event) => {
-                      event.stopPropagation();
-                      onTogglePinned(column.id, !column.pinned);
-                    }}
-                  >
-                    <PinIcon />
-                  </button>
-                  <ColumnName column={column} />
+                  {column.exact ? (
+                    <button
+                      className="column-picker-pin"
+                      type="button"
+                      aria-label={`${column.pinned ? "Unpin" : "Pin"} ${column.name}`}
+                      aria-pressed={column.pinned}
+                      title={`${column.pinned ? "Unpin" : "Pin"} column`}
+                      onClick={(event) => {
+                        event.stopPropagation();
+                        onTogglePinned(column.id, !column.pinned);
+                      }}
+                    >
+                      <PinIcon />
+                    </button>
+                  ) : (
+                    <span className="column-picker-pin-spacer" />
+                  )}
+                  <span className="column-picker-label">
+                    <span
+                      className={`column-picker-name${column.namePrefix === undefined ? " is-plain" : " is-path"}`}
+                      title={safeNativeTooltipTitle(column.name)}
+                    >
+                      {column.namePrefix === undefined ? (
+                        safeVisualPathText(column.name)
+                      ) : (
+                        <>
+                          <span className="column-picker-prefix">
+                            <span className="column-picker-prefix-text">
+                              <span
+                                className="column-picker-prefix-content"
+                                dir="ltr"
+                              >
+                                {safeVisualPathText(
+                                  column.namePrefix.endsWith(".")
+                                    ? column.namePrefix.slice(0, -1)
+                                    : column.namePrefix,
+                                )}
+                              </span>
+                            </span>
+                            {column.namePrefix.endsWith(".") && (
+                              <span
+                                className="column-picker-prefix-separator"
+                                aria-hidden="true"
+                              >
+                                .
+                              </span>
+                            )}
+                          </span>
+                          <span className="column-picker-leaf">
+                            {safeVisualPathText(column.nameLeaf ?? "")}
+                          </span>
+                        </>
+                      )}
+                    </span>
+                    {column.disabledReason !== undefined && (
+                      <span className="column-picker-reason">
+                        {column.disabledReason}
+                      </span>
+                    )}
+                  </span>
                   <span className="column-picker-type" title={column.type}>
                     {column.type}
                   </span>
@@ -218,49 +279,10 @@ export function ColumnPicker({
       </div>
       <span className="column-picker-count" role="status">
         {normalizedQuery.length === 0
-          ? `${visibleCount.toLocaleString("en-US")} of ${columns.length.toLocaleString("en-US")} visible`
-          : `${filteredColumns.length.toLocaleString("en-US")} matching columns`}
+          ? `${projectedCount.toLocaleString("en-US")} projected columns`
+          : `${filteredColumns.length.toLocaleString("en-US")} matching fields`}
       </span>
     </div>
-  );
-}
-
-function ColumnName({ column }: { column: ColumnPickerColumn }) {
-  const pathTitle = column.titlePrefix !== undefined;
-  return (
-    <span
-      className={`column-picker-name ${pathTitle ? "is-path" : "is-plain"}`}
-      title={safeNativeTooltipTitle(column.name)}
-    >
-      {pathTitle ? (
-        <>
-          <span className="viewda-grid-header-prefix">
-            <span className="viewda-grid-header-prefix-text">
-              <span className="viewda-grid-header-prefix-content" dir="ltr">
-                {safeVisualPathText(
-                  column.titlePrefix?.endsWith(".")
-                    ? column.titlePrefix.slice(0, -1)
-                    : (column.titlePrefix ?? ""),
-                )}
-              </span>
-            </span>
-            {column.titlePrefix?.endsWith(".") && (
-              <span
-                className="viewda-grid-header-prefix-separator"
-                aria-hidden="true"
-              >
-                .
-              </span>
-            )}
-          </span>
-          <span className="viewda-grid-header-leaf">
-            {safeVisualPathText(column.titleLeaf ?? "")}
-          </span>
-        </>
-      ) : (
-        safeVisualPathText(column.name)
-      )}
-    </span>
   );
 }
 

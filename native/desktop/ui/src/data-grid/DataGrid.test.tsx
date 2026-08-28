@@ -1617,7 +1617,7 @@ describe("DataGrid window rendering", () => {
 
     openColumnMenu(7);
     fireEvent.click(screen.getByRole("menuitem", { name: "Hide column" }));
-    expect(screen.getByLabelText("Query")).toHaveTextContent("[7/8 cols]");
+    expect(screen.getByLabelText("Query")).toHaveTextContent("[7 cols]");
 
     addNumberFilter("42");
     await waitFor(() =>
@@ -1634,7 +1634,7 @@ describe("DataGrid window rendering", () => {
         '"column_0" = 42',
       ),
     );
-    expect(screen.getByLabelText("Query")).toHaveTextContent("[7/8 cols]");
+    expect(screen.getByLabelText("Query")).toHaveTextContent("[7 cols]");
 
     fireEvent.click(screen.getByRole("button", { name: "Show all columns" }));
     expect(
@@ -1652,14 +1652,14 @@ describe("DataGrid window rendering", () => {
       />,
     );
 
-    expect(screen.getByLabelText("Query")).toHaveTextContent("[8/8 cols]");
+    expect(screen.getByLabelText("Query")).toHaveTextContent("[8 cols]");
     expect(gridMock.props?.columns[0]).toMatchObject({
       title: "column_7",
       pinned: true,
     });
     const picker = openSelectPicker();
     expect(
-      within(picker).getByRole("checkbox", { name: "Show column_7" }),
+      within(picker).getByRole("checkbox", { name: "Project column_7" }),
     ).toBeChecked();
     const unpin = within(picker).getByRole("button", {
       name: "Unpin column_7",
@@ -1670,9 +1670,9 @@ describe("DataGrid window rendering", () => {
       pinned: false,
     });
     fireEvent.click(
-      within(picker).getByRole("checkbox", { name: "Show column_7" }),
+      within(picker).getByRole("checkbox", { name: "Project column_7" }),
     );
-    expect(screen.getByLabelText("Query")).toHaveTextContent("[7/8 cols]");
+    expect(screen.getByLabelText("Query")).toHaveTextContent("[7 cols]");
 
     view.rerender(
       <DataGrid
@@ -1682,11 +1682,19 @@ describe("DataGrid window rendering", () => {
       />,
     );
     expect(
-      within(picker).getByRole("checkbox", { name: "Show column_7" }),
+      within(picker).getByRole("checkbox", { name: "Project column_7" }),
     ).not.toBeChecked();
     expect(
-      within(picker).getByRole("button", { name: "Pin column_7" }),
-    ).toHaveAttribute("aria-pressed", "false");
+      within(picker).queryByRole("button", { name: "Pin column_7" }),
+    ).toBeNull();
+    fireEvent.click(
+      within(picker).getByRole("checkbox", { name: "Project column_7" }),
+    );
+    await waitFor(() =>
+      expect(
+        within(picker).getByRole("button", { name: "Pin column_7" }),
+      ).toHaveAttribute("aria-pressed", "false"),
+    );
   });
 
   it("recursively flattens structs into full grid columns and restores their ancestor", async () => {
@@ -1738,7 +1746,7 @@ describe("DataGrid window rendering", () => {
     fireEvent.click(screen.getByRole("menuitem", { name: "Pin column" }));
     expect(
       screen.getByLabelText("Query").querySelector(".query-select"),
-    ).toHaveTextContent("[3/3 cols]");
+    ).toHaveTextContent("[3 cols]");
     expect(
       screen.getByLabelText("Query").querySelector(".query-select"),
     ).toHaveAttribute("title", '"profile", "id", "tail"');
@@ -1777,7 +1785,7 @@ describe("DataGrid window rendering", () => {
     ).toBeVisible();
     expect(
       screen.getByLabelText("Query").querySelector(".query-select"),
-    ).toHaveTextContent("[4/4 cols]");
+    ).toHaveTextContent("[4 cols]");
     expect(
       screen.getByLabelText("Query").querySelector(".query-select"),
     ).toHaveAttribute(
@@ -1788,7 +1796,7 @@ describe("DataGrid window rendering", () => {
     const picker = openSelectPicker();
     expect(
       within(picker).getByRole("checkbox", {
-        name: 'Show profile."city.name"',
+        name: 'Project profile."city.name"',
       }),
     ).toBeChecked();
     expect(
@@ -1797,17 +1805,12 @@ describe("DataGrid window rendering", () => {
       }),
     ).toHaveAttribute("aria-pressed", "true");
     const pickerPath = within(picker)
-      .getByRole("checkbox", { name: 'Show profile."city.name"' })
+      .getByRole("checkbox", { name: 'Project profile."city.name"' })
       .closest(".column-picker-row")!;
     expect(pickerPath.querySelector(".column-picker-name")).toHaveTextContent(
       'profile."city.name"',
     );
-    expect(
-      pickerPath.querySelector(".viewda-grid-header-prefix-content"),
-    ).toHaveTextContent("profile");
-    expect(
-      pickerPath.querySelector(".viewda-grid-header-leaf"),
-    ).toHaveTextContent('"city.name"');
+    expect(pickerPath).toHaveAttribute("aria-level", "2");
     fireEvent.click(
       screen.getByLabelText("Query").querySelector(".query-select")!,
     );
@@ -1919,13 +1922,18 @@ describe("DataGrid window rendering", () => {
 
     openColumnMenu(0);
     expect(
-      screen.getByRole("menuitem", {
-        name: "Unflatten profile.address (2 columns → 1; removes 1 filter, 1 sort)",
+      screen.queryByRole("menuitem", {
+        name: "Unflatten profile.address",
       }),
-    ).toBeInTheDocument();
+    ).toBeNull();
     const ancestorMenu = screen.getByRole("menu", {
       name: 'profile.address."postal""code" column',
     });
+    expect(
+      within(ancestorMenu).getAllByRole("menuitem", {
+        name: /^Unflatten /,
+      }),
+    ).toHaveLength(1);
     const separators = within(ancestorMenu).getAllByRole("separator");
     expect(separators).toHaveLength(2);
     separators.forEach((separator) =>
@@ -1933,7 +1941,7 @@ describe("DataGrid window rendering", () => {
     );
     fireEvent.click(
       screen.getByRole("menuitem", {
-        name: "Unflatten profile (3 columns → 1; removes 1 filter, 1 sort)",
+        name: "Unflatten profile",
       }),
     );
 
@@ -1966,6 +1974,161 @@ describe("DataGrid window rendering", () => {
         ["tail"],
       ]),
     );
+  });
+
+  it("projects arbitrary leaves from different schema branches in schema order", async () => {
+    const projectionSource: desktop.SourceSummary = {
+      ...source,
+      rowCount: 4,
+      columnCount: 3,
+      schemaNodeCount: 9,
+      schema: [
+        {
+          name: "profile",
+          physicalType: "GROUP",
+          logicalType: null,
+          children: [
+            { ...source.schema[0]!, name: "first" },
+            { ...source.schema[0]!, name: "last" },
+          ],
+        },
+        {
+          name: "account",
+          physicalType: "GROUP",
+          logicalType: null,
+          children: [
+            { ...source.schema[0]!, name: "score" },
+            { ...source.schema[0]!, name: "tag" },
+          ],
+        },
+        { ...source.schema[0]!, name: "tail" },
+      ],
+    };
+    render(<DataGrid source={projectionSource} />);
+    const picker = openSelectPicker();
+    fireEvent.click(within(picker).getByRole("button", { name: "Hide all" }));
+    fireEvent.click(
+      within(picker).getByRole("checkbox", {
+        name: "Project account.score",
+      }),
+    );
+    fireEvent.click(
+      within(picker).getByRole("checkbox", {
+        name: "Project profile.last",
+      }),
+    );
+
+    expect(gridMock.props?.columns.map((column) => column.id)).toEqual([
+      '["profile","last"]',
+      '["account","score"]',
+    ]);
+    const profile = within(picker).getByRole("checkbox", {
+      name: "Project profile",
+    }) as HTMLInputElement;
+    expect(profile.indeterminate).toBe(true);
+    await waitFor(() =>
+      expect(desktop.getDataWindow).toHaveBeenLastCalledWith(7, 0, 0, 4, [
+        ["profile", "last"],
+        ["account", "score"],
+      ]),
+    );
+
+    fireEvent.click(profile);
+    expect(gridMock.props?.columns.map((column) => column.id)).toEqual([
+      '["profile","first"]',
+      '["profile","last"]',
+      '["account","score"]',
+    ]);
+    expect(profile).toBeChecked();
+    expect(profile.indeterminate).toBe(false);
+    await waitFor(() =>
+      expect(desktop.getDataWindow).toHaveBeenLastCalledWith(7, 0, 0, 4, [
+        ["profile", "first"],
+        ["profile", "last"],
+        ["account", "score"],
+      ]),
+    );
+  });
+
+  it("shows an exact struct as partial until its leaves are projected", () => {
+    render(<DataGrid source={nestedSource} />);
+    const picker = openSelectPicker();
+    const profile = within(picker).getByRole("checkbox", {
+      name: "Project profile",
+    }) as HTMLInputElement;
+    const city = within(picker).getByRole("checkbox", {
+      name: 'Project profile."city.name"',
+    });
+    const postal = within(picker).getByRole("checkbox", {
+      name: 'Project profile.address."postal""code"',
+    });
+
+    expect(profile).not.toBeChecked();
+    expect(profile.indeterminate).toBe(true);
+    expect(city).not.toBeChecked();
+    expect(postal).not.toBeChecked();
+
+    fireEvent.click(profile);
+    expect(profile).toBeChecked();
+    expect(profile.indeterminate).toBe(false);
+    expect(city).toBeChecked();
+    expect(postal).toBeChecked();
+    expect(gridMock.props?.columns.map((column) => column.id)).toEqual([
+      '["id"]',
+      '["profile","city.name"]',
+      '["profile","address","postal\\"code"]',
+      '["profile","address","geo","latitude"]',
+      '["tail"]',
+    ]);
+  });
+
+  it("matches a scalar struct Flatten with the equivalent picker projection", () => {
+    const flatSource: desktop.SourceSummary = {
+      ...source,
+      rowCount: 4,
+      columnCount: 2,
+      schemaNodeCount: 4,
+      schema: [
+        {
+          name: "group",
+          physicalType: "GROUP",
+          logicalType: null,
+          children: [
+            { ...source.schema[0]!, name: "left" },
+            { ...source.schema[0]!, name: "right" },
+          ],
+        },
+        { ...source.schema[0]!, name: "tail" },
+      ],
+    };
+    render(<DataGrid source={flatSource} />);
+    openColumnMenu(0);
+    fireEvent.click(screen.getByRole("menuitem", { name: "Flatten" }));
+    const flattened = gridMock.props?.columns.map((column) => column.id);
+    expect(flattened).toEqual([
+      '["group","left"]',
+      '["group","right"]',
+      '["tail"]',
+    ]);
+
+    openColumnMenu(0);
+    fireEvent.click(screen.getByRole("menuitem", { name: "Unflatten group" }));
+    const picker = openSelectPicker();
+    fireEvent.click(
+      within(picker).getByRole("checkbox", { name: "Project group.left" }),
+    );
+    fireEvent.click(
+      within(picker).getByRole("checkbox", { name: "Project group.right" }),
+    );
+    expect(gridMock.props?.columns.map((column) => column.id)).toEqual(
+      flattened,
+    );
+
+    fireEvent.click(within(picker).getByRole("button", { name: "Show all" }));
+    expect(gridMock.props?.columns.map((column) => column.id)).toEqual([
+      '["group"]',
+      '["tail"]',
+    ]);
   });
 
   it("keeps the requested struct selected when Sidebar Flatten needs its parent first", () => {
@@ -2099,7 +2262,7 @@ describe("DataGrid window rendering", () => {
     openColumnMenu(1);
     fireEvent.click(
       screen.getByRole("menuitem", {
-        name: "Unflatten profile (2 columns → 1)",
+        name: "Unflatten profile",
       }),
     );
 
@@ -2123,7 +2286,7 @@ describe("DataGrid window rendering", () => {
     );
   });
 
-  it("removes a pin-mismatched child from its rail and restores it when repinned", async () => {
+  it("keeps split rail segments when children have different pin states", async () => {
     const profileType = struct({
       "city.name": utf8(),
       address: struct({ 'postal"code': int32() }),
@@ -2174,9 +2337,13 @@ describe("DataGrid window rendering", () => {
         (column) => column.id === '["profile","city.name"]',
       ) ?? -1;
     expect(unpinnedCityIndex).toBeGreaterThan(0);
-    expect(gridMock.props?.columns[unpinnedCityIndex]).not.toHaveProperty(
-      "groupRail",
-    );
+    expect(gridMock.props?.columns[unpinnedCityIndex]).toMatchObject({
+      groupRail: {
+        title: "profile · struct<…>",
+        start: true,
+        end: true,
+      },
+    });
 
     openColumnMenu(unpinnedCityIndex);
     fireEvent.click(screen.getByRole("menuitem", { name: "Pin column" }));
@@ -2392,6 +2559,64 @@ describe("DataGrid window rendering", () => {
       title: "wide.child_99",
       groupRail: { start: false, end: true },
     });
+    const picker = openSelectPicker();
+    expect(within(picker).getAllByRole("checkbox").length).toBeLessThan(20);
+    fireEvent.change(within(picker).getByRole("searchbox"), {
+      target: { value: "child_99" },
+    });
+    expect(within(picker).getAllByRole("checkbox")).toHaveLength(2);
+    expect(
+      within(picker).getByRole("checkbox", {
+        name: "Project wide.child_99",
+      }),
+    ).toBeChecked();
+  });
+
+  it("indexes one 10k-wide projection macro instead of rescanning the schema", () => {
+    let childNameReads = 0;
+    const children = Array.from({ length: 10_000 }, (_, index) => {
+      const field: desktop.SchemaField = {
+        name: "",
+        physicalType: "INT32",
+        logicalType: null,
+        children: [],
+      };
+      Object.defineProperty(field, "name", {
+        enumerable: true,
+        get: () => {
+          childNameReads += 1;
+          return `child_${index}`;
+        },
+      });
+      return field;
+    });
+    const wideSource: desktop.SourceSummary = {
+      ...source,
+      displayName: "10k-wide-struct.parquet",
+      rowCount: 1,
+      columnCount: 1,
+      schema: [
+        {
+          name: "wide",
+          physicalType: "GROUP",
+          logicalType: null,
+          children,
+        },
+      ],
+      schemaNodeCount: 10_001,
+    };
+    render(<DataGrid source={wideSource} />);
+    const picker = openSelectPicker();
+    childNameReads = 0;
+
+    fireEvent.click(
+      within(picker).getByRole("checkbox", { name: "Project wide" }),
+    );
+
+    expect(gridMock.props?.columns).toHaveLength(10_000);
+    expect(gridMock.props?.columns[0]?.id).toBe('["wide","child_0"]');
+    expect(gridMock.props?.columns[9_999]?.id).toBe('["wide","child_9999"]');
+    expect(childNameReads).toBeLessThan(100_000);
   });
 
   it("preserves a generated six-level struct path through recursive flattening", async () => {
@@ -2532,7 +2757,7 @@ describe("DataGrid window rendering", () => {
     openColumnMenu(0);
     fireEvent.click(
       screen.getByRole("menuitem", {
-        name: "Unflatten group (5 columns → 1; removes 5 filters, 1 sort)",
+        name: "Unflatten group",
       }),
     );
 
@@ -2584,7 +2809,7 @@ describe("DataGrid window rendering", () => {
     openColumnMenu(1);
     expect(
       screen.getByRole("menuitem", {
-        name: "Unflatten profile (2 columns → 1)",
+        name: "Unflatten profile",
       }),
     ).toBeInTheDocument();
   });
@@ -2597,10 +2822,10 @@ describe("DataGrid window rendering", () => {
     fireEvent.click(screen.getByRole("menuitem", { name: "Hide column" }));
     const picker = openSelectPicker();
     const lastColumn = within(picker).getByRole("checkbox", {
-      name: "Show column_7",
+      name: "Project column_7",
     });
     expect(lastColumn).not.toBeChecked();
-    expect(screen.getByLabelText("Query")).toHaveTextContent("[7/8 cols]");
+    expect(screen.getByLabelText("Query")).toHaveTextContent("[7 cols]");
     await waitFor(() =>
       expect(desktop.getDataWindow).toHaveBeenLastCalledWith(
         7,
@@ -2757,7 +2982,7 @@ describe("DataGrid window rendering", () => {
     const picker = openSelectPicker();
 
     fireEvent.click(
-      within(picker).getByRole("checkbox", { name: "Show column_7" }),
+      within(picker).getByRole("checkbox", { name: "Project column_7" }),
     );
 
     await waitFor(() =>
@@ -2791,7 +3016,7 @@ describe("DataGrid window rendering", () => {
 
     const picker = openSelectPicker();
     fireEvent.click(
-      within(picker).getByRole("checkbox", { name: "Show column_7" }),
+      within(picker).getByRole("checkbox", { name: "Project column_7" }),
     );
 
     expect(gridMock.props?.selection?.current).toBeUndefined();
@@ -2929,7 +3154,7 @@ describe("DataGrid window rendering", () => {
 
     fireEvent.click(within(picker).getByRole("button", { name: "Hide all" }));
 
-    expect(screen.getByLabelText("Query")).toHaveTextContent("[0/8 cols]");
+    expect(screen.getByLabelText("Query")).toHaveTextContent("[0 cols]");
     expect(screen.getByText("No columns selected.")).toBeInTheDocument();
     expect(
       within(picker).getByRole("button", { name: "Hide all" }),
@@ -2973,7 +3198,7 @@ describe("DataGrid window rendering", () => {
     });
 
     const lastColumn = within(picker).getByRole("checkbox", {
-      name: "Show column_9999",
+      name: "Project column_9999",
     });
     expect(lastColumn).toBeInTheDocument();
     expect(within(picker).getAllByRole("checkbox")).toHaveLength(1);
@@ -2982,10 +3207,7 @@ describe("DataGrid window rendering", () => {
     const selectButton = screen
       .getByLabelText("Query")
       .querySelector<HTMLButtonElement>(".query-select");
-    expect(selectButton).toHaveAttribute(
-      "title",
-      "9,999 of 10,000 columns visible",
-    );
+    expect(selectButton).toHaveAttribute("title", "9,999 projected columns");
     expect(selectButton?.title.length).toBeLessThan(100);
   });
 
@@ -2995,12 +3217,12 @@ describe("DataGrid window rendering", () => {
     );
 
     const picker = openSelectPicker();
-    const list = within(picker).getByRole("list", { name: "Columns" });
-    expect(list).toHaveStyle({ maxHeight: "288px" });
+    const list = within(picker).getByRole("tree", { name: "Columns" });
+    expect(list).toHaveStyle({ maxHeight: "336px" });
     expect(list.style.height).toBe("");
-    expect(within(list).getAllByRole("listitem")).toHaveLength(3);
+    expect(within(list).getAllByRole("treeitem")).toHaveLength(3);
     expect(within(picker).getByRole("status")).toHaveTextContent(
-      "3 of 3 visible",
+      "3 projected columns",
     );
   });
 
@@ -3013,12 +3235,12 @@ describe("DataGrid window rendering", () => {
     expect(search).toHaveFocus();
     fireEvent.keyDown(search, { key: "ArrowDown" });
     const first = within(picker).getByRole("checkbox", {
-      name: "Show column_0",
+      name: "Project column_0",
     });
     expect(first).toHaveFocus();
     fireEvent.keyDown(first, { key: "ArrowDown" });
     const second = within(picker).getByRole("checkbox", {
-      name: "Show column_1",
+      name: "Project column_1",
     });
     expect(second).toHaveFocus();
     fireEvent.keyDown(second, { key: " " });
@@ -3067,7 +3289,7 @@ describe("DataGrid window rendering", () => {
 
     const picker = openSelectPicker();
     fireEvent.click(
-      within(picker).getByRole("checkbox", { name: "Show column_0" }),
+      within(picker).getByRole("checkbox", { name: "Project column_0" }),
     );
 
     await waitFor(() =>
@@ -5933,6 +6155,9 @@ describe("DataGrid window rendering", () => {
       schemaNodeCount: 3,
     };
 
+    const consoleError = vi
+      .spyOn(console, "error")
+      .mockImplementation(() => undefined);
     render(<DataGrid source={nestedDuplicateSource} />);
     await waitFor(() =>
       expect(
@@ -5958,6 +6183,18 @@ describe("DataGrid window rendering", () => {
     );
     expect(gridMock.props?.columns).toHaveLength(1);
     expect(gridMock.props?.columns[0]?.id).toBe('["profile"]');
+
+    const picker = openSelectPicker();
+    const duplicateChildren = within(picker).getAllByRole("checkbox", {
+      name: "Project profile.city",
+    });
+    expect(duplicateChildren).toHaveLength(2);
+    duplicateChildren.forEach((child) => expect(child).toBeDisabled());
+    expect(
+      within(picker).getAllByText(/contains duplicate child names/),
+    ).toHaveLength(2);
+    expect(consoleError.mock.calls.flat().join(" ")).not.toContain("same key");
+    consoleError.mockRestore();
   });
 
   it("keeps duplicate sibling names as distinct schema nodes", () => {
