@@ -18,7 +18,7 @@ import {
   type SchemaField,
   type SourceSummary,
 } from "../desktop";
-import { SchemaTreeNode } from "../SchemaTree";
+import { LIST_MAP_COLUMN_REASON, SchemaTreeNode } from "../SchemaTree";
 import {
   fieldPathKey,
   formatFieldPath,
@@ -29,6 +29,8 @@ import {
 const LOGICAL_SCHEMA_NODE_LIMIT = 2_048;
 const LOGICAL_SCHEMA_DEPTH_LIMIT = 64;
 const LOGICAL_SCHEMA_TEXT_LIMIT = 160;
+const DUPLICATE_PATH_ACTION_REASON =
+  "Unavailable because this source has duplicate column names.";
 
 type StatisticsState =
   | { kind: "idle" }
@@ -53,18 +55,20 @@ export function SchemaSidebar({
   source,
   dataTypes = new Map(),
   pathActionsEnabled = true,
-  pathActionsDisabledDescriptionId,
+  flattenedPathKeys = new Set(),
   onSelectPath,
   onFlattenPath,
+  onUnflattenPath,
 }: {
   open: boolean;
   selectedPath: FieldPath | null;
   source: SourceSummary;
   dataTypes?: ReadonlyMap<string, DataType>;
   pathActionsEnabled?: boolean;
-  pathActionsDisabledDescriptionId?: string;
+  flattenedPathKeys?: ReadonlySet<string>;
   onSelectPath: (fieldPath: FieldPath) => void;
   onFlattenPath: (fieldPath: FieldPath) => void;
+  onUnflattenPath?: (fieldPath: FieldPath) => void;
 }) {
   const [statistics, setStatistics] = useState<StatisticsState>({
     kind: "idle",
@@ -197,15 +201,14 @@ export function SchemaSidebar({
                   pathActionDisabledReason={
                     pathActionsEnabled
                       ? undefined
-                      : "Path actions are unavailable because the source contains duplicate top-level names."
+                      : DUPLICATE_PATH_ACTION_REASON
                   }
-                  pathActionDisabledDescriptionId={
-                    pathActionsDisabledDescriptionId
-                  }
+                  flattenedPathKeys={flattenedPathKeys}
                   onSelectPath={(path, selectedField) =>
                     void selectField(path, selectedField)
                   }
                   onFlattenPath={onFlattenPath}
+                  onUnflattenPath={onUnflattenPath}
                 />
               ) : (
                 <LogicalSchemaNode
@@ -216,11 +219,10 @@ export function SchemaSidebar({
                   dataType={dataType}
                   selectedPath={selectedPath}
                   pathActionsEnabled={pathActionsEnabled}
-                  pathActionsDisabledDescriptionId={
-                    pathActionsDisabledDescriptionId
-                  }
+                  flattenedPathKeys={flattenedPathKeys}
                   onSelect={selectField}
                   onFlatten={onFlattenPath}
+                  onUnflatten={onUnflattenPath}
                 />
               );
             })}
@@ -252,9 +254,10 @@ function LogicalSchemaNode({
   dataType,
   selectedPath,
   pathActionsEnabled,
-  pathActionsDisabledDescriptionId,
+  flattenedPathKeys,
   onSelect,
   onFlatten,
+  onUnflatten,
 }: {
   name: string;
   field: SchemaField;
@@ -262,18 +265,31 @@ function LogicalSchemaNode({
   dataType: DataType;
   selectedPath: FieldPath | null;
   pathActionsEnabled: boolean;
-  pathActionsDisabledDescriptionId?: string;
+  flattenedPathKeys: ReadonlySet<string>;
   onSelect: (fieldPath: FieldPath, field: SchemaField) => void;
   onFlatten?: (fieldPath: FieldPath) => void;
+  onUnflatten?: (fieldPath: FieldPath) => void;
 }) {
   const projection = useMemo(
     () => _projectLogicalSchema(name, dataType),
     [dataType, name],
   );
   const flattenDisabledReason = flattenUnavailableReason(field);
+  const flattened = flattenedPathKeys.has(fieldPathKey(fieldPath));
   const pathActionDisabledReason = pathActionsEnabled
     ? undefined
-    : "Path actions are unavailable because the source contains duplicate top-level names.";
+    : DUPLICATE_PATH_ACTION_REASON;
+  const flattenAccessibleReason =
+    pathActionDisabledReason ??
+    (!flattened && flattenDisabledReason !== undefined
+      ? `Unavailable: ${flattenUnavailableLabel(field).toLowerCase()}.`
+      : undefined);
+  const flattenSecondaryLabel =
+    pathActionDisabledReason !== undefined
+      ? "Duplicate column names"
+      : !flattened && flattenDisabledReason !== undefined
+        ? flattenUnavailableLabel(field)
+        : undefined;
   return (
     <li>
       <button
@@ -281,10 +297,10 @@ function LogicalSchemaNode({
         type="button"
         disabled={!pathActionsEnabled}
         title={pathActionDisabledReason}
-        aria-describedby={
+        aria-label={
           pathActionDisabledReason === undefined
             ? undefined
-            : pathActionsDisabledDescriptionId
+            : `${formatFieldPath(fieldPath)}. ${pathActionDisabledReason}`
         }
         aria-pressed={
           selectedPath !== null && sameFieldPath(selectedPath, fieldPath)
@@ -296,27 +312,33 @@ function LogicalSchemaNode({
           {projection.type}
         </span>
       </button>
-      {dataType.typeId === Type.Struct && onFlatten !== undefined && (
-        <button
-          className="schema-flatten-action"
-          type="button"
-          disabled={
-            pathActionDisabledReason !== undefined ||
-            flattenDisabledReason !== undefined
-          }
-          title={pathActionDisabledReason ?? flattenDisabledReason}
-          aria-describedby={
-            pathActionDisabledReason === undefined
-              ? undefined
-              : pathActionsDisabledDescriptionId
-          }
-          onClick={() => onFlatten(fieldPath)}
-        >
-          {flattenDisabledReason === undefined
-            ? "Flatten to columns"
-            : flattenUnavailableLabel(field)}
-        </button>
-      )}
+      {dataType.typeId === Type.Struct &&
+        (onFlatten !== undefined || onUnflatten !== undefined) && (
+          <button
+            className="schema-flatten-action"
+            type="button"
+            disabled={
+              pathActionDisabledReason !== undefined ||
+              (!flattened && flattenDisabledReason !== undefined)
+            }
+            title={
+              pathActionDisabledReason ??
+              (flattened ? undefined : flattenDisabledReason)
+            }
+            aria-label={`${flattened ? "Unflatten" : "Flatten"} ${formatFieldPath(fieldPath)}${flattenAccessibleReason === undefined ? "" : `. ${flattenAccessibleReason}`}`}
+            onClick={() =>
+              flattened ? onUnflatten?.(fieldPath) : onFlatten?.(fieldPath)
+            }
+          >
+            <span>{flattened ? "Unflatten" : "Flatten"}</span>
+            {flattenSecondaryLabel !== undefined && (
+              <span className="menu-shortcut">{flattenSecondaryLabel}</span>
+            )}
+          </button>
+        )}
+      {projection.rows.some(
+        (row) => !row.addressable && row.segments.length > 0,
+      ) && <p className="schema-continuation">{LIST_MAP_COLUMN_REASON}</p>}
       {projection.rows.length > 0 && (
         <ul className="logical-schema-rows">
           {projection.rows.map((row, index) => {
@@ -328,13 +350,31 @@ function LogicalSchemaNode({
             const selectable = row.addressable && rowField !== undefined;
             const rowPathDisabledReason =
               pathActionDisabledReason ??
-              (row.addressable && rowField === undefined
-                ? "Path actions are unavailable because this field is not uniquely addressable in the source schema."
-                : undefined);
+              (!row.addressable && row.segments.length > 0
+                ? LIST_MAP_COLUMN_REASON
+                : row.addressable && rowField === undefined
+                  ? "This field cannot be selected because its name is not unique in the source schema."
+                  : undefined);
             const rowFlattenDisabledReason =
               rowField === undefined
                 ? undefined
                 : flattenUnavailableReason(rowField);
+            const rowFlattened = flattenedPathKeys.has(fieldPathKey(rowPath));
+            const rowFlattenAccessibleReason =
+              pathActionDisabledReason ??
+              (!rowFlattened &&
+              rowFlattenDisabledReason !== undefined &&
+              rowField !== undefined
+                ? `Unavailable: ${flattenUnavailableLabel(rowField).toLowerCase()}.`
+                : undefined);
+            const rowFlattenSecondaryLabel =
+              pathActionDisabledReason !== undefined
+                ? "Duplicate column names"
+                : !rowFlattened &&
+                    rowFlattenDisabledReason !== undefined &&
+                    rowField !== undefined
+                  ? flattenUnavailableLabel(rowField)
+                  : undefined;
             return (
               <li
                 key={`${index}:${row.name}`}
@@ -346,10 +386,10 @@ function LogicalSchemaNode({
                   type="button"
                   disabled={!pathActionsEnabled || !selectable}
                   title={rowPathDisabledReason}
-                  aria-describedby={
-                    pathActionDisabledReason === undefined
+                  aria-label={
+                    rowPathDisabledReason === undefined
                       ? undefined
-                      : pathActionsDisabledDescriptionId
+                      : `${formatFieldPath(rowPath)}. ${rowPathDisabledReason}`
                   }
                   aria-pressed={
                     selectedPath !== null &&
@@ -366,27 +406,32 @@ function LogicalSchemaNode({
                 </button>
                 {selectable &&
                   row.dataType.typeId === Type.Struct &&
-                  onFlatten !== undefined && (
+                  (onFlatten !== undefined || onUnflatten !== undefined) && (
                     <button
                       className="schema-flatten-action"
                       type="button"
                       disabled={
                         pathActionDisabledReason !== undefined ||
-                        rowFlattenDisabledReason !== undefined
+                        (!rowFlattened &&
+                          rowFlattenDisabledReason !== undefined)
                       }
                       title={
-                        pathActionDisabledReason ?? rowFlattenDisabledReason
+                        pathActionDisabledReason ??
+                        (rowFlattened ? undefined : rowFlattenDisabledReason)
                       }
-                      aria-describedby={
-                        pathActionDisabledReason === undefined
-                          ? undefined
-                          : pathActionsDisabledDescriptionId
+                      aria-label={`${rowFlattened ? "Unflatten" : "Flatten"} ${formatFieldPath(rowPath)}${rowFlattenAccessibleReason === undefined ? "" : `. ${rowFlattenAccessibleReason}`}`}
+                      onClick={() =>
+                        rowFlattened
+                          ? onUnflatten?.(rowPath)
+                          : onFlatten?.(rowPath)
                       }
-                      onClick={() => onFlatten(rowPath)}
                     >
-                      {rowFlattenDisabledReason === undefined
-                        ? "Flatten to columns"
-                        : flattenUnavailableLabel(rowField)}
+                      <span>{rowFlattened ? "Unflatten" : "Flatten"}</span>
+                      {rowFlattenSecondaryLabel !== undefined && (
+                        <span className="menu-shortcut">
+                          {rowFlattenSecondaryLabel}
+                        </span>
+                      )}
                     </button>
                   )}
               </li>
@@ -824,9 +869,8 @@ function flattenUnavailableReason(field: SchemaField): string | undefined {
 }
 
 function flattenUnavailableLabel(field: SchemaField): string {
-  if (field.children.length === 0)
-    return "Flatten unavailable: no child fields";
-  return "Flatten unavailable: duplicate child names";
+  if (field.children.length === 0) return "No child fields";
+  return "Duplicate child names";
 }
 
 function formatApproximateCount(value: number): string {

@@ -188,13 +188,71 @@ describe("color theme", () => {
     });
     expectDeclarations(".viewda-grid-header-prefix-text", {
       direction: "rtl",
-      "unicode-bidi": "isolate",
       "text-overflow": "ellipsis",
+    });
+    expectDeclarations(".viewda-grid-header-prefix-content", {
+      direction: "ltr",
+      "unicode-bidi": "isolate",
+    });
+    expectDeclarations(".viewda-grid-header-bidi-control", {
+      display: "none",
     });
     expectDeclarations(".viewda-grid-header-prefix-separator", {
       direction: "ltr",
       "unicode-bidi": "isolate",
       flex: "0 0 auto",
+    });
+    expect(() => declaration(".viewda-grid-header-leaf", "color")).toThrow(
+      "Missing color",
+    );
+  });
+
+  it("keeps flattened group rails continuous and visible in both themes", () => {
+    expectDeclarations(".viewda-grid-group-rail", {
+      right: "-1px",
+      height: "2px",
+      background: "var(--grid-selection-strong)",
+      "pointer-events": "none",
+    });
+    expect(() => declaration(".viewda-grid-group-rail", "opacity")).toThrow(
+      "Missing opacity",
+    );
+    expectDeclarations(
+      ".viewda-grid-column-header.has-group-start .viewda-grid-group-rail",
+      { left: "4px" },
+    );
+    expectDeclarations(
+      ".viewda-grid-column-header.has-group-end .viewda-grid-group-rail",
+      { right: "4px" },
+    );
+
+    const lightRoot = styles.match(/:root \{([^}]*)\}/s)?.[1];
+    const darkRoot = styles.match(
+      /:root\[data-theme="dark"\] \{([^}]*)\}/s,
+    )?.[1];
+    expect(lightRoot).toBeDefined();
+    expect(darkRoot).toBeDefined();
+    if (lightRoot === undefined || darkRoot === undefined) {
+      throw new Error("Theme variables are missing.");
+    }
+    for (const root of [lightRoot, darkRoot]) {
+      expect(
+        contrastRatio(
+          readColorVariable(root, "grid-selection-strong"),
+          readColorVariable(root, "grid-header"),
+        ),
+      ).toBeGreaterThanOrEqual(3);
+    }
+  });
+
+  it("keeps picker path leaves visible and plain names tail-truncated", () => {
+    expectDeclarations(".column-picker-name", {
+      display: "flex",
+      overflow: "hidden",
+    });
+    expectDeclarations(".column-picker-name.is-plain", {
+      display: "block",
+      "text-overflow": "ellipsis",
     });
   });
 
@@ -305,6 +363,27 @@ describe("grid layout containment", () => {
     });
   });
 
+  it("reserves a stable notice lane outside the interactive grid", () => {
+    expectDeclarations(".data-grid-view::before", {
+      "min-height": "32px",
+      flex: "0 0 32px",
+      order: "1",
+    });
+    expectDeclarations(
+      ".data-grid-view > :not(.query-row):not(.grid-controls)",
+      { order: "2" },
+    );
+    expectDeclarations(".grid-controls", {
+      position: "absolute",
+      top: "34px",
+      right: "0px",
+      left: "0px",
+      height: "32px",
+      "min-height": "32px",
+    });
+    expectDeclarations(".query-row", { flex: "0 0 34px" });
+  });
+
   it("lets tiny viewport placement override Peek's normal resize floor", () => {
     expectDeclarations(".value-peek", {
       "min-width": "0px",
@@ -410,13 +489,13 @@ describe("schema field layout", () => {
 
     expect(
       declaration(
-        ".sidebar-schema-tree button.schema-field:hover",
+        ".sidebar-schema-tree button.schema-field:hover:not(:disabled)",
         "background",
       ),
     ).toBe("var(--grid-selection)");
     expect(
       declaration(
-        '.sidebar-schema-tree button.schema-field[aria-pressed="true"]',
+        '.sidebar-schema-tree button.schema-field[aria-pressed="true"]:not(:disabled)',
         "background",
       ),
     ).toBe("var(--grid-selection)");
@@ -426,6 +505,35 @@ describe("schema field layout", () => {
         "outline",
       ),
     ).toBe("2px solid var(--grid-selection-strong)");
+    expectDeclarations(".sidebar-schema-tree button.schema-field:disabled", {
+      color: "var(--grid-text-faint)",
+      cursor: "default",
+    });
+    expect(
+      declaration(
+        ".sidebar-schema-tree button.schema-field:disabled .schema-type",
+        "color",
+      ),
+    ).toBe("inherit");
+    expectDeclarations(".sidebar-schema-tree .schema-flatten-action:disabled", {
+      color: "var(--grid-text-faint)",
+      cursor: "default",
+    });
+    expectDeclarations(".sidebar-schema-tree .schema-flatten-action", {
+      display: "grid",
+      "justify-items": "start",
+      "line-height": "1.2",
+    });
+    expectDeclarations(
+      ".sidebar-schema-tree .schema-flatten-action .menu-shortcut",
+      { "font-size": "9px" },
+    );
+    expect(
+      declaration(
+        ".sidebar-schema-tree .schema-flatten-action:hover:not(:disabled)",
+        "background",
+      ),
+    ).toBe("var(--grid-selection)");
   });
 });
 

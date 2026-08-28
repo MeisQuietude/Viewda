@@ -1,4 +1,13 @@
 import type { FieldPath, SchemaField } from "./desktop";
+import {
+  fieldPathKey,
+  formatFieldPath,
+  formatFieldPathSegment,
+  sameFieldPath,
+} from "./data-grid/field-path";
+
+export const LIST_MAP_COLUMN_REASON =
+  "Fields inside a list or map cannot be used as columns.";
 
 export interface RenderedSchemaField extends SchemaField {
   hasUnloadedChildren?: boolean;
@@ -19,9 +28,10 @@ export function SchemaTreeNode({
   selectedPath,
   addressable = true,
   pathActionDisabledReason,
-  pathActionDisabledDescriptionId,
+  flattenedPathKeys,
   onSelectPath,
   onFlattenPath,
+  onUnflattenPath,
 }: {
   field: RenderedSchemaField;
   selected?: boolean;
@@ -33,12 +43,30 @@ export function SchemaTreeNode({
   selectedPath?: FieldPath | null;
   addressable?: boolean;
   pathActionDisabledReason?: string;
-  pathActionDisabledDescriptionId?: string;
+  flattenedPathKeys?: ReadonlySet<string>;
   onSelectPath?: (fieldPath: FieldPath, field: SchemaField) => void;
   onFlattenPath?: (fieldPath: FieldPath) => void;
+  onUnflattenPath?: (fieldPath: FieldPath) => void;
 }) {
   const isLeaf = field.children.length === 0 && !field.hasUnloadedChildren;
   const duplicateChildren = duplicateFieldNames(field.children);
+  const flattened = flattenedPathKeys?.has(fieldPathKey(fieldPath)) ?? false;
+  const flattenDisabledReason =
+    pathActionDisabledReason ??
+    (!flattened && duplicateChildren.size > 0
+      ? "Flatten is unavailable because this struct contains duplicate child names."
+      : undefined);
+  const flattenAccessibleReason =
+    pathActionDisabledReason ??
+    (!flattened && duplicateChildren.size > 0
+      ? "Unavailable: duplicate child names."
+      : undefined);
+  const flattenSecondaryLabel =
+    pathActionDisabledReason !== undefined
+      ? "Duplicate column names"
+      : !flattened && duplicateChildren.size > 0
+        ? "Duplicate child names"
+        : undefined;
   const pathActionUnavailable =
     onSelectPath !== undefined && pathActionDisabledReason !== undefined;
   const leafIndex = field.leafIndex ?? leafOffset;
@@ -71,49 +99,55 @@ export function SchemaTreeNode({
           type="button"
           disabled={pathActionUnavailable}
           title={pathActionDisabledReason}
-          aria-describedby={
-            pathActionUnavailable ? pathActionDisabledDescriptionId : undefined
+          aria-label={
+            pathActionUnavailable
+              ? `${formatFieldPath(fieldPath)}. ${pathActionDisabledReason}`
+              : undefined
           }
           aria-pressed={
             selected ||
             (isLeaf && selectedLeaf === leafIndex) ||
-            samePath(selectedPath, fieldPath)
+            (selectedPath !== null &&
+              selectedPath !== undefined &&
+              sameFieldPath(selectedPath, fieldPath))
           }
           onClick={selectable}
         >
           {content}
         </button>
       )}
-      {addressable && isStructField(field) && onFlattenPath !== undefined && (
-        <button
-          className="schema-flatten-action"
-          type="button"
-          disabled={
-            pathActionDisabledReason !== undefined || duplicateChildren.size > 0
-          }
-          title={
-            pathActionDisabledReason ??
-            (duplicateChildren.size > 0
-              ? "Flatten is unavailable because this struct contains duplicate child names."
-              : undefined)
-          }
-          aria-describedby={
-            pathActionDisabledReason === undefined
-              ? undefined
-              : pathActionDisabledDescriptionId
-          }
-          onClick={() => onFlattenPath(fieldPath)}
-        >
-          {duplicateChildren.size > 0
-            ? "Flatten unavailable: duplicate child names"
-            : "Flatten to columns"}
-        </button>
+      {addressable &&
+        isStructField(field) &&
+        (onFlattenPath !== undefined || onUnflattenPath !== undefined) && (
+          <button
+            className="schema-flatten-action"
+            type="button"
+            disabled={flattenDisabledReason !== undefined}
+            title={flattenDisabledReason}
+            aria-label={`${flattened ? "Unflatten" : "Flatten"} ${formatFieldPath(fieldPath)}${flattenAccessibleReason === undefined ? "" : `. ${flattenAccessibleReason}`}`}
+            onClick={() =>
+              flattened
+                ? onUnflattenPath?.(fieldPath)
+                : onFlattenPath?.(fieldPath)
+            }
+          >
+            <span>{flattened ? "Unflatten" : "Flatten"}</span>
+            {flattenSecondaryLabel !== undefined && (
+              <span className="menu-shortcut">{flattenSecondaryLabel}</span>
+            )}
+          </button>
+        )}
+      {addressable && isListOrMapField(field) && field.children.length > 0 && (
+        <p className="schema-continuation">{LIST_MAP_COLUMN_REASON}</p>
       )}
       {field.children.length > 0 && (
         <ul>
           {field.children.map((child, childIndex) => {
             const duplicateReason = duplicateChildren.has(child.name)
-              ? `Path actions are unavailable because this struct contains multiple fields named ${JSON.stringify(child.name)}.`
+              ? `This field cannot be selected because its parent contains multiple fields named ${formatFieldPathSegment(child.name)}.`
+              : undefined;
+            const containerReason = isListOrMapField(field)
+              ? LIST_MAP_COLUMN_REASON
               : undefined;
             return (
               <SchemaTreeNode
@@ -130,13 +164,12 @@ export function SchemaTreeNode({
                   duplicateReason === undefined
                 }
                 pathActionDisabledReason={
-                  pathActionDisabledReason ?? duplicateReason
+                  pathActionDisabledReason ?? duplicateReason ?? containerReason
                 }
-                pathActionDisabledDescriptionId={
-                  pathActionDisabledDescriptionId
-                }
+                flattenedPathKeys={flattenedPathKeys}
                 onSelectPath={onSelectPath}
                 onFlattenPath={onFlattenPath}
+                onUnflattenPath={onUnflattenPath}
               />
             );
           })}
@@ -160,15 +193,10 @@ function isStructField(field: SchemaField): boolean {
   );
 }
 
-function samePath(
-  left: readonly string[] | null | undefined,
-  right: readonly string[],
-): boolean {
+function isListOrMapField(field: SchemaField): boolean {
   return (
-    left !== null &&
-    left !== undefined &&
-    left.length === right.length &&
-    left.every((segment, index) => segment === right[index])
+    field.logicalType?.startsWith("List") === true ||
+    field.logicalType?.startsWith("Map") === true
   );
 }
 

@@ -1,7 +1,6 @@
 import {
   useCallback,
   useEffect,
-  useId,
   useLayoutEffect,
   useMemo,
   useRef,
@@ -204,6 +203,11 @@ interface ColumnState {
   width: number;
   pinned: boolean;
   hidden: boolean;
+}
+
+interface ColumnNotice {
+  message: string;
+  kind: "status" | "alert";
 }
 
 interface HeaderMenu {
@@ -602,7 +606,7 @@ export function DataGrid({
   const [flattenedParents, setFlattenedParents] = useState<
     ReadonlyMap<string, ColumnState>
   >(() => new Map());
-  const [columnNotice, setColumnNotice] = useState<string | null>(null);
+  const [columnNotice, setColumnNotice] = useState<ColumnNotice | null>(null);
   const [monospaceColumns, setMonospaceColumns] = useState<ReadonlySet<string>>(
     () => new Set(),
   );
@@ -773,7 +777,6 @@ export function DataGrid({
     !pathActionsAvailable &&
     source.schemaIsTruncated &&
     (schemaTotal === null || schema.length < schemaTotal);
-  const duplicatePathActionsReasonId = useId();
   const identityFieldPaths = useMemo(
     () => schema.map((field) => [field.name]),
     [schema],
@@ -813,13 +816,36 @@ export function DataGrid({
     () => visibleColumnStates.map((column) => column.fieldPath),
     [visibleColumnStates],
   );
-  const visibleProjectionKey = visibleFieldPaths.map(fieldPathKey).join("\0");
+  const visibleProjectionKey = useMemo(
+    () => visibleFieldPaths.map(fieldPathKey).join("\0"),
+    [visibleFieldPaths],
+  );
+  const visibleColumnKeys = useMemo(
+    () => visibleColumnStates.map((column) => column.key),
+    [visibleColumnStates],
+  );
+  const previousVisibleColumnKeysRef = useRef(visibleColumnKeys);
+  useLayoutEffect(() => {
+    const previous = previousVisibleColumnKeysRef.current;
+    previousVisibleColumnKeysRef.current = visibleColumnKeys;
+    setPeek((current) => {
+      if (
+        current === null ||
+        previous[current.address.column] ===
+          visibleColumnKeys[current.address.column]
+      ) {
+        return current;
+      }
+      peekValueCacheRef.current = null;
+      return null;
+    });
+  }, [visibleColumnKeys]);
   const selectTitle = useMemo(() => {
     if (selectIsIdentity) {
       return "*";
     }
     if (!pathActionsAvailable) {
-      return "All source columns in physical order";
+      return "All source columns in file order";
     }
     if (visibleFieldPaths.length > SELECT_TOOLTIP_COLUMN_LIMIT) {
       return `${visibleFieldPaths.length.toLocaleString("en-US")} of ${columnStates.length.toLocaleString("en-US")} columns visible`;
@@ -835,9 +861,11 @@ export function DataGrid({
   const pickerColumns = useMemo(
     () =>
       columnStates.map((column) => {
+        const titleParts = fieldPathTitleParts(column.fieldPath);
         return {
           id: column.key,
           name: column.title,
+          ...titleParts,
           type: column.field.logicalType ?? column.field.physicalType,
           visible: !column.hidden,
           pinned: column.pinned,
@@ -856,6 +884,19 @@ export function DataGrid({
   const orderByClause = useMemo(
     () => formatOrderByClause(sort, schema),
     [sort, schema],
+  );
+  const railMetadataByColumnKey = useMemo(
+    () =>
+      flattenedRailMetadata(
+        visibleColumnStates,
+        flattenedParents,
+        logicalDataTypes,
+      ),
+    [flattenedParents, logicalDataTypes, visibleColumnStates],
+  );
+  const flattenedPathKeys = useMemo(
+    () => new Set(flattenedParents.keys()),
+    [flattenedParents],
   );
 
   useEffect(() => {
@@ -876,56 +917,18 @@ export function DataGrid({
 
   const columns = useMemo<GridColumn[]>(
     () =>
-      visibleColumnStates.map((column, index) => {
+      visibleColumnStates.map((column) => {
         const displayedSort = pendingView?.sort ?? sort;
         const sortIndex = displayedSort.findIndex((entry) =>
           sameFieldPath(entry.fieldPath, column.fieldPath),
         );
         const key = column.key;
-        const groupPath = flattenedRailPath(
-          column.fieldPath,
-          column.pinned,
-          flattenedParents,
-        );
-        const sameGroup = (candidate: ColumnState | undefined) =>
-          candidate !== undefined &&
-          candidate.pinned === column.pinned &&
-          groupPath !== null &&
-          sameFieldPath(
-            flattenedRailPath(
-              candidate.fieldPath,
-              candidate.pinned,
-              flattenedParents,
-            ) ?? [],
-            groupPath,
-          );
-        const groupType =
-          groupPath === null
-            ? undefined
-            : logicalDataTypes.get(fieldPathKey(groupPath));
-        const prefix = column.fieldPath.slice(0, -1);
+        const groupRail = railMetadataByColumnKey.get(key);
         return {
           id: key,
           title: column.title,
-          ...(prefix.length === 0
-            ? {}
-            : {
-                titlePrefix: `${prefix.map(formatFieldPathSegment).join(".")}.`,
-                titleLeaf: formatFieldPathSegment(column.fieldPath.at(-1)!),
-              }),
-          ...(groupPath === null
-            ? {}
-            : {
-                groupRail: {
-                  title: `${formatFieldPath(groupPath)} · ${
-                    groupType === undefined
-                      ? schemaRailType(resolveSchemaField(schema, groupPath))
-                      : formatDataTypeLabel(groupType)
-                  }`,
-                  start: !sameGroup(visibleColumnStates[index - 1]),
-                  end: !sameGroup(visibleColumnStates[index + 1]),
-                },
-              }),
+          ...fieldPathTitleParts(column.fieldPath),
+          ...(groupRail === undefined ? {} : { groupRail }),
           width: column.width,
           monospace: monospaceColumns.has(key),
           pinned: column.pinned,
@@ -945,12 +948,10 @@ export function DataGrid({
         };
       }),
     [
-      flattenedParents,
-      logicalDataTypes,
       monospaceColumns,
       pendingView,
       pathActionsAvailable,
-      schema,
+      railMetadataByColumnKey,
       sort,
       visibleColumnStates,
     ],
@@ -2542,20 +2543,23 @@ export function DataGrid({
         const parent = current[index];
         if (parent === undefined || !isStructField(parent.field)) {
           const parentPath = fieldPath.slice(0, -1);
-          setColumnNotice(
-            parent === undefined
-              ? flattenedParents.has(fieldPathKey(fieldPath))
-                ? `${formatFieldPath(fieldPath)} is already flattened.`
-                : `Flatten ${formatFieldPath(parentPath) || "the parent struct"} first.`
-              : `${formatFieldPath(fieldPath)} is not a struct field.`,
-          );
+          setColumnNotice({
+            message:
+              parent === undefined
+                ? flattenedParents.has(fieldPathKey(fieldPath))
+                  ? `${formatFieldPath(fieldPath)} is already flattened.`
+                  : `Flatten ${formatFieldPath(parentPath) || "the parent struct"} first.`
+                : `${formatFieldPath(fieldPath)} is not a struct field.`,
+            kind: "status",
+          });
           return current;
         }
         const duplicateChild = duplicateChildName(parent.field);
         if (duplicateChild !== undefined) {
-          setColumnNotice(
-            `${formatFieldPath(fieldPath)} cannot be flattened because it contains multiple fields named ${formatFieldPathSegment(duplicateChild)}.`,
-          );
+          setColumnNotice({
+            message: `${formatFieldPath(fieldPath)} cannot be flattened because it contains multiple fields named ${formatFieldPathSegment(duplicateChild)}.`,
+            kind: "status",
+          });
           return current;
         }
         const children = parent.field.children.map((field) => {
@@ -2573,9 +2577,10 @@ export function DataGrid({
           next.set(fieldPathKey(parent.fieldPath), parent);
           return next;
         });
-        setColumnNotice(
-          `${formatFieldPath(fieldPath)} expanded to ${children.length.toLocaleString("en-US")} columns.`,
-        );
+        setColumnNotice({
+          message: `Flattened ${formatFieldPath(fieldPath)} into ${children.length.toLocaleString("en-US")} columns.`,
+          kind: "status",
+        });
         setSelection(clearColumnSelection);
         setCopyLimit(null);
         return [
@@ -2642,11 +2647,16 @@ export function DataGrid({
           current.sort.filter((column) => !dependentSort(column)),
         );
       }
-      setColumnNotice(
-        removedFilterPaths.length + removedSortPaths.length === 0
-          ? `${formatFieldPath(fieldPath)} restored as one column.`
-          : `${formatFieldPath(fieldPath)} restored; removed ${formatDroppedPathNotice(removedFilterPaths, removedSortPaths)}.`,
-      );
+      setColumnNotice({
+        message:
+          removedFilterPaths.length + removedSortPaths.length === 0
+            ? `Unflattened ${formatFieldPath(fieldPath)} into one column.`
+            : `Unflattened ${formatFieldPath(fieldPath)} into one column; removed ${formatDroppedPathNotice(removedFilterPaths, removedSortPaths)}.`,
+        kind:
+          removedFilterPaths.length + removedSortPaths.length === 0
+            ? "status"
+            : "alert",
+      });
       setSelection(clearColumnSelection);
       setCopyLimit(null);
       setHeaderMenu(null);
@@ -3226,6 +3236,36 @@ export function DataGrid({
     setSchemaFocusRequest((request) => request + 1);
   }, []);
 
+  const flattenFromSidebar = useCallback(
+    (fieldPath: FieldPath) => {
+      const field = columnStates.find((column) =>
+        sameFieldPath(column.fieldPath, fieldPath),
+      )?.field;
+      selectSchemaPath(fieldPath);
+      flattenPath(fieldPath);
+      if (
+        field !== undefined &&
+        isStructField(field) &&
+        duplicateChildName(field) === undefined &&
+        field.children[0] !== undefined
+      ) {
+        const childPath = [...fieldPath, field.children[0].name];
+        schemaFocusPathRef.current = childPath;
+        setSelectedSchemaPath(childPath);
+        setSchemaFocusRequest((request) => request + 1);
+      }
+    },
+    [columnStates, flattenPath, selectSchemaPath],
+  );
+
+  const unflattenFromSidebar = useCallback(
+    (fieldPath: FieldPath) => {
+      unflattenPath(fieldPath);
+      selectSchemaPath(fieldPath);
+    },
+    [selectSchemaPath, unflattenPath],
+  );
+
   const openFilterForCell = useCallback(
     (fieldPath: FieldPath, row: number, bounds: Rectangle) => {
       const field = resolveSchemaField(schema, fieldPath);
@@ -3276,14 +3316,35 @@ export function DataGrid({
     headerMenu === null
       ? undefined
       : columnStates.find((column) => column.key === headerMenu.columnKey);
-  const menuUnflattenPaths =
+  const menuColumnDuplicateChild =
+    menuColumn === undefined ? undefined : duplicateChildName(menuColumn.field);
+  const menuView = pendingView ?? activeView;
+  const menuUnflattenActions =
     menuColumn === undefined
       ? []
       : menuColumn.fieldPath
           .slice(0, -1)
           .map((_, index) => menuColumn.fieldPath.slice(0, index + 1))
           .filter((path) => flattenedParents.has(fieldPathKey(path)))
-          .reverse();
+          .reverse()
+          .map((path) => ({
+            path,
+            columnCount: columnStates.filter(
+              (column) =>
+                column.fieldPath.length > path.length &&
+                fieldPathStartsWith(column.fieldPath, path),
+            ).length,
+            filterCount: menuView.filters.filter(
+              (filter) =>
+                filter.fieldPath.length > path.length &&
+                fieldPathStartsWith(filter.fieldPath, path),
+            ).length,
+            sortCount: menuView.sort.filter(
+              (sortColumn) =>
+                sortColumn.fieldPath.length > path.length &&
+                fieldPathStartsWith(sortColumn.fieldPath, path),
+            ).length,
+          }));
   const peekValue = resolvedPeek?.value;
   const peekLoading =
     peek !== null &&
@@ -3309,7 +3370,7 @@ export function DataGrid({
   const exportBusy = exportStarting || exportStatus?.state === "running";
   const exportUnavailableLabel = pathActionsAvailable
     ? "Export is available after dataset inspection finishes"
-    : "Export is unavailable because duplicate top-level names cannot be addressed by path";
+    : "Export is unavailable because this file repeats column names";
   const runningExportLabel =
     exportStatus?.state === "running"
       ? `Exporting ${exportStatus.fileName} (${formatBytes(exportStatus.bytesWritten)})…`
@@ -3428,8 +3489,15 @@ export function DataGrid({
               className={`query-where ${whereClause.length === 0 ? "query-empty-slot" : ""}`}
               type="button"
               disabled={!pathActionsAvailable}
-              aria-describedby={
-                pathActionsAvailable ? undefined : duplicatePathActionsReasonId
+              aria-label={
+                pathActionsAvailable
+                  ? undefined
+                  : "WHERE unavailable: duplicate column names"
+              }
+              title={
+                pathActionsAvailable
+                  ? undefined
+                  : "WHERE is unavailable because this source has duplicate column names."
               }
               aria-expanded={wherePopupOpen}
               onClick={toggleWherePopup}
@@ -3443,8 +3511,15 @@ export function DataGrid({
               className={`query-order ${orderByClause.length === 0 ? "query-empty-slot" : ""}`}
               type="button"
               disabled={!pathActionsAvailable}
-              aria-describedby={
-                pathActionsAvailable ? undefined : duplicatePathActionsReasonId
+              aria-label={
+                pathActionsAvailable
+                  ? undefined
+                  : "ORDER BY unavailable: duplicate column names"
+              }
+              title={
+                pathActionsAvailable
+                  ? undefined
+                  : "ORDER BY is unavailable because this source has duplicate column names."
               }
               aria-expanded={sortPopupOpen}
               onClick={() => {
@@ -3595,11 +3670,16 @@ export function DataGrid({
         <button
           className="query-fit-widths"
           type="button"
-          aria-label="Fit column widths"
-          title="Fit column widths"
           disabled={identitySchemaPending}
-          aria-describedby={
-            identitySchemaPending ? duplicatePathActionsReasonId : undefined
+          aria-label={
+            identitySchemaPending
+              ? "Fit column widths after duplicate columns finish loading"
+              : "Fit column widths"
+          }
+          title={
+            identitySchemaPending
+              ? "Fit column widths after duplicate columns finish loading"
+              : "Fit column widths"
           }
           onClick={fitVisibleColumnWidths}
         >
@@ -3632,27 +3712,26 @@ export function DataGrid({
       </div>
       {((hiddenCount > 0 && visibleColumnStates.length > 0) ||
         !pathActionsAvailable ||
-        columnNotice !== null ||
+        columnNotice?.kind === "status" ||
         copyLimit !== null ||
         copyingSelection) && (
         <div className="grid-controls">
           {copyingSelection && <span role="status">Preparing copy…</span>}
-          {columnNotice !== null && (
+          {columnNotice?.kind === "status" && (
             <span role="status">
-              {columnNotice}{" "}
+              {columnNotice.message}{" "}
               <button type="button" onClick={() => setColumnNotice(null)}>
                 Dismiss
               </button>
             </span>
           )}
           {!pathActionsAvailable && (
-            <span id={duplicatePathActionsReasonId} role="status">
-              Duplicate top-level names require source-order column identity.
+            <span role="status">
+              This file repeats column names, so Viewda identifies columns by
+              position. Filtering, sorting, flattening, statistics, and export
+              need unique names and are unavailable.
               {identitySchemaPending &&
-                " The complete schema is loading before rows can be read."}
-              {
-                " Path-based filtering, sorting, flattening, statistics, and export are unavailable."
-              }
+                " Viewda is loading every column before showing rows."}
             </span>
           )}
           {copyLimit !== null && (
@@ -3669,6 +3748,13 @@ export function DataGrid({
             </>
           )}
         </div>
+      )}
+      {columnNotice?.kind === "alert" && (
+        <ViewErrorAlert
+          error={{ message: columnNotice.message }}
+          dismissLabel="Dismiss Unflatten alert"
+          onDismiss={() => setColumnNotice(null)}
+        />
       )}
       {loadError !== null && (
         <ViewErrorAlert
@@ -3711,13 +3797,16 @@ export function DataGrid({
           source={schemaSource}
           dataTypes={logicalDataTypes}
           pathActionsEnabled={pathActionsAvailable}
-          pathActionsDisabledDescriptionId={
-            pathActionsAvailable ? undefined : duplicatePathActionsReasonId
-          }
+          flattenedPathKeys={flattenedPathKeys}
           onSelectPath={selectSchemaPath}
-          onFlattenPath={flattenPath}
+          onFlattenPath={flattenFromSidebar}
+          onUnflattenPath={unflattenFromSidebar}
         />
-        {visibleColumnStates.length === 0 ? (
+        {identitySchemaPending ? (
+          <div className="filtered-empty-state" role="status">
+            <p>Preparing columns…</p>
+          </div>
+        ) : visibleColumnStates.length === 0 ? (
           <div className="filtered-empty-state">
             <p>No columns selected.</p>
             <button type="button" onClick={showAllColumns}>
@@ -3901,6 +3990,7 @@ export function DataGrid({
           anchor={peek.bounds}
           focusRequest={peekFocusRequest}
           loading={peekLoading}
+          showCopyPath={pathActionsAvailable}
           onClose={() => setPeek(null)}
           onReturnFocus={() => gridRef.current?.focus()}
           onCopyIntent={(text) =>
@@ -3983,29 +4073,41 @@ export function DataGrid({
             <button
               type="button"
               role="menuitem"
-              disabled={duplicateChildName(menuColumn.field) !== undefined}
+              aria-label={
+                menuColumnDuplicateChild === undefined
+                  ? "Flatten"
+                  : `Flatten ${menuColumn.title}. Unavailable: duplicate child names.`
+              }
+              disabled={menuColumnDuplicateChild !== undefined}
               title={
-                duplicateChildName(menuColumn.field) === undefined
+                menuColumnDuplicateChild === undefined
                   ? undefined
                   : "Flatten is unavailable because this struct contains duplicate child names."
               }
               onClick={() => flattenPath(menuColumn.fieldPath)}
             >
-              {duplicateChildName(menuColumn.field) === undefined
-                ? "Flatten to columns"
-                : "Flatten unavailable: duplicate child names"}
+              <span>Flatten</span>
+              {menuColumnDuplicateChild !== undefined && (
+                <span className="menu-shortcut">Duplicate child names</span>
+              )}
             </button>
           )}
-          {menuUnflattenPaths.map((path) => (
+          {menuUnflattenActions.length > 0 && (
+            <div className="grid-menu-separator" role="separator" />
+          )}
+          {menuUnflattenActions.map((action) => (
             <button
-              key={fieldPathKey(path)}
+              key={fieldPathKey(action.path)}
               type="button"
               role="menuitem"
-              onClick={() => unflattenPath(path)}
+              onClick={() => unflattenPath(action.path)}
             >
-              Unflatten {formatFieldPath(path)}
+              {formatUnflattenActionLabel(action)}
             </button>
           ))}
+          {menuUnflattenActions.length > 0 && (
+            <div className="grid-menu-separator" role="separator" />
+          )}
           <button
             type="button"
             role="menuitem"
@@ -4485,6 +4587,32 @@ function duplicateChildName(field: SchemaField): string | undefined {
 const NOTICE_PATH_LIMIT = 3;
 const NOTICE_PATH_CHARACTER_LIMIT = 56;
 
+function formatUnflattenActionLabel({
+  path,
+  columnCount,
+  filterCount,
+  sortCount,
+}: {
+  path: FieldPath;
+  columnCount: number;
+  filterCount: number;
+  sortCount: number;
+}): string {
+  const removed = [
+    ...(filterCount === 0
+      ? []
+      : [
+          `${filterCount.toLocaleString("en-US")} ${filterCount === 1 ? "filter" : "filters"}`,
+        ]),
+    ...(sortCount === 0
+      ? []
+      : [
+          `${sortCount.toLocaleString("en-US")} ${sortCount === 1 ? "sort" : "sorts"}`,
+        ]),
+  ];
+  return `Unflatten ${formatFieldPath(path)} (${columnCount.toLocaleString("en-US")} ${columnCount === 1 ? "column" : "columns"} → 1${removed.length === 0 ? "" : `; removes ${removed.join(", ")}`})`;
+}
+
 function formatDroppedPathNotice(
   filterPaths: readonly FieldPath[],
   sortPaths: readonly FieldPath[],
@@ -4513,27 +4641,73 @@ function boundedNoticePath(path: FieldPath): string {
   return `${characters.slice(0, prefixLength).join("")}…${characters.slice(-suffixLength).join("")}`;
 }
 
-function outermostFlattenedPath(
-  fieldPath: readonly string[],
+function flattenedRailMetadata(
+  columns: readonly ColumnState[],
   flattenedParents: ReadonlyMap<string, ColumnState>,
-): FieldPath | null {
-  for (let length = 1; length < fieldPath.length; length += 1) {
-    const candidate = fieldPath.slice(0, length);
-    if (flattenedParents.has(fieldPathKey(candidate))) return candidate;
+  logicalDataTypes: ReadonlyMap<string, DataType>,
+): ReadonlyMap<string, NonNullable<GridColumn["groupRail"]>> {
+  const groupsByRoot = new Map<
+    string,
+    {
+      key: string;
+      parentPinned: boolean;
+      railPinned: boolean | undefined;
+      title: string;
+    }
+  >();
+  for (const [key, parent] of flattenedParents) {
+    if (parent.fieldPath.length !== 1) continue;
+    const logicalType = logicalDataTypes.get(key);
+    groupsByRoot.set(parent.fieldPath[0]!, {
+      key,
+      parentPinned: parent.pinned,
+      railPinned: undefined,
+      title: `${parent.title} · ${
+        logicalType === undefined
+          ? schemaRailType(parent.field)
+          : formatDataTypeLabel(logicalType)
+      }`,
+    });
   }
-  return null;
+  for (const column of columns) {
+    if (column.fieldPath.length < 2) continue;
+    const group = groupsByRoot.get(column.fieldPath[0]!);
+    if (
+      group !== undefined &&
+      (group.railPinned === undefined || column.pinned === group.parentPinned)
+    ) {
+      group.railPinned = column.pinned;
+    }
+  }
+  const groupByColumn = columns.map((column) => {
+    if (column.fieldPath.length < 2) return undefined;
+    const group = groupsByRoot.get(column.fieldPath[0]!);
+    return group?.railPinned === column.pinned ? group : undefined;
+  });
+  const metadata = new Map<string, NonNullable<GridColumn["groupRail"]>>();
+  columns.forEach((column, index) => {
+    const group = groupByColumn[index];
+    if (group === undefined) return;
+    metadata.set(column.key, {
+      title: group.title,
+      start: groupByColumn[index - 1]?.key !== group.key,
+      end: groupByColumn[index + 1]?.key !== group.key,
+    });
+  });
+  return metadata;
 }
 
-function flattenedRailPath(
-  fieldPath: readonly string[],
-  pinned: boolean,
-  flattenedParents: ReadonlyMap<string, ColumnState>,
-): FieldPath | null {
-  const groupPath = outermostFlattenedPath(fieldPath, flattenedParents);
-  if (groupPath === null) return null;
-  return flattenedParents.get(fieldPathKey(groupPath))?.pinned === pinned
-    ? groupPath
-    : null;
+function fieldPathTitleParts(fieldPath: FieldPath): {
+  titlePrefix?: string;
+  titleLeaf?: string;
+} {
+  const prefix = fieldPath.slice(0, -1);
+  return prefix.length === 0
+    ? {}
+    : {
+        titlePrefix: `${prefix.map(formatFieldPathSegment).join(".")}.`,
+        titleLeaf: formatFieldPathSegment(fieldPath.at(-1)!),
+      };
 }
 
 function schemaRailType(field: SchemaField | undefined): string {

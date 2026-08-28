@@ -47,6 +47,7 @@ export function ValuePeek({
   anchor,
   focusRequest = 0,
   loading = false,
+  showCopyPath = true,
   onClose,
   onReturnFocus,
   onCopy,
@@ -58,6 +59,7 @@ export function ValuePeek({
   anchor: Rectangle;
   focusRequest?: number;
   loading?: boolean;
+  showCopyPath?: boolean;
   onClose: () => void;
   onReturnFocus: () => void;
 } & ValueCopyHandlers) {
@@ -319,7 +321,7 @@ export function ValuePeek({
             ref={treeRef}
             value={value}
             label={label}
-            fieldPath={fieldPath}
+            fieldPath={showCopyPath ? fieldPath : undefined}
             {...(onCopyIntent === undefined
               ? { onCopy: onCopy! }
               : { onCopyIntent })}

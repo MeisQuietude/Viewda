@@ -24,6 +24,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import * as desktop from "../desktop";
 import { DataGrid } from "./DataGrid";
 import type { ArrowDataWindow } from "./arrow-window";
+import { formatFieldPath } from "./field-path";
 import { CompactSelection, type GridSelection } from "./grid-model";
 import {
   createGridPerformanceController,
@@ -483,6 +484,55 @@ describe("DataGrid window rendering", () => {
     );
   });
 
+  it("keeps Peek open when pagination appends an unrelated trailing column", async () => {
+    const page =
+      deferred<Awaited<ReturnType<typeof desktop.getSourceSchemaPage>>>();
+    vi.mocked(desktop.getSourceSchemaPage).mockReturnValue(page.promise);
+    render(
+      <DataGrid
+        source={{
+          ...source,
+          rowCount: 1,
+          columnCount: 2,
+          schema: [source.schema[0]!],
+          schemaNodeCount: 2,
+          schemaIsTruncated: true,
+        }}
+      />,
+    );
+    await waitFor(() => expect(desktop.getDataWindow).toHaveBeenCalledOnce());
+    act(() => {
+      const address = { column: 0, row: 0 };
+      gridMock.props?.onSelectionChange({
+        columns: CompactSelection.empty(),
+        rows: CompactSelection.empty(),
+        current: {
+          cell: address,
+          range: { x: 0, y: 0, width: 1, height: 1 },
+          rangeStack: [],
+        },
+      });
+      gridMock.props?.onCellPeek?.(address, {
+        x: 20,
+        y: 20,
+        width: 120,
+        height: 28,
+      });
+    });
+    expect(screen.getByRole("dialog", { name: "Peek column_0" })).toBeVisible();
+
+    await act(async () =>
+      page.resolve({
+        offset: 1,
+        totalCount: 2,
+        columns: [{ ...source.schema[1]!, name: "trailing" }],
+      }),
+    );
+
+    await waitFor(() => expect(gridMock.props?.columns).toHaveLength(2));
+    expect(screen.getByRole("dialog", { name: "Peek column_0" })).toBeVisible();
+  });
+
   it("discards a delayed schema page when complete content replaces the preview", async () => {
     const earlyPrefix = Array.from({ length: 256 }, (_, index) => ({
       ...source.schema[0]!,
@@ -622,9 +672,7 @@ describe("DataGrid window rendering", () => {
     openColumnMenu(0);
     fireEvent.click(screen.getByRole("menuitem", { name: "Pin column" }));
     openColumnMenu(0);
-    fireEvent.click(
-      screen.getByRole("menuitem", { name: "Flatten to columns" }),
-    );
+    fireEvent.click(screen.getByRole("menuitem", { name: "Flatten" }));
     expect(gridMock.props?.columns).toHaveLength(257);
     act(() => gridMock.props?.onSort(0, false));
     await waitFor(() =>
@@ -658,9 +706,7 @@ describe("DataGrid window rendering", () => {
     expect(gridMock.props?.columns[256]?.id).toBe("source:256");
     expect(gridMock.props?.columns.at(-1)?.title).toBe("column_299");
     expect(desktop.cancelDataView).toHaveBeenCalledWith(7, 1);
-    expect(
-      screen.getByText(/Duplicate top-level names require source-order/),
-    ).toBeVisible();
+    expect(screen.getByText(/This file repeats column names/)).toBeVisible();
     await waitFor(() =>
       expect(
         vi.mocked(desktop.getDataWindow).mock.calls.some((call) => {
@@ -750,10 +796,12 @@ describe("DataGrid window rendering", () => {
       screen.queryByRole("button", { name: "Load more columns" }),
     ).not.toBeInTheDocument();
     expect(
-      screen.getByText(
-        /The complete schema is loading before rows can be read/,
-      ),
+      screen.getByText(/Viewda is loading every column before showing rows/),
     ).toBeVisible();
+    expect(
+      screen.getByText("Preparing columns…").closest('[role="status"]'),
+    ).toBeInTheDocument();
+    expect(screen.queryByTestId("viewda-grid")).not.toBeInTheDocument();
 
     const identityPaths = Array.from({ length: 600 }, (_, index) => [
       index === 256 ? "column_0" : `column_${index}`,
@@ -1695,9 +1743,7 @@ describe("DataGrid window rendering", () => {
       screen.getByLabelText("Query").querySelector(".query-select"),
     ).toHaveAttribute("title", '"profile", "id", "tail"');
     openColumnMenu(0);
-    fireEvent.click(
-      screen.getByRole("menuitem", { name: "Flatten to columns" }),
-    );
+    fireEvent.click(screen.getByRole("menuitem", { name: "Flatten" }));
 
     expect(gridMock.props?.columns.slice(0, 2)).toMatchObject([
       {
@@ -1726,7 +1772,9 @@ describe("DataGrid window rendering", () => {
         },
       },
     ]);
-    expect(screen.getByText(/profile expanded to 2 columns\./)).toBeVisible();
+    expect(
+      screen.getByText(/Flattened profile into 2 columns\./),
+    ).toBeVisible();
     expect(
       screen.getByLabelText("Query").querySelector(".query-select"),
     ).toHaveTextContent("[4/4 cols]");
@@ -1748,6 +1796,18 @@ describe("DataGrid window rendering", () => {
         name: 'Unpin profile."city.name"',
       }),
     ).toHaveAttribute("aria-pressed", "true");
+    const pickerPath = within(picker)
+      .getByRole("checkbox", { name: 'Show profile."city.name"' })
+      .closest(".column-picker-row")!;
+    expect(pickerPath.querySelector(".column-picker-name")).toHaveTextContent(
+      'profile."city.name"',
+    );
+    expect(
+      pickerPath.querySelector(".viewda-grid-header-prefix-content"),
+    ).toHaveTextContent("profile");
+    expect(
+      pickerPath.querySelector(".viewda-grid-header-leaf"),
+    ).toHaveTextContent('"city.name"');
     fireEvent.click(
       screen.getByLabelText("Query").querySelector(".query-select")!,
     );
@@ -1764,17 +1824,18 @@ describe("DataGrid window rendering", () => {
     if (addressNode === null) throw new Error("address schema node is missing");
     fireEvent.click(
       within(addressNode).getAllByRole("button", {
-        name: "Flatten to columns",
-      })[0]!,
-    );
-    fireEvent.click(
-      within(addressNode).getAllByRole("button", {
-        name: "Flatten to columns",
+        name: "Flatten profile.address",
       })[0]!,
     );
     expect(
-      screen.getByText("profile.address is already flattened."),
-    ).toBeVisible();
+      within(addressNode).getByRole("button", {
+        name: "Unflatten profile.address",
+      }),
+    ).toBeInTheDocument();
+    await waitFor(() =>
+      expect(gridMock.scrollToColumn).toHaveBeenLastCalledWith(0, 16),
+    );
+    expect(gridMock.props?.selection.columns.hasIndex(0)).toBe(true);
 
     expect(gridMock.props?.columns.slice(0, 2)).toMatchObject([
       {
@@ -1858,10 +1919,22 @@ describe("DataGrid window rendering", () => {
 
     openColumnMenu(0);
     expect(
-      screen.getByRole("menuitem", { name: "Unflatten profile.address" }),
+      screen.getByRole("menuitem", {
+        name: "Unflatten profile.address (2 columns → 1; removes 1 filter, 1 sort)",
+      }),
     ).toBeInTheDocument();
+    const ancestorMenu = screen.getByRole("menu", {
+      name: 'profile.address."postal""code" column',
+    });
+    const separators = within(ancestorMenu).getAllByRole("separator");
+    expect(separators).toHaveLength(2);
+    separators.forEach((separator) =>
+      expect(separator).toHaveClass("grid-menu-separator"),
+    );
     fireEvent.click(
-      screen.getByRole("menuitem", { name: "Unflatten profile" }),
+      screen.getByRole("menuitem", {
+        name: "Unflatten profile (3 columns → 1; removes 1 filter, 1 sort)",
+      }),
     );
 
     await waitFor(() =>
@@ -1869,11 +1942,11 @@ describe("DataGrid window rendering", () => {
         memoryLimit: "mb384",
       }),
     );
-    expect(
-      screen.getByText(
-        'profile restored; removed filters: profile.address."postal""code"; sorts: profile.address."postal""code".',
-      ),
-    ).toBeVisible();
+    const unflattenAlert = screen.getByRole("alert");
+    expect(unflattenAlert).toHaveClass("grid-error", "view-error");
+    expect(unflattenAlert).toHaveTextContent(
+      'Unflattened profile into one column; removed filters: profile.address."postal""code"; sorts: profile.address."postal""code".',
+    );
     expect(gridMock.props?.columns.map((column) => column.id)).toEqual([
       '["profile"]',
       '["id"]',
@@ -1885,7 +1958,169 @@ describe("DataGrid window rendering", () => {
     });
     expect(gridMock.mountCount).toBe(1);
     expect(gridMock.scrollToRow).not.toHaveBeenCalled();
+    expect(gridMock.scrollToColumn).toHaveBeenCalledWith(0, 16);
+    await waitFor(() =>
+      expect(desktop.getDataWindow).toHaveBeenLastCalledWith(7, 3, 0, 4, [
+        ["profile"],
+        ["id"],
+        ["tail"],
+      ]),
+    );
+  });
+
+  it("keeps the requested struct selected when Sidebar Flatten needs its parent first", () => {
+    render(<DataGrid source={nestedSource} />);
+    fireEvent.click(screen.getByRole("button", { name: "Schema" }));
+    const sidebar = screen.getByRole("complementary", {
+      name: "Schema sidebar",
+    });
+    const addressNode = within(sidebar).getByText("address").closest("li");
+    if (addressNode === null) throw new Error("address schema node is missing");
+
+    fireEvent.click(
+      within(addressNode).getByRole("button", {
+        name: "Flatten profile.address",
+      }),
+    );
+
+    expect(screen.getByText("Flatten profile first.")).toBeVisible();
+    expect(
+      within(addressNode).getByText("address").closest("button"),
+    ).toHaveAttribute("aria-pressed", "true");
+    expect(
+      within(addressNode).getByText('postal"code').closest("button"),
+    ).not.toHaveAttribute("aria-pressed", "true");
     expect(gridMock.scrollToColumn).not.toHaveBeenCalled();
+  });
+
+  it("closes Peek on pin reorder and recopies the reordered header path", async () => {
+    const fieldPath = ["profile", "weird name", "leaf"];
+    const pathSource: desktop.SourceSummary = {
+      ...source,
+      rowCount: 1,
+      columnCount: 2,
+      schemaNodeCount: 4,
+      schema: [
+        { ...source.schema[0]!, name: "id" },
+        {
+          name: "profile",
+          physicalType: "GROUP",
+          logicalType: null,
+          children: [
+            {
+              name: "weird name",
+              physicalType: "GROUP",
+              logicalType: null,
+              children: [
+                {
+                  name: "leaf",
+                  physicalType: "BYTE_ARRAY",
+                  logicalType: "String",
+                  children: [],
+                },
+              ],
+            },
+          ],
+        },
+      ],
+    };
+    render(<DataGrid source={pathSource} />);
+    await waitFor(() => expect(desktop.getDataWindow).toHaveBeenCalledOnce());
+
+    openColumnMenu(1);
+    fireEvent.click(screen.getByRole("menuitem", { name: "Flatten" }));
+    openColumnMenu(1);
+    fireEvent.click(screen.getByRole("menuitem", { name: "Flatten" }));
+    await waitFor(() =>
+      expect(desktop.getDataWindow).toHaveBeenLastCalledWith(7, 0, 0, 1, [
+        ["id"],
+        fieldPath,
+      ]),
+    );
+
+    const openPathPeek = () => {
+      const column =
+        gridMock.props?.columns.findIndex(
+          (candidate) => candidate.id === JSON.stringify(fieldPath),
+        ) ?? -1;
+      expect(column).toBeGreaterThanOrEqual(0);
+      const selection = {
+        columns: CompactSelection.empty(),
+        rows: CompactSelection.empty(),
+        current: {
+          cell: { column, row: 0 },
+          range: { x: column, y: 0, width: 1, height: 1 },
+          rangeStack: [],
+        },
+      };
+      act(() => {
+        gridMock.props?.onSelectionChange(selection);
+        gridMock.props?.onCellPeek?.(selection.current.cell, {
+          x: 20,
+          y: 20,
+          width: 120,
+          height: 28,
+        });
+      });
+      return column;
+    };
+
+    const originalIndex = openPathPeek();
+    expect(screen.getByRole("button", { name: "Copy path" })).toBeVisible();
+    openColumnMenu(originalIndex);
+    fireEvent.click(screen.getByRole("menuitem", { name: "Pin column" }));
+    expect(
+      screen.queryByRole("button", { name: "Copy path" }),
+    ).not.toBeInTheDocument();
+
+    const reorderedIndex = openPathPeek();
+    expect(reorderedIndex).toBe(0);
+    const headerTitle = gridMock.props?.columns[reorderedIndex]?.title;
+    expect(headerTitle).toBe(formatFieldPath(fieldPath));
+    fireEvent.click(screen.getByRole("button", { name: "Copy path" }));
+
+    await waitFor(() =>
+      expect(clipboardWrite).toHaveBeenCalledWith(headerTitle),
+    );
+  });
+
+  it("restores an unpinned flattened parent in the middle of its columns", async () => {
+    render(<DataGrid source={nestedSource} />);
+    await waitFor(() => expect(desktop.getDataWindow).toHaveBeenCalledOnce());
+    openColumnMenu(1);
+    fireEvent.click(screen.getByRole("menuitem", { name: "Flatten" }));
+    expect(gridMock.props?.columns.map((column) => column.id)).toEqual([
+      '["id"]',
+      '["profile","city.name"]',
+      '["profile","address"]',
+      '["tail"]',
+    ]);
+
+    openColumnMenu(1);
+    fireEvent.click(
+      screen.getByRole("menuitem", {
+        name: "Unflatten profile (2 columns → 1)",
+      }),
+    );
+
+    expect(gridMock.props?.columns.map((column) => column.id)).toEqual([
+      '["id"]',
+      '["profile"]',
+      '["tail"]',
+    ]);
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+    expect(
+      screen
+        .getByText(/Unflattened profile into one column\./)
+        .closest('[role="status"]'),
+    ).toBeInTheDocument();
+    await waitFor(() =>
+      expect(desktop.getDataWindow).toHaveBeenLastCalledWith(7, 0, 0, 4, [
+        ["id"],
+        ["profile"],
+        ["tail"],
+      ]),
+    );
   });
 
   it("removes a pin-mismatched child from its rail and restores it when repinned", async () => {
@@ -1921,9 +2156,7 @@ describe("DataGrid window rendering", () => {
     openColumnMenu(1);
     fireEvent.click(screen.getByRole("menuitem", { name: "Pin column" }));
     openColumnMenu(0);
-    fireEvent.click(
-      screen.getByRole("menuitem", { name: "Flatten to columns" }),
-    );
+    fireEvent.click(screen.getByRole("menuitem", { name: "Flatten" }));
 
     openColumnMenu(0);
     fireEvent.click(screen.getByRole("menuitem", { name: "Unpin column" }));
@@ -1976,6 +2209,39 @@ describe("DataGrid window rendering", () => {
     ]);
   });
 
+  it("keeps one outer rail when every child of an unpinned parent is pinned", () => {
+    render(<DataGrid source={nestedSource} />);
+    openColumnMenu(1);
+    fireEvent.click(screen.getByRole("menuitem", { name: "Flatten" }));
+
+    for (const id of ['["profile","city.name"]', '["profile","address"]']) {
+      const index =
+        gridMock.props?.columns.findIndex((column) => column.id === id) ?? -1;
+      expect(index).toBeGreaterThanOrEqual(0);
+      openColumnMenu(index);
+      fireEvent.click(screen.getByRole("menuitem", { name: "Pin column" }));
+    }
+
+    expect(gridMock.props?.columns.slice(0, 2)).toMatchObject([
+      {
+        id: '["profile","city.name"]',
+        groupRail: {
+          title: "profile · struct<…>",
+          start: true,
+          end: false,
+        },
+      },
+      {
+        id: '["profile","address"]',
+        groupRail: {
+          title: "profile · struct<…>",
+          start: false,
+          end: true,
+        },
+      },
+    ]);
+  });
+
   it("keeps a spaced nested path through flatten, filter, sort, and export", async () => {
     vi.mocked(desktop.prepareDataView).mockImplementation(
       async (_generation, revision) => ({ revision, rowCount: 4 }),
@@ -2005,9 +2271,7 @@ describe("DataGrid window rendering", () => {
     render(<DataGrid source={spacedSource} />);
 
     openColumnMenu(0);
-    fireEvent.click(
-      screen.getByRole("menuitem", { name: "Flatten to columns" }),
-    );
+    fireEvent.click(screen.getByRole("menuitem", { name: "Flatten" }));
     expect(gridMock.props?.columns[0]).toMatchObject({
       id: '["profile","display name"]',
       title: 'profile."display name"',
@@ -2100,9 +2364,7 @@ describe("DataGrid window rendering", () => {
     };
     render(<DataGrid source={wideSource} />);
     openColumnMenu(0);
-    fireEvent.click(
-      screen.getByRole("menuitem", { name: "Flatten to columns" }),
-    );
+    fireEvent.click(screen.getByRole("menuitem", { name: "Flatten" }));
 
     const paths = children.map((child) => ["wide", child.name]);
     await waitFor(() =>
@@ -2166,9 +2428,7 @@ describe("DataGrid window rendering", () => {
 
     for (let depth = 0; depth < 6; depth += 1) {
       openColumnMenu(0);
-      fireEvent.click(
-        screen.getByRole("menuitem", { name: "Flatten to columns" }),
-      );
+      fireEvent.click(screen.getByRole("menuitem", { name: "Flatten" }));
     }
 
     const fieldPath = [
@@ -2232,9 +2492,7 @@ describe("DataGrid window rendering", () => {
     };
     render(<DataGrid source={boundedSource} />);
     openColumnMenu(0);
-    fireEvent.click(
-      screen.getByRole("menuitem", { name: "Flatten to columns" }),
-    );
+    fireEvent.click(screen.getByRole("menuitem", { name: "Flatten" }));
 
     for (let index = 0; index < 5; index += 1) {
       openFilterEditor(index);
@@ -2272,7 +2530,11 @@ describe("DataGrid window rendering", () => {
       expect(desktop.prepareDataView).toHaveBeenCalledTimes(8),
     );
     openColumnMenu(0);
-    fireEvent.click(screen.getByRole("menuitem", { name: "Unflatten group" }));
+    fireEvent.click(
+      screen.getByRole("menuitem", {
+        name: "Unflatten group (5 columns → 1; removes 5 filters, 1 sort)",
+      }),
+    );
 
     await waitFor(() =>
       expect(desktop.prepareDataView).toHaveBeenLastCalledWith(
@@ -2283,11 +2545,9 @@ describe("DataGrid window rendering", () => {
         { memoryLimit: "mb384" },
       ),
     );
-    expect(
-      screen.getByText(
-        "group restored; removed filters: group.child_0, group.child_1, group.child_2, +2 more; sorts: group.child_0.",
-      ),
-    ).toBeVisible();
+    expect(screen.getByRole("alert")).toHaveTextContent(
+      "Unflattened group into one column; removed filters: group.child_0, group.child_1, group.child_2, +2 more; sorts: group.child_0.",
+    );
     expect(gridMock.props?.columns.map((column) => column.id)).toEqual([
       '["group"]',
       '["tail"]',
@@ -2299,9 +2559,7 @@ describe("DataGrid window rendering", () => {
       <DataGrid source={nestedSource} contentIdentity="early-sample" />,
     );
     openColumnMenu(1);
-    fireEvent.click(
-      screen.getByRole("menuitem", { name: "Flatten to columns" }),
-    );
+    fireEvent.click(screen.getByRole("menuitem", { name: "Flatten" }));
 
     view.rerender(
       <DataGrid
@@ -2322,10 +2580,12 @@ describe("DataGrid window rendering", () => {
         '["tail"]',
       ]),
     );
-    expect(screen.queryByText(/profile expanded to 2 columns/)).toBeNull();
+    expect(screen.queryByText(/Flattened profile into 2 columns/)).toBeNull();
     openColumnMenu(1);
     expect(
-      screen.getByRole("menuitem", { name: "Unflatten profile" }),
+      screen.getByRole("menuitem", {
+        name: "Unflatten profile (2 columns → 1)",
+      }),
     ).toBeInTheDocument();
   });
 
@@ -4778,7 +5038,7 @@ describe("DataGrid window rendering", () => {
     expect(within(sidebar).getByText("1 column")).toBeInTheDocument();
     expect(desktop.getColumnStatistics).not.toHaveBeenCalled();
 
-    fireEvent.click(within(sidebar).getByRole("button", { name: /profile/ }));
+    fireEvent.click(within(sidebar).getByText("profile").closest("button")!);
     await waitFor(() =>
       expect(desktop.getColumnStatistics).toHaveBeenCalledWith(
         7,
@@ -5592,20 +5852,19 @@ describe("DataGrid window rendering", () => {
     expect(gridMock.props?.getCellContent({ column: 1, row: 0 })).toMatchObject(
       { displayData: "second value" },
     );
-    const reason = screen.getByText(
-      /Duplicate top-level names require source-order/,
-    );
+    const reason = screen.getByText(/This file repeats column names/);
     expect(reason).toBeVisible();
-    expect(reason.id).not.toBe("");
     const query = screen.getByLabelText("Query");
-    expect(query.querySelector(".query-where")).toHaveAttribute(
-      "aria-describedby",
-      reason.id,
+    const where = query.querySelector(".query-where");
+    const orderBy = query.querySelector(".query-order");
+    expect(where).toHaveAccessibleName(
+      "WHERE unavailable: duplicate column names",
     );
-    expect(query.querySelector(".query-order")).toHaveAttribute(
-      "aria-describedby",
-      reason.id,
+    expect(orderBy).toHaveAccessibleName(
+      "ORDER BY unavailable: duplicate column names",
     );
+    expect(where).not.toHaveAttribute("aria-describedby");
+    expect(orderBy).not.toHaveAttribute("aria-describedby");
     fireEvent.click(screen.getByRole("button", { name: "Schema" }));
     const schemaPathActions = within(
       screen.getByRole("complementary", { name: "Schema sidebar" }),
@@ -5613,16 +5872,33 @@ describe("DataGrid window rendering", () => {
       .getAllByRole("button")
       .filter((button) => button.hasAttribute("disabled"));
     expect(schemaPathActions.length).toBeGreaterThan(0);
-    schemaPathActions.forEach((button) =>
-      expect(button).toHaveAttribute("aria-describedby", reason.id),
-    );
+    schemaPathActions.forEach((button) => {
+      expect(button).not.toHaveAttribute("aria-describedby");
+      expect(button).toHaveAccessibleName(/duplicate column names/);
+    });
     openGridMenu();
     const unavailableExport = screen.getAllByRole("menuitem", {
-      name: /Export is unavailable because duplicate top-level names/,
+      name: /Export is unavailable because this file repeats column names/,
     });
     expect(unavailableExport.length).toBeGreaterThan(0);
     unavailableExport.forEach((action) => expect(action).toBeDisabled());
     expect(desktop.startDataExport).not.toHaveBeenCalled();
+
+    clipboardWrite.mockClear();
+    act(() =>
+      gridMock.props?.onCellPeek?.(
+        { column: 1, row: 0 },
+        { x: 20, y: 20, width: 120, height: 28 },
+      ),
+    );
+    expect(
+      screen.getByRole("dialog", { name: "Peek duplicate" }),
+    ).toHaveTextContent("second value");
+    expect(
+      screen.queryByRole("button", { name: "Copy path" }),
+    ).not.toBeInTheDocument();
+    expect(clipboardWrite).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole("button", { name: "Close Peek" }));
 
     openColumnMenu(1);
     fireEvent.click(screen.getByRole("menuitem", { name: "Pin column" }));
@@ -5666,9 +5942,16 @@ describe("DataGrid window rendering", () => {
 
     openColumnMenu(0);
     const flatten = screen.getByRole("menuitem", {
-      name: "Flatten unavailable: duplicate child names",
+      name: "Flatten profile. Unavailable: duplicate child names.",
     });
     expect(flatten).toBeDisabled();
+    expect(flatten).toHaveAccessibleName(
+      "Flatten profile. Unavailable: duplicate child names.",
+    );
+    expect(flatten).toHaveTextContent("FlattenDuplicate child names");
+    expect(flatten.querySelector(".menu-shortcut")).toHaveTextContent(
+      "Duplicate child names",
+    );
     expect(flatten).toHaveAttribute(
       "title",
       "Flatten is unavailable because this struct contains duplicate child names.",

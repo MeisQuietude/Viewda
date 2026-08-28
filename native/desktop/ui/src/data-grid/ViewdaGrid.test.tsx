@@ -791,17 +791,79 @@ describe("ViewdaGrid foundation", () => {
     expect(header.querySelector(".viewda-grid-header-leaf")).toHaveTextContent(
       '"postal code"',
     );
+    expect(header).toHaveAttribute(
+      "title",
+      "Flattened column group: profile · struct<…>",
+    );
+    expect(header).toHaveAccessibleName('profile.address."postal code"');
+    expect(header).toHaveAccessibleDescription(
+      "Flattened column group: profile · struct<…>",
+    );
     expect(header.querySelector(".viewda-grid-group-rail")).toHaveAttribute(
-      "title",
-      "profile · struct<…>",
+      "aria-hidden",
+      "true",
     );
-    expect(header.querySelector(".viewda-grid-header-title")).toHaveAttribute(
+    expect(header.querySelector(".viewda-grid-group-rail")).not.toHaveAttribute(
       "title",
-      'profile.address."postal code"',
     );
+    expect(
+      header.querySelector(".viewda-grid-header-title"),
+    ).not.toHaveAttribute("title");
     expect(header.querySelector(".viewda-grid-header-title")).toHaveClass(
       "is-path",
     );
+  });
+
+  it("neutralizes bidi controls in every header title position", () => {
+    const override = "\u202e";
+    const scenarios = [
+      {
+        title: `top${override}level`,
+        controlParentClass: "is-plain",
+      },
+      {
+        title: `profile."weird${override} name".leaf`,
+        titlePrefix: `profile."weird${override} name".`,
+        titleLeaf: "leaf",
+        controlParentClass: "viewda-grid-header-prefix-content",
+      },
+      {
+        title: `profile."leaf${override} name"`,
+        titlePrefix: "profile.",
+        titleLeaf: `"leaf${override} name"`,
+        controlParentClass: "viewda-grid-header-leaf",
+      },
+    ];
+    render(
+      <ViewdaGrid
+        {...props({
+          columns: scenarios.map((scenario, index) => ({
+            ...column(index),
+            title: scenario.title,
+            ...(scenario.titlePrefix === undefined
+              ? {}
+              : {
+                  titlePrefix: scenario.titlePrefix,
+                  titleLeaf: scenario.titleLeaf,
+                }),
+          })),
+          rowCount: 1,
+        })}
+      />,
+    );
+
+    for (const scenario of scenarios) {
+      const header = screen.getByRole("columnheader", {
+        name: scenario.title,
+      });
+      expect(header).toHaveAttribute("aria-label", scenario.title);
+      const titleElement = header.querySelector(".viewda-grid-header-title");
+      expect(titleElement?.textContent).toBe(scenario.title);
+      expect(titleElement).not.toHaveAttribute("title");
+      const control = header.querySelector(".viewda-grid-header-bidi-control");
+      expect(control?.textContent).toBe(override);
+      expect(control?.parentElement).toHaveClass(scenario.controlParentClass);
+    }
   });
 
   it("omits unavailable header actions and keeps the title and resize handle", () => {

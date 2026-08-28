@@ -3,10 +3,14 @@ import { useEffect, useMemo, useRef, useState } from "react";
 const ROW_HEIGHT = 36;
 const VIEWPORT_HEIGHT = 288;
 const OVERSCAN_ROWS = 3;
+const BIDI_CONTROL_CHARACTER =
+  /([\u061c\u200e\u200f\u202a-\u202e\u2066-\u2069])/u;
 
 export interface ColumnPickerColumn {
   id: string;
   name: string;
+  titlePrefix?: string;
+  titleLeaf?: string;
   type: string;
   visible: boolean;
   pinned: boolean;
@@ -202,9 +206,7 @@ export function ColumnPicker({
                   >
                     <PinIcon />
                   </button>
-                  <span className="column-picker-name" title={column.name}>
-                    {column.name}
-                  </span>
+                  <ColumnName column={column} />
                   <span className="column-picker-type" title={column.type}>
                     {column.type}
                   </span>
@@ -221,6 +223,61 @@ export function ColumnPicker({
       </span>
     </div>
   );
+}
+
+function ColumnName({ column }: { column: ColumnPickerColumn }) {
+  const pathTitle = column.titlePrefix !== undefined;
+  return (
+    <span
+      className={`column-picker-name ${pathTitle ? "is-path" : "is-plain"}`}
+      title={safeNativeTooltipTitle(column.name)}
+    >
+      {pathTitle ? (
+        <>
+          <span className="viewda-grid-header-prefix">
+            <span className="viewda-grid-header-prefix-text">
+              <span className="viewda-grid-header-prefix-content" dir="ltr">
+                {safeVisualPathText(
+                  column.titlePrefix?.endsWith(".")
+                    ? column.titlePrefix.slice(0, -1)
+                    : (column.titlePrefix ?? ""),
+                )}
+              </span>
+            </span>
+            {column.titlePrefix?.endsWith(".") && (
+              <span
+                className="viewda-grid-header-prefix-separator"
+                aria-hidden="true"
+              >
+                .
+              </span>
+            )}
+          </span>
+          <span className="viewda-grid-header-leaf">
+            {safeVisualPathText(column.titleLeaf ?? "")}
+          </span>
+        </>
+      ) : (
+        safeVisualPathText(column.name)
+      )}
+    </span>
+  );
+}
+
+function safeVisualPathText(text: string) {
+  return text.split(BIDI_CONTROL_CHARACTER).map((part, index) =>
+    BIDI_CONTROL_CHARACTER.test(part) ? (
+      <span className="viewda-grid-header-bidi-control" key={index}>
+        {part}
+      </span>
+    ) : (
+      part
+    ),
+  );
+}
+
+function safeNativeTooltipTitle(text: string): string | undefined {
+  return BIDI_CONTROL_CHARACTER.test(text) ? undefined : text;
 }
 
 function PinIcon() {

@@ -1009,12 +1009,12 @@ export const ValueTree = forwardRef<
   const hasDetail = binaryBytes !== null || scalarDetail !== null;
   const invalidOffset =
     preparedValue.kind === "invalidJson" ? preparedValue.errorOffset + 1 : null;
-  const showToolbar =
-    fieldPath !== undefined ||
+  const showTreeControls =
     parseStatus !== null ||
     preparedValue.kind === "invalidJson" ||
     preparedValue.kind === "rawJson" ||
     valueChildCount(root.value) > 0;
+  const showToolbar = fieldPath !== undefined || showTreeControls;
   const progressText = operationText(operation, parseStatus);
   const progressRunning =
     parseStatus?.phase === "running" ||
@@ -1025,32 +1025,35 @@ export const ValueTree = forwardRef<
     <div className={`value-tree-wrap${hasDetail ? " has-detail" : ""}`}>
       {showToolbar && (
         <div className="value-tree-toolbar">
-          <input
-            type="search"
-            value={query}
-            aria-label={
-              preparedValue.kind === "rawJson"
-                ? "Search raw JSON source"
-                : "Search keys and values"
-            }
-            placeholder={
-              preparedValue.kind === "rawJson"
-                ? "Search raw JSON source"
-                : "Search keys and values"
-            }
-            disabled={parseStatus !== null}
-            onChange={(event) => changeQuery(event.currentTarget.value)}
-            onKeyDown={(event) => {
-              if (event.key === "Enter") {
-                event.preventDefault();
-                navigateMatch(event.shiftKey ? -1 : 1);
+          {showTreeControls && (
+            <input
+              type="search"
+              value={query}
+              aria-label={
+                preparedValue.kind === "rawJson"
+                  ? "Search raw JSON source"
+                  : "Search keys and values"
               }
-            }}
-          />
+              placeholder={
+                preparedValue.kind === "rawJson"
+                  ? "Search raw JSON source"
+                  : "Search keys and values"
+              }
+              disabled={parseStatus !== null}
+              onChange={(event) => changeQuery(event.currentTarget.value)}
+              onKeyDown={(event) => {
+                if (event.key === "Enter") {
+                  event.preventDefault();
+                  navigateMatch(event.shiftKey ? -1 : 1);
+                }
+              }}
+            />
+          )}
           <div className="value-tree-toolbar-actions">
             {fieldPath !== undefined && (
               <button
                 type="button"
+                disabled={activeNode === undefined}
                 onClick={() => {
                   if (activeNode === undefined) return;
                   const text = valueNodePath(fieldPath, activeNode);
@@ -1067,30 +1070,34 @@ export const ValueTree = forwardRef<
                 Copy path
               </button>
             )}
-            <button
-              type="button"
-              disabled={
-                parseStatus !== null ||
-                preparedValue.kind === "invalidJson" ||
-                preparedValue.kind === "rawJson" ||
-                valueChildCount(root.value) === 0 ||
-                query.length > 0
-              }
-              onClick={expandAll}
-            >
-              Expand all
-            </button>
-            <button
-              type="button"
-              disabled={
-                parseStatus !== null ||
-                valueChildCount(root.value) === 0 ||
-                query.length > 0
-              }
-              onClick={collapseAll}
-            >
-              Collapse all
-            </button>
+            {showTreeControls && (
+              <>
+                <button
+                  type="button"
+                  disabled={
+                    parseStatus !== null ||
+                    preparedValue.kind === "invalidJson" ||
+                    preparedValue.kind === "rawJson" ||
+                    valueChildCount(root.value) === 0 ||
+                    query.length > 0
+                  }
+                  onClick={expandAll}
+                >
+                  Expand all
+                </button>
+                <button
+                  type="button"
+                  disabled={
+                    parseStatus !== null ||
+                    valueChildCount(root.value) === 0 ||
+                    query.length > 0
+                  }
+                  onClick={collapseAll}
+                >
+                  Collapse all
+                </button>
+              </>
+            )}
             {(parseStatus !== null ||
               (operation !== null && operation.phase !== "complete")) &&
               (parseStatus?.phase === "canceled" ||

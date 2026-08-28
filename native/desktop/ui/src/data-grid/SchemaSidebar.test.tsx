@@ -128,6 +128,15 @@ describe("SchemaSidebar logical schema", () => {
     expect(screen.queryByText("entries")).not.toBeInTheDocument();
     expect(screen.queryByText("physical_child")).not.toBeInTheDocument();
     expect(screen.getByTitle("map<string, int32>")).toBeInTheDocument();
+    expect(
+      screen.getAllByText(
+        "Fields inside a list or map cannot be used as columns.",
+      ),
+    ).toHaveLength(2);
+    expect(screen.getByText("item_id").closest("button")).toHaveAttribute(
+      "title",
+      "Fields inside a list or map cannot be used as columns.",
+    );
     expect(screen.queryByText(/Schema is incomplete/)).not.toBeInTheDocument();
   });
 
@@ -222,7 +231,7 @@ describe("SchemaSidebar logical schema", () => {
       schemaNodeCount: 3,
       schemaIsTruncated: false,
     };
-    render(
+    const view = render(
       <SchemaSidebar
         open
         selectedPath={null}
@@ -242,9 +251,13 @@ describe("SchemaSidebar logical schema", () => {
     );
 
     const flatten = within(parent).getByRole("button", {
-      name: "Flatten unavailable: duplicate child names",
+      name: "Flatten profile. Unavailable: duplicate child names.",
     });
     expect(flatten).toBeDisabled();
+    expect(flatten).toHaveAccessibleName(
+      "Flatten profile. Unavailable: duplicate child names.",
+    );
+    expect(flatten).toHaveTextContent("FlattenDuplicate child names");
     const ambiguousFields = within(parent)
       .getAllByText("city")
       .map((name) => name.closest("button"));
@@ -253,10 +266,33 @@ describe("SchemaSidebar logical schema", () => {
       expect(button).toBeDisabled();
       expect(button).toHaveAttribute(
         "title",
-        'Path actions are unavailable because this struct contains multiple fields named "city".',
+        "This field cannot be selected because its parent contains multiple fields named city.",
       );
     });
     expect(onFlattenPath).not.toHaveBeenCalled();
+
+    view.rerender(
+      <SchemaSidebar
+        open
+        selectedPath={null}
+        source={duplicateChildren}
+        dataTypes={
+          new Map([
+            [
+              '["profile"]',
+              struct([field("city", utf8()), field("city", utf8())]),
+            ],
+          ])
+        }
+        onSelectPath={onSelectPath}
+        onFlattenPath={onFlattenPath}
+      />,
+    );
+    expect(
+      screen.getByRole("button", {
+        name: "Flatten profile. Unavailable: duplicate child names.",
+      }),
+    ).toBeDisabled();
   });
 
   it("does not offer an executable flatten action without loaded child fields", () => {
@@ -285,13 +321,97 @@ describe("SchemaSidebar logical schema", () => {
     );
 
     const flatten = screen.getByRole("button", {
-      name: "Flatten unavailable: no child fields",
+      name: "Flatten empty. Unavailable: no child fields.",
     });
     expect(flatten).toBeDisabled();
+    expect(flatten).toHaveAccessibleName(
+      "Flatten empty. Unavailable: no child fields.",
+    );
+    expect(flatten).toHaveTextContent("FlattenNo child fields");
     expect(flatten).toHaveAttribute(
       "title",
       "Flatten is unavailable because this struct has no child fields.",
     );
+  });
+
+  it("includes the duplicate-source reason in physical and logical Flatten controls", () => {
+    readyStatistics();
+    const view = render(
+      <SchemaSidebar
+        open
+        selectedPath={null}
+        source={source()}
+        pathActionsEnabled={false}
+        onSelectPath={vi.fn()}
+        onFlattenPath={vi.fn()}
+      />,
+    );
+
+    const accessibleName =
+      "Flatten duplicate. Unavailable because this source has duplicate column names.";
+    const physicalFlatten = screen.getByRole("button", {
+      name: accessibleName,
+    });
+    expect(physicalFlatten).toBeDisabled();
+    expect(physicalFlatten).toHaveTextContent("FlattenDuplicate column names");
+
+    view.rerender(
+      <SchemaSidebar
+        open
+        selectedPath={null}
+        source={source()}
+        dataTypes={
+          new Map([['["duplicate"]', struct({ physical_child: int32() })]])
+        }
+        pathActionsEnabled={false}
+        onSelectPath={vi.fn()}
+        onFlattenPath={vi.fn()}
+      />,
+    );
+    const logicalFlatten = screen.getByRole("button", {
+      name: "Flatten duplicate. Unavailable because this source has duplicate column names.",
+    });
+    expect(logicalFlatten).toBeDisabled();
+    expect(logicalFlatten).toHaveAccessibleName(accessibleName);
+    expect(logicalFlatten).toHaveTextContent("FlattenDuplicate column names");
+  });
+
+  it("uses one keyboard-focusable action to toggle Flatten and Unflatten", () => {
+    readyStatistics();
+    const onFlattenPath = vi.fn();
+    const onUnflattenPath = vi.fn();
+    const view = render(
+      <SchemaSidebar
+        open
+        selectedPath={null}
+        source={source()}
+        onSelectPath={vi.fn()}
+        onFlattenPath={onFlattenPath}
+        onUnflattenPath={onUnflattenPath}
+      />,
+    );
+
+    const flatten = screen.getByRole("button", { name: "Flatten duplicate" });
+    flatten.focus();
+    expect(document.activeElement).toBe(flatten);
+    fireEvent.click(flatten);
+    expect(onFlattenPath).toHaveBeenCalledWith(["duplicate"]);
+
+    view.rerender(
+      <SchemaSidebar
+        open
+        selectedPath={null}
+        source={source()}
+        flattenedPathKeys={new Set(['["duplicate"]'])}
+        onSelectPath={vi.fn()}
+        onFlattenPath={onFlattenPath}
+        onUnflattenPath={onUnflattenPath}
+      />,
+    );
+    fireEvent.click(
+      screen.getByRole("button", { name: "Unflatten duplicate" }),
+    );
+    expect(onUnflattenPath).toHaveBeenCalledWith(["duplicate"]);
   });
 
   it("labels list lengths and map pair counts without offering scalar min and max", async () => {

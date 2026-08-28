@@ -215,6 +215,29 @@ describe("ValuePeek", () => {
     );
   });
 
+  it("hides only Copy path when path actions are unavailable", () => {
+    render(
+      <ValuePeek
+        label="profile"
+        value={typedValue({ name: "Ada" }, struct({ name: utf8() }))}
+        anchor={defaultAnchor}
+        showCopyPath={false}
+        onClose={vi.fn()}
+        onReturnFocus={vi.fn()}
+        onCopy={vi.fn()}
+      />,
+    );
+
+    expect(
+      screen.queryByRole("button", { name: "Copy path" }),
+    ).not.toBeInTheDocument();
+    expect(
+      screen.getByRole("searchbox", { name: "Search keys and values" }),
+    ).toBeVisible();
+    expect(screen.getByRole("button", { name: "Expand all" })).toBeVisible();
+    expect(screen.getByRole("button", { name: "Collapse all" })).toBeVisible();
+  });
+
   it("keeps Space inert in the focused tree and closes Esc back to the grid", () => {
     const onClose = vi.fn();
     const onReturnFocus = vi.fn();
@@ -273,6 +296,13 @@ describe("ValuePeek", () => {
 
     expect(
       screen.queryByRole("button", { name: "Copy JSON" }),
+    ).not.toBeInTheDocument();
+    expect(screen.queryByRole("searchbox")).not.toBeInTheDocument();
+    expect(
+      screen.queryByRole("button", { name: "Expand all" }),
+    ).not.toBeInTheDocument();
+    expect(
+      screen.queryByRole("button", { name: "Collapse all" }),
     ).not.toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: "Copy path" }));
     await act(async () => vi.runAllTimersAsync());

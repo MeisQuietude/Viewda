@@ -10,7 +10,7 @@ Backward-incompatible entries start with **Breaking:**.
 
 ### Added
 
-- Flatten struct fields into regular Data grid columns at any depth. Nested columns retain grid controls, statistics, copy and CSV export behavior; nested JSON keeps decimals as exact strings and normalizes non-finite numbers; schema and column menus can restore any flattened ancestor without resetting the scroll position. Duplicate top-level names remain visible in source order, while actions that require an unambiguous name path are disabled with an explanation.
+- Flatten and Unflatten struct fields at any depth to work with nested values as regular Data columns. Flattened columns can be filtered, sorted, pinned, hidden, resized, inspected, copied, and exported; the schema sidebar exposes the same actions. Nested list and map statistics report container sizes, Grid Copy and CSV use matching JSON text, and sources with duplicate names remain readable while ambiguous actions explain why they are unavailable.
 
 ## 0.3.0 — 2026-08-26
 
