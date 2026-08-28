@@ -9,7 +9,7 @@ import {
 } from "@uwdata/flechette";
 import { describe, expect, it } from "vitest";
 
-import type { DataFilter, SchemaField, SortColumn } from "../desktop";
+import type { DataFilter, JsonPath, SchemaField, SortColumn } from "../desktop";
 import {
   columnFilterKind,
   filterInputFromCell,
@@ -233,6 +233,50 @@ describe("canonical filter query formatting", () => {
     expect(formatOrderByClause(sort, schema)).toBe(
       '"label" DESC, "value""quoted" ASC',
     );
+  });
+
+  it("identifies JSON paths and formats their effective scalar types", () => {
+    const jsonField = field("payload.data", "BYTE_ARRAY", "JSON");
+    const path: JsonPath = [
+      { field: "items" },
+      { index: 0 },
+      { field: "unit.price" },
+    ];
+
+    expect(
+      formatFilterCondition(
+        {
+          fieldPath: ["payload.data"],
+          jsonTarget: { path, valueType: "number" },
+          operator: "greaterThan",
+          values: ["10"],
+        },
+        jsonField,
+      ),
+    ).toBe('"payload.data".items[0]."unit.price" > 10');
+    expect(
+      formatFilterCondition(
+        {
+          fieldPath: ["payload.data"],
+          jsonTarget: { path, valueType: "mixed" },
+          operator: "equals",
+          values: ["O'Reilly"],
+        },
+        jsonField,
+      ),
+    ).toBe("\"payload.data\".items[0].\"unit.price\" = 'O''Reilly'");
+    expect(
+      formatOrderByClause(
+        [
+          {
+            fieldPath: ["payload.data"],
+            jsonTarget: { path, valueType: "mixed" },
+            direction: "descending",
+          },
+        ],
+        [jsonField],
+      ),
+    ).toBe('"payload.data".items[0]."unit.price" DESC');
   });
 
   it("renders SELECT in projection order with the engine's identifier quoting", () => {

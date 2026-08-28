@@ -1157,12 +1157,23 @@ button {
 
 .sort-popup li {
   display: grid;
-  grid-template-columns: minmax(120px, 1fr) auto auto auto auto;
-  align-items: center;
   gap: 5px;
   padding: 7px 8px;
   border-radius: 5px;
   background: var(--grid-cell);
+}
+
+.sort-column-row {
+  display: grid;
+  grid-template-columns: minmax(120px, 1fr) auto auto auto auto;
+  align-items: center;
+  gap: 5px;
+}
+
+.sort-popup .sort-json-mode {
+  display: grid;
+  grid-template-columns: auto minmax(160px, 1fr);
+  justify-content: initial;
 }
 
 .sort-popup li code {
@@ -2122,6 +2133,118 @@ button {
   background: var(--grid-header);
   box-shadow: 0 8px 24px rgb(27 29 30 / 14%);
   font-size: 12px;
+}
+
+.filter-editor.has-json-path {
+  width: min(420px, calc(100vw - 48px));
+  max-height: calc(100vh - 24px);
+  overflow: auto;
+}
+
+.json-path-picker {
+  display: grid;
+  min-width: 0;
+  gap: 6px;
+  padding: 8px;
+  border: 1px solid var(--grid-border-soft);
+  border-radius: 6px;
+  background: var(--grid-cell);
+}
+
+.json-path-picker > p {
+  margin: 0;
+  color: var(--grid-text-muted);
+  font-size: 10px;
+  line-height: 1.35;
+}
+
+.json-path-picker .json-path-cost-note {
+  color: var(--grid-text);
+}
+
+.json-path-picker .json-path-sample-warning,
+.json-path-picker .json-path-manual-error {
+  color: var(--error-text);
+}
+
+.json-path-picker > input,
+.json-path-picker label input,
+.json-path-picker label select {
+  box-sizing: border-box;
+  width: 100%;
+  min-height: 28px;
+  padding: 4px 7px;
+  border: 1px solid var(--grid-border);
+  border-radius: 4px;
+  color: var(--grid-text);
+  background: var(--grid-header);
+  font: inherit;
+}
+
+.json-path-picker label {
+  display: grid;
+  gap: 3px;
+  color: var(--grid-text-muted);
+  font-size: 10px;
+}
+
+.json-path-tree {
+  position: relative;
+  min-height: 44px;
+  overflow: auto;
+  border: 1px solid var(--grid-border-soft);
+  border-radius: 4px;
+  background: var(--grid-header);
+}
+
+.json-path-tree > p {
+  margin: 0;
+  padding: 10px;
+  color: var(--grid-text-faint);
+}
+
+.json-path-tree-row,
+.filter-editor .json-path-tree-row,
+.sort-popup .json-path-tree-row {
+  position: absolute;
+  top: 0;
+  right: 0;
+  left: 0;
+  display: grid;
+  box-sizing: border-box;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  height: 44px;
+  overflow: hidden;
+  padding-right: 8px;
+  border: 0;
+  border-radius: 0;
+  color: var(--grid-text);
+  background: transparent;
+  text-align: left;
+  cursor: pointer;
+  gap: 8px;
+}
+
+.json-path-tree-row:hover:not([aria-disabled="true"]),
+.json-path-tree-row[aria-selected="true"] {
+  background: var(--grid-selection);
+}
+
+.json-path-tree-row[aria-disabled="true"] {
+  color: var(--grid-text-faint);
+  cursor: default;
+}
+
+.json-path-tree-row code {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.json-path-tree-row span {
+  color: var(--grid-text-faint);
+  font-size: 9px;
 }
 
 .filter-editor strong {

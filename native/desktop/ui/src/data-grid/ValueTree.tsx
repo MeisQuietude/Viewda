@@ -16,6 +16,7 @@ import { ChunkScheduler } from "./chunk-scheduler";
 import {
   ChunkedJsonSource,
   createIncrementalJsonParser,
+  decodeJsonStringPrefix,
   sourceSlice,
 } from "./json-value";
 import { arrowUtf8Bytes } from "./arrow-value";
@@ -24,8 +25,18 @@ import {
   ValueCopyLimitError,
 } from "./value-json-serializer";
 import { codePointSafePrefix } from "./unicode";
-import type { FieldPath } from "../desktop";
+import type {
+  FieldPath,
+  JsonFieldTarget,
+  JsonPath,
+  JsonValueType,
+} from "../desktop";
 import { formatFieldPath, formatFieldPathSegment } from "./field-path";
+import {
+  formatJsonFieldTarget,
+  JSON_PATH_BYTE_LIMIT,
+  jsonPathIsValid,
+} from "./json-path";
 import {
   BINARY_HEX_ROW_BYTES,
   binaryValueBytes,
@@ -159,9 +170,18 @@ export const ValueTree = forwardRef<
     label: string;
     fieldPath?: FieldPath;
     onPromoteField?: (fieldPath: FieldPath) => void;
+    onFilterJsonField?: (target: JsonFieldTarget) => void;
   } & ValueCopyHandlers
 >(function ValueTree(
-  { value, label, fieldPath, onPromoteField, onCopy, onCopyIntent },
+  {
+    value,
+    label,
+    fieldPath,
+    onPromoteField,
+    onFilterJsonField,
+    onCopy,
+    onCopyIntent,
+  },
   forwardedRef,
 ) {
   const treeRef = useRef<HTMLDivElement>(null);
@@ -1026,6 +1046,14 @@ export const ValueTree = forwardRef<
     fieldPath === undefined || onPromoteField === undefined
       ? undefined
       : structNodeFieldPath(fieldPath, activeNode);
+  const activeValuePath =
+    fieldPath === undefined || activeNode === undefined
+      ? undefined
+      : valueNodePath(fieldPath, activeNode);
+  const jsonFieldTarget =
+    fieldPath === undefined || onFilterJsonField === undefined
+      ? undefined
+      : jsonFieldTargetForNode(activeNode);
 
   return (
     <div className={`value-tree-wrap${hasDetail ? " has-detail" : ""}`}>
@@ -1056,6 +1084,14 @@ export const ValueTree = forwardRef<
             />
           )}
           <div className="value-tree-toolbar-actions">
+            {jsonFieldTarget !== undefined && (
+              <button
+                type="button"
+                onClick={() => onFilterJsonField?.(jsonFieldTarget)}
+              >
+                Filter by this field
+              </button>
+            )}
             {promoteFieldPath !== undefined && (
               <button
                 type="button"
@@ -1067,15 +1103,16 @@ export const ValueTree = forwardRef<
             {fieldPath !== undefined && (
               <button
                 type="button"
-                disabled={activeNode === undefined}
+                disabled={activeValuePath === undefined}
                 onClick={() => {
-                  if (activeNode === undefined) return;
-                  const text = valueNodePath(fieldPath, activeNode);
+                  if (activeValuePath === undefined) return;
                   const submit =
                     onCopyIntent ??
                     ((prepared: Promise<string>) =>
                       prepared.then((result) => onCopy?.(result)));
-                  void Promise.resolve(submit(Promise.resolve(text))).then(
+                  void Promise.resolve(
+                    submit(Promise.resolve(activeValuePath)),
+                  ).then(
                     () => setCopyMessage("Copied path."),
                     () => setCopyError("The value path could not be copied."),
                   );
@@ -1643,7 +1680,17 @@ function childNode(parent: TreeNode, ordinal: number): TreeNode | undefined {
   };
 }
 
-function valueNodePath(fieldPath: FieldPath, node: TreeNode): string {
+function valueNodePath(
+  fieldPath: FieldPath,
+  node: TreeNode,
+): string | undefined {
+  if (node.value.kind === "json") {
+    if (node.parent === null) return formatFieldPath(fieldPath);
+    const jsonPath = jsonPathForNode(node);
+    return jsonPath === undefined
+      ? undefined
+      : formatJsonFieldTarget(fieldPath, jsonPath);
+  }
   const descendants: TreeNode[] = [];
   for (let current: TreeNode | null = node; current?.parent !== null;) {
     descendants.push(current);
@@ -1662,6 +1709,59 @@ function valueNodePath(fieldPath: FieldPath, node: TreeNode): string {
     }
   }
   return path;
+}
+
+function jsonFieldTargetForNode(
+  node: TreeNode | undefined,
+): JsonFieldTarget | undefined {
+  if (node?.value.kind !== "json") return undefined;
+  const valueType = jsonNodeValueType(node.value.node.kind);
+  if (valueType === undefined) return undefined;
+  const path = jsonPathForNode(node);
+  return path === undefined || !jsonPathIsValid(path)
+    ? undefined
+    : { path, valueType };
+}
+
+function jsonPathForNode(node: TreeNode): JsonPath | undefined {
+  if (node.parent === null) return undefined;
+  const reversed: JsonPath = [];
+  for (let current = node; current.parent !== null; current = current.parent) {
+    const parent = current.parent;
+    if (parent.value.kind !== "json") return undefined;
+    if (parent.value.node.kind === "array") {
+      reversed.push({ index: current.ordinal });
+      continue;
+    }
+    if (parent.value.node.kind !== "object") return undefined;
+    const source = current.labelSearch;
+    if (source?.kind !== "jsonString") return undefined;
+    const decoded = decodeJsonStringPrefix(
+      source.source,
+      source.start,
+      source.end,
+      JSON_PATH_BYTE_LIMIT + 1,
+    );
+    if (decoded.truncated) return undefined;
+    reversed.push({ field: decoded.text });
+  }
+  const path = reversed.reverse();
+  return jsonPathIsValid(path) ? path : undefined;
+}
+
+function jsonNodeValueType(kind: string): JsonValueType | undefined {
+  switch (kind) {
+    case "boolean":
+      return "boolean";
+    case "number":
+      return "number";
+    case "string":
+      return "text";
+    case "null":
+      return "mixed";
+    default:
+      return undefined;
+  }
 }
 
 function structNodeFieldPath(

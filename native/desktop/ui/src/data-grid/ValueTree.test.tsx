@@ -24,6 +24,7 @@ import { arrowTypedValue, rawJsonValue, typedValue } from "./value-format";
 import { decodeArrowWindow, windowArrowValue } from "./arrow-window";
 import { VALUE_COPY_CHARACTER_LIMIT } from "./value-json-serializer";
 import { ChunkedJsonSource, JSON_NODE_METADATA_LIMIT } from "./json-value";
+import { formatJsonFieldTarget, JSON_PATH_BYTE_LIMIT } from "./json-path";
 
 afterEach(() => {
   cleanup();
@@ -142,6 +143,92 @@ describe("ValueTree", () => {
     fireEvent.click(screen.getByRole("button", { name: "Promote to column" }));
 
     expect(onPromoteField).toHaveBeenCalledWith(["profile", "address"]);
+  });
+
+  it("filters and copies an exact JSON path without using bounded labels", async () => {
+    vi.useFakeTimers();
+    const longKey = `prefix.${"x".repeat(180)}"quoted`;
+    const path = [
+      { field: longKey },
+      { index: 0 },
+      { field: "unit.price" },
+    ] as const;
+    const onFilterJsonField = vi.fn();
+    const onCopy = vi.fn();
+    render(
+      <ValueTree
+        label="payload"
+        fieldPath={["payload"]}
+        value={typedValue(
+          JSON.stringify({ [longKey]: [{ "unit.price": 12 }] }),
+          utf8(),
+          "JSON",
+        )}
+        onFilterJsonField={onFilterJsonField}
+        onPromoteField={vi.fn()}
+        onCopy={onCopy}
+      />,
+    );
+    await act(async () => vi.runAllTimersAsync());
+
+    const tree = screen.getByRole("tree", { name: "payload value" });
+    tree.focus();
+    fireEvent.keyDown(tree, { key: "ArrowDown" });
+    for (let step = 0; step < 4; step += 1) {
+      fireEvent.keyDown(tree, { key: "ArrowRight" });
+    }
+    fireEvent.click(
+      screen.getByRole("button", { name: "Filter by this field" }),
+    );
+
+    expect(onFilterJsonField).toHaveBeenCalledWith({
+      path,
+      valueType: "number",
+    });
+    expect(
+      screen.queryByRole("button", { name: "Promote to column" }),
+    ).toBeNull();
+
+    fireEvent.click(screen.getByRole("button", { name: "Copy path" }));
+    await act(async () => Promise.resolve());
+    expect(onCopy).toHaveBeenCalledWith(
+      formatJsonFieldTarget(["payload"], path),
+    );
+    vi.useRealTimers();
+  });
+
+  it("does not expose an address for a JSON key beyond the wire limit", async () => {
+    vi.useFakeTimers();
+    const onFilterJsonField = vi.fn();
+    const onCopy = vi.fn();
+    const oversizedKey = "x".repeat(JSON_PATH_BYTE_LIMIT + 1);
+    render(
+      <ValueTree
+        label="payload"
+        fieldPath={["payload"]}
+        value={typedValue(
+          JSON.stringify({ [oversizedKey]: 12 }),
+          utf8(),
+          "JSON",
+        )}
+        onFilterJsonField={onFilterJsonField}
+        onCopy={onCopy}
+      />,
+    );
+    await act(async () => vi.runAllTimersAsync());
+
+    const tree = screen.getByRole("tree", { name: "payload value" });
+    tree.focus();
+    fireEvent.keyDown(tree, { key: "ArrowDown" });
+
+    expect(
+      screen.queryByRole("button", { name: "Filter by this field" }),
+    ).toBeNull();
+    const copyPath = screen.getByRole("button", { name: "Copy path" });
+    expect(copyPath).toBeDisabled();
+    fireEvent.click(copyPath);
+    expect(onFilterJsonField).not.toHaveBeenCalled();
+    expect(onCopy).not.toHaveBeenCalled();
   });
 
   it("renders an empty field name explicitly", () => {

@@ -28,6 +28,7 @@ import {
   type DataExportStatus,
   type DataFilter,
   type FieldPath,
+  type JsonFieldTarget,
   type DataViewSettings,
   type DataViewResourceDiagnostics,
   type SortColumn,
@@ -90,6 +91,7 @@ import {
   formatOrderByClause,
   formatSelectClause,
   formatWhereClause,
+  isJsonField,
 } from "./filter-query";
 import {
   clampedVisibleStart,
@@ -102,7 +104,7 @@ import {
   type ScrollState,
 } from "./row-window";
 import { formatDataTypeLabel, SchemaSidebar } from "./SchemaSidebar";
-import { nextSort } from "./sort";
+import { nextSort, sameSortIdentity } from "./sort";
 import {
   fieldPathKey,
   fieldPathStartsWith,
@@ -112,6 +114,12 @@ import {
   sameFieldPath,
 } from "./field-path";
 import { ColumnPicker, type ColumnPickerColumn } from "./ColumnPicker";
+import { JsonPathPicker } from "./JsonPathPicker";
+import {
+  formatJsonFieldTarget,
+  jsonPathKey,
+  sameJsonTarget,
+} from "./json-path";
 import { ValuePeek } from "./ValuePeek";
 import { arrowTypedValue, typedValue, type TypedValue } from "./value-format";
 import {
@@ -304,6 +312,10 @@ interface PendingView {
   sort: SortColumn[];
 }
 
+interface SortDraftColumn extends SortColumn {
+  jsonPathMode: boolean;
+}
+
 interface ViewErrorState {
   message: string;
   diagnostics?: string;
@@ -468,6 +480,7 @@ function viewDefinitionEquals(
       return (
         next !== undefined &&
         sameFieldPath(filter.fieldPath, next.fieldPath) &&
+        sameJsonTarget(filter.jsonTarget, next.jsonTarget) &&
         filter.operator === next.operator &&
         (filter.matchCase ?? false) === (next.matchCase ?? false) &&
         filter.values.length === next.values.length &&
@@ -482,6 +495,7 @@ function viewDefinitionEquals(
       return (
         next !== undefined &&
         sameFieldPath(column.fieldPath, next.fieldPath) &&
+        sameJsonTarget(column.jsonTarget, next.jsonTarget) &&
         column.direction === next.direction
       );
     })
@@ -597,6 +611,10 @@ export function DataGrid({
   const schemaPageRequest = useRef(0);
   const schemaPageActive = useRef(false);
   const schemaSource = useMemo(() => ({ ...source, schema }), [schema, source]);
+  const jsonSchemaSourceRevision = useMemo(
+    () => JSON.stringify([contentIdentity ?? null, source.rowCount]),
+    [contentIdentity, source.rowCount],
+  );
   const [columnStates, setColumnStates] = useState<ColumnState[]>(() => {
     const duplicateNames = duplicateTopLevelNames(source.schema);
     return source.schema.map((field, sourceIndex) =>
@@ -670,7 +688,23 @@ export function DataGrid({
     top: WHERE_POPUP_MARGIN,
   });
   const [sortPopupOpen, setSortPopupOpen] = useState(false);
-  const [sortDraft, setSortDraft] = useState<SortColumn[]>([]);
+  const [sortDraft, setSortDraft] = useState<SortDraftColumn[]>([]);
+  const sortDraftHasDuplicateIdentity = useMemo(
+    () =>
+      sortDraft.some((column, index) =>
+        column.jsonPathMode && column.jsonTarget === undefined
+          ? false
+          : sortDraft
+              .slice(0, index)
+              .some(
+                (candidate) =>
+                  (!candidate.jsonPathMode ||
+                    candidate.jsonTarget !== undefined) &&
+                  sameSortIdentity(candidate, column),
+              ),
+      ),
+    [sortDraft],
+  );
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const [selectedSchemaPath, setSelectedSchemaPath] =
     useState<FieldPath | null>(null);
@@ -917,8 +951,10 @@ export function DataGrid({
     () =>
       visibleColumnStates.map((column) => {
         const displayedSort = pendingView?.sort ?? sort;
-        const sortIndex = displayedSort.findIndex((entry) =>
-          sameFieldPath(entry.fieldPath, column.fieldPath),
+        const sortIndex = displayedSort.findIndex(
+          (entry) =>
+            entry.jsonTarget === undefined &&
+            sameFieldPath(entry.fieldPath, column.fieldPath),
         );
         const key = column.key;
         const groupRail = railMetadataByColumnKey.get(key);
@@ -2618,13 +2654,9 @@ export function DataGrid({
       const dependentSort = (column: SortColumn) =>
         column.fieldPath.length > fieldPath.length &&
         fieldPathStartsWith(column.fieldPath, fieldPath);
-      const removedFilterPaths = current.filters
-        .filter(dependentFilter)
-        .map((filter) => filter.fieldPath);
-      const removedSortPaths = current.sort
-        .filter(dependentSort)
-        .map((column) => column.fieldPath);
-      if (removedFilterPaths.length + removedSortPaths.length > 0) {
+      const removedFilters = current.filters.filter(dependentFilter);
+      const removedSortColumns = current.sort.filter(dependentSort);
+      if (removedFilters.length + removedSortColumns.length > 0) {
         applyView(
           current.filters.filter((filter) => !dependentFilter(filter)),
           current.sort.filter((column) => !dependentSort(column)),
@@ -2632,11 +2664,11 @@ export function DataGrid({
       }
       setColumnNotice({
         message:
-          removedFilterPaths.length + removedSortPaths.length === 0
+          removedFilters.length + removedSortColumns.length === 0
             ? `Unflattened ${formatFieldPath(fieldPath)} into one column.`
-            : `Unflattened ${formatFieldPath(fieldPath)} into one column; removed ${formatDroppedPathNotice(removedFilterPaths, removedSortPaths)}.`,
+            : `Unflattened ${formatFieldPath(fieldPath)} into one column; removed ${formatDroppedTargetNotice(removedFilters, removedSortColumns)}.`,
         kind:
-          removedFilterPaths.length + removedSortPaths.length === 0
+          removedFilters.length + removedSortColumns.length === 0
             ? "status"
             : "alert",
       });
@@ -3333,6 +3365,28 @@ export function DataGrid({
     ],
   );
 
+  const filterJsonFieldFromPeek = useCallback(
+    (jsonTarget: JsonFieldTarget) => {
+      if (peek === null) return;
+      const fieldPath = visibleColumnStates[peek.address.column]?.fieldPath;
+      if (fieldPath === undefined) return;
+      setFilterEditor({
+        fieldPath,
+        jsonTarget,
+        left: Math.max(4, Math.min(peek.bounds.x, window.innerWidth - 432)),
+        top: Math.max(
+          4,
+          Math.min(
+            peek.bounds.y + peek.bounds.height,
+            window.innerHeight - 268,
+          ),
+        ),
+      });
+      setPeek(null);
+    },
+    [peek, visibleColumnStates],
+  );
+
   const openFilterForCell = useCallback(
     (fieldPath: FieldPath, row: number, bounds: Rectangle) => {
       const field = resolveSchemaField(schema, fieldPath);
@@ -3571,10 +3625,14 @@ export function DataGrid({
               onClick={() => {
                 setSelectPopupOpen(false);
                 setWherePopupOpen(false);
-                setSortDraft([
-                  ...(pendingViewRef.current?.sort ??
-                    activeViewRef.current.sort),
-                ]);
+                setSortDraft(
+                  (
+                    pendingViewRef.current?.sort ?? activeViewRef.current.sort
+                  ).map((column) => ({
+                    ...column,
+                    jsonPathMode: column.jsonTarget !== undefined,
+                  })),
+                );
                 setSortPopupOpen((open) => !open);
               }}
             >
@@ -3590,68 +3648,148 @@ export function DataGrid({
                   <p>No ORDER BY columns.</p>
                 ) : (
                   <ol>
-                    {sortDraft.map((column, index) => (
-                      <li key={fieldPathKey(column.fieldPath)}>
-                        <code>{formatFieldPath(column.fieldPath)}</code>
-                        <select
-                          aria-label={`Direction for ${formatFieldPath(column.fieldPath)}`}
-                          value={column.direction}
-                          onChange={(event) =>
-                            setSortDraft((current) =>
-                              current.map((item, itemIndex) =>
-                                itemIndex === index
-                                  ? {
-                                      ...item,
-                                      direction: event.target.value as
-                                        "ascending" | "descending",
-                                    }
-                                  : item,
-                              ),
-                            )
+                    {sortDraft.map((column, index) => {
+                      const field = resolveSchemaField(
+                        schema,
+                        column.fieldPath,
+                      );
+                      const jsonField =
+                        field !== undefined && isJsonField(field);
+                      const label =
+                        column.jsonTarget === undefined
+                          ? formatFieldPath(column.fieldPath)
+                          : formatJsonFieldTarget(
+                              column.fieldPath,
+                              column.jsonTarget.path,
+                            );
+                      return (
+                        <li
+                          key={fieldPathKey(column.fieldPath) + ":" + index}
+                          className={
+                            column.jsonPathMode ? "has-json-path" : undefined
                           }
                         >
-                          <option value="ascending">ASC</option>
-                          <option value="descending">DESC</option>
-                        </select>
-                        <button
-                          type="button"
-                          aria-label={`Move ${formatFieldPath(column.fieldPath)} earlier`}
-                          disabled={index === 0}
-                          onClick={() =>
-                            setSortDraft((current) =>
-                              moveSortColumn(current, index, index - 1),
-                            )
-                          }
-                        >
-                          ↑
-                        </button>
-                        <button
-                          type="button"
-                          aria-label={`Move ${formatFieldPath(column.fieldPath)} later`}
-                          disabled={index === sortDraft.length - 1}
-                          onClick={() =>
-                            setSortDraft((current) =>
-                              moveSortColumn(current, index, index + 1),
-                            )
-                          }
-                        >
-                          ↓
-                        </button>
-                        <button
-                          type="button"
-                          aria-label={`Remove sort ${formatFieldPath(column.fieldPath)}`}
-                          onClick={() =>
-                            setSortDraft((current) =>
-                              current.filter(
-                                (_item, itemIndex) => itemIndex !== index,
-                              ),
-                            )
-                          }
-                        >
-                          Remove
-                        </button>
-                      </li>
-                    ))}
+                          <div className="sort-column-row">
+                            <code>{label}</code>
+                            <select
+                              aria-label={`Direction for ${label}`}
+                              value={column.direction}
+                              onChange={(event) =>
+                                setSortDraft((current) =>
+                                  current.map((item, itemIndex) =>
+                                    itemIndex === index
+                                      ? {
+                                          ...item,
+                                          direction: event.target.value as
+                                            "ascending" | "descending",
+                                        }
+                                      : item,
+                                  ),
+                                )
+                              }
+                            >
+                              <option value="ascending">ASC</option>
+                              <option value="descending">DESC</option>
+                            </select>
+                            <button
+                              type="button"
+                              aria-label={`Move ${label} earlier`}
+                              disabled={index === 0}
+                              onClick={() =>
+                                setSortDraft((current) =>
+                                  moveSortColumn(current, index, index - 1),
+                                )
+                              }
+                            >
+                              ↑
+                            </button>
+                            <button
+                              type="button"
+                              aria-label={`Move ${label} later`}
+                              disabled={index === sortDraft.length - 1}
+                              onClick={() =>
+                                setSortDraft((current) =>
+                                  moveSortColumn(current, index, index + 1),
+                                )
+                              }
+                            >
+                              ↓
+                            </button>
+                            <button
+                              type="button"
+                              aria-label={`Remove sort ${label}`}
+                              onClick={() =>
+                                setSortDraft((current) =>
+                                  current.filter(
+                                    (_item, itemIndex) => itemIndex !== index,
+                                  ),
+                                )
+                              }
+                            >
+                              Remove
+                            </button>
+                          </div>
+                          {jsonField && (
+                            <label className="sort-json-mode">
+                              Sort value
+                              <select
+                                aria-label={`Sort value for ${formatFieldPath(column.fieldPath)}`}
+                                value={
+                                  column.jsonPathMode
+                                    ? "jsonField"
+                                    : "wholeColumn"
+                                }
+                                onChange={(event) => {
+                                  const jsonPathMode =
+                                    event.target.value === "jsonField";
+                                  setSortDraft((current) =>
+                                    current.map((item, itemIndex) =>
+                                      itemIndex !== index
+                                        ? item
+                                        : jsonPathMode
+                                          ? { ...item, jsonPathMode: true }
+                                          : {
+                                              fieldPath: item.fieldPath,
+                                              direction: item.direction,
+                                              jsonPathMode: false,
+                                            },
+                                    ),
+                                  );
+                                }}
+                              >
+                                <option value="wholeColumn">
+                                  Whole JSON column
+                                </option>
+                                <option value="jsonField">JSON field…</option>
+                              </select>
+                            </label>
+                          )}
+                          {jsonField && column.jsonPathMode && (
+                            <JsonPathPicker
+                              generation={source.generation}
+                              sourceRevisionKey={jsonSchemaSourceRevision}
+                              fieldPath={column.fieldPath}
+                              target={column.jsonTarget ?? null}
+                              onChange={(jsonTarget) =>
+                                setSortDraft((current) =>
+                                  current.map((item, itemIndex) =>
+                                    itemIndex !== index
+                                      ? item
+                                      : jsonTarget === null
+                                        ? {
+                                            fieldPath: item.fieldPath,
+                                            direction: item.direction,
+                                            jsonPathMode: true,
+                                          }
+                                        : { ...item, jsonTarget },
+                                  ),
+                                )
+                              }
+                            />
+                          )}
+                        </li>
+                      );
+                    })}
                   </ol>
                 )}
                 <label>
@@ -3663,13 +3801,21 @@ export function DataGrid({
                         (candidate) => candidate.key === event.target.value,
                       );
                       if (column !== undefined) {
-                        setSortDraft((current) => [
-                          ...current,
-                          {
-                            fieldPath: column.fieldPath,
-                            direction: "ascending",
-                          },
-                        ]);
+                        setSortDraft((current) => {
+                          const jsonPathMode =
+                            isJsonField(column.field) &&
+                            current.some((sorted) =>
+                              sameFieldPath(sorted.fieldPath, column.fieldPath),
+                            );
+                          return [
+                            ...current,
+                            {
+                              fieldPath: column.fieldPath,
+                              direction: "ascending",
+                              jsonPathMode,
+                            },
+                          ];
+                        });
                       }
                     }}
                   >
@@ -3680,20 +3826,51 @@ export function DataGrid({
                       <option
                         key={column.key}
                         value={column.key}
-                        disabled={sortDraft.some((sorted) =>
-                          sameFieldPath(sorted.fieldPath, column.fieldPath),
-                        )}
+                        disabled={
+                          isJsonField(column.field)
+                            ? sortDraft.some(
+                                (sorted) =>
+                                  sorted.jsonPathMode &&
+                                  sorted.jsonTarget === undefined &&
+                                  sameFieldPath(
+                                    sorted.fieldPath,
+                                    column.fieldPath,
+                                  ),
+                              )
+                            : sortDraft.some((sorted) =>
+                                sameFieldPath(
+                                  sorted.fieldPath,
+                                  column.fieldPath,
+                                ),
+                              )
+                        }
                       >
                         {column.title}
                       </option>
                     ))}
                   </select>
                 </label>
+                {sortDraftHasDuplicateIdentity && (
+                  <p className="sort-popup-error" role="alert">
+                    Each whole column or JSON path can be sorted only once.
+                  </p>
+                )}
                 <div className="sort-popup-actions">
                   <button type="button" onClick={() => setSortPopupOpen(false)}>
                     Cancel
                   </button>
-                  <button type="button" onClick={() => changeSort(sortDraft)}>
+                  <button
+                    type="button"
+                    disabled={
+                      sortDraftHasDuplicateIdentity ||
+                      sortDraft.some(
+                        (column) =>
+                          column.jsonPathMode &&
+                          column.jsonTarget === undefined,
+                      )
+                    }
+                    onClick={() => changeSort(sortColumnsFromDraft(sortDraft))}
+                  >
                     Apply
                   </button>
                 </div>
@@ -4042,6 +4219,9 @@ export function DataGrid({
           onPromoteField={
             pathActionsAvailable ? promoteFieldToColumn : undefined
           }
+          onFilterJsonField={
+            pathActionsAvailable ? filterJsonFieldFromPeek : undefined
+          }
           onClose={() => setPeek(null)}
           onReturnFocus={() => gridRef.current?.focus()}
           onCopyIntent={(text) =>
@@ -4295,6 +4475,7 @@ export function DataGrid({
           request={filterEditor}
           field={filterEditorField}
           sourceGeneration={source.generation}
+          sourceRevisionKey={jsonSchemaSourceRevision}
           nextSuggestionRevision={nextSuggestionRevision}
           onApply={(filter) =>
             changeFilters(
@@ -4483,11 +4664,15 @@ function isTypingTarget(target: EventTarget | null): boolean {
   );
 }
 
-function moveSortColumn(
-  sort: readonly SortColumn[],
-  from: number,
-  to: number,
-): SortColumn[] {
+function sortColumnsFromDraft(draft: readonly SortDraftColumn[]): SortColumn[] {
+  return draft.map(({ fieldPath, jsonTarget, direction }) => ({
+    fieldPath,
+    ...(jsonTarget === undefined ? {} : { jsonTarget }),
+    direction,
+  }));
+}
+
+function moveSortColumn<T>(sort: readonly T[], from: number, to: number): T[] {
   if (
     from === to ||
     from < 0 ||
@@ -4913,26 +5098,44 @@ function formatUnflattenActionLabel({ path }: { path: FieldPath }): string {
   return `Unflatten ${formatFieldPath(path)}`;
 }
 
-function formatDroppedPathNotice(
-  filterPaths: readonly FieldPath[],
-  sortPaths: readonly FieldPath[],
+function formatDroppedTargetNotice(
+  filters: readonly DataFilter[],
+  sort: readonly SortColumn[],
 ): string {
-  const category = (label: string, paths: readonly FieldPath[]) => {
-    const unique = new Map(paths.map((path) => [fieldPathKey(path), path]));
+  const category = (
+    label: string,
+    targets: readonly (DataFilter | SortColumn)[],
+  ) => {
+    const unique = new Map(
+      targets.map((target) => [
+        fieldPathKey(target.fieldPath) +
+          ":" +
+          (target.jsonTarget === undefined
+            ? ""
+            : jsonPathKey(target.jsonTarget.path)),
+        target,
+      ]),
+    );
     const visible = [...unique.values()]
       .slice(0, NOTICE_PATH_LIMIT)
-      .map(boundedNoticePath);
+      .map((target) =>
+        boundedNoticeText(
+          target.jsonTarget === undefined
+            ? formatFieldPath(target.fieldPath)
+            : formatJsonFieldTarget(target.fieldPath, target.jsonTarget.path),
+        ),
+      );
     const remaining = unique.size - visible.length;
     return `${label}: ${visible.join(", ")}${remaining > 0 ? `, +${remaining.toLocaleString("en-US")} more` : ""}`;
   };
   return [
-    ...(filterPaths.length === 0 ? [] : [category("filters", filterPaths)]),
-    ...(sortPaths.length === 0 ? [] : [category("sorts", sortPaths)]),
+    ...(filters.length === 0 ? [] : [category("filters", filters)]),
+    ...(sort.length === 0 ? [] : [category("sorts", sort)]),
   ].join("; ");
 }
 
-function boundedNoticePath(path: FieldPath): string {
-  const characters = Array.from(formatFieldPath(path));
+function boundedNoticeText(text: string): string {
+  const characters = Array.from(text);
   if (characters.length <= NOTICE_PATH_CHARACTER_LIMIT) {
     return characters.join("");
   }

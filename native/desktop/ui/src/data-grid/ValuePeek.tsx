@@ -8,7 +8,7 @@ import {
 } from "react";
 
 import type { Rectangle } from "./grid-model";
-import type { FieldPath } from "../desktop";
+import type { FieldPath, JsonFieldTarget } from "../desktop";
 import {
   ValueTree,
   type ValueCopyHandlers,
@@ -51,6 +51,7 @@ export function ValuePeek({
   onClose,
   onReturnFocus,
   onPromoteField,
+  onFilterJsonField,
   onCopy,
   onCopyIntent,
 }: {
@@ -64,6 +65,7 @@ export function ValuePeek({
   onClose: () => void;
   onReturnFocus: () => void;
   onPromoteField?: (fieldPath: FieldPath) => void;
+  onFilterJsonField?: (target: JsonFieldTarget) => void;
 } & ValueCopyHandlers) {
   const popoverRef = useRef<HTMLDivElement>(null);
   const treeRef = useRef<ValueTreeHandle>(null);
@@ -325,6 +327,7 @@ export function ValuePeek({
             label={label}
             fieldPath={showCopyPath ? fieldPath : undefined}
             onPromoteField={onPromoteField}
+            onFilterJsonField={onFilterJsonField}
             {...(onCopyIntent === undefined
               ? { onCopy: onCopy! }
               : { onCopyIntent })}

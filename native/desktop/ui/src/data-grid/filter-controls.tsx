@@ -13,16 +13,21 @@ import {
   type DataFilter,
   type DataFilterOperator,
   type FieldPath,
+  type JsonFieldTarget,
+  type JsonValueType,
   type SchemaField,
   type TextValueSuggestions,
 } from "../desktop";
 import {
   columnFilterKind,
+  isJsonField,
   temporalFormatForField,
   type ColumnFilterKind,
   type TemporalFormat,
 } from "./filter-query";
 import { formatFieldPath } from "./field-path";
+import { formatJsonFieldTarget } from "./json-path";
+import { JsonPathPicker } from "./JsonPathPicker";
 
 export interface FilterEditorRequest {
   fieldPath: FieldPath;
@@ -32,6 +37,7 @@ export interface FilterEditorRequest {
   initialFilter?: DataFilter;
   initialOperator?: DataFilterOperator;
   initialValue?: string;
+  jsonTarget?: JsonFieldTarget;
 }
 
 interface OperatorOption {
@@ -101,6 +107,7 @@ export function FilterEditor({
   request,
   field,
   sourceGeneration,
+  sourceRevisionKey = "",
   nextSuggestionRevision,
   onApply,
   onCancel,
@@ -108,12 +115,28 @@ export function FilterEditor({
   request: FilterEditorRequest;
   field: SchemaField;
   sourceGeneration: number;
+  sourceRevisionKey?: string;
   nextSuggestionRevision: () => number;
   onApply: (filter: DataFilter) => void;
   onCancel: () => void;
 }) {
-  const fieldLabel = formatFieldPath(request.fieldPath);
-  const kind = columnFilterKind(field);
+  const initialJsonTarget =
+    request.initialFilter?.jsonTarget ?? request.jsonTarget ?? null;
+  const jsonField = isJsonField(field);
+  const [jsonFieldMode, setJsonFieldMode] = useState(
+    initialJsonTarget !== null,
+  );
+  const [jsonTarget, setJsonTarget] = useState<JsonFieldTarget | null>(
+    initialJsonTarget,
+  );
+  const kind =
+    jsonFieldMode && jsonTarget !== null
+      ? jsonFilterKind(jsonTarget.valueType)
+      : columnFilterKind(field);
+  const fieldLabel =
+    jsonFieldMode && jsonTarget !== null
+      ? formatJsonFieldTarget(request.fieldPath, jsonTarget.path)
+      : formatFieldPath(request.fieldPath);
   const requestedOperator =
     request.initialFilter?.operator ?? request.initialOperator;
   const options = OPERATOR_OPTIONS[kind];
@@ -155,8 +178,10 @@ export function FilterEditor({
     secondValue,
   );
   const values = valueResult.values;
+  const operatorIsValid = options.some(({ value }) => value === operator);
   const suggestions = useTextValueSuggestions({
     enabled:
+      !jsonFieldMode &&
       kind === "text" &&
       operator !== "oneOf" &&
       operator !== "isNull" &&
@@ -168,6 +193,8 @@ export function FilterEditor({
     nextSuggestionRevision,
   });
   const canApply =
+    (!jsonFieldMode || jsonTarget !== null) &&
+    operatorIsValid &&
     values !== null &&
     (kind !== "text" ||
       operator === "isNull" ||
@@ -182,6 +209,23 @@ export function FilterEditor({
     valueResult.temporalError,
     field,
   );
+
+  useEffect(() => {
+    if (options.some(({ value }) => value === operator)) return;
+    setOperator(defaultFilterOperator(kind));
+  }, [kind, operator, options]);
+
+  useEffect(() => {
+    if (
+      kind === "boolean" &&
+      operator !== "isNull" &&
+      operator !== "isNotNull" &&
+      firstValue.length === 0
+    ) {
+      setFirstValue("true");
+    }
+    if (kind !== "text") setMatchCase(false);
+  }, [firstValue.length, kind, operator]);
 
   useEffect(() => {
     const closeOutside = (event: PointerEvent) => {
@@ -205,14 +249,23 @@ export function FilterEditor({
   return (
     <form
       ref={editorRef}
-      className="filter-editor"
+      className={"filter-editor" + (jsonField ? " has-json-path" : "")}
       aria-label={`Filter ${fieldLabel}`}
-      style={{ left: request.left, top: request.top }}
+      style={{
+        left: jsonField
+          ? Math.max(4, Math.min(request.left, window.innerWidth - 444))
+          : request.left,
+        top: request.top,
+        maxHeight: jsonField
+          ? Math.max(160, window.innerHeight - request.top - 12)
+          : undefined,
+      }}
       onSubmit={(event) => {
         event.preventDefault();
         if (canApply && values !== null) {
           onApply({
             fieldPath: request.fieldPath,
+            ...(jsonFieldMode && jsonTarget !== null ? { jsonTarget } : {}),
             operator,
             values,
             ...(isSubstringOperator(operator) && matchCase
@@ -223,6 +276,32 @@ export function FilterEditor({
       }}
     >
       <strong>{fieldLabel}</strong>
+      {jsonField && (
+        <label>
+          <span>Filter value</span>
+          <select
+            aria-label="Filter value"
+            value={jsonFieldMode ? "jsonField" : "wholeColumn"}
+            onChange={(event) => {
+              const nextMode = event.target.value === "jsonField";
+              setJsonFieldMode(nextMode);
+              if (!nextMode) setJsonTarget(null);
+            }}
+          >
+            <option value="wholeColumn">Whole JSON column</option>
+            <option value="jsonField">JSON field…</option>
+          </select>
+        </label>
+      )}
+      {jsonFieldMode && (
+        <JsonPathPicker
+          generation={sourceGeneration}
+          sourceRevisionKey={sourceRevisionKey}
+          fieldPath={request.fieldPath}
+          target={jsonTarget}
+          onChange={setJsonTarget}
+        />
+      )}
       <label>
         <span>Condition</span>
         <select
@@ -284,6 +363,18 @@ export function FilterEditor({
       </div>
     </form>
   );
+}
+
+function jsonFilterKind(valueType: JsonValueType): ColumnFilterKind {
+  switch (valueType) {
+    case "boolean":
+      return "boolean";
+    case "number":
+      return "number";
+    case "text":
+    case "mixed":
+      return "text";
+  }
 }
 
 function FilterValues({

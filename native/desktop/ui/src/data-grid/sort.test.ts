@@ -49,6 +49,34 @@ describe("grid sort order", () => {
     ]);
   });
 
+  it("cycles only the whole-column sort and preserves JSON-path sorts", () => {
+    const jsonSorts: SortColumn[] = [
+      {
+        fieldPath: ["payload"],
+        jsonTarget: { path: [{ field: "rank" }], valueType: "number" },
+        direction: "descending",
+      },
+      {
+        fieldPath: ["payload"],
+        jsonTarget: { path: [{ field: "name" }], valueType: "text" },
+        direction: "ascending",
+      },
+    ];
+
+    const ascending = nextSort(jsonSorts, ["payload"], false);
+    expect(ascending).toEqual([
+      { fieldPath: ["payload"], direction: "ascending" },
+      ...jsonSorts,
+    ]);
+    expect(nextSort(ascending, ["payload"], false)).toEqual([
+      { fieldPath: ["payload"], direction: "descending" },
+      ...jsonSorts,
+    ]);
+    expect(
+      nextSort(nextSort(ascending, ["payload"], false), ["payload"], false),
+    ).toEqual(jsonSorts);
+  });
+
   it("selects neutral, directional and prioritized header icons", () => {
     const sort: SortColumn[] = [
       { fieldPath: ["primary"], direction: "ascending" },
@@ -63,5 +91,20 @@ describe("grid sort order", () => {
     expect(sortedColumnIcon([sort[0]!], ["primary"])).toBe(
       "viewda-sort-ascending",
     );
+    expect(
+      sortedColumnIcon(
+        [
+          {
+            fieldPath: ["primary"],
+            jsonTarget: {
+              path: [{ field: "nested" }],
+              valueType: "number",
+            },
+            direction: "ascending",
+          },
+        ],
+        ["primary"],
+      ),
+    ).toBe("viewda-sort-neutral");
   });
 });

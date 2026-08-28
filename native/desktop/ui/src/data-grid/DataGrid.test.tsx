@@ -181,6 +181,65 @@ const nestedSource: desktop.SourceSummary = {
   schemaNodeCount: 8,
 };
 
+const jsonSource: desktop.SourceSummary = {
+  ...source,
+  displayName: "json.parquet",
+  rowCount: 4,
+  columnCount: 1,
+  schema: [
+    {
+      name: "payload",
+      physicalType: "BYTE_ARRAY",
+      logicalType: "JSON",
+      children: [],
+    },
+  ],
+  schemaNodeCount: 1,
+};
+
+const jsonSchemaInference: desktop.JsonSchemaInference = {
+  isSampleDerived: true,
+  sampleRowLimit: 512,
+  sampleValueByteLimit: 1_048_576,
+  sampleValueCharacterLimit: 1_048_576,
+  sampleTotalByteLimit: 16_777_216,
+  sampleArrowByteLimit: 33_554_432,
+  sampledRowCount: 4,
+  sampledValueBytes: 120,
+  hasMoreRows: false,
+  isTruncated: false,
+  invalidValueCount: 0,
+  oversizedValueCount: 0,
+  nodes: [
+    {
+      segment: { field: "items" },
+      observedTypes: ["array"],
+      effectiveType: null,
+      children: [
+        {
+          segment: { index: 0 },
+          observedTypes: ["object"],
+          effectiveType: null,
+          children: [
+            {
+              segment: { field: "amount" },
+              observedTypes: ["number"],
+              effectiveType: "number",
+              children: [],
+            },
+            {
+              segment: { field: "mixed.value" },
+              observedTypes: ["number", "string"],
+              effectiveType: "mixed",
+              children: [],
+            },
+          ],
+        },
+      ],
+    },
+  ],
+};
+
 const fieldColumnOffsets = (fieldPaths: readonly desktop.FieldPath[]) =>
   new Map(
     fieldPaths.map((fieldPath, offset) => [JSON.stringify(fieldPath), offset]),
@@ -250,6 +309,7 @@ beforeEach(() => {
     values: [],
     isPartial: false,
   });
+  vi.spyOn(desktop, "inferJsonSchema").mockResolvedValue(jsonSchemaInference);
   vi.spyOn(desktop, "cancelTextValueSuggestions").mockResolvedValue();
   vi.spyOn(desktop, "getColumnStatistics").mockResolvedValue({
     minimum: "1",
@@ -3824,6 +3884,362 @@ describe("DataGrid window rendering", () => {
     await waitFor(() =>
       expect(screen.getByLabelText("Query")).not.toHaveTextContent(
         '"column_0" = -7',
+      ),
+    );
+  });
+
+  it("applies a manually entered JSON array path and cancels its scan", async () => {
+    const preparation = deferred<desktop.DataViewStatus>();
+    vi.mocked(desktop.prepareDataView).mockReturnValueOnce(preparation.promise);
+    render(<DataGrid source={jsonSource} />);
+
+    openFilterEditor(0);
+    const editor = screen.getByRole("form", { name: "Filter payload" });
+    fireEvent.change(within(editor).getByLabelText("Filter value"), {
+      target: { value: "jsonField" },
+    });
+    expect(
+      await within(editor).findByText(/Sample-derived fields from at most/),
+    ).toBeInTheDocument();
+    expect(within(editor).getByText(/scans the JSON column/)).toBeVisible();
+    vi.mocked(desktop.getTextValueSuggestions).mockClear();
+
+    const manualPath = within(editor).getByLabelText("Manual JSON path");
+    fireEvent.change(manualPath, { target: { value: "items[" } });
+    expect(
+      within(editor).getByRole("button", { name: "Add condition" }),
+    ).toBeDisabled();
+    expect(desktop.prepareDataView).not.toHaveBeenCalled();
+
+    fireEvent.change(manualPath, {
+      target: { value: 'items[3]."late.value"' },
+    });
+    fireEvent.change(within(editor).getByLabelText("Value type"), {
+      target: { value: "number" },
+    });
+    fireEvent.change(within(editor).getByLabelText("Condition"), {
+      target: { value: "greaterThan" },
+    });
+    fireEvent.change(within(editor).getByLabelText("Value"), {
+      target: { value: "10" },
+    });
+    await act(async () => new Promise((resolve) => setTimeout(resolve, 200)));
+    expect(desktop.getTextValueSuggestions).not.toHaveBeenCalled();
+    fireEvent.click(
+      within(editor).getByRole("button", { name: "Add condition" }),
+    );
+
+    await waitFor(() =>
+      expect(desktop.prepareDataView).toHaveBeenCalledWith(
+        7,
+        1,
+        [
+          {
+            fieldPath: ["payload"],
+            jsonTarget: {
+              path: [{ field: "items" }, { index: 3 }, { field: "late.value" }],
+              valueType: "number",
+            },
+            operator: "greaterThan",
+            values: ["10"],
+          },
+        ],
+        [],
+        { memoryLimit: "mb384" },
+      ),
+    );
+    expect(screen.getByLabelText("Query")).toHaveTextContent(
+      "preparing view… cancel",
+    );
+    fireEvent.click(
+      within(screen.getByLabelText("Query")).getByRole("button", {
+        name: "cancel",
+      }),
+    );
+    await waitFor(() =>
+      expect(desktop.cancelDataView).toHaveBeenCalledWith(7, 1),
+    );
+  });
+
+  it("invalidates shared JSON inference when the source revision changes", async () => {
+    const inference = vi.mocked(desktop.inferJsonSchema);
+    inference.mockClear();
+    const revisionSource = { ...jsonSource, generation: 811 };
+    const { rerender } = render(
+      <DataGrid source={revisionSource} contentIdentity="early-sample" />,
+    );
+
+    openFilterEditor(0);
+    let editor = screen.getByRole("form", { name: "Filter payload" });
+    fireEvent.change(within(editor).getByLabelText("Filter value"), {
+      target: { value: "jsonField" },
+    });
+    await within(editor).findByText(/Sample-derived fields from at most/);
+    expect(inference).toHaveBeenCalledTimes(1);
+    fireEvent.click(within(editor).getByRole("button", { name: "Cancel" }));
+
+    fireEvent.click(document.querySelector<HTMLButtonElement>(".query-order")!);
+    let popup = screen.getByRole("dialog", { name: "ORDER BY columns" });
+    fireEvent.change(within(popup).getByLabelText("Add column"), {
+      target: { value: '["payload"]' },
+    });
+    fireEvent.change(within(popup).getByLabelText("Sort value for payload"), {
+      target: { value: "jsonField" },
+    });
+    await within(popup).findByText(/Sample-derived fields from at most/);
+    expect(inference).toHaveBeenCalledTimes(1);
+    fireEvent.click(within(popup).getByRole("button", { name: "Cancel" }));
+
+    rerender(<DataGrid source={revisionSource} contentIdentity="complete" />);
+    openFilterEditor(0);
+    editor = screen.getByRole("form", { name: "Filter payload" });
+    fireEvent.change(within(editor).getByLabelText("Filter value"), {
+      target: { value: "jsonField" },
+    });
+    await waitFor(() => expect(inference).toHaveBeenCalledTimes(2));
+    fireEvent.click(within(editor).getByRole("button", { name: "Cancel" }));
+
+    rerender(
+      <DataGrid
+        source={{ ...revisionSource, rowCount: revisionSource.rowCount + 1 }}
+        contentIdentity="complete"
+      />,
+    );
+    fireEvent.click(document.querySelector<HTMLButtonElement>(".query-order")!);
+    popup = screen.getByRole("dialog", { name: "ORDER BY columns" });
+    fireEvent.change(within(popup).getByLabelText("Add column"), {
+      target: { value: '["payload"]' },
+    });
+    fireEvent.change(within(popup).getByLabelText("Sort value for payload"), {
+      target: { value: "jsonField" },
+    });
+    await waitFor(() => expect(inference).toHaveBeenCalledTimes(3));
+  });
+
+  it("sorts a sampled mixed JSON path with the mixed target contract", async () => {
+    render(<DataGrid source={jsonSource} />);
+
+    const orderButton =
+      document.querySelector<HTMLButtonElement>(".query-order");
+    expect(orderButton).not.toBeNull();
+    fireEvent.click(orderButton!);
+    const popup = screen.getByRole("dialog", { name: "ORDER BY columns" });
+    fireEvent.change(within(popup).getByLabelText("Add column"), {
+      target: { value: '["payload"]' },
+    });
+    fireEvent.change(within(popup).getByLabelText("Sort value for payload"), {
+      target: { value: "jsonField" },
+    });
+    const apply = within(popup).getByRole("button", { name: "Apply" });
+    fireEvent.change(await within(popup).findByLabelText("Manual JSON path"), {
+      target: { value: "items[" },
+    });
+    expect(apply).toBeDisabled();
+    expect(desktop.prepareDataView).not.toHaveBeenCalled();
+    fireEvent.click(
+      await within(popup).findByRole("treeitem", {
+        name: 'items[0]."mixed.value" mixed · text',
+      }),
+    );
+    expect(apply).toBeEnabled();
+    fireEvent.click(apply);
+
+    await waitFor(() =>
+      expect(desktop.prepareDataView).toHaveBeenCalledWith(
+        7,
+        1,
+        [],
+        [
+          {
+            fieldPath: ["payload"],
+            direction: "ascending",
+            jsonTarget: {
+              path: [
+                { field: "items" },
+                { index: 0 },
+                { field: "mixed.value" },
+              ],
+              valueType: "mixed",
+            },
+          },
+        ],
+        { memoryLimit: "mb384" },
+      ),
+    );
+    expect(screen.getByLabelText("Query")).toHaveTextContent(
+      'payload.items[0]."mixed.value" ASC',
+    );
+  });
+
+  it("sorts multiple JSON paths from one column without duplicating an identity", async () => {
+    render(<DataGrid source={jsonSource} />);
+
+    fireEvent.click(document.querySelector<HTMLButtonElement>(".query-order")!);
+    const popup = screen.getByRole("dialog", { name: "ORDER BY columns" });
+    const addColumn = within(popup).getByLabelText("Add column");
+    fireEvent.change(addColumn, { target: { value: '["payload"]' } });
+    fireEvent.change(within(popup).getByLabelText("Sort value for payload"), {
+      target: { value: "jsonField" },
+    });
+    const firstPath = await within(popup).findByLabelText("Manual JSON path");
+    fireEvent.change(firstPath, { target: { value: "items[0].rank" } });
+    fireEvent.change(within(popup).getByLabelText("Value type"), {
+      target: { value: "number" },
+    });
+
+    fireEvent.change(addColumn, { target: { value: '["payload"]' } });
+    const paths = within(popup).getAllByLabelText("Manual JSON path");
+    const types = within(popup).getAllByLabelText("Value type");
+    fireEvent.change(paths[1]!, { target: { value: "items[0].rank" } });
+    fireEvent.change(types[1]!, { target: { value: "text" } });
+
+    const apply = within(popup).getByRole("button", { name: "Apply" });
+    expect(apply).toBeDisabled();
+    expect(within(popup).getByRole("alert")).toHaveTextContent(
+      "Each whole column or JSON path can be sorted only once.",
+    );
+
+    fireEvent.change(paths[1]!, { target: { value: "items[0].name" } });
+    expect(apply).toBeEnabled();
+    fireEvent.click(apply);
+
+    await waitFor(() =>
+      expect(desktop.prepareDataView).toHaveBeenCalledWith(
+        7,
+        1,
+        [],
+        [
+          {
+            fieldPath: ["payload"],
+            direction: "ascending",
+            jsonTarget: {
+              path: [{ field: "items" }, { index: 0 }, { field: "rank" }],
+              valueType: "number",
+            },
+          },
+          {
+            fieldPath: ["payload"],
+            direction: "ascending",
+            jsonTarget: {
+              path: [{ field: "items" }, { index: 0 }, { field: "name" }],
+              valueType: "text",
+            },
+          },
+        ],
+        { memoryLimit: "mb384" },
+      ),
+    );
+    expect(gridMock.props?.columns[0]?.sort.direction).toBe("neutral");
+
+    act(() => gridMock.props?.onSort(0, false));
+    await waitFor(() =>
+      expect(desktop.prepareDataView).toHaveBeenLastCalledWith(
+        7,
+        2,
+        [],
+        [
+          { fieldPath: ["payload"], direction: "ascending" },
+          {
+            fieldPath: ["payload"],
+            direction: "ascending",
+            jsonTarget: {
+              path: [{ field: "items" }, { index: 0 }, { field: "rank" }],
+              valueType: "number",
+            },
+          },
+          {
+            fieldPath: ["payload"],
+            direction: "ascending",
+            jsonTarget: {
+              path: [{ field: "items" }, { index: 0 }, { field: "name" }],
+              valueType: "text",
+            },
+          },
+        ],
+        { memoryLimit: "mb384" },
+      ),
+    );
+  });
+
+  it("opens an exact JSON field filter from Peek", async () => {
+    const json = JSON.stringify({ items: [{ "unit.price": 12 }] });
+    decodeArrowWindow.mockImplementation(
+      (
+        _bytes: ArrayBuffer,
+        rowOffset: number,
+        fieldPaths: readonly desktop.FieldPath[],
+      ): ArrowDataWindow => ({
+        rowOffset,
+        rowCount: 4,
+        fieldPaths,
+        fieldColumnOffsets: fieldColumnOffsets(fieldPaths),
+        table: {
+          schema: { fields: [{ type: utf8() }] },
+          getChildAt: () => ({ at: () => json }),
+        } as unknown as ArrowDataWindow["table"],
+      }),
+    );
+    render(<DataGrid source={jsonSource} />);
+    await waitFor(() => expect(desktop.getDataWindow).toHaveBeenCalled());
+    const selection = {
+      columns: CompactSelection.empty(),
+      rows: CompactSelection.empty(),
+      current: {
+        cell: { column: 0, row: 0 },
+        range: { x: 0, y: 0, width: 1, height: 1 },
+        rangeStack: [],
+      },
+    };
+    act(() => {
+      gridMock.props?.onSelectionChange(selection);
+      gridMock.props?.onCellPeek?.(selection.current.cell, {
+        x: 20,
+        y: 20,
+        width: 120,
+        height: 28,
+      });
+    });
+    expect(
+      await screen.findByText("items", {
+        selector: ".value-tree-name.is-key",
+      }),
+    ).toBeInTheDocument();
+    const tree = screen.getByRole("tree", { name: "payload value" });
+    tree.focus();
+    fireEvent.keyDown(tree, { key: "ArrowDown" });
+    for (let step = 0; step < 4; step += 1) {
+      fireEvent.keyDown(tree, { key: "ArrowRight" });
+    }
+    fireEvent.click(
+      screen.getByRole("button", { name: "Filter by this field" }),
+    );
+
+    const editor = screen.getByRole("form", {
+      name: 'Filter payload.items[0]."unit.price"',
+    });
+    fireEvent.change(within(editor).getByLabelText("Value"), {
+      target: { value: "12" },
+    });
+    fireEvent.click(
+      within(editor).getByRole("button", { name: "Add condition" }),
+    );
+    await waitFor(() =>
+      expect(desktop.prepareDataView).toHaveBeenCalledWith(
+        7,
+        1,
+        [
+          {
+            fieldPath: ["payload"],
+            jsonTarget: {
+              path: [{ field: "items" }, { index: 0 }, { field: "unit.price" }],
+              valueType: "number",
+            },
+            operator: "equals",
+            values: ["12"],
+          },
+        ],
+        [],
+        { memoryLimit: "mb384" },
       ),
     );
   });
