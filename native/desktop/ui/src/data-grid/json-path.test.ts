@@ -82,6 +82,21 @@ describe("JSON path grammar", () => {
     expect(parseJsonPath(formatted)).toEqual({ path, error: null });
   });
 
+  it("combines escaped UTF-16 surrogate pairs and rejects lone surrogates", () => {
+    const parsed = parseJsonPath('"face\\uD83D\\uDE00"');
+
+    expect(parsed).toEqual({ path: [{ field: "face😀" }], error: null });
+    if (parsed.path !== null) {
+      expect(parseJsonPath(formatJsonPath(parsed.path))).toEqual(parsed);
+    }
+    expect(parseJsonPath('"bad\\uD83D"').path).toBeNull();
+    expect(parseJsonPath('"bad\\uD83D\\u0041"').path).toBeNull();
+    expect(parseJsonPath('"bad\\uDE00"').path).toBeNull();
+    expect(parseJsonPath('"bad\\uD83X"').path).toBeNull();
+    expect(jsonPathIsValid([{ field: "bad\ud800" }])).toBe(false);
+    expect(jsonPathIsValid([{ field: "bad\udc00" }])).toBe(false);
+  });
+
   it.each([
     "",
     "items.",

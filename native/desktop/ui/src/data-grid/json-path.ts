@@ -1,17 +1,19 @@
-import type {
-  FieldPath,
-  JsonFieldTarget,
-  JsonPath,
-  JsonPathSegment,
+import {
+  JSON_PATH_BYTE_LIMIT,
+  jsonPathIsValid,
+  type FieldPath,
+  type JsonFieldTarget,
+  type JsonPath,
+  type JsonPathSegment,
 } from "../desktop";
 import { formatFieldPath } from "./field-path";
 
 const SIMPLE_FIELD_CHARACTER = /[A-Za-z0-9_]/;
 const SIMPLE_FIELD = /^[A-Za-z0-9_]+$/;
 const BIDI_CONTROL = /[\u061c\u200e\u200f\u202a-\u202e\u2066-\u2069]/;
-const MAX_PATH_SEGMENTS = 64;
-export const JSON_PATH_BYTE_LIMIT = 4_096;
 const MAX_ARRAY_INDEX = 4_294_967_295;
+
+export { JSON_PATH_BYTE_LIMIT, jsonPathIsValid };
 
 export type JsonPathParseResult =
   { path: JsonPath; error: null } | { path: null; error: string };
@@ -137,27 +139,6 @@ export function sameJsonTarget(
   );
 }
 
-export function jsonPathIsValid(path: readonly JsonPathSegment[]): boolean {
-  if (path.length === 0 || path.length > MAX_PATH_SEGMENTS) return false;
-  let bytes = 0;
-  for (const segment of path) {
-    if ("index" in segment) {
-      if (
-        !Number.isSafeInteger(segment.index) ||
-        segment.index < 0 ||
-        segment.index > MAX_ARRAY_INDEX
-      ) {
-        return false;
-      }
-      bytes += String(segment.index).length;
-    } else {
-      bytes += new TextEncoder().encode(segment.field).byteLength;
-    }
-    if (bytes > JSON_PATH_BYTE_LIMIT) return false;
-  }
-  return true;
-}
-
 function parseQuotedField(
   text: string,
   start: number,
@@ -173,7 +154,27 @@ function parseQuotedField(
       }
       const unicode = text.slice(offset + 2, offset + 6);
       if (text[offset + 1] === "u" && /^[0-9A-Fa-f]{4}$/.test(unicode)) {
-        field += String.fromCharCode(Number.parseInt(unicode, 16));
+        const unit = Number.parseInt(unicode, 16);
+        if (unit >= 0xd800 && unit <= 0xdbff) {
+          const lowUnicode = text.slice(offset + 8, offset + 12);
+          if (
+            text.slice(offset + 6, offset + 8) !== "\\u" ||
+            !/^[0-9A-Fa-f]{4}$/.test(lowUnicode)
+          ) {
+            return "A high-surrogate Unicode escape must be followed by a low-surrogate escape.";
+          }
+          const lowUnit = Number.parseInt(lowUnicode, 16);
+          if (lowUnit < 0xdc00 || lowUnit > 0xdfff) {
+            return "A high-surrogate Unicode escape must be followed by a low-surrogate escape.";
+          }
+          field += String.fromCharCode(unit, lowUnit);
+          offset += 12;
+          continue;
+        }
+        if (unit >= 0xdc00 && unit <= 0xdfff) {
+          return "A low-surrogate Unicode escape must follow a high-surrogate escape.";
+        }
+        field += String.fromCharCode(unit);
         offset += 6;
         continue;
       }

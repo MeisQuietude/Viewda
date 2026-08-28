@@ -49,6 +49,7 @@ import {
   onSourceDragState,
   type DatasetStatus,
 } from "./desktop";
+import { parseJsonPath } from "./data-grid/json-path";
 
 const { channelHandlers, invokeMock, listenMock } = vi.hoisted(() => ({
   channelHandlers: [] as Array<(message: unknown) => void>,
@@ -742,6 +743,62 @@ describe("desktop seam", () => {
         {
           fieldPath: ["payload"],
           jsonTarget,
+          direction: "ascending",
+        },
+      ],
+      settings: { memoryLimit: "mb384" },
+    });
+  });
+
+  it("rejects invalid UTF-16 JSON paths before invoke and preserves valid pairs", async () => {
+    const invalidPath = [{ field: "bad\ud800" }];
+    await expect(
+      prepareDataView(
+        7,
+        1,
+        [
+          {
+            fieldPath: ["payload"],
+            jsonTarget: { path: invalidPath, valueType: "text" },
+            operator: "equals",
+            values: ["value"],
+          },
+        ],
+        [],
+        { memoryLimit: "mb384" },
+      ),
+    ).rejects.toEqual(new DataWindowCommandError("unsupported"));
+    expect(invokeMock).not.toHaveBeenCalled();
+
+    const parsed = parseJsonPath('"face\\uD83D\\uDE00"');
+    expect(parsed.path).toEqual([{ field: "face😀" }]);
+    if (parsed.path === null) throw new Error("valid JSON path was rejected");
+    invokeMock.mockResolvedValue({ revision: 2, rowCount: 3 });
+    await prepareDataView(
+      7,
+      2,
+      [],
+      [
+        {
+          fieldPath: ["payload"],
+          jsonTarget: { path: parsed.path, valueType: "text" },
+          direction: "ascending",
+        },
+      ],
+      { memoryLimit: "mb384" },
+    );
+
+    expect(invokeMock).toHaveBeenCalledWith("prepare_data_view", {
+      generation: 7,
+      viewRevision: 2,
+      filters: [],
+      sort: [
+        {
+          fieldPath: ["payload"],
+          jsonTarget: {
+            path: [{ field: "face😀" }],
+            valueType: "text",
+          },
           direction: "ascending",
         },
       ],
