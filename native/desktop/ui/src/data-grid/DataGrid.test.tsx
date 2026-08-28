@@ -2162,6 +2162,71 @@ describe("DataGrid window rendering", () => {
     ]);
   });
 
+  it("omits Parquet list and map encoding wrappers from the column picker", () => {
+    const containerSource: desktop.SourceSummary = {
+      ...source,
+      columnCount: 3,
+      schemaNodeCount: 8,
+      schema: [
+        { ...source.schema[0]!, name: "id" },
+        {
+          name: "tags",
+          physicalType: "GROUP",
+          logicalType: "List",
+          children: [
+            {
+              name: "list",
+              physicalType: "GROUP",
+              logicalType: null,
+              children: [
+                { ...source.schema[0]!, name: "item", logicalType: "String" },
+              ],
+            },
+          ],
+        },
+        {
+          name: "attributes",
+          physicalType: "GROUP",
+          logicalType: "Map",
+          children: [
+            {
+              name: "entries",
+              physicalType: "GROUP",
+              logicalType: null,
+              children: [
+                { ...source.schema[0]!, name: "key", logicalType: "String" },
+                { ...source.schema[0]!, name: "value", logicalType: "String" },
+              ],
+            },
+          ],
+        },
+      ],
+    };
+    render(<DataGrid source={containerSource} />);
+    const picker = openSelectPicker();
+
+    expect(
+      within(picker).getByRole("checkbox", { name: "Project tags" }),
+    ).toBeChecked();
+    expect(
+      within(picker).getByRole("checkbox", { name: "Project attributes" }),
+    ).toBeChecked();
+    expect(within(picker).getAllByRole("treeitem")).toHaveLength(3);
+    expect(
+      within(picker).queryByRole("checkbox", { name: "Project tags.list" }),
+    ).toBeNull();
+    expect(
+      within(picker).queryByRole("checkbox", {
+        name: "Project attributes.entries",
+      }),
+    ).toBeNull();
+
+    fireEvent.change(within(picker).getByRole("searchbox"), {
+      target: { value: "entries" },
+    });
+    expect(within(picker).getByText("No matching columns.")).toBeVisible();
+  });
+
   it("matches a scalar struct Flatten with the equivalent picker projection", () => {
     const flatSource: desktop.SourceSummary = {
       ...source,
@@ -2372,7 +2437,7 @@ describe("DataGrid window rendering", () => {
     );
   });
 
-  it("promotes a Peek struct through the shared structural replacement contract", async () => {
+  it("promotes a Peek leaf through the shared structural replacement contract", async () => {
     vi.mocked(desktop.prepareDataView).mockImplementation(
       async (_generation, revision) => ({ revision, rowCount: 4 }),
     );
@@ -2468,6 +2533,8 @@ describe("DataGrid window rendering", () => {
     );
     const tree = await screen.findByRole("tree", { name: "profile value" });
     fireEvent.keyDown(tree, { key: "ArrowDown" });
+    fireEvent.keyDown(tree, { key: "ArrowRight" });
+    fireEvent.keyDown(tree, { key: "ArrowDown" });
     fireEvent.click(screen.getByRole("button", { name: "Promote to column" }));
 
     await waitFor(() =>
@@ -2480,11 +2547,11 @@ describe("DataGrid window rendering", () => {
       ),
     );
     expect(gridMock.props?.columns.map((column) => column.id)).toEqual([
-      '["profile","address"]',
+      '["profile","address","city"]',
       '["tail"]',
     ]);
     expect(screen.getByRole("alert")).toHaveTextContent(
-      "Promoted profile.address to one column; removed filters: profile; sorts: profile.",
+      "Promoted profile.address.city to one column; removed filters: profile; sorts: profile.",
     );
   });
 

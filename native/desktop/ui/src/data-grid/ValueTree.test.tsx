@@ -119,7 +119,7 @@ describe("ValueTree", () => {
     );
   });
 
-  it("promotes an active struct field with its column-address path", () => {
+  it("promotes active struct and leaf fields with their column paths", () => {
     const onPromoteField = vi.fn();
     render(
       <ValueTree
@@ -140,9 +140,26 @@ describe("ValueTree", () => {
     fireEvent.keyDown(screen.getByRole("tree", { name: "profile value" }), {
       key: "ArrowDown",
     });
+    const actionGroups = document.querySelectorAll(
+      ".value-tree-toolbar-actions > .value-tree-toolbar-action-group",
+    );
+    expect(actionGroups).toHaveLength(1);
+    expect(actionGroups[0]).toHaveTextContent("Expand allCollapse all");
+    expect(actionGroups[0]?.querySelectorAll("button")).toHaveLength(2);
     fireEvent.click(screen.getByRole("button", { name: "Promote to column" }));
 
-    expect(onPromoteField).toHaveBeenCalledWith(["profile", "address"]);
+    expect(onPromoteField).toHaveBeenNthCalledWith(1, ["profile", "address"]);
+
+    const tree = screen.getByRole("tree", { name: "profile value" });
+    fireEvent.keyDown(tree, { key: "ArrowRight" });
+    fireEvent.keyDown(tree, { key: "ArrowDown" });
+    fireEvent.click(screen.getByRole("button", { name: "Promote to column" }));
+
+    expect(onPromoteField).toHaveBeenNthCalledWith(2, [
+      "profile",
+      "address",
+      "city",
+    ]);
   });
 
   it("filters and copies an exact JSON path without using bounded labels", async () => {

@@ -10,8 +10,6 @@ import {
   useState,
   type KeyboardEvent,
 } from "react";
-import { Type, type DataType } from "@uwdata/flechette";
-
 import { ChunkScheduler } from "./chunk-scheduler";
 import {
   ChunkedJsonSource,
@@ -1046,7 +1044,7 @@ export const ValueTree = forwardRef<
   const promoteFieldPath =
     fieldPath === undefined || onPromoteField === undefined
       ? undefined
-      : structNodeFieldPath(fieldPath, activeNode);
+      : schemaNodeFieldPath(fieldPath, activeNode);
   const activeValuePath =
     fieldPath === undefined || activeNode === undefined
       ? undefined
@@ -1123,7 +1121,7 @@ export const ValueTree = forwardRef<
               </button>
             )}
             {showTreeControls && (
-              <>
+              <div className="value-tree-toolbar-action-group">
                 <button
                   type="button"
                   disabled={
@@ -1148,7 +1146,7 @@ export const ValueTree = forwardRef<
                 >
                   Collapse all
                 </button>
-              </>
+              </div>
             )}
             {(parseStatus !== null ||
               (operation !== null && operation.phase !== "complete")) &&
@@ -1783,15 +1781,11 @@ function jsonNodeValueType(kind: string): JsonValueType | undefined {
   }
 }
 
-function structNodeFieldPath(
+function schemaNodeFieldPath(
   fieldPath: FieldPath,
   node: TreeNode | undefined,
 ): FieldPath | undefined {
-  if (
-    node === undefined ||
-    node.parent === null ||
-    !isStructValue(node.value)
-  ) {
+  if (node === undefined || node.parent === null) {
     return undefined;
   }
   const segments: string[] = [];
@@ -1801,18 +1795,6 @@ function structNodeFieldPath(
     current = current.parent;
   }
   return [...fieldPath, ...segments.reverse()];
-}
-
-function isStructValue(value: TypedValue | undefined): boolean {
-  if (
-    value === undefined ||
-    (value.kind !== "arrow" && value.kind !== "value")
-  ) {
-    return false;
-  }
-  let dataType: DataType = value.dataType;
-  while (dataType.typeId === Type.Dictionary) dataType = dataType.dictionary;
-  return dataType.typeId === Type.Struct;
 }
 
 function createRootNode(label: string, value: TypedValue): TreeNode {

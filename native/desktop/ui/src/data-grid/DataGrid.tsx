@@ -36,7 +36,6 @@ import {
   type SourceSummary,
 } from "../desktop";
 import { loadBundledEmojiFont } from "../fonts";
-import { LIST_MAP_COLUMN_REASON } from "../SchemaTree";
 import {
   decodeArrowWindow,
   windowArrowValueAt,
@@ -3398,7 +3397,7 @@ export function DataGrid({
   const promoteFieldToColumn = useCallback(
     (fieldPath: FieldPath) => {
       const field = schemaPathIndex.get(fieldPathKey(fieldPath))?.field;
-      if (field === undefined || !isStructField(field)) {
+      if (field === undefined) {
         setColumnNotice({
           message: `${formatFieldPath(fieldPath)} cannot be promoted because its field path is ambiguous.`,
           kind: "status",
@@ -5117,16 +5116,14 @@ function projectionPickerColumns(
     rows.push(row);
 
     const childStates: Array<"none" | "partial" | "all"> = [];
-    if (field.children.length > 0) {
+    if (field.children.length > 0 && !isListOrMapField(field)) {
       const duplicateNames = duplicateFieldNames(field.children);
       for (const child of field.children) {
         const childReason =
           disabledReason ??
-          (isListOrMapField(field)
-            ? LIST_MAP_COLUMN_REASON
-            : duplicateNames.has(child.name)
-              ? `This field is unavailable because ${formatFieldPath(fieldPath)} contains duplicate child names.`
-              : undefined);
+          (duplicateNames.has(child.name)
+            ? `This field is unavailable because ${formatFieldPath(fieldPath)} contains duplicate child names.`
+            : undefined);
         const childState = visit(
           child,
           [...fieldPath, child.name],

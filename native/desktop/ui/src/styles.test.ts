@@ -432,6 +432,18 @@ describe("grid layout containment", () => {
     });
   });
 
+  it("wraps Peek toolbar actions only between related groups", () => {
+    expectDeclarations(".value-tree-toolbar-actions", {
+      display: "flex",
+      "flex-wrap": "wrap",
+    });
+    expectDeclarations(".value-tree-toolbar-action-group", {
+      display: "flex",
+      flex: "0 0 auto",
+      "flex-wrap": "nowrap",
+    });
+  });
+
   it("aligns the compact binary legend and rows without a content floor", () => {
     expect(styles).toMatch(
       /\.value-peek-binary-head,\s*\.value-peek-binary-row\s*\{[^}]*grid-template-columns:\s*8ch minmax\(0,\s*23ch\) 8ch;/s,

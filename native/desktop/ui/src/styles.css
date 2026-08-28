@@ -1792,6 +1792,13 @@ button {
   flex-wrap: wrap;
 }
 
+.value-tree-toolbar-action-group {
+  display: flex;
+  gap: 3px;
+  flex: 0 0 auto;
+  flex-wrap: nowrap;
+}
+
 .value-tree-toolbar button {
   min-height: 27px;
   padding: 0 6px;
