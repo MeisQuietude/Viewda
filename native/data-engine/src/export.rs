@@ -1131,8 +1131,14 @@ fn canonical_scalar_json_expression(field: &SchemaField, value: &str) -> String 
         return canonical_integer_json_expression(value);
     }
     if matches!(field.physical_type.as_str(), "FLOAT" | "DOUBLE") {
+        // Grid copy and CSV use shortest round-trip finite numbers without an optional positive
+        // exponent sign. DuckDB additionally retains fixed-point `.0`, so remove it for integers.
         return format!(
             "CASE WHEN {value} IS NULL THEN NULL \
+             WHEN {value} = 0 THEN CAST('0' AS JSON) \
+             WHEN isfinite({value}) AND {value} = trunc({value}) AND abs({value}) < 1e21 \
+             THEN CAST(substring(CAST(to_json({value}) AS VARCHAR), 1, \
+             length(CAST(to_json({value}) AS VARCHAR)) - 2) AS JSON) \
              WHEN isfinite({value}) THEN to_json({value}) \
              WHEN isnan({value}) THEN to_json('NaN') \
              WHEN {value} > 0 THEN to_json('Infinity') \
@@ -1382,26 +1388,17 @@ mod tests {
 
         reader.export().expect("nested CSV export");
 
+        let profile = include_str!("../../test-fixtures/canonical-nested-profile.json").trim_end();
+        let quoted_profile = format!("\"{}\"", profile.replace('"', "\"\""));
         assert_eq!(
             fs::read_to_string(target).expect("nested CSV"),
-            concat!(
-                "profile,tags,attributes,\"profile.\"\"weird.name\"\"\"\r\n",
-                "\"{\"\"weird.name\"\":\"\"Ada\"\",\"\"age\"\":37,",
-                "\"\"scale_zero\"\":\"\"37\"\",",
-                "\"\"trailing_zero\"\":\"\"1.20\"\",",
-                "\"\"unsafe_decimal\"\":\"\"9007199254740993\"\",",
-                "\"\"small_decimal\"\":\"\"0.00000000000000000001\"\",",
-                "\"\"nan\"\":\"\"NaN\"\",",
-                "\"\"positive_infinity\"\":\"\"Infinity\"\",",
-                "\"\"negative_infinity\"\":\"\"-Infinity\"\",",
-                "\"\"nullable_float\"\":null,",
-                "\"\"unsafe\"\":\"\"9007199254740993\"\",",
-                "\"\"payload\"\":\"\"AQID\"\",",
-                "\"\"labels\"\":[[\"\"language\"\",\"\"English\"\"],",
-                "[\"\"language\"\",\"\"French\"\"]],",
-                "\"\"recorded_at\"\":\"\"9007199254740993\"\"}\",",
-                "\"[1,2]\",\"[[\"\"a\"\",1],[\"\"b\"\",2]]\",Ada\r\n",
-                "null,null,null,\r\n",
+            format!(
+                concat!(
+                    "profile,tags,attributes,\"profile.\"\"weird.name\"\"\"\r\n",
+                    "{},\"[1,2]\",\"[[\"\"a\"\",1],[\"\"b\"\",2]]\",Ada\r\n",
+                    "null,null,null,\r\n",
+                ),
+                quoted_profile
             )
         );
     }
@@ -2008,6 +2005,13 @@ mod tests {
             Field::new("trailing_zero", DataType::Decimal128(10, 2), false),
             Field::new("unsafe_decimal", DataType::Decimal128(38, 0), false),
             Field::new("small_decimal", DataType::Decimal128(38, 20), false),
+            Field::new("finite_one", DataType::Float64, false),
+            Field::new("negative_zero", DataType::Float64, false),
+            Field::new("large_finite", DataType::Float64, false),
+            Field::new("fractional_exponent", DataType::Float64, false),
+            Field::new("positive_exponent", DataType::Float64, false),
+            Field::new("negative_exponent", DataType::Float64, false),
+            Field::new("rounding_sensitive_integral", DataType::Float64, false),
             Field::new("nan", DataType::Float64, false),
             Field::new("positive_infinity", DataType::Float64, false),
             Field::new("negative_infinity", DataType::Float64, false),
@@ -2049,6 +2053,13 @@ mod tests {
                         .with_precision_and_scale(38, 20)
                         .expect("small decimal"),
                 ) as ArrayRef,
+                Arc::new(Float64Array::from(vec![1.0, 0.0])) as ArrayRef,
+                Arc::new(Float64Array::from(vec![-0.0, 0.0])) as ArrayRef,
+                Arc::new(Float64Array::from(vec![1e20, 0.0])) as ArrayRef,
+                Arc::new(Float64Array::from(vec![1.25e-7, 0.0])) as ArrayRef,
+                Arc::new(Float64Array::from(vec![1e21, 0.0])) as ArrayRef,
+                Arc::new(Float64Array::from(vec![-1e21, 0.0])) as ArrayRef,
+                Arc::new(Float64Array::from(vec![1_000_000_000_000_000_100_f64, 0.0])) as ArrayRef,
                 Arc::new(Float64Array::from(vec![f64::NAN, 0.0])) as ArrayRef,
                 Arc::new(Float64Array::from(vec![f64::INFINITY, 0.0])) as ArrayRef,
                 Arc::new(Float64Array::from(vec![f64::NEG_INFINITY, 0.0])) as ArrayRef,

@@ -267,7 +267,7 @@ export function valueToJson(input: TypedValue): string {
   if (typeof value === "bigint") return jsonInteger(value);
   if (typeof value === "number") {
     return Number.isFinite(value)
-      ? String(value)
+      ? String(value).replace("e+", "e")
       : JSON.stringify(String(value));
   }
   return JSON.stringify(String(value));
