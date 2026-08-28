@@ -119,6 +119,75 @@ const source: desktop.SourceSummary = {
   stringsTruncated: false,
 };
 
+const nestedSource: desktop.SourceSummary = {
+  ...source,
+  displayName: "nested.parquet",
+  rowCount: 4,
+  columnCount: 3,
+  schema: [
+    {
+      name: "id",
+      physicalType: "INT64",
+      logicalType: null,
+      children: [],
+    },
+    {
+      name: "profile",
+      physicalType: "GROUP",
+      logicalType: null,
+      children: [
+        {
+          name: "city.name",
+          physicalType: "BYTE_ARRAY",
+          logicalType: "String",
+          children: [],
+        },
+        {
+          name: "address",
+          physicalType: "GROUP",
+          logicalType: null,
+          children: [
+            {
+              name: 'postal"code',
+              physicalType: "INT32",
+              logicalType: null,
+              children: [],
+            },
+            {
+              name: "geo",
+              physicalType: "GROUP",
+              logicalType: null,
+              children: [
+                {
+                  name: "latitude",
+                  physicalType: "DOUBLE",
+                  logicalType: null,
+                  children: [],
+                },
+              ],
+            },
+          ],
+        },
+      ],
+    },
+    {
+      name: "tail",
+      physicalType: "BOOLEAN",
+      logicalType: null,
+      children: [],
+    },
+  ],
+  schemaNodeCount: 8,
+};
+
+const fieldColumnOffsets = (fieldPaths: readonly desktop.FieldPath[]) =>
+  new Map(
+    fieldPaths.map((fieldPath, offset) => [JSON.stringify(fieldPath), offset]),
+  );
+
+const sourceFieldPaths = (indices: readonly number[]) =>
+  indices.map((index) => [`column_${index}`]);
+
 beforeEach(() => {
   document.documentElement.style.setProperty(
     "--font-ui",
@@ -139,20 +208,18 @@ beforeEach(() => {
     (
       _bytes: ArrayBuffer,
       rowOffset: number,
-      sourceIndices: readonly number[],
+      fieldPaths: readonly desktop.FieldPath[],
     ): ArrowDataWindow => {
-      const sourceColumnOffsets = new Map(
-        sourceIndices.map((sourceIndex, offset) => [sourceIndex, offset]),
-      );
+      const offsets = fieldColumnOffsets(fieldPaths);
       return {
         rowOffset,
         rowCount:
           vi.mocked(desktop.getDataWindow).mock.calls.at(-1)?.[3] ?? 512,
-        sourceIndices,
-        sourceColumnOffsets,
+        fieldPaths,
+        fieldColumnOffsets: offsets,
         table: {
           schema: {
-            fields: Array.from({ length: sourceIndices.length }, () => ({
+            fields: Array.from({ length: fieldPaths.length }, () => ({
               type: utf8(),
             })),
           },
@@ -187,8 +254,10 @@ beforeEach(() => {
     minimum: "1",
     maximum: "9",
     minMaxComputed: true,
+    nullCount: 1_250,
     nullShare: 0.125,
     approximateDistinctCount: 42,
+    containerCount: null,
   });
   vi.spyOn(desktop, "cancelColumnStatistics").mockResolvedValue();
   vi.spyOn(desktop, "getDataExportStatus").mockResolvedValue(null);
@@ -305,7 +374,7 @@ describe("DataGrid window rendering", () => {
         0,
         0,
         512,
-        [0, 1, 2, 3, 4, 5, 6, 7],
+        sourceFieldPaths([0, 1, 2, 3, 4, 5, 6, 7]),
       ),
     );
 
@@ -323,7 +392,7 @@ describe("DataGrid window rendering", () => {
         0,
         0,
         10,
-        [8, 9, 10, 11, 12, 13, 14, 15, 16],
+        sourceFieldPaths([8, 9, 10, 11, 12, 13, 14, 15, 16]),
       ),
     );
 
@@ -351,7 +420,7 @@ describe("DataGrid window rendering", () => {
         0,
         0,
         10,
-        [12, 13, 14, 15, 16, 17, 18, 19],
+        sourceFieldPaths([12, 13, 14, 15, 16, 17, 18, 19]),
       ),
     );
     expect(gridMock.props?.getCellContent({ row: 0, column: 0 }).kind).toBe(
@@ -404,7 +473,404 @@ describe("DataGrid window rendering", () => {
       });
     });
     await waitFor(() =>
-      expect(desktop.getDataWindow).toHaveBeenCalledWith(7, 0, 0, 10, [299]),
+      expect(desktop.getDataWindow).toHaveBeenCalledWith(
+        7,
+        0,
+        0,
+        10,
+        sourceFieldPaths([299]),
+      ),
+    );
+  });
+
+  it("discards a delayed schema page when complete content replaces the preview", async () => {
+    const earlyPrefix = Array.from({ length: 256 }, (_, index) => ({
+      ...source.schema[0]!,
+      name: `column_${index}`,
+    }));
+    const completePrefix = Array.from({ length: 300 }, (_, index) => ({
+      ...source.schema[0]!,
+      name: `column_${index}`,
+    }));
+    const stalePage =
+      deferred<Awaited<ReturnType<typeof desktop.getSourceSchemaPage>>>();
+    const activePage =
+      deferred<Awaited<ReturnType<typeof desktop.getSourceSchemaPage>>>();
+    vi.mocked(desktop.getSourceSchemaPage).mockImplementation(
+      (_generation, offset) => {
+        if (offset === 256) return stalePage.promise;
+        if (offset === 300) return activePage.promise;
+        throw new Error(`Unexpected schema page offset: ${offset}`);
+      },
+    );
+    const view = render(
+      <DataGrid
+        source={{
+          ...source,
+          columnCount: 600,
+          schema: earlyPrefix,
+          schemaNodeCount: 600,
+          schemaIsTruncated: true,
+        }}
+        contentIdentity="early-sample"
+      />,
+    );
+    await waitFor(() =>
+      expect(desktop.getSourceSchemaPage).toHaveBeenCalledWith(7, 256, 256),
+    );
+
+    view.rerender(
+      <DataGrid
+        source={{
+          ...source,
+          columnCount: 320,
+          schema: completePrefix,
+          schemaNodeCount: 320,
+          schemaIsTruncated: true,
+        }}
+        contentIdentity="complete"
+      />,
+    );
+
+    await waitFor(() =>
+      expect(desktop.getSourceSchemaPage).toHaveBeenCalledWith(7, 300, 256),
+    );
+    await act(async () =>
+      stalePage.resolve({
+        offset: 256,
+        totalCount: 600,
+        columns: Array.from({ length: 256 }, (_, index) => ({
+          ...source.schema[0]!,
+          name: `stale_${256 + index}`,
+        })),
+      }),
+    );
+
+    view.rerender(
+      <DataGrid
+        source={{
+          ...source,
+          columnCount: 320,
+          schema: completePrefix,
+          schemaNodeCount: 320,
+          schemaIsTruncated: true,
+        }}
+        contentIdentity="complete"
+        active={false}
+      />,
+    );
+    view.rerender(
+      <DataGrid
+        source={{
+          ...source,
+          columnCount: 320,
+          schema: completePrefix,
+          schemaNodeCount: 320,
+          schemaIsTruncated: true,
+        }}
+        contentIdentity="complete"
+      />,
+    );
+
+    expect(desktop.getSourceSchemaPage).toHaveBeenCalledTimes(2);
+    await act(async () =>
+      activePage.resolve({
+        offset: 300,
+        totalCount: 320,
+        columns: Array.from({ length: 20 }, (_, index) => ({
+          ...source.schema[0]!,
+          name: `column_${300 + index}`,
+        })),
+      }),
+    );
+    await waitFor(() => expect(gridMock.props?.columns).toHaveLength(320));
+    expect(gridMock.props?.columns).toHaveLength(320);
+    expect(gridMock.props?.columns[256]?.title).toBe("column_256");
+    expect(gridMock.props?.columns.at(-1)?.title).toBe("column_319");
+  });
+
+  it("collapses flattened paths when a later schema page reveals duplicate roots", async () => {
+    const prefix = Array.from({ length: 256 }, (_, index) => ({
+      ...source.schema[0]!,
+      name: `column_${index}`,
+      ...(index === 0
+        ? {
+            physicalType: "GROUP",
+            children: [
+              { ...source.schema[0]!, name: "left" },
+              { ...source.schema[0]!, name: "right" },
+            ],
+          }
+        : {}),
+    }));
+    const wideSource: desktop.SourceSummary = {
+      ...source,
+      columnCount: 300,
+      schema: prefix,
+      schemaNodeCount: 302,
+      schemaIsTruncated: true,
+    };
+    const page =
+      deferred<Awaited<ReturnType<typeof desktop.getSourceSchemaPage>>>();
+    vi.mocked(desktop.getSourceSchemaPage).mockReturnValue(page.promise);
+
+    render(<DataGrid source={wideSource} />);
+    await waitFor(() =>
+      expect(desktop.getSourceSchemaPage).toHaveBeenCalledWith(7, 256, 256),
+    );
+    act(() => gridMock.props?.onColumnResize(0, 240));
+    openColumnMenu(0);
+    fireEvent.click(screen.getByRole("menuitem", { name: "Pin column" }));
+    openColumnMenu(0);
+    fireEvent.click(
+      screen.getByRole("menuitem", { name: "Flatten to columns" }),
+    );
+    expect(gridMock.props?.columns).toHaveLength(257);
+    act(() => gridMock.props?.onSort(0, false));
+    await waitFor(() =>
+      expect(desktop.prepareDataView).toHaveBeenLastCalledWith(
+        7,
+        1,
+        [],
+        [{ fieldPath: ["column_0", "left"], direction: "ascending" }],
+        { memoryLimit: "mb384" },
+      ),
+    );
+
+    await act(async () =>
+      page.resolve({
+        offset: 256,
+        totalCount: 300,
+        columns: Array.from({ length: 44 }, (_, index) => ({
+          ...source.schema[0]!,
+          name: index === 0 ? "column_0" : `column_${256 + index}`,
+        })),
+      }),
+    );
+
+    await waitFor(() => expect(gridMock.props?.columns).toHaveLength(300));
+    expect(gridMock.props?.columns[0]).toMatchObject({
+      id: "source:0",
+      width: 240,
+      pinned: true,
+      sort: { direction: "neutral" },
+    });
+    expect(gridMock.props?.columns[256]?.id).toBe("source:256");
+    expect(gridMock.props?.columns.at(-1)?.title).toBe("column_299");
+    expect(desktop.cancelDataView).toHaveBeenCalledWith(7, 1);
+    expect(
+      screen.getByText(/Duplicate top-level names require source-order/),
+    ).toBeVisible();
+    await waitFor(() =>
+      expect(
+        vi.mocked(desktop.getDataWindow).mock.calls.some((call) => {
+          const fieldPaths = call[4];
+          return (
+            call[1] === 0 &&
+            fieldPaths.length === 300 &&
+            fieldPaths[0]?.[0] === "column_0" &&
+            fieldPaths[256]?.[0] === "column_0"
+          );
+        }),
+      ).toBe(true),
+    );
+  });
+
+  it("loads every schema page before requesting duplicate-name identity columns", async () => {
+    const prefix = Array.from({ length: 256 }, (_, index) => ({
+      ...source.schema[0]!,
+      name: `column_${index}`,
+    }));
+    const wideSource: desktop.SourceSummary = {
+      ...source,
+      rowCount: 4,
+      columnCount: 600,
+      schema: prefix,
+      schemaNodeCount: 600,
+      schemaIsTruncated: true,
+    };
+    const secondPage =
+      deferred<Awaited<ReturnType<typeof desktop.getSourceSchemaPage>>>();
+    const thirdPage =
+      deferred<Awaited<ReturnType<typeof desktop.getSourceSchemaPage>>>();
+    vi.mocked(desktop.getSourceSchemaPage).mockImplementation(
+      (_generation, offset) => {
+        if (offset === 256) return secondPage.promise;
+        if (offset === 512) return thirdPage.promise;
+        throw new Error(`Unexpected schema page offset: ${offset}`);
+      },
+    );
+    decodeArrowWindow.mockImplementation(
+      (
+        _bytes: ArrayBuffer,
+        rowOffset: number,
+        fieldPaths: readonly desktop.FieldPath[],
+      ): ArrowDataWindow => ({
+        rowOffset,
+        rowCount: 4,
+        fieldPaths,
+        fieldColumnOffsets: fieldColumnOffsets(fieldPaths),
+        table: {
+          schema: {
+            fields: fieldPaths.map(() => ({ type: utf8() })),
+          },
+          getChildAt: (offset: number) => ({
+            at: () => `source ${offset}`,
+          }),
+        } as unknown as ArrowDataWindow["table"],
+      }),
+    );
+
+    render(<DataGrid source={wideSource} />);
+    await waitFor(() => expect(desktop.getDataWindow).toHaveBeenCalled());
+    await waitFor(() =>
+      expect(desktop.getSourceSchemaPage).toHaveBeenCalledWith(7, 256, 256),
+    );
+    const windowCallsBeforeDuplicate = vi.mocked(desktop.getDataWindow).mock
+      .calls.length;
+
+    await act(async () =>
+      secondPage.resolve({
+        offset: 256,
+        totalCount: 600,
+        columns: Array.from({ length: 256 }, (_, index) => ({
+          ...source.schema[0]!,
+          name: index === 0 ? "column_0" : `column_${256 + index}`,
+        })),
+      }),
+    );
+
+    await waitFor(() =>
+      expect(desktop.getSourceSchemaPage).toHaveBeenCalledWith(7, 512, 256),
+    );
+    expect(desktop.getDataWindow).toHaveBeenCalledTimes(
+      windowCallsBeforeDuplicate,
+    );
+    expect(
+      screen.queryByRole("button", { name: "Load more columns" }),
+    ).not.toBeInTheDocument();
+    expect(
+      screen.getByText(
+        /The complete schema is loading before rows can be read/,
+      ),
+    ).toBeVisible();
+
+    const identityPaths = Array.from({ length: 600 }, (_, index) => [
+      index === 256 ? "column_0" : `column_${index}`,
+    ]);
+    await act(async () =>
+      thirdPage.resolve({
+        offset: 512,
+        totalCount: 600,
+        columns: Array.from({ length: 88 }, (_, index) => ({
+          ...source.schema[0]!,
+          name: `column_${512 + index}`,
+        })),
+      }),
+    );
+
+    await waitFor(() =>
+      expect(desktop.getDataWindow).toHaveBeenCalledWith(
+        7,
+        0,
+        0,
+        4,
+        identityPaths,
+      ),
+    );
+    expect(desktop.getSourceSchemaPage).toHaveBeenCalledTimes(2);
+    expect(
+      vi
+        .mocked(desktop.getDataWindow)
+        .mock.calls.some(
+          (call) =>
+            call[4].length > 256 && call[4].length < identityPaths.length,
+        ),
+    ).toBe(false);
+    expect(gridMock.props?.columns).toHaveLength(600);
+    expect(gridMock.props?.columns[0]?.id).toBe("source:0");
+    expect(gridMock.props?.columns[256]?.id).toBe("source:256");
+    expect(gridMock.props?.getCellContent({ column: 0, row: 0 })).toMatchObject(
+      { displayData: "source 0" },
+    );
+    expect(
+      gridMock.props?.getCellContent({ column: 256, row: 0 }),
+    ).toMatchObject({ displayData: "source 256" });
+  });
+
+  it("retries failed duplicate-name pagination without partial identity reads", async () => {
+    const prefix = Array.from({ length: 256 }, (_, index) => ({
+      ...source.schema[0]!,
+      name: index === 1 ? "column_0" : `column_${index}`,
+    }));
+    const wideSource: desktop.SourceSummary = {
+      ...source,
+      rowCount: 4,
+      columnCount: 600,
+      schema: prefix,
+      schemaNodeCount: 600,
+      schemaIsTruncated: true,
+    };
+    let firstPageAttempt = true;
+    vi.mocked(desktop.getSourceSchemaPage).mockImplementation(
+      (_generation, offset) => {
+        if (offset === 256 && firstPageAttempt) {
+          firstPageAttempt = false;
+          return Promise.reject(new Error("schema page unavailable"));
+        }
+        if (offset === 256) {
+          return Promise.resolve({
+            offset: 256,
+            totalCount: 600,
+            columns: Array.from({ length: 256 }, (_, index) => ({
+              ...source.schema[0]!,
+              name: `column_${256 + index}`,
+            })),
+          });
+        }
+        if (offset === 512) {
+          return Promise.resolve({
+            offset: 512,
+            totalCount: 600,
+            columns: Array.from({ length: 88 }, (_, index) => ({
+              ...source.schema[0]!,
+              name: `column_${512 + index}`,
+            })),
+          });
+        }
+        throw new Error(`Unexpected schema page offset: ${offset}`);
+      },
+    );
+
+    render(<DataGrid source={wideSource} />);
+
+    const retry = await screen.findByRole("button", {
+      name: "Retry loading columns",
+    });
+    expect(desktop.getSourceSchemaPage).toHaveBeenCalledTimes(1);
+    expect(desktop.getSourceSchemaPage).toHaveBeenLastCalledWith(7, 256, 256);
+    expect(desktop.getDataWindow).not.toHaveBeenCalled();
+
+    fireEvent.click(retry);
+
+    const identityPaths = Array.from({ length: 600 }, (_, index) => [
+      index === 1 ? "column_0" : `column_${index}`,
+    ]);
+    await waitFor(() =>
+      expect(desktop.getDataWindow).toHaveBeenCalledWith(
+        7,
+        0,
+        0,
+        4,
+        identityPaths,
+      ),
+    );
+    expect(desktop.getSourceSchemaPage).toHaveBeenNthCalledWith(2, 7, 256, 256);
+    expect(desktop.getSourceSchemaPage).toHaveBeenNthCalledWith(3, 7, 512, 256);
+    expect(desktop.getSourceSchemaPage).toHaveBeenCalledTimes(3);
+    expect(desktop.getDataWindow).toHaveBeenCalledTimes(1);
+    expect(vi.mocked(desktop.getDataWindow).mock.calls[0]?.[4]).toHaveLength(
+      600,
     );
   });
 
@@ -470,7 +936,7 @@ describe("DataGrid window rendering", () => {
         1,
         expect.any(Number),
         37,
-        [0, 1, 2, 3, 4, 5, 6, 7],
+        sourceFieldPaths([0, 1, 2, 3, 4, 5, 6, 7]),
       ),
     );
 
@@ -488,7 +954,7 @@ describe("DataGrid window rendering", () => {
         1,
         0,
         10,
-        [10, 11, 12, 13],
+        sourceFieldPaths([10, 11, 12, 13]),
       ),
     );
     const recentRequests = JSON.parse(diagnosticsController.stop() ?? "null")
@@ -499,13 +965,13 @@ describe("DataGrid window rendering", () => {
           reason: "initial",
           filtered: true,
           sorted: false,
-          projectionKey: "0:7:c:6bf6a41d",
+          projectionKey: expect.any(String),
         }),
         expect.objectContaining({
           reason: "columnProjection",
           filtered: true,
           sorted: false,
-          projectionKey: "10:13:c:7a1f3ce5",
+          projectionKey: expect.any(String),
         }),
       ]),
     );
@@ -534,7 +1000,13 @@ describe("DataGrid window rendering", () => {
     });
 
     await waitFor(() =>
-      expect(desktop.getDataWindow).toHaveBeenCalledWith(7, 0, 0, 512, [2, 3]),
+      expect(desktop.getDataWindow).toHaveBeenCalledWith(
+        7,
+        0,
+        0,
+        512,
+        sourceFieldPaths([2, 3]),
+      ),
     );
     expect(desktop.prepareDataView).not.toHaveBeenCalled();
   });
@@ -563,7 +1035,7 @@ describe("DataGrid window rendering", () => {
       0,
       0,
       512,
-      [0, 1, 2, 3, 4],
+      sourceFieldPaths([0, 1, 2, 3, 4]),
     );
     const copied = clipboardWrite.mock.calls[0]?.[0] as string;
     expect(copied.split("\n")).toEqual([
@@ -580,17 +1052,15 @@ describe("DataGrid window rendering", () => {
       (
         _bytes: ArrayBuffer,
         rowOffset: number,
-        sourceIndices: readonly number[],
+        fieldPaths: readonly desktop.FieldPath[],
       ): ArrowDataWindow => ({
         rowOffset,
         rowCount: 512,
-        sourceIndices,
-        sourceColumnOffsets: new Map(
-          sourceIndices.map((sourceIndex, offset) => [sourceIndex, offset]),
-        ),
+        fieldPaths,
+        fieldColumnOffsets: fieldColumnOffsets(fieldPaths),
         table: {
           schema: {
-            fields: sourceIndices.map(() => ({ type: utf8() })),
+            fields: fieldPaths.map(() => ({ type: utf8() })),
           },
           getChildAt: () => ({ at: () => ({ toString }) }),
         } as unknown as ArrowDataWindow["table"],
@@ -709,7 +1179,13 @@ describe("DataGrid window rendering", () => {
     });
 
     await waitFor(() =>
-      expect(desktop.getDataWindow).toHaveBeenCalledWith(7, 1, 0, 37, [2, 3]),
+      expect(desktop.getDataWindow).toHaveBeenCalledWith(
+        7,
+        1,
+        0,
+        37,
+        sourceFieldPaths([2, 3]),
+      ),
     );
   });
 
@@ -778,7 +1254,7 @@ describe("DataGrid window rendering", () => {
       0,
       0,
       512,
-      [0, 1, 2, 3, 4, 5, 6, 7],
+      sourceFieldPaths([0, 1, 2, 3, 4, 5, 6, 7]),
     );
     await waitFor(() =>
       expect(gridMock.revisionChanged).toHaveBeenCalledOnce(),
@@ -835,7 +1311,7 @@ describe("DataGrid window rendering", () => {
     render(<DataGrid source={source} />);
 
     expect(gridMock.props?.columns[0]).toMatchObject({
-      id: "0",
+      id: '["column_0"]',
       title: "column_0",
       monospace: false,
       pinned: false,
@@ -921,7 +1397,7 @@ describe("DataGrid window rendering", () => {
       0,
       0,
       64,
-      [0, 1, 2, 3, 4, 5, 6],
+      sourceFieldPaths([2, 0, 1, 3, 4, 5, 6]),
     );
     expect(desktop.getDataWindow).toHaveBeenNthCalledWith(
       2,
@@ -929,13 +1405,13 @@ describe("DataGrid window rendering", () => {
       0,
       0,
       64,
-      [0, 1, 2, 3, 4, 5, 6],
+      sourceFieldPaths([2, 0, 1, 3, 4, 5, 6]),
     );
-    expect(gridMock.props?.columns[0]?.id).toBe("2");
+    expect(gridMock.props?.columns[0]?.id).toBe('["column_2"]');
 
     fireEvent.click(screen.getByRole("button", { name: "Show all columns" }));
     const restored = gridMock.props?.columns.find(
-      (column) => column.id === "7",
+      (column) => column.id === '["column_7"]',
     );
     expect(
       restored !== undefined && "width" in restored ? restored.width : 0,
@@ -955,23 +1431,23 @@ describe("DataGrid window rendering", () => {
       (
         _bytes: ArrayBuffer,
         rowOffset: number,
-        sourceIndices: readonly number[],
+        fieldPaths: readonly desktop.FieldPath[],
       ): ArrowDataWindow => ({
         rowOffset,
         rowCount: 2,
-        sourceIndices,
-        sourceColumnOffsets: new Map(
-          sourceIndices.map((sourceIndex, offset) => [sourceIndex, offset]),
-        ),
+        fieldPaths,
+        fieldColumnOffsets: fieldColumnOffsets(fieldPaths),
         table: {
           schema: {
-            fields: sourceIndices.map((sourceIndex) => ({
-              type: sourceIndex === 0 ? int32() : utf8(),
+            fields: fieldPaths.map((fieldPath) => ({
+              type: fieldPath.at(-1) === "number" ? int32() : utf8(),
             })),
           },
           getChildAt: (columnOffset: number) => ({
             at: () =>
-              sourceIndices[columnOffset] === 0 ? 123_456 : "wide label",
+              fieldPaths[columnOffset]?.at(-1) === "number"
+                ? 123_456
+                : "wide label",
           }),
         } as unknown as ArrowDataWindow["table"],
       }),
@@ -1000,7 +1476,10 @@ describe("DataGrid window rendering", () => {
     fireEvent.click(screen.getByRole("button", { name: "Fit column widths" }));
 
     await waitFor(() => expect(desktop.getDataWindow).toHaveBeenCalledOnce());
-    expect(desktop.getDataWindow).toHaveBeenCalledWith(7, 0, 0, 2, [0, 1]);
+    expect(desktop.getDataWindow).toHaveBeenCalledWith(7, 0, 0, 2, [
+      ["number"],
+      ["label"],
+    ]);
     await waitFor(() => {
       expect(
         gridMock.props?.columns.map((column) =>
@@ -1125,7 +1604,7 @@ describe("DataGrid window rendering", () => {
       />,
     );
 
-    expect(screen.getByLabelText("Query")).toHaveTextContent("*");
+    expect(screen.getByLabelText("Query")).toHaveTextContent("[8/8 cols]");
     expect(gridMock.props?.columns[0]).toMatchObject({
       title: "column_7",
       pinned: true,
@@ -1162,6 +1641,694 @@ describe("DataGrid window rendering", () => {
     ).toHaveAttribute("aria-pressed", "false");
   });
 
+  it("recursively flattens structs into full grid columns and restores their ancestor", async () => {
+    vi.mocked(desktop.prepareDataView).mockImplementation(
+      async (_generation, revision) => ({ revision, rowCount: 4 }),
+    );
+    const addressType = struct({
+      'postal"code': int32(),
+      geo: struct({ latitude: int32() }),
+    });
+    const profileType = struct({
+      "city.name": utf8(),
+      address: addressType,
+    });
+    decodeArrowWindow.mockImplementation(
+      (
+        _bytes: ArrayBuffer,
+        rowOffset: number,
+        fieldPaths: readonly desktop.FieldPath[],
+      ): ArrowDataWindow => ({
+        rowOffset,
+        rowCount: 4,
+        fieldPaths,
+        fieldColumnOffsets: fieldColumnOffsets(fieldPaths),
+        table: {
+          schema: {
+            fields: fieldPaths.map((fieldPath) => ({
+              type:
+                fieldPath.length === 1 && fieldPath[0] === "profile"
+                  ? profileType
+                  : fieldPath.at(-1) === "address"
+                    ? addressType
+                    : fieldPath.at(-1) === "geo"
+                      ? struct({ latitude: int32() })
+                      : fieldPath.at(-1) === 'postal"code'
+                        ? int32()
+                        : utf8(),
+            })),
+          },
+          getChildAt: () => ({ at: () => null }),
+        } as unknown as ArrowDataWindow["table"],
+      }),
+    );
+    render(<DataGrid source={nestedSource} />);
+    await waitFor(() => expect(desktop.getDataWindow).toHaveBeenCalledOnce());
+
+    act(() => gridMock.props?.onColumnResize(1, 240));
+    openColumnMenu(1);
+    fireEvent.click(screen.getByRole("menuitem", { name: "Pin column" }));
+    expect(
+      screen.getByLabelText("Query").querySelector(".query-select"),
+    ).toHaveTextContent("[3/3 cols]");
+    expect(
+      screen.getByLabelText("Query").querySelector(".query-select"),
+    ).toHaveAttribute("title", '"profile", "id", "tail"');
+    openColumnMenu(0);
+    fireEvent.click(
+      screen.getByRole("menuitem", { name: "Flatten to columns" }),
+    );
+
+    expect(gridMock.props?.columns.slice(0, 2)).toMatchObject([
+      {
+        id: '["profile","city.name"]',
+        title: 'profile."city.name"',
+        titlePrefix: "profile.",
+        titleLeaf: '"city.name"',
+        width: 240,
+        pinned: true,
+        sortable: true,
+        filterable: true,
+        groupRail: {
+          title: "profile · struct<…>",
+          start: true,
+          end: false,
+        },
+      },
+      {
+        id: '["profile","address"]',
+        width: 240,
+        pinned: true,
+        groupRail: {
+          title: "profile · struct<…>",
+          start: false,
+          end: true,
+        },
+      },
+    ]);
+    expect(screen.getByText(/profile expanded to 2 columns\./)).toBeVisible();
+    expect(
+      screen.getByLabelText("Query").querySelector(".query-select"),
+    ).toHaveTextContent("[4/4 cols]");
+    expect(
+      screen.getByLabelText("Query").querySelector(".query-select"),
+    ).toHaveAttribute(
+      "title",
+      '"profile"."city.name", "profile"."address", "id", "tail"',
+    );
+
+    const picker = openSelectPicker();
+    expect(
+      within(picker).getByRole("checkbox", {
+        name: 'Show profile."city.name"',
+      }),
+    ).toBeChecked();
+    expect(
+      within(picker).getByRole("button", {
+        name: 'Unpin profile."city.name"',
+      }),
+    ).toHaveAttribute("aria-pressed", "true");
+    fireEvent.click(
+      screen.getByLabelText("Query").querySelector(".query-select")!,
+    );
+
+    openColumnMenu(0);
+    fireEvent.click(screen.getByRole("menuitem", { name: "Unpin column" }));
+    expect(gridMock.props?.columns[0]?.id).toBe('["profile","address"]');
+
+    fireEvent.click(screen.getByRole("button", { name: "Schema" }));
+    const sidebar = screen.getByRole("complementary", {
+      name: "Schema sidebar",
+    });
+    const addressNode = within(sidebar).getByText("address").closest("li");
+    if (addressNode === null) throw new Error("address schema node is missing");
+    fireEvent.click(
+      within(addressNode).getAllByRole("button", {
+        name: "Flatten to columns",
+      })[0]!,
+    );
+    fireEvent.click(
+      within(addressNode).getAllByRole("button", {
+        name: "Flatten to columns",
+      })[0]!,
+    );
+    expect(
+      screen.getByText("profile.address is already flattened."),
+    ).toBeVisible();
+
+    expect(gridMock.props?.columns.slice(0, 2)).toMatchObject([
+      {
+        id: '["profile","address","postal\\"code"]',
+        titlePrefix: "profile.address.",
+        titleLeaf: '"postal""code"',
+        width: 240,
+        pinned: true,
+        groupRail: {
+          title: "profile · struct<…>",
+          start: true,
+          end: false,
+        },
+      },
+      {
+        id: '["profile","address","geo"]',
+        width: 240,
+        pinned: true,
+        groupRail: {
+          title: "profile · struct<…>",
+          start: false,
+          end: true,
+        },
+      },
+    ]);
+    await waitFor(() =>
+      expect(desktop.getDataWindow).toHaveBeenLastCalledWith(7, 0, 0, 4, [
+        ["profile", "address", 'postal"code'],
+        ["profile", "address", "geo"],
+        ["id"],
+        ["profile", "city.name"],
+        ["tail"],
+      ]),
+    );
+
+    act(() => gridMock.props?.onSort(0, false));
+    await waitFor(() =>
+      expect(desktop.prepareDataView).toHaveBeenLastCalledWith(
+        7,
+        1,
+        [],
+        [
+          {
+            fieldPath: ["profile", "address", 'postal"code'],
+            direction: "ascending",
+          },
+        ],
+        { memoryLimit: "mb384" },
+      ),
+    );
+    openFilterEditor(0);
+    const editor = screen.getByRole("form", {
+      name: 'Filter profile.address."postal""code"',
+    });
+    fireEvent.change(within(editor).getByLabelText("Condition"), {
+      target: { value: "isNull" },
+    });
+    fireEvent.click(
+      within(editor).getByRole("button", { name: "Add condition" }),
+    );
+    await waitFor(() =>
+      expect(desktop.prepareDataView).toHaveBeenLastCalledWith(
+        7,
+        2,
+        [
+          {
+            fieldPath: ["profile", "address", 'postal"code'],
+            operator: "isNull",
+            values: [],
+          },
+        ],
+        [
+          {
+            fieldPath: ["profile", "address", 'postal"code'],
+            direction: "ascending",
+          },
+        ],
+        { memoryLimit: "mb384" },
+      ),
+    );
+
+    openColumnMenu(0);
+    expect(
+      screen.getByRole("menuitem", { name: "Unflatten profile.address" }),
+    ).toBeInTheDocument();
+    fireEvent.click(
+      screen.getByRole("menuitem", { name: "Unflatten profile" }),
+    );
+
+    await waitFor(() =>
+      expect(desktop.prepareDataView).toHaveBeenLastCalledWith(7, 3, [], [], {
+        memoryLimit: "mb384",
+      }),
+    );
+    expect(
+      screen.getByText(
+        'profile restored; removed filters: profile.address."postal""code"; sorts: profile.address."postal""code".',
+      ),
+    ).toBeVisible();
+    expect(gridMock.props?.columns.map((column) => column.id)).toEqual([
+      '["profile"]',
+      '["id"]',
+      '["tail"]',
+    ]);
+    expect(gridMock.props?.columns[0]).toMatchObject({
+      width: 240,
+      pinned: true,
+    });
+    expect(gridMock.mountCount).toBe(1);
+    expect(gridMock.scrollToRow).not.toHaveBeenCalled();
+    expect(gridMock.scrollToColumn).not.toHaveBeenCalled();
+  });
+
+  it("removes a pin-mismatched child from its rail and restores it when repinned", async () => {
+    const profileType = struct({
+      "city.name": utf8(),
+      address: struct({ 'postal"code': int32() }),
+    });
+    decodeArrowWindow.mockImplementation(
+      (
+        _bytes: ArrayBuffer,
+        rowOffset: number,
+        fieldPaths: readonly desktop.FieldPath[],
+      ): ArrowDataWindow => ({
+        rowOffset,
+        rowCount: 4,
+        fieldPaths,
+        fieldColumnOffsets: fieldColumnOffsets(fieldPaths),
+        table: {
+          schema: {
+            fields: fieldPaths.map((fieldPath) => ({
+              type:
+                fieldPath.length === 1 && fieldPath[0] === "profile"
+                  ? profileType
+                  : utf8(),
+            })),
+          },
+          getChildAt: () => ({ at: () => null }),
+        } as unknown as ArrowDataWindow["table"],
+      }),
+    );
+    render(<DataGrid source={nestedSource} />);
+    await waitFor(() => expect(desktop.getDataWindow).toHaveBeenCalledOnce());
+    openColumnMenu(1);
+    fireEvent.click(screen.getByRole("menuitem", { name: "Pin column" }));
+    openColumnMenu(0);
+    fireEvent.click(
+      screen.getByRole("menuitem", { name: "Flatten to columns" }),
+    );
+
+    openColumnMenu(0);
+    fireEvent.click(screen.getByRole("menuitem", { name: "Unpin column" }));
+
+    expect(gridMock.props?.columns[0]).toMatchObject({
+      id: '["profile","address"]',
+      groupRail: {
+        title: "profile · struct<…>",
+        start: true,
+        end: true,
+      },
+    });
+    const unpinnedCityIndex =
+      gridMock.props?.columns.findIndex(
+        (column) => column.id === '["profile","city.name"]',
+      ) ?? -1;
+    expect(unpinnedCityIndex).toBeGreaterThan(0);
+    expect(gridMock.props?.columns[unpinnedCityIndex]).not.toHaveProperty(
+      "groupRail",
+    );
+
+    openColumnMenu(unpinnedCityIndex);
+    fireEvent.click(screen.getByRole("menuitem", { name: "Pin column" }));
+
+    await waitFor(() =>
+      expect(desktop.getDataWindow).toHaveBeenLastCalledWith(7, 0, 0, 4, [
+        ["profile", "city.name"],
+        ["profile", "address"],
+        ["id"],
+        ["tail"],
+      ]),
+    );
+    expect(gridMock.props?.columns.slice(0, 2)).toMatchObject([
+      {
+        id: '["profile","city.name"]',
+        groupRail: {
+          title: "profile · struct<…>",
+          start: true,
+          end: false,
+        },
+      },
+      {
+        id: '["profile","address"]',
+        groupRail: {
+          title: "profile · struct<…>",
+          start: false,
+          end: true,
+        },
+      },
+    ]);
+  });
+
+  it("keeps a spaced nested path through flatten, filter, sort, and export", async () => {
+    vi.mocked(desktop.prepareDataView).mockImplementation(
+      async (_generation, revision) => ({ revision, rowCount: 4 }),
+    );
+    const spacedSource: desktop.SourceSummary = {
+      ...source,
+      displayName: "spaced-field.parquet",
+      rowCount: 4,
+      columnCount: 1,
+      schema: [
+        {
+          name: "profile",
+          physicalType: "GROUP",
+          logicalType: null,
+          children: [
+            {
+              name: "display name",
+              physicalType: "BYTE_ARRAY",
+              logicalType: "String",
+              children: [],
+            },
+          ],
+        },
+      ],
+      schemaNodeCount: 2,
+    };
+    render(<DataGrid source={spacedSource} />);
+
+    openColumnMenu(0);
+    fireEvent.click(
+      screen.getByRole("menuitem", { name: "Flatten to columns" }),
+    );
+    expect(gridMock.props?.columns[0]).toMatchObject({
+      id: '["profile","display name"]',
+      title: 'profile."display name"',
+    });
+
+    act(() => gridMock.props?.onSort(0, false));
+    await waitFor(() =>
+      expect(desktop.prepareDataView).toHaveBeenLastCalledWith(
+        7,
+        1,
+        [],
+        [
+          {
+            fieldPath: ["profile", "display name"],
+            direction: "ascending",
+          },
+        ],
+        { memoryLimit: "mb384" },
+      ),
+    );
+
+    openFilterEditor(0);
+    const editor = screen.getByRole("form", {
+      name: 'Filter profile."display name"',
+    });
+    fireEvent.change(within(editor).getByLabelText("Condition"), {
+      target: { value: "textContains" },
+    });
+    fireEvent.change(within(editor).getByRole("combobox", { name: "Value" }), {
+      target: { value: "Ada" },
+    });
+    fireEvent.click(
+      within(editor).getByRole("button", { name: "Add condition" }),
+    );
+    await waitFor(() =>
+      expect(desktop.prepareDataView).toHaveBeenLastCalledWith(
+        7,
+        2,
+        [
+          {
+            fieldPath: ["profile", "display name"],
+            operator: "textContains",
+            values: ["Ada"],
+          },
+        ],
+        [
+          {
+            fieldPath: ["profile", "display name"],
+            direction: "ascending",
+          },
+        ],
+        { memoryLimit: "mb384" },
+      ),
+    );
+
+    openGridMenu();
+    fireEvent.click(
+      screen.getByRole("menuitem", { name: /Export current view \(4 rows\)/ }),
+    );
+    await waitFor(() =>
+      expect(desktop.startDataExport).toHaveBeenCalledWith(7, 2, "view", {
+        fieldPaths: [["profile", "display name"]],
+        rowRanges: [],
+        output: { format: "csv", options: {} },
+      }),
+    );
+  });
+
+  it("flattens a generated 100-child struct into addressable columns", async () => {
+    const children = Array.from({ length: 100 }, (_, index) => ({
+      name: `child_${index}`,
+      physicalType: "INT32",
+      logicalType: null,
+      children: [],
+    }));
+    const wideSource: desktop.SourceSummary = {
+      ...source,
+      displayName: "wide-struct.parquet",
+      rowCount: 4,
+      columnCount: 1,
+      schema: [
+        {
+          name: "wide",
+          physicalType: "GROUP",
+          logicalType: null,
+          children,
+        },
+      ],
+      schemaNodeCount: 101,
+    };
+    render(<DataGrid source={wideSource} />);
+    openColumnMenu(0);
+    fireEvent.click(
+      screen.getByRole("menuitem", { name: "Flatten to columns" }),
+    );
+
+    const paths = children.map((child) => ["wide", child.name]);
+    await waitFor(() =>
+      expect(desktop.getDataWindow).toHaveBeenLastCalledWith(
+        7,
+        0,
+        0,
+        4,
+        paths.slice(0, 8),
+      ),
+    );
+    expect(
+      vi
+        .mocked(desktop.getDataWindow)
+        .mock.calls.every((call) => call[4].length <= 8),
+    ).toBe(true);
+    expect(gridMock.props?.columns).toHaveLength(100);
+    expect(gridMock.props?.columns[0]).toMatchObject({
+      id: '["wide","child_0"]',
+      title: "wide.child_0",
+      groupRail: { start: true, end: false },
+    });
+    expect(gridMock.props?.columns[99]).toMatchObject({
+      id: '["wide","child_99"]',
+      title: "wide.child_99",
+      groupRail: { start: false, end: true },
+    });
+  });
+
+  it("preserves a generated six-level struct path through recursive flattening", async () => {
+    let nestedField: desktop.SchemaField = {
+      name: "leaf",
+      physicalType: "BYTE_ARRAY",
+      logicalType: "String",
+      children: [],
+    };
+    for (let depth = 5; depth >= 1; depth -= 1) {
+      nestedField = {
+        name: `level_${depth}`,
+        physicalType: "GROUP",
+        logicalType: null,
+        children: [nestedField],
+      };
+    }
+    const deepSource: desktop.SourceSummary = {
+      ...source,
+      displayName: "deep-struct.parquet",
+      rowCount: 4,
+      columnCount: 1,
+      schema: [
+        {
+          name: "root",
+          physicalType: "GROUP",
+          logicalType: null,
+          children: [nestedField],
+        },
+      ],
+      schemaNodeCount: 7,
+    };
+    render(<DataGrid source={deepSource} />);
+
+    for (let depth = 0; depth < 6; depth += 1) {
+      openColumnMenu(0);
+      fireEvent.click(
+        screen.getByRole("menuitem", { name: "Flatten to columns" }),
+      );
+    }
+
+    const fieldPath = [
+      "root",
+      "level_1",
+      "level_2",
+      "level_3",
+      "level_4",
+      "level_5",
+      "leaf",
+    ];
+    await waitFor(() =>
+      expect(desktop.getDataWindow).toHaveBeenLastCalledWith(7, 0, 0, 4, [
+        fieldPath,
+      ]),
+    );
+    expect(gridMock.props?.columns).toMatchObject([
+      {
+        id: JSON.stringify(fieldPath),
+        title: "root.level_1.level_2.level_3.level_4.level_5.leaf",
+        titlePrefix: "root.level_1.level_2.level_3.level_4.level_5.",
+        titleLeaf: "leaf",
+        groupRail: {
+          title: "root · struct<…>",
+          start: true,
+          end: true,
+        },
+      },
+    ]);
+  });
+
+  it("names bounded dependent filters and sorts when unflattening", async () => {
+    vi.mocked(desktop.prepareDataView).mockImplementation(
+      async (_generation, revision) => ({ revision, rowCount: 4 }),
+    );
+    const boundedSource: desktop.SourceSummary = {
+      ...source,
+      displayName: "bounded-notice.parquet",
+      rowCount: 4,
+      columnCount: 2,
+      schema: [
+        {
+          name: "group",
+          physicalType: "GROUP",
+          logicalType: null,
+          children: Array.from({ length: 5 }, (_, index) => ({
+            name: `child_${index}`,
+            physicalType: "INT32",
+            logicalType: null,
+            children: [],
+          })),
+        },
+        {
+          name: "tail",
+          physicalType: "INT32",
+          logicalType: null,
+          children: [],
+        },
+      ],
+      schemaNodeCount: 7,
+    };
+    render(<DataGrid source={boundedSource} />);
+    openColumnMenu(0);
+    fireEvent.click(
+      screen.getByRole("menuitem", { name: "Flatten to columns" }),
+    );
+
+    for (let index = 0; index < 5; index += 1) {
+      openFilterEditor(index);
+      const editor = screen.getByRole("form", {
+        name: `Filter group.child_${index}`,
+      });
+      fireEvent.change(within(editor).getByLabelText("Condition"), {
+        target: { value: "isNull" },
+      });
+      fireEvent.click(
+        within(editor).getByRole("button", { name: "Add condition" }),
+      );
+      await waitFor(() =>
+        expect(desktop.prepareDataView).toHaveBeenCalledTimes(index + 1),
+      );
+    }
+    openFilterEditor(5);
+    const tailEditor = screen.getByRole("form", { name: "Filter tail" });
+    fireEvent.change(within(tailEditor).getByLabelText("Condition"), {
+      target: { value: "isNull" },
+    });
+    fireEvent.click(
+      within(tailEditor).getByRole("button", { name: "Add condition" }),
+    );
+    await waitFor(() =>
+      expect(desktop.prepareDataView).toHaveBeenCalledTimes(6),
+    );
+
+    act(() => gridMock.props?.onSort(0, false));
+    await waitFor(() =>
+      expect(desktop.prepareDataView).toHaveBeenCalledTimes(7),
+    );
+    act(() => gridMock.props?.onSort(5, true));
+    await waitFor(() =>
+      expect(desktop.prepareDataView).toHaveBeenCalledTimes(8),
+    );
+    openColumnMenu(0);
+    fireEvent.click(screen.getByRole("menuitem", { name: "Unflatten group" }));
+
+    await waitFor(() =>
+      expect(desktop.prepareDataView).toHaveBeenLastCalledWith(
+        7,
+        9,
+        [{ fieldPath: ["tail"], operator: "isNull", values: [] }],
+        [{ fieldPath: ["tail"], direction: "ascending" }],
+        { memoryLimit: "mb384" },
+      ),
+    );
+    expect(
+      screen.getByText(
+        "group restored; removed filters: group.child_0, group.child_1, group.child_2, +2 more; sorts: group.child_0.",
+      ),
+    ).toBeVisible();
+    expect(gridMock.props?.columns.map((column) => column.id)).toEqual([
+      '["group"]',
+      '["tail"]',
+    ]);
+  });
+
+  it("keeps flattened columns when an early dataset sample becomes complete", async () => {
+    const view = render(
+      <DataGrid source={nestedSource} contentIdentity="early-sample" />,
+    );
+    openColumnMenu(1);
+    fireEvent.click(
+      screen.getByRole("menuitem", { name: "Flatten to columns" }),
+    );
+
+    view.rerender(
+      <DataGrid
+        source={{
+          ...nestedSource,
+          rowCount: 8,
+          schema: structuredClone(nestedSource.schema),
+        }}
+        contentIdentity="complete"
+      />,
+    );
+
+    await waitFor(() =>
+      expect(gridMock.props?.columns.map((column) => column.id)).toEqual([
+        '["id"]',
+        '["profile","city.name"]',
+        '["profile","address"]',
+        '["tail"]',
+      ]),
+    );
+    expect(screen.queryByText(/profile expanded to 2 columns/)).toBeNull();
+    openColumnMenu(1);
+    expect(
+      screen.getByRole("menuitem", { name: "Unflatten profile" }),
+    ).toBeInTheDocument();
+  });
+
   it("keeps the SELECT picker and grid column menu on one visibility state", async () => {
     render(<DataGrid source={source} />);
     await waitFor(() => expect(desktop.getDataWindow).toHaveBeenCalledOnce());
@@ -1180,7 +2347,7 @@ describe("DataGrid window rendering", () => {
         0,
         0,
         512,
-        [0, 1, 2, 3, 4, 5, 6],
+        sourceFieldPaths([0, 1, 2, 3, 4, 5, 6]),
       ),
     );
 
@@ -1521,7 +2688,7 @@ describe("DataGrid window rendering", () => {
         0,
         0,
         512,
-        [0, 1, 2, 3, 4, 5, 6, 7],
+        sourceFieldPaths([0, 1, 2, 3, 4, 5, 6, 7]),
       ),
     );
     expect(screen.queryByText("No columns selected.")).not.toBeInTheDocument();
@@ -1603,7 +2770,7 @@ describe("DataGrid window rendering", () => {
         0,
         0,
         512,
-        [0, 2, 3, 4, 5, 6, 7],
+        sourceFieldPaths([0, 2, 3, 4, 5, 6, 7]),
       ),
     );
     expect(desktop.prepareDataView).not.toHaveBeenCalled();
@@ -1621,8 +2788,8 @@ describe("DataGrid window rendering", () => {
       expect(desktop.prepareDataView).toHaveBeenLastCalledWith(
         7,
         2,
-        [{ columnIndex: 0, operator: "equals", values: ["1"] }],
-        [{ sourceIndex: 0, direction: "ascending" }],
+        [{ fieldPath: ["column_0"], operator: "equals", values: ["1"] }],
+        [{ fieldPath: ["column_0"], direction: "ascending" }],
         { memoryLimit: "mb384" },
       ),
     );
@@ -1649,7 +2816,7 @@ describe("DataGrid window rendering", () => {
         2,
         0,
         37,
-        [1, 2, 3, 4, 5, 6, 7],
+        sourceFieldPaths([1, 2, 3, 4, 5, 6, 7]),
       ),
     );
     expect(desktop.prepareDataView).not.toHaveBeenCalled();
@@ -1664,7 +2831,7 @@ describe("DataGrid window rendering", () => {
     );
     const popup = screen.getByRole("dialog", { name: "ORDER BY columns" });
     fireEvent.change(within(popup).getByLabelText("Add column"), {
-      target: { value: "0" },
+      target: { value: '["column_0"]' },
     });
     fireEvent.click(within(popup).getByRole("button", { name: "Apply" }));
 
@@ -1702,7 +2869,7 @@ describe("DataGrid window rendering", () => {
       expect(desktop.prepareDataView).toHaveBeenCalledWith(
         7,
         1,
-        [{ columnIndex: 0, operator: "equals", values: ["42"] }],
+        [{ fieldPath: ["column_0"], operator: "equals", values: ["42"] }],
         [],
         { memoryLimit: "mb1536" },
       ),
@@ -1736,12 +2903,12 @@ describe("DataGrid window rendering", () => {
       (
         _bytes: ArrayBuffer,
         rowOffset: number,
-        sourceIndices: readonly number[],
+        fieldPaths: readonly desktop.FieldPath[],
       ): ArrowDataWindow => ({
         rowOffset,
         rowCount: 2,
-        sourceIndices,
-        sourceColumnOffsets: new Map([[0, 0]]),
+        fieldPaths,
+        fieldColumnOffsets: fieldColumnOffsets(fieldPaths),
         table: {
           schema: { fields: [{ type: list(utf8()) }] },
           getChildAt: () => ({ at: () => nestedValue }),
@@ -1765,7 +2932,9 @@ describe("DataGrid window rendering", () => {
       gridMock.props?.onColumnAutoFit(0);
     });
     await waitFor(() =>
-      expect(desktop.getDataWindow).toHaveBeenCalledWith(7, 0, 0, 2, [0]),
+      expect(desktop.getDataWindow).toHaveBeenCalledWith(7, 0, 0, 2, [
+        ["number"],
+      ]),
     );
     expect(
       gridMock.props?.columns[0] !== undefined &&
@@ -1788,12 +2957,12 @@ describe("DataGrid window rendering", () => {
       (
         _bytes: ArrayBuffer,
         rowOffset: number,
-        sourceIndices: readonly number[],
+        fieldPaths: readonly desktop.FieldPath[],
       ): ArrowDataWindow => ({
         rowOffset,
         rowCount: 1,
-        sourceIndices,
-        sourceColumnOffsets: new Map([[0, 0]]),
+        fieldPaths,
+        fieldColumnOffsets: fieldColumnOffsets(fieldPaths),
         table: {
           schema: { fields: [{ type: list(utf8()) }] },
           getChildAt: () => ({ at: () => nestedValue }),
@@ -1838,12 +3007,12 @@ describe("DataGrid window rendering", () => {
       (
         _bytes: ArrayBuffer,
         rowOffset: number,
-        sourceIndices: readonly number[],
+        fieldPaths: readonly desktop.FieldPath[],
       ): ArrowDataWindow => ({
         rowOffset,
         rowCount: Math.min(512, nestedSource.rowCount - rowOffset),
-        sourceIndices,
-        sourceColumnOffsets: new Map([[0, 0]]),
+        fieldPaths,
+        fieldColumnOffsets: fieldColumnOffsets(fieldPaths),
         table: {
           schema: { fields: [{ type: list(int32()) }] },
           getChildAt: () => ({ at: (row: number) => [rowOffset + row] }),
@@ -1894,7 +3063,7 @@ describe("DataGrid window rendering", () => {
         7,
         1,
         [],
-        [{ sourceIndex: 2, direction: "ascending" }],
+        [{ fieldPath: ["column_2"], direction: "ascending" }],
         { memoryLimit: "mb384" },
       ),
     );
@@ -1912,8 +3081,8 @@ describe("DataGrid window rendering", () => {
         2,
         [],
         [
-          { sourceIndex: 2, direction: "ascending" },
-          { sourceIndex: 3, direction: "ascending" },
+          { fieldPath: ["column_2"], direction: "ascending" },
+          { fieldPath: ["column_3"], direction: "ascending" },
         ],
         { memoryLimit: "mb384" },
       ),
@@ -1952,7 +3121,7 @@ describe("DataGrid window rendering", () => {
         7,
         1,
         [],
-        [{ sourceIndex: 2, direction: "ascending" }],
+        [{ fieldPath: ["column_2"], direction: "ascending" }],
         { memoryLimit: "mb384" },
       ),
     );
@@ -1970,7 +3139,7 @@ describe("DataGrid window rendering", () => {
         7,
         2,
         [],
-        [{ sourceIndex: 2, direction: "ascending" }],
+        [{ fieldPath: ["column_2"], direction: "ascending" }],
         { memoryLimit: "mb384" },
       ),
     );
@@ -1990,10 +3159,10 @@ describe("DataGrid window rendering", () => {
     fireEvent.click(screen.getAllByRole("button", { name: "⋯" })[1]!);
     let popup = screen.getByRole("dialog", { name: "ORDER BY columns" });
     fireEvent.change(within(popup).getByLabelText("Add column"), {
-      target: { value: "0" },
+      target: { value: '["quoted\\"name"]' },
     });
     fireEvent.change(within(popup).getByLabelText("Add column"), {
-      target: { value: "1" },
+      target: { value: '["second"]' },
     });
     fireEvent.change(within(popup).getByLabelText("Direction for second"), {
       target: { value: "descending" },
@@ -2015,8 +3184,8 @@ describe("DataGrid window rendering", () => {
       1,
       [],
       [
-        { sourceIndex: 1, direction: "descending" },
-        { sourceIndex: 0, direction: "ascending" },
+        { fieldPath: ["second"], direction: "descending" },
+        { fieldPath: ['quoted"name'], direction: "ascending" },
       ],
       { memoryLimit: "mb384" },
     );
@@ -2046,7 +3215,7 @@ describe("DataGrid window rendering", () => {
     fireEvent.click(screen.getAllByRole("button", { name: "⋯" })[1]!);
     let popup = screen.getByRole("dialog", { name: "ORDER BY columns" });
     fireEvent.change(within(popup).getByLabelText("Add column"), {
-      target: { value: "0" },
+      target: { value: '["column_0"]' },
     });
     fireEvent.click(within(popup).getByRole("button", { name: "Apply" }));
     await waitFor(() =>
@@ -2054,7 +3223,7 @@ describe("DataGrid window rendering", () => {
         7,
         1,
         [],
-        [{ sourceIndex: 0, direction: "ascending" }],
+        [{ fieldPath: ["column_0"], direction: "ascending" }],
         { memoryLimit: "mb384" },
       ),
     );
@@ -2065,7 +3234,7 @@ describe("DataGrid window rendering", () => {
       within(popup).getByRole("button", { name: "Remove sort column_0" }),
     ).toBeInTheDocument();
     fireEvent.change(within(popup).getByLabelText("Add column"), {
-      target: { value: "1" },
+      target: { value: '["column_1"]' },
     });
     fireEvent.click(within(popup).getByRole("button", { name: "Apply" }));
 
@@ -2075,8 +3244,8 @@ describe("DataGrid window rendering", () => {
         2,
         [],
         [
-          { sourceIndex: 0, direction: "ascending" },
-          { sourceIndex: 1, direction: "ascending" },
+          { fieldPath: ["column_0"], direction: "ascending" },
+          { fieldPath: ["column_1"], direction: "ascending" },
         ],
         { memoryLimit: "mb384" },
       ),
@@ -2103,8 +3272,8 @@ describe("DataGrid window rendering", () => {
       expect(desktop.prepareDataView).toHaveBeenLastCalledWith(
         7,
         2,
-        [{ columnIndex: 0, operator: "equals", values: ["4"] }],
-        [{ sourceIndex: 2, direction: "ascending" }],
+        [{ fieldPath: ["column_0"], operator: "equals", values: ["4"] }],
+        [{ fieldPath: ["column_2"], direction: "ascending" }],
         { memoryLimit: "mb384" },
       ),
     );
@@ -2207,7 +3376,13 @@ describe("DataGrid window rendering", () => {
       expect(desktop.prepareDataView).toHaveBeenLastCalledWith(
         7,
         1,
-        [{ columnIndex: 0, operator: "textContains", values: ["Alpha"] }],
+        [
+          {
+            fieldPath: ["label"],
+            operator: "textContains",
+            values: ["Alpha"],
+          },
+        ],
         [],
         { memoryLimit: "mb384" },
       ),
@@ -2231,7 +3406,7 @@ describe("DataGrid window rendering", () => {
         2,
         [
           {
-            columnIndex: 0,
+            fieldPath: ["label"],
             operator: "textContains",
             values: ["Alpha"],
             matchCase: true,
@@ -2260,7 +3435,7 @@ describe("DataGrid window rendering", () => {
       expect(desktop.prepareDataView).toHaveBeenCalledWith(
         7,
         1,
-        [{ columnIndex: 0, operator: "equals", values: ["1"] }],
+        [{ fieldPath: ["column_0"], operator: "equals", values: ["1"] }],
         [],
         { memoryLimit: "mb384" },
       ),
@@ -2314,7 +3489,7 @@ describe("DataGrid window rendering", () => {
         1,
         expect.any(Number),
         512,
-        [0, 1, 2, 3],
+        sourceFieldPaths([0, 1, 2, 3]),
       ),
     );
     expect(
@@ -2337,7 +3512,13 @@ describe("DataGrid window rendering", () => {
     });
 
     await waitFor(() =>
-      expect(desktop.getDataWindow).toHaveBeenCalledWith(7, 1, 0, 3, [0, 1]),
+      expect(desktop.getDataWindow).toHaveBeenCalledWith(
+        7,
+        1,
+        0,
+        3,
+        sourceFieldPaths([0, 1]),
+      ),
     );
     await waitFor(() =>
       expect(gridMock.props?.getCellContent({ column: 1, row: 0 }).kind).toBe(
@@ -2397,7 +3578,7 @@ describe("DataGrid window rendering", () => {
         1,
         2_063_885,
         512,
-        [0, 1, 2, 3],
+        [["boolean_value"], ["int16_value"], ["column_2"], ["column_3"]],
       ),
     );
 
@@ -2424,8 +3605,8 @@ describe("DataGrid window rendering", () => {
       expect(desktop.prepareDataView).toHaveBeenLastCalledWith(
         7,
         2,
-        [{ columnIndex: 0, operator: "isNull", values: [] }],
-        [{ sourceIndex: 1, direction: "ascending" }],
+        [{ fieldPath: ["boolean_value"], operator: "isNull", values: [] }],
+        [{ fieldPath: ["int16_value"], direction: "ascending" }],
         { memoryLimit: "mb384" },
       ),
     );
@@ -2438,7 +3619,7 @@ describe("DataGrid window rendering", () => {
         2,
         269_796,
         512,
-        [0, 1, 2, 3],
+        [["boolean_value"], ["int16_value"], ["column_2"], ["column_3"]],
       ),
     );
     await waitFor(() =>
@@ -2468,7 +3649,7 @@ describe("DataGrid window rendering", () => {
       expect(desktop.prepareDataView).toHaveBeenLastCalledWith(
         7,
         2,
-        [{ columnIndex: 1, operator: "equals", values: ["2"] }],
+        [{ fieldPath: ["column_1"], operator: "equals", values: ["2"] }],
         [],
         { memoryLimit: "mb384" },
       ),
@@ -2490,17 +3671,15 @@ describe("DataGrid window rendering", () => {
       (
         bytes: ArrayBuffer,
         rowOffset: number,
-        sourceIndices: readonly number[],
+        fieldPaths: readonly desktop.FieldPath[],
       ): ArrowDataWindow => ({
         rowOffset,
         rowCount: 3,
-        sourceIndices,
-        sourceColumnOffsets: new Map(
-          sourceIndices.map((sourceIndex, offset) => [sourceIndex, offset]),
-        ),
+        fieldPaths,
+        fieldColumnOffsets: fieldColumnOffsets(fieldPaths),
         table: {
           schema: {
-            fields: sourceIndices.map(() => ({
+            fields: fieldPaths.map(() => ({
               type:
                 bytes.byteLength === 2
                   ? struct({ stale_child: utf8() })
@@ -2601,7 +3780,7 @@ describe("DataGrid window rendering", () => {
       0,
       936,
       expect.any(Number),
-      [20, 21],
+      sourceFieldPaths([20, 21]),
     );
     gridMock.revisionChanged.mockReset();
 
@@ -2613,7 +3792,7 @@ describe("DataGrid window rendering", () => {
       0,
       expect.any(Number),
       expect.any(Number),
-      [20, 21],
+      sourceFieldPaths([20, 21]),
     );
     expect(
       vi.mocked(desktop.getDataWindow).mock.calls.at(-1)?.[2],
@@ -2643,18 +3822,18 @@ describe("DataGrid window rendering", () => {
       expect.objectContaining({
         reason: "columnProjection",
         rowOffset: 0,
-        projectionKey: "20:21:c:ec9472a2",
+        projectionKey: expect.any(String),
         outcome: "supersededBeforeStart",
       }),
       expect.objectContaining({
         reason: "rowWindow",
         rowOffset: 936,
-        projectionKey: "20:21:c:ec9472a2",
+        projectionKey: expect.any(String),
         stale: true,
       }),
       expect.objectContaining({
         reason: "rowWindow",
-        projectionKey: "20:21:c:ec9472a2",
+        projectionKey: expect.any(String),
         outcome: "completed",
         stale: false,
       }),
@@ -2695,7 +3874,7 @@ describe("DataGrid window rendering", () => {
       0,
       0,
       62,
-      [20, 21],
+      sourceFieldPaths([20, 21]),
     );
 
     act(() => {
@@ -2719,7 +3898,7 @@ describe("DataGrid window rendering", () => {
       0,
       expect.any(Number),
       512,
-      [20, 21],
+      sourceFieldPaths([20, 21]),
     );
     expect(
       vi.mocked(desktop.getDataWindow).mock.calls.at(-1)?.[2],
@@ -2772,7 +3951,13 @@ describe("DataGrid window rendering", () => {
     await act(async () => awayWindow.resolve(new ArrayBuffer(1)));
 
     await waitFor(() => expect(desktop.getDataWindow).toHaveBeenCalledTimes(2));
-    expect(desktop.getDataWindow).toHaveBeenLastCalledWith(7, 0, 8, 10, [20]);
+    expect(desktop.getDataWindow).toHaveBeenLastCalledWith(
+      7,
+      0,
+      8,
+      10,
+      sourceFieldPaths([20]),
+    );
     expect(gridMock.revisionChanged).not.toHaveBeenCalled();
 
     await act(async () => returningSupplement.resolve(new ArrayBuffer(2)));
@@ -2831,7 +4016,13 @@ describe("DataGrid window rendering", () => {
     });
 
     expect(desktop.getDataWindow).toHaveBeenCalledOnce();
-    expect(desktop.getDataWindow).toHaveBeenLastCalledWith(7, 0, 22, 62, [20]);
+    expect(desktop.getDataWindow).toHaveBeenLastCalledWith(
+      7,
+      0,
+      22,
+      62,
+      sourceFieldPaths([20]),
+    );
     expect(gridMock.props?.getCellContent({ row: 67, column: 20 }).kind).toBe(
       "loading",
     );
@@ -2943,7 +4134,13 @@ describe("DataGrid window rendering", () => {
 
       await act(async () => vi.advanceTimersByTimeAsync(1));
       expect(desktop.getDataWindow).toHaveBeenCalledOnce();
-      expect(desktop.getDataWindow).toHaveBeenLastCalledWith(7, 0, 0, 62, [20]);
+      expect(desktop.getDataWindow).toHaveBeenLastCalledWith(
+        7,
+        0,
+        0,
+        62,
+        sourceFieldPaths([20]),
+      );
     } finally {
       vi.useRealTimers();
     }
@@ -3032,7 +4229,7 @@ describe("DataGrid window rendering", () => {
       1,
       expect.any(Number),
       expect.any(Number),
-      [0, 1],
+      sourceFieldPaths([0, 1]),
     );
     expect(desktop.getDataViewStatus).not.toHaveBeenCalled();
 
@@ -3404,7 +4601,7 @@ describe("DataGrid window rendering", () => {
       expect(desktop.prepareDataView).toHaveBeenLastCalledWith(
         7,
         2,
-        [{ columnIndex: 1, operator: "equals", values: ["2"] }],
+        [{ fieldPath: ["column_1"], operator: "equals", values: ["2"] }],
         [],
         { memoryLimit: "mb384" },
       ),
@@ -3481,17 +4678,15 @@ describe("DataGrid window rendering", () => {
       (
         _bytes: ArrayBuffer,
         rowOffset: number,
-        sourceIndices: readonly number[],
+        fieldPaths: readonly desktop.FieldPath[],
       ): ArrowDataWindow => ({
         rowOffset,
         rowCount: 1,
-        sourceIndices,
-        sourceColumnOffsets: new Map(
-          sourceIndices.map((sourceIndex, offset) => [sourceIndex, offset]),
-        ),
+        fieldPaths,
+        fieldColumnOffsets: fieldColumnOffsets(fieldPaths),
         table: {
           schema: {
-            fields: sourceIndices.map(() => ({
+            fields: fieldPaths.map(() => ({
               type: timestamp(TimeUnit.MICROSECOND, "UTC"),
             })),
           },
@@ -3585,7 +4780,11 @@ describe("DataGrid window rendering", () => {
 
     fireEvent.click(within(sidebar).getByRole("button", { name: /profile/ }));
     await waitFor(() =>
-      expect(desktop.getColumnStatistics).toHaveBeenCalledWith(7, 0, true),
+      expect(desktop.getColumnStatistics).toHaveBeenCalledWith(
+        7,
+        ["profile"],
+        true,
+      ),
     );
     expect(await within(sidebar).findByText("12.5%")).toBeInTheDocument();
     expect(within(sidebar).getByText("≈ 42")).toBeInTheDocument();
@@ -3788,18 +4987,17 @@ describe("DataGrid window rendering", () => {
       (
         _bytes: ArrayBuffer,
         rowOffset: number,
-        sourceIndices: readonly number[],
+        fieldPaths: readonly desktop.FieldPath[],
       ): ArrowDataWindow => ({
         rowOffset,
         rowCount: 3,
-        sourceIndices,
-        sourceColumnOffsets: new Map(
-          sourceIndices.map((sourceIndex, offset) => [sourceIndex, offset]),
-        ),
+        fieldPaths,
+        fieldColumnOffsets: fieldColumnOffsets(fieldPaths),
         table: {
-          schema: { fields: sourceIndices.map(() => ({ type: utf8() })) },
+          schema: { fields: fieldPaths.map(() => ({ type: utf8() })) },
           getChildAt: (offset: number) => ({
-            at: () => (sourceIndices[offset] === 1 ? json : json),
+            at: () =>
+              fieldPaths[offset]?.at(-1) === "json_value" ? json : json,
           }),
         } as unknown as ArrowDataWindow["table"],
       }),
@@ -3903,18 +5101,17 @@ describe("DataGrid window rendering", () => {
       (
         _bytes: ArrayBuffer,
         rowOffset: number,
-        sourceIndices: readonly number[],
+        fieldPaths: readonly desktop.FieldPath[],
       ): ArrowDataWindow => ({
         rowOffset,
         rowCount: 3,
-        sourceIndices,
-        sourceColumnOffsets: new Map(
-          sourceIndices.map((sourceIndex, offset) => [sourceIndex, offset]),
-        ),
+        fieldPaths,
+        fieldColumnOffsets: fieldColumnOffsets(fieldPaths),
         table: {
-          schema: { fields: sourceIndices.map(() => ({ type: utf8() })) },
+          schema: { fields: fieldPaths.map(() => ({ type: utf8() })) },
           getChildAt: (offset: number) => ({
-            at: () => (sourceIndices[offset] === 299 ? json : "plain"),
+            at: () =>
+              fieldPaths[offset]?.at(-1) === "json_value" ? json : "plain",
           }),
         } as unknown as ArrowDataWindow["table"],
       }),
@@ -3942,7 +5139,9 @@ describe("DataGrid window rendering", () => {
       });
     });
     await waitFor(() =>
-      expect(desktop.getDataWindow).toHaveBeenLastCalledWith(7, 0, 0, 3, [299]),
+      expect(desktop.getDataWindow).toHaveBeenLastCalledWith(7, 0, 0, 3, [
+        ["json_value"],
+      ]),
     );
     const selection = {
       columns: CompactSelection.empty(),
@@ -4002,12 +5201,12 @@ describe("DataGrid window rendering", () => {
       (
         _bytes: ArrayBuffer,
         rowOffset: number,
-        sourceIndices: readonly number[],
+        fieldPaths: readonly desktop.FieldPath[],
       ): ArrowDataWindow => ({
         rowOffset,
         rowCount: 1,
-        sourceIndices,
-        sourceColumnOffsets: new Map([[0, 0]]),
+        fieldPaths,
+        fieldColumnOffsets: fieldColumnOffsets(fieldPaths),
         table: {
           schema: { fields: [{ type: utf8() }] },
           getChildAt: () => ({ at: () => json }),
@@ -4096,17 +5295,15 @@ describe("DataGrid window rendering", () => {
       (
         _bytes: ArrayBuffer,
         rowOffset: number,
-        sourceIndices: readonly number[],
+        fieldPaths: readonly desktop.FieldPath[],
       ): ArrowDataWindow => ({
         rowOffset,
         rowCount: 512,
-        sourceIndices,
-        sourceColumnOffsets: new Map(
-          sourceIndices.map((sourceIndex, offset) => [sourceIndex, offset]),
-        ),
+        fieldPaths,
+        fieldColumnOffsets: fieldColumnOffsets(fieldPaths),
         table: {
           schema: {
-            fields: sourceIndices.map(() => ({ type: utf8() })),
+            fields: fieldPaths.map(() => ({ type: utf8() })),
           },
           getChildAt: () => ({ at }),
         } as unknown as ArrowDataWindow["table"],
@@ -4194,20 +5391,18 @@ describe("DataGrid window rendering", () => {
       (
         _bytes: ArrayBuffer,
         rowOffset: number,
-        sourceIndices: readonly number[],
+        fieldPaths: readonly desktop.FieldPath[],
       ): ArrowDataWindow => {
         const at = decodeCount === 0 ? firstAt : replacementAt;
         decodeCount += 1;
         return {
           rowOffset,
           rowCount: 512,
-          sourceIndices,
-          sourceColumnOffsets: new Map(
-            sourceIndices.map((sourceIndex, offset) => [sourceIndex, offset]),
-          ),
+          fieldPaths,
+          fieldColumnOffsets: fieldColumnOffsets(fieldPaths),
           table: {
             schema: {
-              fields: sourceIndices.map(() => ({ type: utf8() })),
+              fields: fieldPaths.map(() => ({ type: utf8() })),
             },
             getChildAt: () => ({ at }),
           } as unknown as ArrowDataWindow["table"],
@@ -4277,17 +5472,15 @@ describe("DataGrid window rendering", () => {
       (
         _bytes: ArrayBuffer,
         rowOffset: number,
-        sourceIndices: readonly number[],
+        fieldPaths: readonly desktop.FieldPath[],
       ): ArrowDataWindow => ({
         rowOffset,
         rowCount: 512,
-        sourceIndices,
-        sourceColumnOffsets: new Map(
-          sourceIndices.map((sourceIndex, offset) => [sourceIndex, offset]),
-        ),
+        fieldPaths,
+        fieldColumnOffsets: fieldColumnOffsets(fieldPaths),
         table: {
           schema: {
-            fields: sourceIndices.map(() => ({ type: utf8() })),
+            fields: fieldPaths.map(() => ({ type: utf8() })),
           },
           getChildAt: () => ({ at }),
         } as unknown as ArrowDataWindow["table"],
@@ -4351,6 +5544,139 @@ describe("DataGrid window rendering", () => {
     expect(gridMock.focus).toHaveBeenCalledTimes(2);
   });
 
+  it("keeps duplicate top-level columns ordered by source identity", async () => {
+    const duplicateSource: desktop.SourceSummary = {
+      ...source,
+      columnCount: 2,
+      rowCount: 1,
+      schema: [
+        { ...source.schema[0]!, name: "duplicate" },
+        { ...source.schema[1]!, name: "duplicate" },
+      ],
+      schemaNodeCount: 2,
+    };
+    decodeArrowWindow.mockImplementation(
+      (
+        _bytes: ArrayBuffer,
+        rowOffset: number,
+        fieldPaths: readonly desktop.FieldPath[],
+      ): ArrowDataWindow => ({
+        rowOffset,
+        rowCount: 1,
+        fieldPaths,
+        fieldColumnOffsets: new Map([[JSON.stringify(["duplicate"]), 0]]),
+        table: {
+          schema: { fields: [{ type: utf8() }, { type: utf8() }] },
+          getChildAt: (offset: number) => ({
+            at: () => (offset === 0 ? "first value" : "second value"),
+          }),
+        } as unknown as ArrowDataWindow["table"],
+      }),
+    );
+
+    render(<DataGrid source={duplicateSource} />);
+
+    await waitFor(() =>
+      expect(desktop.getDataWindow).toHaveBeenCalledWith(7, 0, 0, 1, [
+        ["duplicate"],
+        ["duplicate"],
+      ]),
+    );
+    expect(gridMock.props?.columns).toMatchObject([
+      { id: "source:0", sortable: false, filterable: false },
+      { id: "source:1", sortable: false, filterable: false },
+    ]);
+    expect(gridMock.props?.getCellContent({ column: 0, row: 0 })).toMatchObject(
+      { displayData: "first value" },
+    );
+    expect(gridMock.props?.getCellContent({ column: 1, row: 0 })).toMatchObject(
+      { displayData: "second value" },
+    );
+    const reason = screen.getByText(
+      /Duplicate top-level names require source-order/,
+    );
+    expect(reason).toBeVisible();
+    expect(reason.id).not.toBe("");
+    const query = screen.getByLabelText("Query");
+    expect(query.querySelector(".query-where")).toHaveAttribute(
+      "aria-describedby",
+      reason.id,
+    );
+    expect(query.querySelector(".query-order")).toHaveAttribute(
+      "aria-describedby",
+      reason.id,
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Schema" }));
+    const schemaPathActions = within(
+      screen.getByRole("complementary", { name: "Schema sidebar" }),
+    )
+      .getAllByRole("button")
+      .filter((button) => button.hasAttribute("disabled"));
+    expect(schemaPathActions.length).toBeGreaterThan(0);
+    schemaPathActions.forEach((button) =>
+      expect(button).toHaveAttribute("aria-describedby", reason.id),
+    );
+    openGridMenu();
+    const unavailableExport = screen.getAllByRole("menuitem", {
+      name: /Export is unavailable because duplicate top-level names/,
+    });
+    expect(unavailableExport.length).toBeGreaterThan(0);
+    unavailableExport.forEach((action) => expect(action).toBeDisabled());
+    expect(desktop.startDataExport).not.toHaveBeenCalled();
+
+    openColumnMenu(1);
+    fireEvent.click(screen.getByRole("menuitem", { name: "Pin column" }));
+    expect(gridMock.props?.columns.map((column) => column.id)).toEqual([
+      "source:1",
+      "source:0",
+    ]);
+    openColumnMenu(0);
+    fireEvent.click(screen.getByRole("menuitem", { name: "Hide column" }));
+    expect(gridMock.props?.columns.map((column) => column.id)).toEqual([
+      "source:0",
+    ]);
+    expect(desktop.prepareDataView).not.toHaveBeenCalled();
+  });
+
+  it("keeps a struct readable but disables flatten for duplicate child names", async () => {
+    const nestedDuplicateSource: desktop.SourceSummary = {
+      ...source,
+      columnCount: 1,
+      rowCount: 1,
+      schema: [
+        {
+          name: "profile",
+          physicalType: "GROUP",
+          logicalType: null,
+          children: [
+            { ...source.schema[0]!, name: "city" },
+            { ...source.schema[0]!, name: "city" },
+          ],
+        },
+      ],
+      schemaNodeCount: 3,
+    };
+
+    render(<DataGrid source={nestedDuplicateSource} />);
+    await waitFor(() =>
+      expect(
+        gridMock.props?.getCellContent({ column: 0, row: 0 }),
+      ).toMatchObject({ displayData: "row 0" }),
+    );
+
+    openColumnMenu(0);
+    const flatten = screen.getByRole("menuitem", {
+      name: "Flatten unavailable: duplicate child names",
+    });
+    expect(flatten).toBeDisabled();
+    expect(flatten).toHaveAttribute(
+      "title",
+      "Flatten is unavailable because this struct contains duplicate child names.",
+    );
+    expect(gridMock.props?.columns).toHaveLength(1);
+    expect(gridMock.props?.columns[0]?.id).toBe('["profile"]');
+  });
+
   it("keeps duplicate sibling names as distinct schema nodes", () => {
     const duplicateSource: desktop.SourceSummary = {
       ...source,
@@ -4412,15 +5738,19 @@ describe("DataGrid window rendering", () => {
           minimum: null,
           maximum: null,
           minMaxComputed: false,
+          nullCount: 100,
           nullShare: 0.01,
           approximateDistinctCount: 31_300_000,
+          containerCount: null,
         })
         .mockResolvedValueOnce({
           minimum: "001",
           maximum: "zzz",
           minMaxComputed: true,
+          nullCount: 100,
           nullShare: 0.01,
           approximateDistinctCount: 31_300_000,
+          containerCount: null,
         });
       render(<DataGrid source={byteArraySource} />);
 
@@ -4431,7 +5761,11 @@ describe("DataGrid window rendering", () => {
       fireEvent.click(within(sidebar).getByRole("button", { name: /label/ }));
 
       await waitFor(() =>
-        expect(desktop.getColumnStatistics).toHaveBeenCalledWith(7, 0, false),
+        expect(desktop.getColumnStatistics).toHaveBeenCalledWith(
+          7,
+          ["label"],
+          false,
+        ),
       );
       expect(await within(sidebar).findByText("≈ 31.3M")).toBeInTheDocument();
       expect(within(sidebar).getByText("1%")).toBeInTheDocument();
@@ -4444,7 +5778,7 @@ describe("DataGrid window rendering", () => {
       await waitFor(() =>
         expect(desktop.getColumnStatistics).toHaveBeenLastCalledWith(
           7,
-          0,
+          ["label"],
           true,
         ),
       );
@@ -4467,7 +5801,11 @@ describe("DataGrid window rendering", () => {
     fireEvent.click(within(sidebar).getByRole("button", { name: /column_0/ }));
 
     await waitFor(() =>
-      expect(desktop.getColumnStatistics).toHaveBeenCalledWith(7, 0, true),
+      expect(desktop.getColumnStatistics).toHaveBeenCalledWith(
+        7,
+        ["column_0"],
+        true,
+      ),
     );
     expect(await within(sidebar).findByText("Minimum")).toBeInTheDocument();
     expect(within(sidebar).getByText("1")).toBeInTheDocument();
@@ -4483,15 +5821,19 @@ describe("DataGrid window rendering", () => {
         minimum: "1",
         maximum: "2",
         minMaxComputed: true,
+        nullCount: 1_250,
         nullShare: 0.125,
         approximateDistinctCount: 2,
+        containerCount: null,
       })
       .mockResolvedValueOnce({
         minimum: "1",
         maximum: "9",
         minMaxComputed: true,
+        nullCount: 5_050,
         nullShare: 0.5,
         approximateDistinctCount: 9,
+        containerCount: null,
       });
     const { rerender } = render(
       <DataGrid source={source} contentIdentity="early-sample" />,
@@ -4531,8 +5873,10 @@ describe("DataGrid window rendering", () => {
         minimum: "2",
         maximum: "8",
         minMaxComputed: true,
+        nullCount: 0,
         nullShare: 0,
         approximateDistinctCount: 4,
+        containerCount: null,
       });
     render(<DataGrid source={source} />);
 
@@ -4542,11 +5886,19 @@ describe("DataGrid window rendering", () => {
     });
     fireEvent.click(within(sidebar).getByRole("button", { name: /column_2/ }));
     await waitFor(() =>
-      expect(desktop.getColumnStatistics).toHaveBeenCalledWith(7, 2, true),
+      expect(desktop.getColumnStatistics).toHaveBeenCalledWith(
+        7,
+        ["column_2"],
+        true,
+      ),
     );
     fireEvent.click(within(sidebar).getByRole("button", { name: /column_4/ }));
     await waitFor(() =>
-      expect(desktop.getColumnStatistics).toHaveBeenCalledWith(7, 4, true),
+      expect(desktop.getColumnStatistics).toHaveBeenCalledWith(
+        7,
+        ["column_4"],
+        true,
+      ),
     );
 
     expect(desktop.cancelColumnStatistics).not.toHaveBeenCalled();
@@ -4600,7 +5952,11 @@ describe("DataGrid window rendering", () => {
       }),
     ).not.toHaveAttribute("value");
     await waitFor(() =>
-      expect(desktop.getColumnStatistics).toHaveBeenCalledWith(7, 3, true),
+      expect(desktop.getColumnStatistics).toHaveBeenCalledWith(
+        7,
+        ["column_3"],
+        true,
+      ),
     );
 
     act(() => {
@@ -4665,7 +6021,7 @@ describe("DataGrid export", () => {
       expect(desktop.prepareDataView).toHaveBeenLastCalledWith(
         7,
         1,
-        [{ columnIndex: 0, operator: "equals", values: ["4"] }],
+        [{ fieldPath: ["column_0"], operator: "equals", values: ["4"] }],
         [],
         { memoryLimit: "mb384" },
       ),
@@ -4678,8 +6034,8 @@ describe("DataGrid export", () => {
       expect(desktop.prepareDataView).toHaveBeenLastCalledWith(
         7,
         2,
-        [{ columnIndex: 0, operator: "equals", values: ["4"] }],
-        [{ sourceIndex: 1, direction: "ascending" }],
+        [{ fieldPath: ["column_0"], operator: "equals", values: ["4"] }],
+        [{ fieldPath: ["column_1"], direction: "ascending" }],
         { memoryLimit: "mb384" },
       ),
     );
@@ -4694,7 +6050,7 @@ describe("DataGrid export", () => {
 
     await waitFor(() =>
       expect(desktop.startDataExport).toHaveBeenCalledWith(7, 2, "view", {
-        columnIndices: [0, 1, 2, 3, 4, 5, 6, 7],
+        fieldPaths: sourceFieldPaths([0, 1, 2, 3, 4, 5, 6, 7]),
         rowRanges: [],
         output: { format: "csv", options: {} },
       }),
@@ -4726,7 +6082,7 @@ describe("DataGrid export", () => {
         0,
         "selection",
         expect.objectContaining({
-          columnIndices: [0, 1, 2, 3, 4],
+          fieldPaths: sourceFieldPaths([0, 1, 2, 3, 4]),
           rowRanges: [
             { start: 1, end: 3 },
             { start: 5, end: 7 },

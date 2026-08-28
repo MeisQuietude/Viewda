@@ -34,6 +34,7 @@ use parquet::arrow::{
     arrow_reader::{
         ArrowReaderMetadata, ArrowReaderOptions, ParquetRecordBatchReaderBuilder, RowSelection,
     },
+    parquet_to_arrow_schema_by_columns,
 };
 use parquet::file::metadata::PageIndexPolicy;
 
@@ -41,16 +42,16 @@ use parquet::file::metadata::PageIndexPolicy;
 use crate::source::windows_file_identity;
 
 use crate::{
-    DataFilter, DataFilterOperator, SchemaField,
+    DataFilter, DataFilterOperator, FieldPath, SchemaField,
+    field_path::{
+        field_path_expression, project_arrow_field_paths, resolve_field_path, validate_field_paths,
+    },
     filter::quote_identifier,
     source::{
         SourceError, SourceSnapshot, SourceSummary, inspect_local_source,
         inspect_local_source_for_dataset,
     },
-    window::{
-        DataWindowError, MAX_WINDOW_ROWS, classify_query_error, set_utc_session_timezone,
-        validate_projection,
-    },
+    window::{DataWindowError, MAX_WINDOW_ROWS, classify_query_error, set_utc_session_timezone},
 };
 use member_catalog::{CATALOG_PAGE_MEMBERS, MemberCatalog, MemberCatalogBuilder};
 
@@ -1146,10 +1147,12 @@ impl DatasetInspector {
             arrow_schema,
             Some(member_limit),
         )?;
-        let projection = (0..reader.summary.schema.len().min(MAX_PREVIEW_COLUMNS))
-            .map(|index| u32::try_from(index).map_err(|_| DatasetError::Unsupported))
-            .collect::<Result<Vec<_>, _>>()?;
-        let arrow_ipc = reader.fetch_columns_while(0, row_count, &projection, &mut keep_going)?;
+        let projection = reader.summary.schema
+            [..reader.summary.schema.len().min(MAX_PREVIEW_COLUMNS)]
+            .iter()
+            .map(|field| FieldPath::from(field.name.as_str()))
+            .collect::<Vec<_>>();
+        let arrow_ipc = reader.fetch_fields_while(0, row_count, &projection, &mut keep_going)?;
         if !keep_going() {
             return Err(DatasetError::Cancelled);
         }
@@ -1633,14 +1636,12 @@ impl DatasetQuerySource {
         &self.summary.schema
     }
 
-    pub(crate) fn projected_arrow_schema(
+    pub(crate) fn projected_field_schema(
         &self,
-        source_indices: &[usize],
+        field_paths: &[FieldPath],
     ) -> Result<SchemaRef, DatasetError> {
-        self.arrow_schema
-            .project(source_indices)
-            .map(Arc::new)
-            .map_err(|_| DataWindowError::Unsupported.into())
+        project_arrow_field_paths(&self.arrow_schema, field_paths)
+            .ok_or_else(|| DataWindowError::Unsupported.into())
     }
 
     pub(crate) fn sparse_empty_relation_sql(&self) -> Result<String, DatasetError> {
@@ -1662,13 +1663,13 @@ impl DatasetQuerySource {
     pub(crate) fn stage_sparse_window_while(
         &self,
         positions: &[DatasetRowPosition],
-        source_indices: &[usize],
+        field_paths: &[FieldPath],
         temporary_parent: &Path,
         keep_going: impl FnMut() -> bool,
     ) -> Result<DatasetSparseRows, DatasetError> {
         self.stage_sparse_rows_while(
             positions,
-            source_indices,
+            field_paths,
             temporary_parent,
             MAX_WINDOW_ROWS as usize,
             MAX_WINDOW_ROWS as usize,
@@ -1679,13 +1680,13 @@ impl DatasetQuerySource {
     pub(crate) fn stage_sparse_export_while(
         &self,
         positions: &[DatasetRowPosition],
-        source_indices: &[usize],
+        field_paths: &[FieldPath],
         temporary_parent: &Path,
         keep_going: impl FnMut() -> bool,
     ) -> Result<DatasetSparseRows, DatasetError> {
         self.stage_sparse_rows_while(
             positions,
-            source_indices,
+            field_paths,
             temporary_parent,
             MAX_EXPORT_SPARSE_ROWS,
             MAX_EXPORT_SPARSE_MEMBERS,
@@ -1696,7 +1697,7 @@ impl DatasetQuerySource {
     fn stage_sparse_rows_while(
         &self,
         positions: &[DatasetRowPosition],
-        source_indices: &[usize],
+        field_paths: &[FieldPath],
         temporary_parent: &Path,
         row_limit: usize,
         member_limit: usize,
@@ -1706,16 +1707,17 @@ impl DatasetQuerySource {
         if positions.is_empty() || positions.len() > row_limit {
             return Err(DatasetError::PageTooLarge);
         }
-        let mut seen_indices = Vec::with_capacity(source_indices.len());
-        for index in source_indices {
-            if *index >= self.summary.schema.len() || seen_indices.contains(index) {
-                return Err(DataWindowError::Unsupported.into());
-            }
-            seen_indices.push(*index);
-        }
+        let resolved = validate_field_paths(&self.summary.schema, field_paths)
+            .ok_or(DataWindowError::Unsupported)?;
+        let mut source_indices = resolved
+            .iter()
+            .map(|resolved| resolved.root_index)
+            .collect::<Vec<_>>();
+        source_indices.sort_unstable();
+        source_indices.dedup();
         let schema = Arc::new(
             self.arrow_schema
-                .project(source_indices)
+                .project(&source_indices)
                 .map_err(|_| DataWindowError::Unsupported)?,
         );
         let requested_order_column = unique_column_name(
@@ -1775,7 +1777,7 @@ impl DatasetQuerySource {
                 &snapshot,
                 &metadata,
                 &member_positions,
-                source_indices,
+                field_paths,
                 &requested_order_column,
                 directory.path(),
                 &mut keep_going,
@@ -1810,7 +1812,7 @@ impl DatasetQuerySource {
         snapshot: &SourceSnapshot,
         metadata: &ArrowReaderMetadata,
         positions: &[(u64, u64)],
-        source_indices: &[usize],
+        field_paths: &[FieldPath],
         requested_order_column: &str,
         directory: &Path,
         keep_going: &mut impl FnMut() -> bool,
@@ -1824,40 +1826,51 @@ impl DatasetQuerySource {
         {
             return Err(self.source.latch_source_changed(&member.relative_path));
         }
-        let member_schema = metadata.schema();
-        let mut physical_columns = Vec::new();
         let mut virtual_columns = Vec::new();
-        for source_index in source_indices {
+        let mut physical_paths = Vec::new();
+        let mut seen_virtual_indices = Vec::new();
+        for field_path in field_paths {
+            let resolved = resolve_field_path(&self.summary.schema, field_path)
+                .ok_or(DataWindowError::Unsupported)?;
+            let source_index = resolved.root_index;
             let expected = self
                 .arrow_schema
                 .fields()
-                .get(*source_index)
+                .get(source_index)
                 .ok_or(DataWindowError::Unsupported)?;
-            if *source_index < self.physical_column_count {
-                if let Some((member_index, member_field)) = member_schema
-                    .fields()
-                    .iter()
-                    .enumerate()
-                    .find(|(_, field)| field.name().eq_ignore_ascii_case(expected.name()))
-                {
-                    physical_columns.push(SparsePhysicalColumn {
-                        member_index,
-                        member_name: member_field.name().to_owned(),
-                        field: Arc::new(
-                            member_field
-                                .as_ref()
-                                .clone()
-                                .with_name(expected.name().to_owned()),
-                        ),
-                    });
-                }
-            } else {
+            if source_index < self.physical_column_count {
+                physical_paths.push(field_path.clone());
+            } else if !seen_virtual_indices.contains(&source_index) {
+                seen_virtual_indices.push(source_index);
                 virtual_columns.push(SparseVirtualColumn {
                     field: Arc::clone(expected),
-                    value: self.sparse_virtual_value(member, *source_index)?,
+                    value: self.sparse_virtual_value(member, source_index)?,
                 });
             }
         }
+        let (leaf_indices, projected_member_schema) =
+            parquet_leaf_projection(metadata, &physical_paths)?;
+        let physical_columns = projected_member_schema
+            .fields()
+            .iter()
+            .map(|member_field| {
+                let expected = self
+                    .arrow_schema
+                    .fields()
+                    .iter()
+                    .find(|field| field.name().eq_ignore_ascii_case(member_field.name()))
+                    .ok_or(DataWindowError::Unsupported)?;
+                Ok(SparsePhysicalColumn {
+                    member_name: member_field.name().to_owned(),
+                    field: Arc::new(
+                        member_field
+                            .as_ref()
+                            .clone()
+                            .with_name(expected.name().to_owned()),
+                    ),
+                })
+            })
+            .collect::<Result<Vec<_>, DatasetError>>()?;
         let mut fields = physical_columns
             .iter()
             .map(|column| Arc::clone(&column.field))
@@ -1920,12 +1933,6 @@ impl DatasetQuerySource {
                 continue;
             }
 
-            let mut member_indices = physical_columns
-                .iter()
-                .map(|column| column.member_index)
-                .collect::<Vec<_>>();
-            member_indices.sort_unstable();
-            member_indices.dedup();
             let file = snapshot
                 .cloned_file()
                 .map_err(|error| self.source.latch_member_error(error, member))?;
@@ -1933,9 +1940,9 @@ impl DatasetQuerySource {
                 .iter()
                 .all(|column| !column.field.data_type().is_nested());
             let reader = ParquetRecordBatchReaderBuilder::new_with_metadata(file, metadata.clone())
-                .with_projection(ProjectionMask::roots(
+                .with_projection(ProjectionMask::leaves(
                     metadata.metadata().file_metadata().schema_descr(),
-                    member_indices,
+                    leaf_indices.iter().copied(),
                 ))
                 .with_row_groups(vec![row_group_index])
                 .with_batch_size(MAX_WINDOW_ROWS as usize);
@@ -2547,33 +2554,34 @@ impl DatasetWindowReader {
         self.fetch_projection(row_offset, row_count, None, keep_going)
     }
 
-    /// Reads selected union-schema columns in the requested order.
-    pub fn fetch_columns(
+    /// Reads selected addressable union-schema fields in the requested order.
+    pub fn fetch_fields(
         &mut self,
         row_offset: u64,
         row_count: u32,
-        source_indices: &[u32],
+        field_paths: &[FieldPath],
     ) -> Result<Vec<u8>, DatasetError> {
-        self.fetch_columns_while(row_offset, row_count, source_indices, || true)
+        self.fetch_fields_while(row_offset, row_count, field_paths, || true)
     }
 
-    /// Reads projected columns while the caller still wants the work.
-    pub fn fetch_columns_while(
+    /// Reads projected fields while the caller still wants the work.
+    pub fn fetch_fields_while(
         &mut self,
         row_offset: u64,
         row_count: u32,
-        source_indices: &[u32],
+        field_paths: &[FieldPath],
         keep_going: impl FnMut() -> bool,
     ) -> Result<Vec<u8>, DatasetError> {
-        let projection = validate_projection(&self.summary.schema, source_indices)?;
-        self.fetch_projection(row_offset, row_count, Some(&projection), keep_going)
+        validate_field_paths(&self.summary.schema, field_paths)
+            .ok_or(DataWindowError::Unsupported)?;
+        self.fetch_projection(row_offset, row_count, Some(field_paths), keep_going)
     }
 
     fn fetch_projection(
         &mut self,
         row_offset: u64,
         row_count: u32,
-        source_indices: Option<&[usize]>,
+        field_paths: Option<&[FieldPath]>,
         mut keep_going: impl FnMut() -> bool,
     ) -> Result<Vec<u8>, DatasetError> {
         let interrupted = Arc::clone(&self.interrupted);
@@ -2582,10 +2590,12 @@ impl DatasetWindowReader {
             return Err(DataWindowError::WindowTooLarge.into());
         }
         self.source.require_active()?;
-        let projected_schema = source_indices
-            .map(|indices| self.arrow_schema.project(indices).map(Arc::new))
-            .transpose()
-            .map_err(|_| DataWindowError::Unsupported)?;
+        let projected_schema = field_paths
+            .map(|paths| {
+                project_arrow_field_paths(&self.arrow_schema, paths)
+                    .ok_or(DataWindowError::Unsupported)
+            })
+            .transpose()?;
         let expected_schema = projected_schema.as_ref().unwrap_or(&self.arrow_schema);
         let mut writer: Option<(SchemaRef, StreamWriter<Vec<u8>>)> = None;
         let active_limit = self
@@ -2637,7 +2647,7 @@ impl DatasetWindowReader {
                         &candidates,
                         remaining_offset,
                         remaining_count,
-                        source_indices,
+                        field_paths,
                     )?;
                     validate_produced_arrow_schema(expected_schema, &rows.schema)?;
                     let writer = match &mut writer {
@@ -2688,9 +2698,9 @@ impl DatasetWindowReader {
         candidates: &[DatasetMember],
         row_offset: u64,
         row_count: u64,
-        source_indices: Option<&[usize]>,
+        field_paths: Option<&[FieldPath]>,
     ) -> Result<DatasetQueryRows, DatasetError> {
-        let query = self.query_sql(source_indices);
+        let query = self.query_sql(field_paths)?;
         let parameters = [
             Value::BigInt(i64::try_from(row_count).map_err(|_| DataWindowError::Unsupported)?),
             Value::BigInt(i64::try_from(row_offset).map_err(|_| DataWindowError::Unsupported)?),
@@ -2738,7 +2748,7 @@ impl DatasetWindowReader {
 
     #[cfg(test)]
     fn query_schema(&self, candidates: &[DatasetMember]) -> Result<SchemaRef, DatasetError> {
-        let query = self.query_sql(None);
+        let query = self.query_sql(None)?;
         let mut statement = self
             .connection
             .prepare(&query)
@@ -2780,7 +2790,7 @@ impl DatasetWindowReader {
         Ok(())
     }
 
-    fn query_sql(&self, source_indices: Option<&[usize]>) -> String {
+    fn query_sql(&self, field_paths: Option<&[FieldPath]>) -> Result<String, DatasetError> {
         let relation = dataset_relation_sql(
             &self.summary,
             self.physical_column_count,
@@ -2788,24 +2798,72 @@ impl DatasetWindowReader {
             None,
             self.schema_seed.is_some(),
         );
-        let projection = source_indices
-            .map_or_else(
-                || (0..self.summary.schema.len()).collect::<Vec<_>>(),
-                <[usize]>::to_vec,
-            )
-            .into_iter()
-            .map(|index| &self.summary.schema[index])
-            .map(|field| quote_identifier(&field.name))
-            .collect::<Vec<_>>()
-            .join(", ");
-        format!("SELECT {projection} FROM {relation} LIMIT ? OFFSET ?")
+        let projection = match field_paths {
+            None => self
+                .summary
+                .schema
+                .iter()
+                .map(|field| quote_identifier(&field.name))
+                .collect::<Vec<_>>()
+                .join(", "),
+            Some(paths) => paths
+                .iter()
+                .map(|path| {
+                    let resolved = resolve_field_path(&self.summary.schema, path)
+                        .ok_or(DataWindowError::Unsupported)?;
+                    let root = quote_identifier(&self.summary.schema[resolved.root_index].name);
+                    let expression =
+                        field_path_expression(path, &root).ok_or(DataWindowError::Unsupported)?;
+                    Ok(format!(
+                        "{expression} AS {}",
+                        quote_identifier(path.leaf_name().ok_or(DataWindowError::Unsupported)?)
+                    ))
+                })
+                .collect::<Result<Vec<_>, DataWindowError>>()?
+                .join(", "),
+        };
+        Ok(format!(
+            "SELECT {projection} FROM {relation} LIMIT ? OFFSET ?"
+        ))
     }
 }
 
 struct SparsePhysicalColumn {
-    member_index: usize,
     member_name: String,
     field: Arc<Field>,
+}
+
+fn parquet_leaf_projection(
+    metadata: &ArrowReaderMetadata,
+    field_paths: &[FieldPath],
+) -> Result<(Vec<usize>, SchemaRef), DatasetError> {
+    let descriptor = metadata.metadata().file_metadata().schema_descr();
+    let leaf_indices = descriptor
+        .columns()
+        .iter()
+        .enumerate()
+        .filter_map(|(index, column)| {
+            field_paths
+                .iter()
+                .any(|path| {
+                    let parts = column.path().parts();
+                    parts.len() >= path.segments().len()
+                        && parts
+                            .iter()
+                            .zip(path.segments())
+                            .all(|(part, segment)| part.eq_ignore_ascii_case(segment))
+                })
+                .then_some(index)
+        })
+        .collect::<Vec<_>>();
+    let mask = ProjectionMask::leaves(descriptor, leaf_indices.iter().copied());
+    let schema = parquet_to_arrow_schema_by_columns(
+        descriptor,
+        mask,
+        metadata.metadata().file_metadata().key_value_metadata(),
+    )
+    .map_err(|_| DataWindowError::Unsupported)?;
+    Ok((leaf_indices, Arc::new(schema)))
 }
 
 struct SparseVirtualColumn {
@@ -3989,22 +4047,23 @@ fn member_matches_prunable_filters(
     filters: &[DataFilter],
 ) -> bool {
     filters.iter().all(|filter| {
-        if summary.schema.get(filter.column_index as usize).is_none() {
+        let Some(resolved) = resolve_field_path(&summary.schema, &filter.field_path) else {
+            return true;
+        };
+        let Ok(column_index) = u32::try_from(resolved.root_index) else {
+            return true;
+        };
+        let is_partition = summary.partition_column_indices.contains(&column_index);
+        if column_index != summary.provenance_column_index && !is_partition {
             return true;
         }
-        let is_partition = summary
-            .partition_column_indices
-            .contains(&filter.column_index);
-        if filter.column_index != summary.provenance_column_index && !is_partition {
-            return true;
-        }
-        let value = if filter.column_index == summary.provenance_column_index {
+        let value = if column_index == summary.provenance_column_index {
             Some(member.relative_path.as_str())
         } else {
             let Some(partition_index) = summary
                 .partition_column_indices
                 .iter()
-                .position(|index| *index == filter.column_index)
+                .position(|index| *index == column_index)
             else {
                 return true;
             };
@@ -4319,12 +4378,70 @@ mod tests {
         io::{Seek, SeekFrom, Write},
     };
 
-    use arrow_array::Int64Array;
-    use arrow_schema::Field;
+    use arrow_array::{Int64Array, StringArray, StructArray};
+    use arrow_schema::{Field, Fields};
     use parquet::file::reader::{FileReader, SerializedFileReader};
     use tempfile::tempdir;
 
     use super::*;
+
+    #[test]
+    fn sparse_nested_projection_selects_only_requested_parquet_leaves() {
+        let source = tempfile::NamedTempFile::new().expect("nested source");
+        let profile_fields = Fields::from(vec![
+            Field::new("city", DataType::Utf8, true),
+            Field::new("zip", DataType::Int64, true),
+        ]);
+        let profile = StructArray::new(
+            profile_fields.clone(),
+            vec![
+                Arc::new(StringArray::from(vec!["Oslo"])) as ArrayRef,
+                Arc::new(Int64Array::from(vec![101])) as ArrayRef,
+            ],
+            None,
+        );
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("profile", DataType::Struct(profile_fields), true),
+            Field::new("tail", DataType::Int64, true),
+        ]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(profile) as ArrayRef,
+                Arc::new(Int64Array::from(vec![9])) as ArrayRef,
+            ],
+        )
+        .expect("nested batch");
+        let file = fs::File::create(source.path()).expect("nested file");
+        let mut writer = ArrowWriter::try_new(file, schema, None).expect("nested writer");
+        writer.write(&batch).expect("nested row");
+        writer.close().expect("nested footer");
+        let file = fs::File::open(source.path()).expect("nested source read");
+        let metadata =
+            ArrowReaderMetadata::load(&file, ArrowReaderOptions::new()).expect("nested metadata");
+
+        let (indices, projected) =
+            parquet_leaf_projection(&metadata, &[FieldPath::new(["profile", "city"])])
+                .expect("leaf projection");
+        let descriptor = metadata.metadata().file_metadata().schema_descr();
+        let paths = indices
+            .iter()
+            .map(|index| descriptor.column(*index).path().parts().to_vec())
+            .collect::<Vec<_>>();
+
+        assert_eq!(indices, [0]);
+        assert_eq!(paths, [vec!["profile".to_owned(), "city".to_owned()]]);
+        let DataType::Struct(children) = projected.field(0).data_type() else {
+            panic!("projected profile should stay a struct");
+        };
+        assert_eq!(
+            children
+                .iter()
+                .map(|field| field.name())
+                .collect::<Vec<_>>(),
+            ["city"]
+        );
+    }
 
     #[test]
     fn query_source_redacts_every_internal_path_from_diagnostics() {
@@ -4416,7 +4533,12 @@ mod tests {
         SPARSE_SOURCE_ROW_GROUP_READS.store(0, Ordering::Relaxed);
         SPARSE_SOURCE_DECODED_ROWS.store(0, Ordering::Relaxed);
         let rows = query_source
-            .stage_sparse_window_while(&positions, &[0], temporary_parent.path(), || true)
+            .stage_sparse_window_while(
+                &positions,
+                &[FieldPath::from("value")],
+                temporary_parent.path(),
+                || true,
+            )
             .expect("sparse rows");
         let sparse_directory = rows._directory.path().to_owned();
         assert_eq!(sparse_directory.parent(), Some(temporary_parent.path()));
@@ -4442,7 +4564,7 @@ mod tests {
         let mut saw_sparse_directory = false;
         let cancelled = query_source.stage_sparse_window_while(
             &positions,
-            &[0],
+            &[FieldPath::from("value")],
             temporary_parent.path(),
             || {
                 let exists = fs::read_dir(temporary_parent.path())
@@ -4471,7 +4593,7 @@ mod tests {
         assert!(matches!(
             query_source.stage_sparse_window_while(
                 &positions,
-                &[0],
+                &[FieldPath::from("value")],
                 temporary_parent.path(),
                 || true,
             ),
@@ -4509,7 +4631,7 @@ mod tests {
                     native_row: 4_095,
                     requested_order: 0,
                 }],
-                &[0],
+                &[FieldPath::from("value")],
                 temporary_parent.path(),
                 || true,
             )
@@ -4664,7 +4786,7 @@ mod tests {
             &reader,
             &[],
             &[crate::DataSort {
-                source_index: 0,
+                field_path: FieldPath::from("value"),
                 direction: crate::DataSortDirection::Ascending,
             }],
             crate::DataViewMemoryLimit::Mb384,
@@ -5038,7 +5160,7 @@ mod tests {
             provenance_column_index: 1,
         };
         let filters = [DataFilter {
-            column_index: 0,
+            field_path: FieldPath::from("year"),
             operator: DataFilterOperator::Equals,
             values: vec!["2026".to_owned()],
             match_case: false,
@@ -5151,7 +5273,7 @@ mod tests {
             interrupted: Arc::new(AtomicBool::new(false)),
         };
 
-        let query = reader.query_sql(None);
+        let query = reader.query_sql(None).expect("dataset query");
 
         assert!(query.len() < 1_500);
         assert!(!query.contains("part-0000.parquet"));

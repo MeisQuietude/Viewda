@@ -1,5 +1,6 @@
 import {
   binary,
+  decimal128,
   field,
   float64,
   int64,
@@ -38,7 +39,13 @@ describe("incremental value JSON serialization", () => {
         {
           safe: 5n,
           unsafe: 9_007_199_254_740_993n,
+          scale_zero: 37n,
+          trailing_zero: 120n,
+          unsafe_decimal: 9_007_199_254_740_993n,
+          small_decimal: 1n,
           nonFinite: Number.NaN,
+          positive_infinity: Number.POSITIVE_INFINITY,
+          negative_infinity: Number.NEGATIVE_INFINITY,
           timestamp: 9_007_199_254_740_993n,
           binary: new Uint8Array([1, 2, 3]),
           labels: [
@@ -49,7 +56,13 @@ describe("incremental value JSON serialization", () => {
         struct({
           safe: int64(),
           unsafe: int64(),
+          scale_zero: decimal128(10, 0),
+          trailing_zero: decimal128(10, 2),
+          unsafe_decimal: decimal128(38, 0),
+          small_decimal: decimal128(38, 20),
           nonFinite: float64(),
+          positive_infinity: float64(),
+          negative_infinity: float64(),
           timestamp: timestamp(TimeUnit.NANOSECOND),
           binary: binary(),
           labels: map(utf8(), utf8()),
@@ -67,7 +80,13 @@ describe("incremental value JSON serialization", () => {
     expect(JSON.parse(result.text)).toEqual({
       safe: 5,
       unsafe: "9007199254740993",
+      scale_zero: "37",
+      trailing_zero: "1.20",
+      unsafe_decimal: "9007199254740993",
+      small_decimal: "0.00000000000000000001",
       nonFinite: "NaN",
+      positive_infinity: "Infinity",
+      negative_infinity: "-Infinity",
       timestamp: "9007199254740993",
       binary: "AQID",
       labels: [

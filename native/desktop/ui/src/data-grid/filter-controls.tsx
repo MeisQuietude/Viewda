@@ -12,6 +12,7 @@ import {
   getTextValueSuggestions,
   type DataFilter,
   type DataFilterOperator,
+  type FieldPath,
   type SchemaField,
   type TextValueSuggestions,
 } from "../desktop";
@@ -21,9 +22,10 @@ import {
   type ColumnFilterKind,
   type TemporalFormat,
 } from "./filter-query";
+import { formatFieldPath } from "./field-path";
 
 export interface FilterEditorRequest {
-  sourceIndex: number;
+  fieldPath: FieldPath;
   left: number;
   top: number;
   filterIndex?: number;
@@ -110,6 +112,7 @@ export function FilterEditor({
   onApply: (filter: DataFilter) => void;
   onCancel: () => void;
 }) {
+  const fieldLabel = formatFieldPath(request.fieldPath);
   const kind = columnFilterKind(field);
   const requestedOperator =
     request.initialFilter?.operator ?? request.initialOperator;
@@ -159,7 +162,7 @@ export function FilterEditor({
       operator !== "isNull" &&
       operator !== "isNotNull",
     sourceGeneration,
-    columnIndex: request.sourceIndex,
+    fieldPath: request.fieldPath,
     prefix: firstValue,
     operator,
     nextSuggestionRevision,
@@ -203,13 +206,13 @@ export function FilterEditor({
     <form
       ref={editorRef}
       className="filter-editor"
-      aria-label={`Filter ${field.name}`}
+      aria-label={`Filter ${fieldLabel}`}
       style={{ left: request.left, top: request.top }}
       onSubmit={(event) => {
         event.preventDefault();
         if (canApply && values !== null) {
           onApply({
-            columnIndex: request.sourceIndex,
+            fieldPath: request.fieldPath,
             operator,
             values,
             ...(isSubstringOperator(operator) && matchCase
@@ -219,7 +222,7 @@ export function FilterEditor({
         }
       }}
     >
-      <strong>{field.name}</strong>
+      <strong>{fieldLabel}</strong>
       <label>
         <span>Condition</span>
         <select
@@ -819,14 +822,14 @@ function isSubstringOperator(operator: DataFilterOperator): boolean {
 function useTextValueSuggestions({
   enabled,
   sourceGeneration,
-  columnIndex,
+  fieldPath,
   prefix,
   operator,
   nextSuggestionRevision,
 }: {
   enabled: boolean;
   sourceGeneration: number;
-  columnIndex: number;
+  fieldPath: FieldPath;
   prefix: string;
   operator: DataFilterOperator;
   nextSuggestionRevision: () => number;
@@ -839,7 +842,7 @@ function useTextValueSuggestions({
 
   useEffect(() => {
     setResult({ result: null, loading: false });
-  }, [columnIndex, sourceGeneration]);
+  }, [fieldPath, sourceGeneration]);
 
   useEffect(() => {
     if (!enabled) {
@@ -859,7 +862,7 @@ function useTextValueSuggestions({
       void getTextValueSuggestions(
         sourceGeneration,
         currentRevision,
-        columnIndex,
+        fieldPath,
         prefix,
         operator,
       ).then(
@@ -888,7 +891,7 @@ function useTextValueSuggestions({
       }
     };
   }, [
-    columnIndex,
+    fieldPath,
     enabled,
     nextSuggestionRevision,
     operator,

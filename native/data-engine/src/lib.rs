@@ -5,6 +5,8 @@ mod dataset;
 #[cfg(feature = "query-engine")]
 mod export;
 #[cfg(feature = "query-engine")]
+mod field_path;
+#[cfg(feature = "query-engine")]
 mod filter;
 mod source;
 #[cfg(feature = "query-engine")]
@@ -38,6 +40,8 @@ pub use export::{
     DataExportProgress, DataExportReader, DataExportRequest, ExportRowRange,
 };
 #[cfg(feature = "query-engine")]
+pub use field_path::FieldPath;
+#[cfg(feature = "query-engine")]
 pub use filter::{DataFilter, DataFilterOperator};
 pub use source::{
     SchemaField, SourceError, SourceIdentity, SourceOpenPhase, SourceSnapshot, SourceSummary,
@@ -45,7 +49,8 @@ pub use source::{
 };
 #[cfg(feature = "query-engine")]
 pub use statistics::{
-    ColumnStatistics, ColumnStatisticsError, ColumnStatisticsReader, StatisticsInterruptHandle,
+    ColumnStatistics, ColumnStatisticsError, ColumnStatisticsReader, ContainerCountStatistics,
+    StatisticsInterruptHandle,
 };
 pub use structure::{
     MAX_BLOOM_PROBE_VALUE_BYTES, StructureBloomProbe, StructureBloomProbeOutcome,

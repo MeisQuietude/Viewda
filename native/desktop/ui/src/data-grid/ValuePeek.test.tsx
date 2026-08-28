@@ -187,7 +187,9 @@ describe("ValuePeek", () => {
     expect(onReturnFocus).toHaveBeenCalledOnce();
     expect(document.activeElement).toBe(tree);
     fireEvent.keyDown(tree, { key: "Tab", shiftKey: true });
-    expect(document.activeElement).toBe(close);
+    expect(document.activeElement).toBe(
+      screen.getByRole("button", { name: "Copy path" }),
+    );
     expect(onReturnFocus).toHaveBeenCalledOnce();
     close.focus();
     fireEvent.keyDown(close, { key: "Tab", shiftKey: true });
@@ -255,7 +257,7 @@ describe("ValuePeek", () => {
     expect(onClose).toHaveBeenCalledOnce();
   });
 
-  it("keeps copying on the tree keyboard contract without header copy buttons", async () => {
+  it("copies the selected path and keeps JSON copying on the tree keyboard contract", async () => {
     vi.useFakeTimers();
     const onCopy = vi.fn();
     render(
@@ -272,15 +274,15 @@ describe("ValuePeek", () => {
     expect(
       screen.queryByRole("button", { name: "Copy JSON" }),
     ).not.toBeInTheDocument();
-    expect(
-      screen.queryByRole("button", { name: "Copy path" }),
-    ).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Copy path" }));
+    await act(async () => vi.runAllTimersAsync());
+    expect(onCopy).toHaveBeenCalledWith("note");
     fireEvent.keyDown(screen.getByRole("tree"), {
       key: "c",
       ctrlKey: true,
     });
     await act(async () => vi.runAllTimersAsync());
-    expect(onCopy).toHaveBeenCalledWith('"text"');
+    expect(onCopy).toHaveBeenLastCalledWith('"text"');
     vi.useRealTimers();
   });
 

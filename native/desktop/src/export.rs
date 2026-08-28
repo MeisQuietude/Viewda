@@ -1028,7 +1028,7 @@ mod tests {
     #[cfg(unix)]
     fn export_request() -> DataExportRequest {
         DataExportRequest {
-            column_indices: vec![0],
+            field_paths: vec![viewda_data_engine::FieldPath::from("value")],
             row_ranges: Vec::new(),
             output: viewda_data_engine::DataExportFormat::Csv {
                 options: viewda_data_engine::CsvExportOptions::default(),

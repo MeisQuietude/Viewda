@@ -148,8 +148,11 @@ beforeEach(() => {
   decodePreview.mockReturnValue({
     rowOffset: 0,
     rowCount: 1,
-    sourceIndices: [0],
-    sourceColumnOffsets: new Map([[0, 0]]),
+    fieldPaths: [["id"], ["file"]],
+    fieldColumnOffsets: new Map([
+      ['["id"]', 0],
+      ['["file"]', 1],
+    ]),
     table: { getChildAt: () => ({ at: () => 42 }) },
   });
   systemDark = false;
@@ -900,11 +903,10 @@ describe("App", () => {
         "Early sample; final dataset order and totals are pending.",
       ),
     ).toBeInTheDocument();
-    expect(decodePreview).toHaveBeenCalledWith(
-      expect.any(ArrayBuffer),
-      0,
-      [0, 1],
-    );
+    expect(decodePreview).toHaveBeenCalledWith(expect.any(ArrayBuffer), 0, [
+      ["id"],
+      ["file"],
+    ]);
     expect(dataGridProps.mock.lastCall?.[0]).toMatchObject({
       contentIdentity: "early-sample",
       exportEnabled: false,

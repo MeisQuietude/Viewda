@@ -2611,7 +2611,7 @@ function GridHeader({
         : `Sort ${details.title}`;
   return (
     <div
-      className={`viewda-grid-column-header${pinned ? " is-pinned" : ""}${details.pending ? " is-pending" : ""}${details.filterable ? " has-filter" : ""}`}
+      className={`viewda-grid-column-header${pinned ? " is-pinned" : ""}${details.pending ? " is-pending" : ""}${details.filterable ? " has-filter" : ""}${details.groupRail?.start ? " has-group-start" : ""}${details.groupRail?.end ? " has-group-end" : ""}`}
       role="columnheader"
       aria-label={details.title}
       aria-colindex={ariaColumnIndex}
@@ -2644,7 +2644,39 @@ function GridHeader({
           )}
         </button>
       )}
-      <span className="viewda-grid-header-title">{details.title}</span>
+      {details.groupRail !== undefined && (
+        <span
+          className="viewda-grid-group-rail"
+          title={details.groupRail.title}
+        />
+      )}
+      <span
+        className={`viewda-grid-header-title${details.titlePrefix === undefined ? " is-plain" : " is-path"}`}
+        title={details.title}
+      >
+        {details.titlePrefix === undefined ? (
+          details.title
+        ) : (
+          <>
+            <span className="viewda-grid-header-prefix">
+              <span className="viewda-grid-header-prefix-text">
+                {details.titlePrefix.endsWith(".")
+                  ? details.titlePrefix.slice(0, -1)
+                  : details.titlePrefix}
+              </span>
+              {details.titlePrefix.endsWith(".") && (
+                <span
+                  className="viewda-grid-header-prefix-separator"
+                  aria-hidden="true"
+                >
+                  .
+                </span>
+              )}
+            </span>
+            <span className="viewda-grid-header-leaf">{details.titleLeaf}</span>
+          </>
+        )}
+      </span>
       {details.filterable && (
         <button
           className="viewda-grid-filter"

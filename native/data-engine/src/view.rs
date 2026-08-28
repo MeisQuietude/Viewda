@@ -29,17 +29,18 @@ use serde::{Deserialize, Serialize};
 use tempfile::TempDir;
 
 use crate::{
+    FieldPath,
     dataset::{
         DatasetError, DatasetQuerySource, DatasetRowPosition, DatasetSessionToken,
         DatasetSetupError, DatasetSparseRows, DatasetWindowReader, redact_path_aliases,
         validate_produced_arrow_schema,
     },
+    field_path::{
+        field_path_expression, project_arrow_field_paths, resolve_field_path, validate_field_paths,
+    },
     filter::{DataFilter, FilterPredicate, build_filter_predicate_with_names, quote_identifier},
     source::{inspect_local_source, inspect_local_source_for_query, open_local_source},
-    window::{
-        DataWindowError, MAX_WINDOW_ROWS, classify_query_error, set_utc_session_timezone,
-        validate_projection,
-    },
+    window::{DataWindowError, MAX_WINDOW_ROWS, classify_query_error, set_utc_session_timezone},
 };
 
 #[cfg(test)]
@@ -101,12 +102,12 @@ impl DataViewMemoryLimit {
     }
 }
 
-/// One source column in the view's canonical sort order.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+/// One addressable field in the view's canonical sort order.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DataSort {
-    /// Zero-based top-level column index from the source summary.
-    pub source_index: u32,
+    /// Field-name segments from the top-level column through struct fields.
+    pub field_path: FieldPath,
     /// Direction applied before the stable file-order tie-break.
     pub direction: DataSortDirection,
 }
@@ -591,8 +592,14 @@ impl DataViewBuilder {
                 let mut needed_indices = self
                     .filters
                     .iter()
-                    .map(|filter| filter.column_index as usize)
-                    .chain(self.sort.iter().map(|sort| sort.source_index as usize))
+                    .filter_map(|filter| {
+                        resolve_field_path(&facts.schema, &filter.field_path)
+                            .map(|resolved| resolved.root_index)
+                    })
+                    .chain(self.sort.iter().filter_map(|sort| {
+                        resolve_field_path(&facts.schema, &sort.field_path)
+                            .map(|resolved| resolved.root_index)
+                    }))
                     .collect::<Vec<_>>();
                 needed_indices.sort_unstable();
                 needed_indices.dedup();
@@ -702,7 +709,7 @@ impl DataViewBuilder {
             .sort
             .iter()
             .filter_map(|sort| {
-                let field = facts.schema.get(sort.source_index as usize)?;
+                let field = resolve_field_path(&facts.schema, &sort.field_path)?.field;
                 Some(DataViewSortDiagnostic {
                     physical_type: field.physical_type.clone(),
                     logical_type: field.logical_type.clone(),
@@ -912,23 +919,30 @@ impl PreparedDataView {
 
     /// Reads a bounded view window without rerunning its filter or sort.
     pub fn fetch_window(&self, row_offset: u64, row_count: u32) -> Result<Vec<u8>, DataViewError> {
-        let source_indices = (0..self.schema.len())
-            .map(|index| u32::try_from(index).map_err(|_| DataWindowError::Unsupported))
-            .collect::<Result<Vec<_>, _>>()?;
-        self.fetch_window_columns(row_offset, row_count, &source_indices)
+        let field_paths = self
+            .schema
+            .iter()
+            .map(|field| FieldPath::from(field.name.as_str()))
+            .collect::<Vec<_>>();
+        self.fetch_window_fields(row_offset, row_count, &field_paths)
     }
 
-    /// Reads selected source columns without rerunning the view's filter or sort.
-    pub fn fetch_window_columns(
+    /// Reads selected addressable fields without rerunning the view's filter or sort.
+    pub fn fetch_window_fields(
         &self,
         row_offset: u64,
         row_count: u32,
-        source_indices: &[u32],
+        field_paths: &[FieldPath],
     ) -> Result<Vec<u8>, DataViewError> {
         if row_count > MAX_WINDOW_ROWS {
             return Err(DataWindowError::WindowTooLarge.into());
         }
-        let source_indices = validate_projection(&self.schema, source_indices)?;
+        let resolved =
+            validate_field_paths(&self.schema, field_paths).ok_or(DataWindowError::Unsupported)?;
+        let requested_root_indices = resolved
+            .iter()
+            .map(|resolved| resolved.root_index)
+            .collect::<Vec<_>>();
         if let DataViewSource::Dataset(dataset) = &self.source {
             let offset = usize::try_from(row_offset).map_err(|_| DataWindowError::Unsupported)?;
             let limit = usize::try_from(row_count).map_err(|_| DataWindowError::Unsupported)?;
@@ -940,28 +954,31 @@ impl PreparedDataView {
             )?;
             if positions.is_empty() {
                 let schema = dataset
-                    .projected_arrow_schema(&source_indices)
+                    .projected_field_schema(field_paths)
                     .map_err(dataset_view_error)?;
                 return encode_empty(schema).map_err(DataViewError::from);
             }
             let rows = dataset
                 .stage_sparse_window_while(
                     &positions,
-                    &source_indices,
+                    field_paths,
                     self.temporary_directory.path(),
                     || !self.interrupted.load(Ordering::Acquire),
                 )
                 .map_err(dataset_view_error)?;
-            return self.fetch_sparse_dataset_window(&rows, &source_indices);
+            return self.fetch_sparse_dataset_window(&rows, field_paths);
         }
-        if let (DataViewSource::File(source_path), Some(metadata)) =
-            (&self.source, &self.source_metadata)
+        let top_level_only = field_paths.iter().all(|path| path.segments().len() == 1);
+        if top_level_only
+            && let (DataViewSource::File(source_path), Some(metadata)) =
+                (&self.source, &self.source_metadata)
         {
             let offset = usize::try_from(row_offset).map_err(|_| DataWindowError::Unsupported)?;
             let limit = usize::try_from(row_count).map_err(|_| DataWindowError::Unsupported)?;
             let positions =
                 read_positions(&self.position_index, &self.position_metadata, offset, limit)?;
-            match read_source_positions(source_path, metadata, &positions, &source_indices) {
+            match read_source_positions(source_path, metadata, &positions, &requested_root_indices)
+            {
                 Ok(window) => return Ok(window),
                 Err(DataWindowError::CorruptSource) => {
                     // TODO(Arrow 59): parquet 58 rejects some valid nested-list row groups.
@@ -971,23 +988,23 @@ impl PreparedDataView {
                 Err(error) => return Err(error.into()),
             }
         }
-        self.fetch_window_columns_with_duckdb(row_offset, row_count, &source_indices)
+        self.fetch_window_fields_with_duckdb(row_offset, row_count, field_paths)
     }
 
-    fn fetch_window_columns_with_duckdb(
+    fn fetch_window_fields_with_duckdb(
         &self,
         row_offset: u64,
         row_count: u32,
-        source_indices: &[usize],
+        field_paths: &[FieldPath],
     ) -> Result<Vec<u8>, DataViewError> {
-        self.fetch_window_columns_with_duckdb_inner(row_offset, row_count, source_indices, || {})
+        self.fetch_window_fields_with_duckdb_inner(row_offset, row_count, field_paths, || {})
     }
 
-    fn fetch_window_columns_with_duckdb_inner(
+    fn fetch_window_fields_with_duckdb_inner(
         &self,
         row_offset: u64,
         row_count: u32,
-        source_indices: &[usize],
+        field_paths: &[FieldPath],
         before_prepare: impl FnOnce(),
     ) -> Result<Vec<u8>, DataViewError> {
         if self.interrupted.load(Ordering::Acquire) {
@@ -1004,7 +1021,7 @@ impl PreparedDataView {
                 self.source_row_count,
                 source_path.to_str().ok_or(DataWindowError::Unsupported)?,
                 position_index_path,
-                source_indices,
+                field_paths,
             )?,
             DataViewSource::Dataset(_) => return Err(DataWindowError::Unsupported.into()),
         };
@@ -1014,22 +1031,25 @@ impl PreparedDataView {
     fn fetch_sparse_dataset_window(
         &self,
         rows: &DatasetSparseRows,
-        source_indices: &[usize],
+        field_paths: &[FieldPath],
     ) -> Result<Vec<u8>, DataViewError> {
         if self.interrupted.load(Ordering::Acquire) {
             return Err(DataWindowError::Cancelled.into());
         }
-        let projection = source_indices
+        let projection = field_paths
             .iter()
-            .map(|index| {
-                let field = self
-                    .schema
-                    .get(*index)
-                    .ok_or(DataWindowError::Unsupported)?;
+            .map(|path| {
+                let resolved =
+                    resolve_field_path(&self.schema, path).ok_or(DataWindowError::Unsupported)?;
+                let root = format!(
+                    "source.{}",
+                    quote_identifier(&self.schema[resolved.root_index].name)
+                );
+                let expression =
+                    field_path_expression(path, &root).ok_or(DataWindowError::Unsupported)?;
                 Ok(format!(
-                    "source.{} AS {}",
-                    quote_identifier(&field.name),
-                    quote_identifier(&field.name)
+                    "{expression} AS {}",
+                    quote_identifier(path.leaf_name().ok_or(DataWindowError::Unsupported)?)
                 ))
             })
             .collect::<Result<Vec<_>, DataWindowError>>()?
@@ -1047,7 +1067,9 @@ impl PreparedDataView {
             .stream_arrow([])
             .map_err(|error| self.classify_sparse_query_error(error))?;
         let produced_schema = batches.get_schema();
-        validate_produced_arrow_schema(rows.schema(), &produced_schema)?;
+        let expected = project_arrow_field_paths(rows.schema(), field_paths)
+            .ok_or(DataWindowError::Unsupported)?;
+        validate_produced_arrow_schema(&expected, &produced_schema)?;
         let mut writer = StreamWriter::try_new(Vec::new(), produced_schema.as_ref())
             .map_err(|_| DataWindowError::EncodingFailed)?;
         let mut written_rows = 0_usize;
@@ -1130,16 +1152,15 @@ fn validate_sort(
     if sort.len() > MAX_SORT_COLUMNS {
         return Err(DataWindowError::InvalidSort);
     }
-    let mut seen = vec![false; schema.len()];
+    let mut seen = Vec::with_capacity(sort.len());
     for column in sort {
-        let index =
-            usize::try_from(column.source_index).map_err(|_| DataWindowError::InvalidSort)?;
-        let Some(slot) = seen.get_mut(index) else {
-            return Err(DataWindowError::InvalidSort);
-        };
-        if std::mem::replace(slot, true) {
+        if resolve_field_path(schema, &column.field_path).is_none() {
             return Err(DataWindowError::InvalidSort);
         }
+        if seen.contains(&column.field_path) {
+            return Err(DataWindowError::InvalidSort);
+        }
+        seen.push(column.field_path.clone());
     }
     Ok(())
 }
@@ -1168,21 +1189,20 @@ fn build_order_clause_with_names(
     }
     let mut order = Vec::with_capacity(sort.len() + 1);
     for sort_column in sort {
-        schema
-            .get(sort_column.source_index as usize)
+        let resolved = resolve_field_path(schema, &sort_column.field_path)
             .ok_or(DataWindowError::InvalidSort)?;
         let direction = match sort_column.direction {
             DataSortDirection::Ascending => "ASC",
             DataSortDirection::Descending => "DESC",
         };
-        order.push(format!(
-            "{} {direction} NULLS LAST",
-            quote_identifier(
-                column_names
-                    .get(sort_column.source_index as usize)
-                    .ok_or(DataWindowError::InvalidSort)?,
-            )
-        ));
+        let root = quote_identifier(
+            column_names
+                .get(resolved.root_index)
+                .ok_or(DataWindowError::InvalidSort)?,
+        );
+        let expression = field_path_expression(&sort_column.field_path, &root)
+            .ok_or(DataWindowError::InvalidSort)?;
+        order.push(format!("{expression} {direction} NULLS LAST"));
     }
     order.push(format!("{source_position} ASC"));
     Ok(order.join(", "))
@@ -1194,7 +1214,7 @@ fn build_window_query(
     source_row_count: u64,
     source_path: &str,
     position_index_path: &str,
-    source_indices: &[usize],
+    field_paths: &[FieldPath],
 ) -> Result<String, DataWindowError> {
     if source_columns.len() != schema.len() {
         return Err(DataWindowError::Unsupported);
@@ -1212,16 +1232,22 @@ fn build_window_query(
         .map(|column| quote_identifier(column))
         .collect::<Vec<_>>()
         .join(", ");
-    let projection = source_indices
+    let projection = field_paths
         .iter()
-        .map(|source_index| {
-            format!(
-                "{source}.{} AS {}",
-                quote_identifier(&source_columns[*source_index]),
-                quote_identifier(&schema[*source_index].name),
-            )
+        .map(|path| {
+            let resolved = resolve_field_path(schema, path).ok_or(DataWindowError::Unsupported)?;
+            let root = format!(
+                "{source}.{}",
+                quote_identifier(&source_columns[resolved.root_index])
+            );
+            let expression =
+                field_path_expression(path, &root).ok_or(DataWindowError::Unsupported)?;
+            Ok(format!(
+                "{expression} AS {}",
+                quote_identifier(path.leaf_name().ok_or(DataWindowError::Unsupported)?)
+            ))
         })
-        .collect::<Vec<_>>()
+        .collect::<Result<Vec<_>, DataWindowError>>()?
         .join(", ");
     let requested_cte = format!(
         "{requested} AS (\
@@ -1649,7 +1675,7 @@ mod tests {
             source.path().to_owned(),
             &[],
             &[DataSort {
-                source_index: 1,
+                field_path: field("label"),
                 direction: DataSortDirection::Ascending,
             }],
         )
@@ -1681,7 +1707,7 @@ mod tests {
             &reader,
             &[],
             &[DataSort {
-                source_index: 0,
+                field_path: field("id"),
                 direction: DataSortDirection::Ascending,
             }],
             DataViewMemoryLimit::Mb384,
@@ -1726,7 +1752,7 @@ mod tests {
     fn dataset_staging_applies_the_prepared_filter_predicate() {
         let (_directory, reader) = write_dataset_fixture();
         let filters = [DataFilter {
-            column_index: 0,
+            field_path: field("id"),
             operator: crate::DataFilterOperator::Equals,
             values: vec!["1".to_owned()],
             match_case: false,
@@ -1735,7 +1761,7 @@ mod tests {
             &reader,
             &filters,
             &[DataSort {
-                source_index: 0,
+                field_path: field("id"),
                 direction: DataSortDirection::Ascending,
             }],
             DataViewMemoryLimit::Mb384,
@@ -1778,7 +1804,7 @@ mod tests {
             &reader,
             &[],
             &[DataSort {
-                source_index: 0,
+                field_path: field("id"),
                 direction: DataSortDirection::Ascending,
             }],
             DataViewMemoryLimit::Mb384,
@@ -1817,7 +1843,7 @@ mod tests {
             source.path().to_owned(),
             &[],
             &[DataSort {
-                source_index: 1,
+                field_path: field("label"),
                 direction: DataSortDirection::Descending,
             }],
         )
@@ -1826,7 +1852,7 @@ mod tests {
         .expect("prepared view");
 
         let bytes = view
-            .fetch_window_columns(0, 2, &[1])
+            .fetch_window_fields(0, 2, &[field("label")])
             .expect("projected window");
         let batches = StreamReader::try_new(Cursor::new(bytes), None)
             .expect("Arrow stream")
@@ -1846,7 +1872,7 @@ mod tests {
             "label-1999"
         );
         let reordered = view
-            .fetch_window_columns(0, 1, &[1, 0])
+            .fetch_window_fields(0, 1, &[field("label"), field("id")])
             .expect("reordered projected window");
         let reordered = StreamReader::try_new(Cursor::new(reordered), None)
             .expect("reordered Arrow stream")
@@ -1865,15 +1891,15 @@ mod tests {
             1_999
         );
         assert!(matches!(
-            view.fetch_window_columns(0, 1, &[]),
+            view.fetch_window_fields(0, 1, &[]),
             Err(DataViewError::Engine(DataWindowError::Unsupported))
         ));
         assert!(matches!(
-            view.fetch_window_columns(0, 1, &[1, 1]),
+            view.fetch_window_fields(0, 1, &[field("label"), field("label")]),
             Err(DataViewError::Engine(DataWindowError::Unsupported))
         ));
         assert!(matches!(
-            view.fetch_window_columns(0, 1, &[2]),
+            view.fetch_window_fields(0, 1, &[field("missing")]),
             Err(DataViewError::Engine(DataWindowError::Unsupported))
         ));
     }
@@ -1892,7 +1918,7 @@ mod tests {
             source.path().to_owned(),
             &[],
             &[DataSort {
-                source_index: 0,
+                field_path: field("id"),
                 direction: DataSortDirection::Ascending,
             }],
         )
@@ -1900,7 +1926,7 @@ mod tests {
         .build()
         .expect("prepared view");
         let sparse = view
-            .fetch_window_columns(0, 2, &[1])
+            .fetch_window_fields(0, 2, &[field("utc_at")])
             .expect("sparse window");
         let sparse = StreamReader::try_new(Cursor::new(sparse), None)
             .expect("sparse Arrow stream")
@@ -1908,7 +1934,7 @@ mod tests {
             .expect("sparse Arrow batch")
             .expect("valid sparse Arrow batch");
         let fallback = view
-            .fetch_window_columns_with_duckdb(0, 2, &[1])
+            .fetch_window_fields_with_duckdb(0, 2, &[field("utc_at")])
             .expect("DuckDB fallback window");
         let fallback = StreamReader::try_new(Cursor::new(fallback), None)
             .expect("fallback Arrow stream")
@@ -1937,7 +1963,7 @@ mod tests {
             source.path().to_owned(),
             &[],
             &[DataSort {
-                source_index: 0,
+                field_path: field("id"),
                 direction: DataSortDirection::Ascending,
             }],
         )
@@ -1945,12 +1971,12 @@ mod tests {
         .build()
         .expect("prepared view");
         let sparse = decode_one_window(
-            view.fetch_window_columns(0, 2, &[1])
+            view.fetch_window_fields(0, 2, &[field("payload")])
                 .expect("sparse window"),
             "sparse",
         );
         let fallback = decode_one_window(
-            view.fetch_window_columns_with_duckdb(0, 2, &[1])
+            view.fetch_window_fields_with_duckdb(0, 2, &[field("payload")])
                 .expect("DuckDB fallback window"),
             "fallback",
         );
@@ -1980,7 +2006,7 @@ mod tests {
             source.path().to_owned(),
             &[],
             &[DataSort {
-                source_index: 1,
+                field_path: field("sort_key"),
                 direction: DataSortDirection::Ascending,
             }],
         )
@@ -2072,7 +2098,7 @@ mod tests {
             source.path().to_owned(),
             &[],
             &[DataSort {
-                source_index: 1,
+                field_path: field("label"),
                 direction: DataSortDirection::Ascending,
             }],
         )
@@ -2121,7 +2147,7 @@ mod tests {
             source.path().to_owned(),
             &[],
             &[DataSort {
-                source_index: 1,
+                field_path: field("label"),
                 direction: DataSortDirection::Descending,
             }],
         )
@@ -2208,7 +2234,7 @@ mod tests {
         let with_filters = DataViewBuilder::new(
             source.path().to_owned(),
             &[DataFilter {
-                column_index: 0,
+                field_path: field("id"),
                 operator: crate::DataFilterOperator::Equals,
                 values: vec!["1".to_owned()],
                 match_case: false,
@@ -2305,7 +2331,12 @@ mod tests {
         };
         fs::remove_file(&removed).expect("remove after position lookup");
         let result = dataset
-            .stage_sparse_window_while(&positions, &[0], view.temporary_directory.path(), || true)
+            .stage_sparse_window_while(
+                &positions,
+                &[field("id")],
+                view.temporary_directory.path(),
+                || true,
+            )
             .map_err(dataset_view_error);
         assert!(matches!(
             result,
@@ -2362,7 +2393,7 @@ mod tests {
             source.path().to_owned(),
             &[],
             &[DataSort {
-                source_index: 1,
+                field_path: field("label"),
                 direction: DataSortDirection::Ascending,
             }],
             DataViewMemoryLimit::Mb768,
@@ -2569,11 +2600,11 @@ mod tests {
                 &schema,
                 &[
                     DataSort {
-                        source_index: 1,
+                        field_path: field("label"),
                         direction: DataSortDirection::Descending,
                     },
                     DataSort {
-                        source_index: 0,
+                        field_path: field("value\"quoted"),
                         direction: DataSortDirection::Ascending,
                     },
                 ],
@@ -2584,6 +2615,10 @@ mod tests {
                     .to_owned()
             )
         );
+    }
+
+    fn field(name: &str) -> FieldPath {
+        FieldPath::new(vec![name.to_owned()])
     }
 
     fn write_fixture() -> NamedTempFile {
@@ -2645,12 +2680,6 @@ mod tests {
             .is_none()
         {}
         let reader = inspector.into_window_reader().expect("dataset reader");
-        let year = reader
-            .summary()
-            .schema
-            .iter()
-            .position(|field| field.name == "year")
-            .expect("partition column") as u32;
         let identity_checks = source.identity_check_count();
         fs::remove_file(directory.path().join("year=2026/pruned.parquet"))
             .expect("remove pruned member");
@@ -2658,13 +2687,13 @@ mod tests {
         DataViewBuilder::for_dataset(
             &reader,
             &[DataFilter {
-                column_index: year,
+                field_path: field("year"),
                 operator: DataFilterOperator::Equals,
                 values: vec!["2025".to_owned()],
                 match_case: false,
             }],
             &[DataSort {
-                source_index: 0,
+                field_path: field("id"),
                 direction: DataSortDirection::Ascending,
             }],
             DataViewMemoryLimit::Mb384,
@@ -2682,7 +2711,7 @@ mod tests {
             DataViewBuilder::for_dataset(
                 &reader,
                 &[DataFilter {
-                    column_index: year,
+                    field_path: field("year"),
                     operator: DataFilterOperator::Equals,
                     values: vec!["2026".to_owned()],
                     match_case: false,

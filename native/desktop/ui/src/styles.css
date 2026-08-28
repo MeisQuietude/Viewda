@@ -357,10 +357,63 @@ button {
 }
 
 .viewda-grid-header-title {
+  display: flex;
+  flex: 1 1 auto;
   min-width: 0;
   overflow: hidden;
-  text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.viewda-grid-header-title.is-plain {
+  display: block;
+  text-overflow: ellipsis;
+}
+
+.viewda-grid-header-prefix {
+  display: flex;
+  min-width: 0;
+  overflow: hidden;
+  color: var(--grid-text-faint);
+}
+
+.viewda-grid-header-prefix-text {
+  min-width: 0;
+  overflow: hidden;
+  direction: rtl;
+  unicode-bidi: isolate;
+  text-align: left;
+  text-overflow: ellipsis;
+}
+
+.viewda-grid-header-prefix-separator {
+  direction: ltr;
+  unicode-bidi: isolate;
+  flex: 0 0 auto;
+}
+
+.viewda-grid-header-leaf {
+  color: var(--grid-text);
+  flex: 0 0 auto;
+}
+
+.viewda-grid-group-rail {
+  position: absolute;
+  top: 1px;
+  right: 0;
+  left: 0;
+  height: 2px;
+  background: var(--grid-selection-strong);
+  opacity: 0.5;
+}
+
+.viewda-grid-column-header.has-group-start .viewda-grid-group-rail {
+  left: 4px;
+  border-radius: 2px 0 0 2px;
+}
+
+.viewda-grid-column-header.has-group-end .viewda-grid-group-rail {
+  right: 4px;
+  border-radius: 0 2px 2px 0;
 }
 
 .viewda-grid-sort,
@@ -1206,6 +1259,28 @@ button {
 .sidebar-schema-tree ul .schema-field {
   min-height: 27px;
   padding-left: 6px;
+}
+
+.sidebar-schema-tree .schema-flatten-action {
+  min-height: 24px;
+  margin: 0 8px 4px 12px;
+  padding: 0 6px;
+  border: 0;
+  border-radius: 4px;
+  color: var(--grid-text-muted);
+  background: transparent;
+  font-size: 10px;
+  cursor: pointer;
+}
+
+.sidebar-schema-tree .schema-flatten-action:hover {
+  color: var(--grid-text);
+  background: var(--grid-selection);
+}
+
+.sidebar-schema-tree .schema-flatten-action:focus-visible {
+  outline: 2px solid var(--grid-selection-strong);
+  outline-offset: -2px;
 }
 
 .sidebar-schema-tree .schema-name {

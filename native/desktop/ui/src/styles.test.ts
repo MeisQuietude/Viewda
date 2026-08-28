@@ -176,6 +176,28 @@ describe("grid performance status", () => {
 });
 
 describe("color theme", () => {
+  it("keeps plain header ellipsis and isolates the trailing path separator", () => {
+    expectDeclarations(".viewda-grid-header-title", {
+      flex: "1 1 auto",
+      "min-width": "0px",
+      overflow: "hidden",
+    });
+    expectDeclarations(".viewda-grid-header-title.is-plain", {
+      display: "block",
+      "text-overflow": "ellipsis",
+    });
+    expectDeclarations(".viewda-grid-header-prefix-text", {
+      direction: "rtl",
+      "unicode-bidi": "isolate",
+      "text-overflow": "ellipsis",
+    });
+    expectDeclarations(".viewda-grid-header-prefix-separator", {
+      direction: "ltr",
+      "unicode-bidi": "isolate",
+      flex: "0 0 auto",
+    });
+  });
+
   it("does not let pinned positioning hide selection colors", () => {
     expect(() =>
       declaration(".viewda-grid-cell.is-pinned", "background"),

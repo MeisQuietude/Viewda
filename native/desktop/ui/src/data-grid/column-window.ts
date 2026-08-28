@@ -1,33 +1,36 @@
-interface SourceColumn {
-  sourceIndex: number;
+import type { FieldPath } from "../desktop";
+import { fieldPathKey } from "./field-path";
+
+interface ProjectedColumn {
+  fieldPath: FieldPath;
 }
 
-export function projectedSourceIndices(
-  columns: readonly SourceColumn[],
+export function projectedFieldPaths(
+  columns: readonly ProjectedColumn[],
   visibleColumnIndices: readonly number[],
   initialColumnCount: number,
-): number[] {
-  const visibleIndices = new Set<number>();
+): FieldPath[] {
+  const visiblePaths = new Set<string>();
   for (const visibleIndex of visibleColumnIndices) {
-    const sourceIndex = columns[visibleIndex]?.sourceIndex;
-    if (sourceIndex !== undefined) {
-      visibleIndices.add(sourceIndex);
+    const fieldPath = columns[visibleIndex]?.fieldPath;
+    if (fieldPath !== undefined) {
+      visiblePaths.add(fieldPathKey(fieldPath));
     }
   }
-  if (visibleIndices.size === 0) {
+  if (visiblePaths.size === 0) {
     for (const column of columns.slice(0, Math.max(1, initialColumnCount))) {
-      visibleIndices.add(column.sourceIndex);
+      visiblePaths.add(fieldPathKey(column.fieldPath));
     }
   }
   return columns
-    .filter((column) => visibleIndices.has(column.sourceIndex))
-    .map((column) => column.sourceIndex);
+    .filter((column) => visiblePaths.has(fieldPathKey(column.fieldPath)))
+    .map((column) => column.fieldPath);
 }
 
 export function projectionContains(
-  candidate: readonly number[],
-  requested: readonly number[],
+  candidate: readonly FieldPath[],
+  requested: readonly FieldPath[],
 ): boolean {
-  const available = new Set(candidate);
-  return requested.every((sourceIndex) => available.has(sourceIndex));
+  const available = new Set(candidate.map(fieldPathKey));
+  return requested.every((fieldPath) => available.has(fieldPathKey(fieldPath)));
 }

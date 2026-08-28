@@ -447,9 +447,11 @@ describe("desktop seam", () => {
         error: { code: "resourceExhausted" },
       },
     });
-    await expect(getDataWindow(3, 0, 0, 10, [0])).rejects.toMatchObject({
-      code: "queryFailed",
-    });
+    await expect(getDataWindow(3, 0, 0, 10, [["value"]])).rejects.toMatchObject(
+      {
+        code: "queryFailed",
+      },
+    );
   });
 
   it("preserves relative members from direct and prepared data errors", async () => {
@@ -468,10 +470,10 @@ describe("desktop seam", () => {
         member: "year=2026/private.parquet",
       });
 
-    const session = await getDataWindow(3, 0, 0, 10, [0]).catch(
+    const session = await getDataWindow(3, 0, 0, 10, [["value"]]).catch(
       (error) => error,
     );
-    const direct = await getDataWindow(3, 0, 0, 10, [0]).catch(
+    const direct = await getDataWindow(3, 0, 0, 10, [["value"]]).catch(
       (error) => error,
     );
     const prepared = await prepareDataView(3, 1, [], [], {
@@ -537,7 +539,7 @@ describe("desktop seam", () => {
       .mockResolvedValueOnce(undefined);
 
     await expect(
-      getTextValueSuggestions(7, 4, 2, "Al", "textContains"),
+      getTextValueSuggestions(7, 4, ["record", "label"], "Al", "textContains"),
     ).resolves.toEqual({
       values: ["Alpha", "Alpine"],
       isPartial: true,
@@ -550,7 +552,7 @@ describe("desktop seam", () => {
       {
         generation: 7,
         suggestionRevision: 4,
-        columnIndex: 2,
+        fieldPath: ["record", "label"],
         prefix: "Al",
         operator: "textContains",
       },
@@ -587,12 +589,12 @@ describe("desktop seam", () => {
     async (code) => {
       invokeMock.mockRejectedValue({ code });
 
-      await expect(getColumnStatistics(3, 2, false)).rejects.toEqual(
-        new ColumnStatisticsCommandError(code),
-      );
+      await expect(
+        getColumnStatistics(3, ["record", "value"], false),
+      ).rejects.toEqual(new ColumnStatisticsCommandError(code));
       expect(invokeMock).toHaveBeenCalledWith("get_column_statistics", {
         generation: 3,
-        columnIndex: 2,
+        fieldPath: ["record", "value"],
         includeMinMax: false,
       });
     },
@@ -600,9 +602,15 @@ describe("desktop seam", () => {
 
   it("passes one view revision through preparation, windows, status and cancellation", async () => {
     const filters = [
-      { columnIndex: 2, operator: "range" as const, values: ["-2", "9"] },
+      {
+        fieldPath: ["record", "value"],
+        operator: "range" as const,
+        values: ["-2", "9"],
+      },
     ];
-    const sort = [{ sourceIndex: 1, direction: "descending" as const }];
+    const sort = [
+      { fieldPath: ["record", "label"], direction: "descending" as const },
+    ];
     invokeMock
       .mockResolvedValueOnce({ revision: 3, rowCount: 4 })
       .mockResolvedValueOnce(new ArrayBuffer(0))
@@ -616,9 +624,9 @@ describe("desktop seam", () => {
       revision: 3,
       rowCount: 4,
     });
-    await expect(getDataWindow(7, 3, 0, 512, [1, 3])).resolves.toBeInstanceOf(
-      ArrayBuffer,
-    );
+    await expect(
+      getDataWindow(7, 3, 0, 512, [["record", "label"], ["other"]]),
+    ).resolves.toBeInstanceOf(ArrayBuffer);
     await expect(getDataViewStatus(7)).resolves.toEqual({
       revision: 3,
       rowCount: 4,
@@ -637,7 +645,7 @@ describe("desktop seam", () => {
       viewRevision: 3,
       rowOffset: 0,
       rowCount: 512,
-      sourceIndices: [1, 3],
+      fieldPaths: [["record", "label"], ["other"]],
     });
     expect(invokeMock).toHaveBeenNthCalledWith(3, "get_data_view_status", {
       generation: 7,
@@ -703,14 +711,14 @@ describe("desktop seam", () => {
   ] as const)("keeps the %s data-window error typed", async (code) => {
     invokeMock.mockRejectedValue({ code });
 
-    await expect(getDataWindow(7, 0, 0, 1, [0])).rejects.toEqual(
+    await expect(getDataWindow(7, 0, 0, 1, [["value"]])).rejects.toEqual(
       new DataWindowCommandError(code),
     );
   });
 
   it("keeps export paths native while passing the active view revision", async () => {
     const request = {
-      columnIndices: [3, 1],
+      fieldPaths: [["record", "value"], ["id"]],
       rowRanges: [{ start: 10, end: 20 }],
       output: { format: "csv" as const, options: {} },
     };
@@ -733,7 +741,9 @@ describe("desktop seam", () => {
       scope: "view",
       request,
     });
-    expect(JSON.stringify(invokeMock.mock.calls[0])).not.toContain("path");
+    expect(JSON.stringify(invokeMock.mock.calls[0])).not.toMatch(
+      /"[^"]*path"\s*:/i,
+    );
   });
 
   it("uses narrow commands for export status and dismissal", async () => {
@@ -761,7 +771,7 @@ describe("desktop seam", () => {
 
     await expect(
       startDataExport(7, 4, "view", {
-        columnIndices: [0],
+        fieldPaths: [["value"]],
         rowRanges: [],
         output: { format: "csv", options: {} },
       }),

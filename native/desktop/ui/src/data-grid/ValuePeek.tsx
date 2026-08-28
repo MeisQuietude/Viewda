@@ -8,6 +8,7 @@ import {
 } from "react";
 
 import type { Rectangle } from "./grid-model";
+import type { FieldPath } from "../desktop";
 import {
   ValueTree,
   type ValueCopyHandlers,
@@ -42,6 +43,7 @@ interface ResizeGesture {
 export function ValuePeek({
   value,
   label,
+  fieldPath = [label],
   anchor,
   focusRequest = 0,
   loading = false,
@@ -52,6 +54,7 @@ export function ValuePeek({
 }: {
   value: TypedValue;
   label: string;
+  fieldPath?: FieldPath;
   anchor: Rectangle;
   focusRequest?: number;
   loading?: boolean;
@@ -316,6 +319,7 @@ export function ValuePeek({
             ref={treeRef}
             value={value}
             label={label}
+            fieldPath={fieldPath}
             {...(onCopyIntent === undefined
               ? { onCopy: onCopy! }
               : { onCopyIntent })}

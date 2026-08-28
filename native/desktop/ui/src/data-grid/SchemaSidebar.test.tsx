@@ -3,6 +3,7 @@ import {
   fireEvent,
   render,
   screen,
+  waitFor,
   within,
 } from "@testing-library/react";
 import {
@@ -34,7 +35,7 @@ function source(): desktop.SourceSummary {
     columnCount: 3,
     schema: [
       {
-        name: "duplicate",
+        name: "nested",
         physicalType: "BYTE_ARRAY",
         logicalType: "String",
         children: [],
@@ -70,8 +71,10 @@ function readyStatistics() {
     minimum: null,
     maximum: null,
     minMaxComputed: true,
+    nullCount: 0,
     nullShare: 0,
     approximateDistinctCount: 1,
+    containerCount: null,
   });
   vi.spyOn(desktop, "cancelColumnStatistics").mockResolvedValue();
 }
@@ -82,9 +85,10 @@ describe("SchemaSidebar logical schema", () => {
     render(
       <SchemaSidebar
         open
-        selectedColumn={null}
+        selectedPath={null}
         source={source()}
-        onSelectColumn={vi.fn()}
+        onSelectPath={vi.fn()}
+        onFlattenPath={vi.fn()}
       />,
     );
 
@@ -100,16 +104,17 @@ describe("SchemaSidebar logical schema", () => {
     render(
       <SchemaSidebar
         open
-        selectedColumn={null}
+        selectedPath={null}
         source={source()}
         dataTypes={
-          new Map<number, DataType>([
-            [0, struct({ address: struct({ city: utf8() }) })],
-            [1, list(struct({ item_id: int32(), label: utf8() }))],
-            [2, map(utf8(), int32())],
+          new Map<string, DataType>([
+            ['["duplicate"]', struct({ address: struct({ city: utf8() }) })],
+            ['["nested"]', list(struct({ item_id: int32(), label: utf8() }))],
+            ['["unloaded"]', map(utf8(), int32())],
           ])
         }
-        onSelectColumn={vi.fn()}
+        onSelectPath={vi.fn()}
+        onFlattenPath={vi.fn()}
       />,
     );
 
@@ -126,30 +131,241 @@ describe("SchemaSidebar logical schema", () => {
     expect(screen.queryByText(/Schema is incomplete/)).not.toBeInTheDocument();
   });
 
-  it("maps duplicate top-level names to their exact source indices", () => {
+  it("selects a top-level field by its structured path", () => {
     readyStatistics();
-    const onSelectColumn = vi.fn();
+    const onSelectPath = vi.fn();
     render(
       <SchemaSidebar
         open
-        selectedColumn={null}
+        selectedPath={null}
         source={source()}
-        dataTypes={new Map([[1, list(struct({ child: utf8() }))]])}
-        onSelectColumn={onSelectColumn}
+        dataTypes={new Map([['["nested"]', list(struct({ child: utf8() }))]])}
+        onSelectPath={onSelectPath}
+        onFlattenPath={vi.fn()}
       />,
     );
 
     const sidebar = screen.getByRole("complementary", {
       name: "Schema sidebar",
     });
-    const duplicateButtons = within(sidebar)
+    const nestedButton = within(sidebar)
       .getAllByRole("button")
-      .filter((button) => button.textContent?.startsWith("duplicate"));
-    fireEvent.click(duplicateButtons[1]!);
+      .find((button) => button.textContent?.startsWith("nested"));
+    fireEvent.click(nestedButton!);
 
-    expect(onSelectColumn).toHaveBeenCalledWith(1);
-    expect(desktop.getColumnStatistics).toHaveBeenCalledWith(7, 1, true);
-    expect(screen.getByText("child").closest("button")).toBeNull();
+    expect(onSelectPath).toHaveBeenCalledWith(["nested"]);
+    expect(desktop.getColumnStatistics).toHaveBeenCalledWith(
+      7,
+      ["nested"],
+      false,
+    );
+    expect(screen.getByText("child").closest("button")).toBeDisabled();
+  });
+
+  it("addresses struct descendants for statistics and schema flattening", () => {
+    readyStatistics();
+    const onSelectPath = vi.fn();
+    const onFlattenPath = vi.fn();
+    render(
+      <SchemaSidebar
+        open
+        selectedPath={null}
+        source={source()}
+        onSelectPath={onSelectPath}
+        onFlattenPath={onFlattenPath}
+      />,
+    );
+
+    fireEvent.click(screen.getByText("physical_child").closest("button")!);
+    expect(onSelectPath).toHaveBeenCalledWith(["duplicate", "physical_child"]);
+    expect(desktop.getColumnStatistics).toHaveBeenCalledWith(
+      7,
+      ["duplicate", "physical_child"],
+      true,
+    );
+    fireEvent.click(
+      screen
+        .getByText("duplicate")
+        .closest("li")!
+        .querySelector(".schema-flatten-action")!,
+    );
+    expect(onFlattenPath).toHaveBeenCalledWith(["duplicate"]);
+  });
+
+  it("disables ambiguous nested path actions without hiding the parent struct", () => {
+    readyStatistics();
+    const onSelectPath = vi.fn();
+    const onFlattenPath = vi.fn();
+    const duplicateChildren: desktop.SourceSummary = {
+      ...source(),
+      schema: [
+        {
+          name: "profile",
+          physicalType: "GROUP",
+          logicalType: null,
+          children: [
+            {
+              name: "city",
+              physicalType: "BYTE_ARRAY",
+              logicalType: "String",
+              children: [],
+            },
+            {
+              name: "city",
+              physicalType: "BYTE_ARRAY",
+              logicalType: "String",
+              children: [],
+            },
+          ],
+        },
+      ],
+      schemaNodeCount: 3,
+      schemaIsTruncated: false,
+    };
+    render(
+      <SchemaSidebar
+        open
+        selectedPath={null}
+        source={duplicateChildren}
+        onSelectPath={onSelectPath}
+        onFlattenPath={onFlattenPath}
+      />,
+    );
+
+    const parent = screen.getByText("profile").closest("li")!;
+    fireEvent.click(within(parent).getByText("profile").closest("button")!);
+    expect(onSelectPath).toHaveBeenCalledWith(["profile"]);
+    expect(desktop.getColumnStatistics).toHaveBeenCalledWith(
+      7,
+      ["profile"],
+      true,
+    );
+
+    const flatten = within(parent).getByRole("button", {
+      name: "Flatten unavailable: duplicate child names",
+    });
+    expect(flatten).toBeDisabled();
+    const ambiguousFields = within(parent)
+      .getAllByText("city")
+      .map((name) => name.closest("button"));
+    expect(ambiguousFields).toHaveLength(2);
+    ambiguousFields.forEach((button) => {
+      expect(button).toBeDisabled();
+      expect(button).toHaveAttribute(
+        "title",
+        'Path actions are unavailable because this struct contains multiple fields named "city".',
+      );
+    });
+    expect(onFlattenPath).not.toHaveBeenCalled();
+  });
+
+  it("does not offer an executable flatten action without loaded child fields", () => {
+    const emptyStruct: desktop.SourceSummary = {
+      ...source(),
+      schema: [
+        {
+          name: "empty",
+          physicalType: "GROUP",
+          logicalType: null,
+          children: [],
+        },
+      ],
+      schemaNodeCount: 1,
+      schemaIsTruncated: false,
+    };
+    render(
+      <SchemaSidebar
+        open
+        selectedPath={null}
+        source={emptyStruct}
+        dataTypes={new Map([['["empty"]', struct({ runtime_child: utf8() })]])}
+        onSelectPath={vi.fn()}
+        onFlattenPath={vi.fn()}
+      />,
+    );
+
+    const flatten = screen.getByRole("button", {
+      name: "Flatten unavailable: no child fields",
+    });
+    expect(flatten).toBeDisabled();
+    expect(flatten).toHaveAttribute(
+      "title",
+      "Flatten is unavailable because this struct has no child fields.",
+    );
+  });
+
+  it("labels list lengths and map pair counts without offering scalar min and max", async () => {
+    const nestedContainers: desktop.SourceSummary = {
+      ...source(),
+      schema: [
+        {
+          name: "tags",
+          physicalType: "GROUP",
+          logicalType: "List",
+          children: [],
+        },
+        {
+          name: "attributes",
+          physicalType: "GROUP",
+          logicalType: "Map",
+          children: [],
+        },
+      ],
+    };
+    vi.spyOn(desktop, "getColumnStatistics").mockImplementation(
+      async (_generation, fieldPath) => ({
+        minimum: null,
+        maximum: null,
+        minMaxComputed: false,
+        nullCount: 1,
+        nullShare: 0.25,
+        approximateDistinctCount: null,
+        containerCount:
+          fieldPath[0] === "tags"
+            ? { minimum: 0, average: 1.5, maximum: 3, emptyCount: 2 }
+            : { minimum: 0, average: 2, maximum: 4, emptyCount: 1 },
+      }),
+    );
+    vi.spyOn(desktop, "cancelColumnStatistics").mockResolvedValue();
+    render(
+      <SchemaSidebar
+        open
+        selectedPath={null}
+        source={nestedContainers}
+        onSelectPath={vi.fn()}
+        onFlattenPath={vi.fn()}
+      />,
+    );
+
+    fireEvent.click(screen.getByText("tags").closest("button")!);
+    await waitFor(() =>
+      expect(desktop.getColumnStatistics).toHaveBeenLastCalledWith(
+        7,
+        ["tags"],
+        false,
+      ),
+    );
+    expect(screen.getByText("Minimum length")).toBeInTheDocument();
+    expect(screen.getByText("Average length")).toBeInTheDocument();
+    expect(screen.getByText("Maximum length")).toBeInTheDocument();
+    expect(screen.getByText("Empty lists")).toBeInTheDocument();
+    expect(screen.queryByText("Distinct")).not.toBeInTheDocument();
+    expect(
+      screen.queryByRole("button", { name: "Compute min/max" }),
+    ).not.toBeInTheDocument();
+
+    fireEvent.click(screen.getByText("attributes").closest("button")!);
+    await waitFor(() =>
+      expect(desktop.getColumnStatistics).toHaveBeenLastCalledWith(
+        7,
+        ["attributes"],
+        false,
+      ),
+    );
+    expect(screen.getByText("Minimum pair count")).toBeInTheDocument();
+    expect(screen.getByText("Average pair count")).toBeInTheDocument();
+    expect(screen.getByText("Maximum pair count")).toBeInTheDocument();
+    expect(screen.getByText("Empty maps")).toBeInTheDocument();
   });
 
   it("bounds wide and deeply wrapped logical schema projections", () => {

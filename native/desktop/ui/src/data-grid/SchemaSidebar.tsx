@@ -14,9 +14,17 @@ import {
   ColumnStatisticsCommandError,
   getColumnStatistics,
   type ColumnStatistics,
+  type FieldPath,
+  type SchemaField,
   type SourceSummary,
 } from "../desktop";
 import { SchemaTreeNode } from "../SchemaTree";
+import {
+  fieldPathKey,
+  formatFieldPath,
+  resolveSchemaField,
+  sameFieldPath,
+} from "./field-path";
 
 const LOGICAL_SCHEMA_NODE_LIMIT = 2_048;
 const LOGICAL_SCHEMA_DEPTH_LIMIT = 64;
@@ -26,13 +34,13 @@ type StatisticsState =
   | { kind: "idle" }
   | {
       kind: "loading";
-      columnIndex: number;
+      fieldPath: FieldPath;
       columnName: string;
       previous: ColumnStatistics | null;
     }
   | {
       kind: "ready";
-      columnIndex: number;
+      fieldPath: FieldPath;
       columnName: string;
       value: ColumnStatistics;
     }
@@ -41,16 +49,22 @@ type StatisticsState =
 
 export function SchemaSidebar({
   open,
-  selectedColumn,
+  selectedPath,
   source,
   dataTypes = new Map(),
-  onSelectColumn,
+  pathActionsEnabled = true,
+  pathActionsDisabledDescriptionId,
+  onSelectPath,
+  onFlattenPath,
 }: {
   open: boolean;
-  selectedColumn: number | null;
+  selectedPath: FieldPath | null;
   source: SourceSummary;
-  dataTypes?: ReadonlyMap<number, DataType>;
-  onSelectColumn: (columnIndex: number) => void;
+  dataTypes?: ReadonlyMap<string, DataType>;
+  pathActionsEnabled?: boolean;
+  pathActionsDisabledDescriptionId?: string;
+  onSelectPath: (fieldPath: FieldPath) => void;
+  onFlattenPath: (fieldPath: FieldPath) => void;
 }) {
   const [statistics, setStatistics] = useState<StatisticsState>({
     kind: "idle",
@@ -68,35 +82,31 @@ export function SchemaSidebar({
   );
 
   const loadStatistics = async (
-    columnIndex: number,
+    fieldPath: FieldPath,
     includeMinMax: boolean,
     previous: ColumnStatistics | null,
   ) => {
-    const field = source.schema[columnIndex];
-    if (field === undefined) {
-      return;
-    }
     const version = requestVersion.current + 1;
     requestVersion.current = version;
-    onSelectColumn(columnIndex);
+    onSelectPath(fieldPath);
     setStatistics({
       kind: "loading",
-      columnIndex,
-      columnName: field.name,
+      fieldPath,
+      columnName: formatFieldPath(fieldPath),
       previous,
     });
 
     try {
       const value = await getColumnStatistics(
         source.generation,
-        columnIndex,
+        fieldPath,
         includeMinMax,
       );
       if (requestVersion.current === version) {
         setStatistics({
           kind: "ready",
-          columnIndex,
-          columnName: field.name,
+          fieldPath,
+          columnName: formatFieldPath(fieldPath),
           value,
         });
       }
@@ -108,27 +118,30 @@ export function SchemaSidebar({
         error instanceof ColumnStatisticsCommandError &&
         error.code === "cancelled"
       ) {
-        setStatistics({ kind: "cancelled", columnName: field.name });
+        setStatistics({
+          kind: "cancelled",
+          columnName: formatFieldPath(fieldPath),
+        });
       } else {
         setStatistics({
           kind: "error",
-          columnName: field.name,
+          columnName: formatFieldPath(fieldPath),
           message: statisticsErrorMessage(error),
         });
       }
     }
   };
 
-  const selectColumn = (columnIndex: number) => {
-    const field = source.schema[columnIndex];
-    if (field !== undefined) {
-      void loadStatistics(columnIndex, !shouldDeferMinMax(field), null);
-    }
+  const selectField = (fieldPath: FieldPath, field: SchemaField) => {
+    void loadStatistics(fieldPath, !shouldDeferMinMax(field), null);
   };
 
   const computeMinMax = () => {
     if (statistics.kind === "ready") {
-      void loadStatistics(statistics.columnIndex, true, statistics.value);
+      const field = resolveSchemaField(source.schema, statistics.fieldPath);
+      if (field !== undefined) {
+        void loadStatistics(statistics.fieldPath, true, statistics.value);
+      }
     }
   };
 
@@ -137,14 +150,14 @@ export function SchemaSidebar({
       return;
     }
     const columnName = statistics.columnName;
-    const columnIndex = statistics.columnIndex;
+    const fieldPath = statistics.fieldPath;
     const previous = statistics.previous;
     const version = requestVersion.current + 1;
     requestVersion.current = version;
     setStatistics(
       previous === null
         ? { kind: "cancelled", columnName }
-        : { kind: "ready", columnIndex, columnName, value: previous },
+        : { kind: "ready", fieldPath, columnName, value: previous },
     );
     try {
       await cancelColumnStatistics(source.generation);
@@ -172,27 +185,48 @@ export function SchemaSidebar({
             <span>{formatColumnCount(source.schema.length)}</span>
           </div>
           <ul className="sidebar-schema-tree">
-            {source.schema.map((field, columnIndex) =>
-              dataTypes.get(columnIndex) === undefined ? (
+            {source.schema.map((field, columnIndex) => {
+              const fieldPath = [field.name];
+              const dataType = dataTypes.get(fieldPathKey(fieldPath));
+              return dataType === undefined ? (
                 <SchemaTreeNode
                   key={columnIndex}
                   field={field}
-                  selected={selectedColumn === columnIndex}
-                  onSelect={() => void selectColumn(columnIndex)}
+                  fieldPath={fieldPath}
+                  selectedPath={selectedPath}
+                  pathActionDisabledReason={
+                    pathActionsEnabled
+                      ? undefined
+                      : "Path actions are unavailable because the source contains duplicate top-level names."
+                  }
+                  pathActionDisabledDescriptionId={
+                    pathActionsDisabledDescriptionId
+                  }
+                  onSelectPath={(path, selectedField) =>
+                    void selectField(path, selectedField)
+                  }
+                  onFlattenPath={onFlattenPath}
                 />
               ) : (
                 <LogicalSchemaNode
                   key={columnIndex}
                   name={field.name}
-                  dataType={dataTypes.get(columnIndex)!}
-                  selected={selectedColumn === columnIndex}
-                  onSelect={() => void selectColumn(columnIndex)}
+                  field={field}
+                  fieldPath={fieldPath}
+                  dataType={dataType}
+                  selectedPath={selectedPath}
+                  pathActionsEnabled={pathActionsEnabled}
+                  pathActionsDisabledDescriptionId={
+                    pathActionsDisabledDescriptionId
+                  }
+                  onSelect={selectField}
+                  onFlatten={onFlattenPath}
                 />
-              ),
-            )}
+              );
+            })}
             {source.schemaIsTruncated &&
               source.schema.some(
-                (_, columnIndex) => !dataTypes.has(columnIndex),
+                (field) => !dataTypes.has(fieldPathKey([field.name])),
               ) && (
                 <li className="logical-schema-incomplete">
                   Schema is incomplete; unloaded fields use the physical view.
@@ -201,6 +235,7 @@ export function SchemaSidebar({
           </ul>
           <StatisticsPanel
             state={statistics}
+            schema={source.schema}
             onCancel={() => void cancelStatistics()}
             onComputeMinMax={computeMinMax}
           />
@@ -212,48 +247,151 @@ export function SchemaSidebar({
 
 function LogicalSchemaNode({
   name,
+  field,
+  fieldPath,
   dataType,
-  selected,
+  selectedPath,
+  pathActionsEnabled,
+  pathActionsDisabledDescriptionId,
   onSelect,
+  onFlatten,
 }: {
   name: string;
+  field: SchemaField;
+  fieldPath: FieldPath;
   dataType: DataType;
-  selected: boolean;
-  onSelect: () => void;
+  selectedPath: FieldPath | null;
+  pathActionsEnabled: boolean;
+  pathActionsDisabledDescriptionId?: string;
+  onSelect: (fieldPath: FieldPath, field: SchemaField) => void;
+  onFlatten?: (fieldPath: FieldPath) => void;
 }) {
   const projection = useMemo(
     () => _projectLogicalSchema(name, dataType),
     [dataType, name],
   );
+  const flattenDisabledReason = flattenUnavailableReason(field);
+  const pathActionDisabledReason = pathActionsEnabled
+    ? undefined
+    : "Path actions are unavailable because the source contains duplicate top-level names.";
   return (
     <li>
       <button
         className="schema-field"
         type="button"
-        aria-pressed={selected}
-        onClick={onSelect}
+        disabled={!pathActionsEnabled}
+        title={pathActionDisabledReason}
+        aria-describedby={
+          pathActionDisabledReason === undefined
+            ? undefined
+            : pathActionsDisabledDescriptionId
+        }
+        aria-pressed={
+          selectedPath !== null && sameFieldPath(selectedPath, fieldPath)
+        }
+        onClick={() => onSelect(fieldPath, field)}
       >
         <span className="schema-name">{projection.name}</span>
         <span className="schema-type" title={projection.type}>
           {projection.type}
         </span>
       </button>
+      {dataType.typeId === Type.Struct && onFlatten !== undefined && (
+        <button
+          className="schema-flatten-action"
+          type="button"
+          disabled={
+            pathActionDisabledReason !== undefined ||
+            flattenDisabledReason !== undefined
+          }
+          title={pathActionDisabledReason ?? flattenDisabledReason}
+          aria-describedby={
+            pathActionDisabledReason === undefined
+              ? undefined
+              : pathActionsDisabledDescriptionId
+          }
+          onClick={() => onFlatten(fieldPath)}
+        >
+          {flattenDisabledReason === undefined
+            ? "Flatten to columns"
+            : flattenUnavailableLabel(field)}
+        </button>
+      )}
       {projection.rows.length > 0 && (
         <ul className="logical-schema-rows">
-          {projection.rows.map((row, index) => (
-            <li
-              key={`${index}:${row.name}`}
-              className="logical-schema-row"
-              style={{ paddingLeft: `${Math.min(row.depth, 8) * 10}px` }}
-            >
-              <div className="schema-field">
-                <span className="schema-name">{row.name}</span>
-                <span className="schema-type" title={row.type}>
-                  {row.type}
-                </span>
-              </div>
-            </li>
-          ))}
+          {projection.rows.map((row, index) => {
+            const rowPath = [...fieldPath, ...row.segments];
+            const rowField = resolveSchemaField(
+              [field],
+              [name, ...row.segments],
+            );
+            const selectable = row.addressable && rowField !== undefined;
+            const rowPathDisabledReason =
+              pathActionDisabledReason ??
+              (row.addressable && rowField === undefined
+                ? "Path actions are unavailable because this field is not uniquely addressable in the source schema."
+                : undefined);
+            const rowFlattenDisabledReason =
+              rowField === undefined
+                ? undefined
+                : flattenUnavailableReason(rowField);
+            return (
+              <li
+                key={`${index}:${row.name}`}
+                className="logical-schema-row"
+                style={{ paddingLeft: `${Math.min(row.depth, 8) * 10}px` }}
+              >
+                <button
+                  className="schema-field"
+                  type="button"
+                  disabled={!pathActionsEnabled || !selectable}
+                  title={rowPathDisabledReason}
+                  aria-describedby={
+                    pathActionDisabledReason === undefined
+                      ? undefined
+                      : pathActionsDisabledDescriptionId
+                  }
+                  aria-pressed={
+                    selectedPath !== null &&
+                    sameFieldPath(selectedPath, rowPath)
+                  }
+                  onClick={() => {
+                    if (rowField !== undefined) onSelect(rowPath, rowField);
+                  }}
+                >
+                  <span className="schema-name">{row.name}</span>
+                  <span className="schema-type" title={row.type}>
+                    {row.type}
+                  </span>
+                </button>
+                {selectable &&
+                  row.dataType.typeId === Type.Struct &&
+                  onFlatten !== undefined && (
+                    <button
+                      className="schema-flatten-action"
+                      type="button"
+                      disabled={
+                        pathActionDisabledReason !== undefined ||
+                        rowFlattenDisabledReason !== undefined
+                      }
+                      title={
+                        pathActionDisabledReason ?? rowFlattenDisabledReason
+                      }
+                      aria-describedby={
+                        pathActionDisabledReason === undefined
+                          ? undefined
+                          : pathActionsDisabledDescriptionId
+                      }
+                      onClick={() => onFlatten(rowPath)}
+                    >
+                      {rowFlattenDisabledReason === undefined
+                        ? "Flatten to columns"
+                        : flattenUnavailableLabel(rowField)}
+                    </button>
+                  )}
+              </li>
+            );
+          })}
         </ul>
       )}
     </li>
@@ -263,7 +401,14 @@ function LogicalSchemaNode({
 interface LogicalSchemaProjection {
   name: string;
   type: string;
-  rows: Array<{ name: string; type: string; depth: number }>;
+  rows: Array<{
+    name: string;
+    type: string;
+    depth: number;
+    segments: string[];
+    addressable: boolean;
+    dataType: DataType;
+  }>;
 }
 
 export function _projectLogicalSchema(
@@ -272,18 +417,27 @@ export function _projectLogicalSchema(
 ): LogicalSchemaProjection {
   const rows: LogicalSchemaProjection["rows"] = [];
   const budget = { visited: 0, incomplete: false };
-  const stack = logicalChildFields(dataType, 1, budget).reverse();
+  const stack = logicalChildFields(dataType, 1, budget, [], true).reverse();
   while (stack.length > 0 && budget.visited < LOGICAL_SCHEMA_NODE_LIMIT) {
     const current = stack.pop()!;
     budget.visited += 1;
     rows.push({
       name: boundedSchemaText(current.field.name),
-      type: shortDataTypeLabel(current.field.type),
+      type: formatDataTypeLabel(current.field.type),
       depth: current.depth,
+      segments: current.segments,
+      addressable: current.addressable,
+      dataType: current.field.type,
     });
     if (current.depth >= LOGICAL_SCHEMA_DEPTH_LIMIT) {
       if (
-        logicalChildFields(current.field.type, current.depth + 1, budget).length
+        logicalChildFields(
+          current.field.type,
+          current.depth + 1,
+          budget,
+          current.segments,
+          current.addressable,
+        ).length
       )
         budget.incomplete = true;
       continue;
@@ -292,17 +446,26 @@ export function _projectLogicalSchema(
       current.field.type,
       current.depth + 1,
       budget,
+      current.segments,
+      current.addressable,
     );
     for (let index = children.length - 1; index >= 0; index -= 1) {
       stack.push(children[index]!);
     }
   }
   if (stack.length > 0 || budget.incomplete) {
-    rows.push({ name: "…", type: "more fields", depth: 1 });
+    rows.push({
+      name: "…",
+      type: "more fields",
+      depth: 1,
+      segments: [],
+      addressable: false,
+      dataType,
+    });
   }
   return {
     name: boundedSchemaText(name),
-    type: shortDataTypeLabel(dataType),
+    type: formatDataTypeLabel(dataType),
     rows,
   };
 }
@@ -311,7 +474,14 @@ function logicalChildFields(
   input: DataType,
   depth: number,
   budget: { visited: number; incomplete: boolean },
-): Array<{ field: Field; depth: number }> {
+  parentSegments: string[],
+  parentAddressable: boolean,
+): Array<{
+  field: Field;
+  depth: number;
+  segments: string[];
+  addressable: boolean;
+}> {
   let dataType = input;
   while (budget.visited < LOGICAL_SCHEMA_NODE_LIMIT) {
     budget.visited += 1;
@@ -322,9 +492,12 @@ function logicalChildFields(
     if (dataType.typeId === Type.Struct) {
       const remaining = Math.max(0, LOGICAL_SCHEMA_NODE_LIMIT - budget.visited);
       if (dataType.children.length > remaining) budget.incomplete = true;
-      return dataType.children
-        .slice(0, remaining)
-        .map((field) => ({ field, depth }));
+      return dataType.children.slice(0, remaining).map((field) => ({
+        field,
+        depth,
+        segments: [...parentSegments, field.name],
+        addressable: parentAddressable,
+      }));
     }
     if (
       dataType.typeId === Type.List ||
@@ -336,12 +509,18 @@ function logicalChildFields(
       const child = dataType.children[0]?.type;
       if (child === undefined) return [];
       dataType = child;
+      parentAddressable = false;
       continue;
     }
     if (dataType.typeId === Type.Map) {
       const entries = dataType.children[0]?.type;
       return entries?.typeId === Type.Struct
-        ? entries.children.map((field) => ({ field, depth }))
+        ? entries.children.map((field) => ({
+            field,
+            depth,
+            segments: [...parentSegments, field.name],
+            addressable: false,
+          }))
         : [];
     }
     return [];
@@ -350,7 +529,7 @@ function logicalChildFields(
   return [];
 }
 
-function shortDataTypeLabel(input: DataType): string {
+export function formatDataTypeLabel(input: DataType): string {
   let dataType = input;
   let dictionaryDepth = 0;
   while (
@@ -442,7 +621,7 @@ function containerChildLabel(dataType: DataType | undefined): string {
   )
     return "list<…>";
   if (dataType.typeId === Type.Map) return "map<…>";
-  return shortDataTypeLabel(dataType);
+  return formatDataTypeLabel(dataType);
 }
 
 function boundedSchemaText(
@@ -474,10 +653,12 @@ function intervalUnitLabel(unit: number): string {
 
 function StatisticsPanel({
   state,
+  schema,
   onCancel,
   onComputeMinMax,
 }: {
   state: StatisticsState;
+  schema: readonly SchemaField[];
   onCancel: () => void;
   onComputeMinMax: () => void;
 }) {
@@ -507,6 +688,10 @@ function StatisticsPanel({
   }
 
   if (state.kind === "ready") {
+    const field = resolveSchemaField(schema, state.fieldPath);
+    const countNoun = field?.logicalType?.startsWith("Map")
+      ? "pair count"
+      : "length";
     return (
       <section
         className="statistics-panel"
@@ -527,11 +712,52 @@ function StatisticsPanel({
             value={formatNullShare(state.value.nullShare)}
           />
           <Statistic
-            label="Distinct"
-            value={formatApproximateCount(state.value.approximateDistinctCount)}
+            label="Null rows"
+            value={state.value.nullCount.toLocaleString("en-US")}
           />
+          {state.value.containerCount === null ? (
+            <Statistic
+              label="Distinct"
+              value={
+                state.value.approximateDistinctCount === null
+                  ? "—"
+                  : formatApproximateCount(state.value.approximateDistinctCount)
+              }
+            />
+          ) : (
+            <>
+              <Statistic
+                label={`Minimum ${countNoun}`}
+                value={
+                  state.value.containerCount.minimum?.toLocaleString() ?? "—"
+                }
+              />
+              <Statistic
+                label={`Average ${countNoun}`}
+                value={
+                  state.value.containerCount.average?.toLocaleString("en-US", {
+                    maximumFractionDigits: 2,
+                  }) ?? "—"
+                }
+              />
+              <Statistic
+                label={`Maximum ${countNoun}`}
+                value={
+                  state.value.containerCount.maximum?.toLocaleString() ?? "—"
+                }
+              />
+              <Statistic
+                label={
+                  countNoun === "pair count" ? "Empty maps" : "Empty lists"
+                }
+                value={state.value.containerCount.emptyCount.toLocaleString(
+                  "en-US",
+                )}
+              />
+            </>
+          )}
         </dl>
-        {!state.value.minMaxComputed && (
+        {!state.value.minMaxComputed && state.value.containerCount === null && (
           <button
             className="statistics-action"
             type="button"
@@ -583,6 +809,26 @@ function formatColumnCount(value: number): string {
   return `${value.toLocaleString()} ${value === 1 ? "column" : "columns"}`;
 }
 
+function flattenUnavailableReason(field: SchemaField): string | undefined {
+  if (field.children.length === 0) {
+    return "Flatten is unavailable because this struct has no child fields.";
+  }
+  const names = new Set<string>();
+  for (const child of field.children) {
+    if (names.has(child.name)) {
+      return "Flatten is unavailable because this struct contains duplicate child names.";
+    }
+    names.add(child.name);
+  }
+  return undefined;
+}
+
+function flattenUnavailableLabel(field: SchemaField): string {
+  if (field.children.length === 0)
+    return "Flatten unavailable: no child fields";
+  return "Flatten unavailable: duplicate child names";
+}
+
 function formatApproximateCount(value: number): string {
   return `≈ ${new Intl.NumberFormat("en-US", {
     notation: "compact",
@@ -591,7 +837,11 @@ function formatApproximateCount(value: number): string {
 }
 
 function shouldDeferMinMax(field: SourceSummary["schema"][number]): boolean {
-  return field.physicalType === "BYTE_ARRAY";
+  return (
+    field.physicalType === "BYTE_ARRAY" ||
+    field.logicalType?.startsWith("List") === true ||
+    field.logicalType?.startsWith("Map") === true
+  );
 }
 
 function statisticsErrorMessage(error: unknown): string {

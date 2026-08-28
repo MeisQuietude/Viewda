@@ -25,8 +25,8 @@ use viewda_data_engine::{
     DataExportRequest, DataFilter, DataFilterOperator, DataSort, DataSortDirection,
     DataViewBuilder, DataViewError, DataViewMemoryLimit, DataWindowError, DataWindowReader,
     DatasetError, DatasetPartitionNode, DatasetPartitionPage, DatasetSource, DatasetWindowReader,
-    ExportRowRange, PartitionValue, StructureCancellation, StructureLoadProgress, StructureReader,
-    TextValueSuggestionsReader,
+    ExportRowRange, FieldPath, PartitionValue, StructureCancellation, StructureLoadProgress,
+    StructureReader, TextValueSuggestionsReader,
 };
 
 #[test]
@@ -90,7 +90,7 @@ fn opening_and_reading_sources_does_not_modify_source_mtimes() {
         file_path.clone(),
         &[],
         &[DataSort {
-            source_index: 0,
+            field_path: FieldPath::from("value"),
             direction: DataSortDirection::Ascending,
         }],
     )
@@ -101,7 +101,7 @@ fn opening_and_reading_sources_does_not_modify_source_mtimes() {
     .expect("prepared file window");
     ColumnStatisticsReader::new(file_path.clone())
         .expect("file statistics reader")
-        .fetch("value", true)
+        .fetch(&FieldPath::from("value"), true)
         .expect("file statistics");
 
     let source = DatasetSource::open_folder(&dataset_directory).expect("folder dataset");
@@ -111,7 +111,7 @@ fn opening_and_reading_sources_does_not_modify_source_mtimes() {
         &dataset,
         &[],
         &[DataSort {
-            source_index: 0,
+            field_path: FieldPath::from("value"),
             direction: DataSortDirection::Ascending,
         }],
         DataViewMemoryLimit::Mb384,
@@ -123,7 +123,7 @@ fn opening_and_reading_sources_does_not_modify_source_mtimes() {
     .expect("prepared dataset window");
     ColumnStatisticsReader::for_dataset(&dataset)
         .expect("dataset statistics reader")
-        .fetch("value", true)
+        .fetch(&FieldPath::from("value"), true)
         .expect("dataset statistics");
 
     let after = observed.map(|path| {
@@ -254,7 +254,7 @@ fn direct_dataset_windows_project_union_columns_in_requested_order() {
 
     let batch = decode_one(
         &reader
-            .fetch_columns(0, 8, &[file_index, 0])
+            .fetch_fields(0, 8, &field_paths(&reader, &[file_index, 0]))
             .expect("projected window"),
     );
 
@@ -300,7 +300,7 @@ fn wide_dataset_keeps_late_columns_for_windows_and_export() {
     let late_index = column_index(&reader, "column_299");
     let batch = decode_one(
         &reader
-            .fetch_columns(0, 1, &[late_index])
+            .fetch_fields(0, 1, &field_paths(&reader, &[late_index]))
             .expect("late column window"),
     );
     assert_eq!(int64_values(&batch, 0), [299]);
@@ -309,7 +309,7 @@ fn wide_dataset_keeps_late_columns_for_windows_and_export() {
     DataExportReader::for_dataset(
         &reader,
         target.clone(),
-        dataset_csv_request(vec![late_index], vec![]),
+        dataset_csv_request(&reader, vec![late_index], vec![]),
         None,
     )
     .expect("wide dataset export")
@@ -1226,7 +1226,7 @@ fn preview_reader_supports_windows_and_prepared_views_over_only_its_fixed_sample
         &reader,
         &[],
         &[DataSort {
-            source_index: 0,
+            field_path: FieldPath::from("id"),
             direction: DataSortDirection::Ascending,
         }],
         DataViewMemoryLimit::Mb384,
@@ -1248,16 +1248,26 @@ fn zero_candidate_filters_return_schema_only_ipc_without_a_query_member() {
     let year = column_index(&reader, "year");
     let file = column_index(&reader, "file");
     let cases = [
-        vec![filter(year, DataFilterOperator::Equals, &["2099"])],
-        vec![filter(year, DataFilterOperator::OneOf, &["2023", "2024"])],
-        vec![filter(file, DataFilterOperator::IsNull, &[])],
+        vec![filter(&reader, year, DataFilterOperator::Equals, &["2099"])],
+        vec![filter(
+            &reader,
+            year,
+            DataFilterOperator::OneOf,
+            &["2023", "2024"],
+        )],
+        vec![filter(&reader, file, DataFilterOperator::IsNull, &[])],
         vec![
-            filter(year, DataFilterOperator::IsNull, &[]),
-            filter(file, DataFilterOperator::IsNotNull, &[]),
+            filter(&reader, year, DataFilterOperator::IsNull, &[]),
+            filter(&reader, file, DataFilterOperator::IsNotNull, &[]),
         ],
         vec![
-            filter(year, DataFilterOperator::IsNotNull, &[]),
-            filter(file, DataFilterOperator::Equals, &["missing.parquet"]),
+            filter(&reader, year, DataFilterOperator::IsNotNull, &[]),
+            filter(
+                &reader,
+                file,
+                DataFilterOperator::Equals,
+                &["missing.parquet"],
+            ),
         ],
     ];
 
@@ -1414,7 +1424,11 @@ fn unions_schema_by_name_fills_missing_values_and_exposes_relative_provenance() 
             &reader,
             0,
             8,
-            &[equals(file, "year=2025/month=12/part-00000.parquet")],
+            &[equals(
+                &reader,
+                file,
+                "year=2025/month=12/part-00000.parquet",
+            )],
         )
         .expect("missing-column candidate"),
     );
@@ -1432,11 +1446,16 @@ fn partition_and_file_filters_prune_paths_before_the_query_boundary() {
     let file = column_index(&reader, "file");
 
     let partition_window =
-        filtered_window(&reader, 0, 8, &[equals(year, "2026")]).expect("partition window");
+        filtered_window(&reader, 0, 8, &[equals(&reader, year, "2026")]).expect("partition window");
     assert_eq!(int64_values(&decode_one(&partition_window), 0), [20]);
 
-    let file_window = filtered_window(&reader, 0, 8, &[equals(file, "year=2025/a.parquet")])
-        .expect("provenance window");
+    let file_window = filtered_window(
+        &reader,
+        0,
+        8,
+        &[equals(&reader, file, "year=2025/a.parquet")],
+    )
+    .expect("provenance window");
     assert_eq!(int64_values(&decode_one(&file_window), 0), [10]);
 }
 
@@ -1495,7 +1514,11 @@ fn infers_canonical_integer_hive_columns_across_query_surfaces() {
 
     let direct = decode_one(
         &reader
-            .fetch_columns(0, 8, &[id, year, month, category, empty, file])
+            .fetch_fields(
+                0,
+                8,
+                &field_paths(&reader, &[id, year, month, category, empty, file]),
+            )
             .expect("typed partition window"),
     );
     assert_eq!(int64_values(&direct, 0), [10, 2, 0]);
@@ -1515,7 +1538,12 @@ fn infers_canonical_integer_hive_columns_across_query_surfaces() {
             &reader,
             0,
             8,
-            &[filter(year, DataFilterOperator::Range, &["2", "9"])],
+            &[filter(
+                &reader,
+                year,
+                DataFilterOperator::Range,
+                &["2", "9"],
+            )],
         )
         .expect("numeric partition range"),
     );
@@ -1525,16 +1553,21 @@ fn infers_canonical_integer_hive_columns_across_query_surfaces() {
             &reader,
             0,
             8,
-            &[filter(year, DataFilterOperator::Equals, &["not-a-number"])],
+            &[filter(
+                &reader,
+                year,
+                DataFilterOperator::Equals,
+                &["not-a-number"],
+            )],
         ),
         Err(DataViewError::Engine(DataWindowError::InvalidFilter))
     );
 
     let sorted = DataViewBuilder::for_dataset(
         &reader,
-        &[filter(year, DataFilterOperator::IsNotNull, &[])],
+        &[filter(&reader, year, DataFilterOperator::IsNotNull, &[])],
         &[DataSort {
-            source_index: year,
+            field_path: field_path(&reader, year),
             direction: DataSortDirection::Ascending,
         }],
         DataViewMemoryLimit::Mb384,
@@ -1544,7 +1577,7 @@ fn infers_canonical_integer_hive_columns_across_query_surfaces() {
     .expect("partition view");
     let sparse = decode_one(
         &sorted
-            .fetch_window_columns(0, 8, &[year, id])
+            .fetch_window_fields(0, 8, &field_paths(&reader, &[year, id]))
             .expect("sparse partition window"),
     );
     assert_eq!(integer_optional_values(&sparse, 0), [Some(2), Some(10)]);
@@ -1552,12 +1585,12 @@ fn infers_canonical_integer_hive_columns_across_query_surfaces() {
 
     let statistics = ColumnStatisticsReader::for_dataset(&reader)
         .expect("partition statistics reader")
-        .fetch("year", true)
+        .fetch(&FieldPath::from("year"), true)
         .expect("partition statistics");
     assert_eq!(statistics.minimum.as_deref(), Some("2"));
     assert_eq!(statistics.maximum.as_deref(), Some("10"));
     assert_eq!(statistics.null_share, 1.0 / 3.0);
-    assert_eq!(statistics.approximate_distinct_count, 2);
+    assert_eq!(statistics.approximate_distinct_count, Some(2));
 
     let suggestions =
         TextValueSuggestionsReader::for_dataset(&reader).expect("partition suggestions reader");
@@ -1565,7 +1598,7 @@ fn infers_canonical_integer_hive_columns_across_query_surfaces() {
         suggestions
             .fetch(
                 "0",
-                &reader.summary().schema[month as usize],
+                &field_path(&reader, month),
                 DataFilterOperator::TextContains,
                 &suggestions.interrupt_handle(),
             )
@@ -1578,7 +1611,7 @@ fn infers_canonical_integer_hive_columns_across_query_surfaces() {
     DataExportReader::for_dataset(
         &reader,
         target.clone(),
-        dataset_csv_request(vec![id, year, month, category], vec![]),
+        dataset_csv_request(&reader, vec![id, year, month, category], vec![]),
         None,
     )
     .expect("typed partition export reader")
@@ -1631,7 +1664,7 @@ fn early_sample_and_fixed_composition_use_their_own_hive_types() {
         string_values(
             &decode_one(
                 &reader
-                    .fetch_columns(0, 8, &[year])
+                    .fetch_fields(0, 8, &field_paths(&reader, &[year]))
                     .expect("fixed-composition window"),
             ),
             0,
@@ -1703,9 +1736,44 @@ fn unions_nested_fields_and_qualifies_nested_conflicts() {
         ),
         [None, Some(100)]
     );
+    let city_path = FieldPath::new(["profile", "city"]);
+    let zip_path = FieldPath::new(["profile", "zip"]);
+    let projected = decode_one(
+        &reader
+            .fetch_fields(0, 8, &[zip_path.clone(), city_path.clone()])
+            .expect("nested dataset projection"),
+    );
+    assert_eq!(integer_optional_values(&projected, 0), [None, Some(100)]);
+    assert_eq!(string_values(&projected, 1), [Some("Oslo"), Some("Riga")]);
+
+    let view = DataViewBuilder::for_dataset(
+        &reader,
+        &[DataFilter {
+            field_path: city_path.clone(),
+            operator: DataFilterOperator::Equals,
+            values: vec!["Riga".to_owned()],
+            match_case: false,
+        }],
+        &[DataSort {
+            field_path: zip_path.clone(),
+            direction: DataSortDirection::Descending,
+        }],
+        DataViewMemoryLimit::Mb384,
+    )
+    .expect("nested dataset view builder")
+    .build()
+    .expect("nested dataset view");
+    let prepared = decode_one(
+        &view
+            .fetch_window_fields(0, 8, &[city_path, zip_path])
+            .expect("prepared nested dataset projection"),
+    );
+    assert_eq!(string_values(&prepared, 0), [Some("Riga")]);
+    assert_eq!(integer_optional_values(&prepared, 1), [Some(100)]);
+
     let file = column_index(&reader, "file");
     let first_only = decode_one(
-        &filtered_window(&reader, 0, 8, &[equals(file, "a.parquet")])
+        &filtered_window(&reader, 0, 8, &[equals(&reader, file, "a.parquet")])
             .expect("missing nested child candidate"),
     );
     let first_profile = first_only
@@ -1766,8 +1834,13 @@ fn widens_safe_numeric_drift_and_rejects_lossy_promotions() {
     let numeric_file = column_index(&numeric_reader, "file");
     assert_eq!(
         decode_one(
-            &filtered_window(&numeric_reader, 0, 8, &[equals(numeric_file, "a.parquet")])
-                .expect("numeric subset window")
+            &filtered_window(
+                &numeric_reader,
+                0,
+                8,
+                &[equals(&numeric_reader, numeric_file, "a.parquet")],
+            )
+            .expect("numeric subset window")
         )
         .schema()
         .field(0)
@@ -1797,7 +1870,7 @@ fn widens_safe_numeric_drift_and_rejects_lossy_promotions() {
                 &floating_reader,
                 0,
                 8,
-                &[equals(floating_file, "a.parquet")]
+                &[equals(&floating_reader, floating_file, "a.parquet")]
             )
             .expect("floating subset window")
         )
@@ -1910,9 +1983,9 @@ fn suffixes_colliding_virtual_columns_without_renaming_physical_columns() {
             0,
             8,
             &[
-                equals(virtual_year, "2026"),
-                equals(virtual_file_partition, "archive"),
-                equals(provenance, "year=2026/FILE=archive/a.parquet"),
+                equals(&reader, virtual_year, "2026"),
+                equals(&reader, virtual_file_partition, "archive"),
+                equals(&reader, provenance, "year=2026/FILE=archive/a.parquet"),
             ],
         )
         .expect("suffixed virtual filter"),
@@ -1929,7 +2002,7 @@ fn suffixes_colliding_virtual_columns_without_renaming_physical_columns() {
         &reader,
         &[],
         &[DataSort {
-            source_index: virtual_year,
+            field_path: field_path(&reader, virtual_year),
             direction: DataSortDirection::Ascending,
         }],
         DataViewMemoryLimit::Mb384,
@@ -1948,6 +2021,7 @@ fn suffixes_colliding_virtual_columns_without_renaming_physical_columns() {
         &reader,
         target.clone(),
         dataset_csv_request(
+            &reader,
             vec![0, virtual_year, virtual_file_partition, provenance],
             vec![],
         ),
@@ -1991,18 +2065,22 @@ fn widens_numeric_schema_across_the_catalog_page_boundary() {
 
     let statistics = ColumnStatisticsReader::for_dataset(&reader)
         .expect("dataset statistics")
-        .fetch("value", true)
+        .fetch(&FieldPath::from("value"), true)
         .expect("cross-page statistics");
     assert_eq!(statistics.maximum.as_deref(), Some("9223372036854775807"));
 
     let file_index = column_index(&reader, "file");
-    let file = &reader.summary().schema[file_index as usize];
     let suggestions =
         TextValueSuggestionsReader::for_dataset(&reader).expect("dataset suggestions");
     let interrupt = suggestions.interrupt_handle();
     assert_eq!(
         suggestions
-            .fetch("256", file, DataFilterOperator::TextContains, &interrupt)
+            .fetch(
+                "256",
+                &field_path(&reader, file_index),
+                DataFilterOperator::TextContains,
+                &interrupt,
+            )
             .expect("later-page suggestion")
             .values,
         ["part-256.parquet"]
@@ -2012,7 +2090,7 @@ fn widens_numeric_schema_across_the_catalog_page_boundary() {
         &reader,
         &[],
         &[DataSort {
-            source_index: 0,
+            field_path: FieldPath::from("value"),
             direction: DataSortDirection::Descending,
         }],
         DataViewMemoryLimit::Mb384,
@@ -2022,7 +2100,7 @@ fn widens_numeric_schema_across_the_catalog_page_boundary() {
     .expect("global sort");
     let sorted = decode_one(
         &view
-            .fetch_window_columns(0, 1, &[0])
+            .fetch_window_fields(0, 1, &[FieldPath::from("value")])
             .expect("sorted later-page row"),
     );
     assert_eq!(int64_values(&sorted, 0), [i64::MAX]);
@@ -2031,7 +2109,7 @@ fn widens_numeric_schema_across_the_catalog_page_boundary() {
     DataExportReader::for_dataset(
         &reader,
         target.clone(),
-        dataset_csv_request(vec![0], Vec::new()),
+        dataset_csv_request(&reader, vec![0], Vec::new()),
         None,
     )
     .expect("dataset export")
@@ -2051,7 +2129,7 @@ fn widens_numeric_schema_across_the_catalog_page_boundary() {
     let export = DataExportReader::for_dataset(
         &reader,
         sorted_target.clone(),
-        dataset_csv_request(vec![0], Vec::new()),
+        dataset_csv_request(&reader, vec![0], Vec::new()),
         Some(view.export_snapshot()),
     )
     .expect("sorted dataset export");
@@ -2131,9 +2209,14 @@ fn keeps_producer_types_and_values_across_dataset_query_paths() {
 
     let view = DataViewBuilder::for_dataset(
         &reader,
-        &[filter(alias, DataFilterOperator::NotEquals, &["missing"])],
+        &[filter(
+            &reader,
+            alias,
+            DataFilterOperator::NotEquals,
+            &["missing"],
+        )],
         &[DataSort {
-            source_index: alias,
+            field_path: field_path(&reader, alias),
             direction: DataSortDirection::Ascending,
         }],
         DataViewMemoryLimit::Mb384,
@@ -2167,7 +2250,7 @@ fn keeps_producer_types_and_values_across_dataset_query_paths() {
     DataExportReader::for_dataset(
         &reader,
         target.clone(),
-        dataset_csv_request(vec![0, 1, 2, 3, 4, alias], vec![]),
+        dataset_csv_request(&reader, vec![0, 1, 2, 3, 4, alias], vec![]),
         Some(view.export_snapshot()),
     )
     .expect("typed export reader")
@@ -2434,7 +2517,7 @@ fn preserves_physical_filename_and_file_row_number_columns() {
         &reader,
         &[],
         &[DataSort {
-            source_index: 1,
+            field_path: FieldPath::from("filename"),
             direction: DataSortDirection::Ascending,
         }],
         DataViewMemoryLimit::Mb384,
@@ -2497,7 +2580,7 @@ fn a_pruned_member_is_checked_only_when_a_query_needs_it() {
     assert_eq!(
         int64_values(
             &decode_one(
-                &filtered_window(&reader, 0, 8, &[equals(year, "2025")])
+                &filtered_window(&reader, 0, 8, &[equals(&reader, year, "2025")])
                     .expect("window pruned away from changed member"),
             ),
             0,
@@ -2505,11 +2588,11 @@ fn a_pruned_member_is_checked_only_when_a_query_needs_it() {
         [10]
     );
     assert_eq!(
-        filtered_window(&reader, 0, 8, &[equals(year, "2026")]),
+        filtered_window(&reader, 0, 8, &[equals(&reader, year, "2026")]),
         Err(DataViewError::Engine(DataWindowError::SourceChanged))
     );
     assert_eq!(
-        filtered_window(&reader, 0, 8, &[equals(year, "2025")]),
+        filtered_window(&reader, 0, 8, &[equals(&reader, year, "2025")]),
         Err(DataViewError::Engine(DataWindowError::SourceChanged))
     );
 }
@@ -2630,7 +2713,7 @@ fn fully_empty_dataset_returns_its_schema_and_no_batches() {
     DataExportReader::for_dataset(
         &reader,
         target.clone(),
-        dataset_csv_request(vec![0, 1], vec![]),
+        dataset_csv_request(&reader, vec![0, 1], vec![]),
         None,
     )
     .expect("empty dataset export reader")
@@ -2642,13 +2725,18 @@ fn fully_empty_dataset_returns_its_schema_and_no_batches() {
     );
 }
 
-fn equals(column_index: u32, value: &str) -> DataFilter {
-    filter(column_index, DataFilterOperator::Equals, &[value])
+fn equals(reader: &DatasetWindowReader, column_index: u32, value: &str) -> DataFilter {
+    filter(reader, column_index, DataFilterOperator::Equals, &[value])
 }
 
-fn filter(column_index: u32, operator: DataFilterOperator, values: &[&str]) -> DataFilter {
+fn filter(
+    reader: &DatasetWindowReader,
+    column_index: u32,
+    operator: DataFilterOperator,
+    values: &[&str],
+) -> DataFilter {
     DataFilter {
-        column_index,
+        field_path: field_path(reader, column_index),
         operator,
         values: values.iter().map(|value| (*value).to_owned()).collect(),
         match_case: false,
@@ -2696,6 +2784,19 @@ fn column_index(reader: &DatasetWindowReader, name: &str) -> u32 {
         .expect("dataset column")
 }
 
+fn field_path(reader: &DatasetWindowReader, column_index: u32) -> FieldPath {
+    FieldPath::new(vec![
+        reader.summary().schema[column_index as usize].name.clone(),
+    ])
+}
+
+fn field_paths(reader: &DatasetWindowReader, column_indices: &[u32]) -> Vec<FieldPath> {
+    column_indices
+        .iter()
+        .map(|index| field_path(reader, *index))
+        .collect()
+}
+
 #[test]
 fn prepared_dataset_view_sorts_stably_and_projects_partition_and_file_columns() {
     let directory = TempDir::new().expect("dataset directory");
@@ -2719,7 +2820,7 @@ fn prepared_dataset_view_sorts_stably_and_projects_partition_and_file_columns() 
         &reader,
         &[],
         &[DataSort {
-            source_index: value,
+            field_path: field_path(&reader, value),
             direction: DataSortDirection::Ascending,
         }],
         DataViewMemoryLimit::Mb384,
@@ -2730,7 +2831,7 @@ fn prepared_dataset_view_sorts_stably_and_projects_partition_and_file_columns() 
 
     let batch = decode_one(
         &view
-            .fetch_window_columns(0, 8, &[file, year, value])
+            .fetch_window_fields(0, 8, &field_paths(&reader, &[file, year, value]))
             .expect("prepared dataset window"),
     );
     assert_eq!(
@@ -2768,7 +2869,7 @@ fn prepared_window_reads_512_distinct_one_row_members() {
         &reader,
         &[],
         &[DataSort {
-            source_index: value,
+            field_path: field_path(&reader, value),
             direction: DataSortDirection::Ascending,
         }],
         DataViewMemoryLimit::Mb384,
@@ -2779,7 +2880,7 @@ fn prepared_window_reads_512_distinct_one_row_members() {
 
     let batch = decode_one(
         &view
-            .fetch_window_columns(0, 512, &[value, file])
+            .fetch_window_fields(0, 512, &field_paths(&reader, &[value, file]))
             .expect("maximum prepared window"),
     );
 
@@ -2804,9 +2905,9 @@ fn prepared_dataset_filters_and_sorts_virtual_columns() {
 
     let by_file = DataViewBuilder::for_dataset(
         &reader,
-        &[equals(year, "2026")],
+        &[equals(&reader, year, "2026")],
         &[DataSort {
-            source_index: file,
+            field_path: field_path(&reader, file),
             direction: DataSortDirection::Ascending,
         }],
         DataViewMemoryLimit::Mb384,
@@ -2816,7 +2917,7 @@ fn prepared_dataset_filters_and_sorts_virtual_columns() {
     .expect("prepared dataset view");
     let by_file_batch = decode_one(
         &by_file
-            .fetch_window_columns(0, 8, &[file, year, value])
+            .fetch_window_fields(0, 8, &field_paths(&reader, &[file, year, value]))
             .expect("partition-filtered file sort"),
     );
     assert_eq!(
@@ -2827,13 +2928,13 @@ fn prepared_dataset_filters_and_sorts_virtual_columns() {
     let by_partition = DataViewBuilder::for_dataset(
         &reader,
         &[DataFilter {
-            column_index: file,
+            field_path: field_path(&reader, file),
             operator: DataFilterOperator::TextContains,
             values: vec![".parquet".to_owned()],
             match_case: true,
         }],
         &[DataSort {
-            source_index: year,
+            field_path: field_path(&reader, year),
             direction: DataSortDirection::Descending,
         }],
         DataViewMemoryLimit::Mb384,
@@ -2843,7 +2944,7 @@ fn prepared_dataset_filters_and_sorts_virtual_columns() {
     .expect("prepared dataset view");
     let prepared = decode_one(
         &by_partition
-            .fetch_window_columns(0, 8, &[value, year, file])
+            .fetch_window_fields(0, 8, &field_paths(&reader, &[value, year, file]))
             .expect("file-filtered partition sort"),
     );
     assert_eq!(
@@ -2853,7 +2954,7 @@ fn prepared_dataset_filters_and_sorts_virtual_columns() {
 
     let direct = decode_one(
         &reader
-            .fetch_columns(0, 8, &[value, year, file])
+            .fetch_fields(0, 8, &field_paths(&reader, &[value, year, file]))
             .expect("direct dataset window"),
     );
     assert_eq!(direct.schema(), prepared.schema());
@@ -2874,9 +2975,9 @@ fn prepared_filter_prunes_a_nonmatching_damaged_member_before_staging_scan() {
 
     let view = DataViewBuilder::for_dataset(
         &reader,
-        &[equals(year, "2025")],
+        &[equals(&reader, year, "2025")],
         &[DataSort {
-            source_index: value,
+            field_path: field_path(&reader, value),
             direction: DataSortDirection::Ascending,
         }],
         DataViewMemoryLimit::Mb384,
@@ -2886,7 +2987,7 @@ fn prepared_filter_prunes_a_nonmatching_damaged_member_before_staging_scan() {
     .expect("predicate must reach staged member scans");
     let batch = decode_one(
         &view
-            .fetch_window_columns(0, 8, &[value])
+            .fetch_window_fields(0, 8, &field_paths(&reader, &[value]))
             .expect("prepared window"),
     );
     assert_eq!(int64_values(&batch, 0), [1]);
@@ -2927,7 +3028,7 @@ fn prepared_dataset_view_preserves_native_order_across_parallel_row_group_scans(
         &reader,
         &[],
         &[DataSort {
-            source_index: key,
+            field_path: field_path(&reader, key),
             direction: DataSortDirection::Ascending,
         }],
         DataViewMemoryLimit::Mb768,
@@ -2938,7 +3039,7 @@ fn prepared_dataset_view_preserves_native_order_across_parallel_row_group_scans(
 
     let crossing = decode_one(
         &view
-            .fetch_window_columns(180, 40, &[file, id])
+            .fetch_window_fields(180, 40, &field_paths(&reader, &[file, id]))
             .expect("cross-member page"),
     );
     assert_eq!(
@@ -2956,7 +3057,7 @@ fn prepared_dataset_view_preserves_native_order_across_parallel_row_group_scans(
     let mut actual = int64_values(
         &decode_one(
             &view
-                .fetch_window_columns(0, 512, &[id])
+                .fetch_window_fields(0, 512, &field_paths(&reader, &[id]))
                 .expect("first prepared page"),
         ),
         0,
@@ -2964,7 +3065,7 @@ fn prepared_dataset_view_preserves_native_order_across_parallel_row_group_scans(
     actual.extend(int64_values(
         &decode_one(
             &view
-                .fetch_window_columns(512, 64, &[id])
+                .fetch_window_fields(512, 64, &field_paths(&reader, &[id]))
                 .expect("last prepared page"),
         ),
         0,
@@ -2996,7 +3097,7 @@ fn prepared_dataset_view_preserves_union_schema_after_partition_pruning() {
     let later = column_index(&reader, "later");
     let year = column_index(&reader, "year");
     let filter = DataFilter {
-        column_index: year,
+        field_path: field_path(&reader, year),
         operator: DataFilterOperator::Equals,
         values: vec!["2025".to_owned()],
         match_case: false,
@@ -3005,7 +3106,7 @@ fn prepared_dataset_view_preserves_union_schema_after_partition_pruning() {
         &reader,
         &[filter],
         &[DataSort {
-            source_index: value,
+            field_path: field_path(&reader, value),
             direction: DataSortDirection::Ascending,
         }],
         DataViewMemoryLimit::Mb384,
@@ -3016,7 +3117,7 @@ fn prepared_dataset_view_preserves_union_schema_after_partition_pruning() {
 
     let batch = decode_one(
         &view
-            .fetch_window_columns(0, 4, &[value, later])
+            .fetch_window_fields(0, 4, &field_paths(&reader, &[value, later]))
             .expect("pruned union window"),
     );
     assert_eq!(integer_optional_values(&batch, 0), [Some(1)]);
@@ -3048,7 +3149,7 @@ fn prepared_dataset_sparse_rows_preserve_nested_union_schema() {
         &reader,
         &[],
         &[DataSort {
-            source_index: key,
+            field_path: field_path(&reader, key),
             direction: DataSortDirection::Ascending,
         }],
         DataViewMemoryLimit::Mb384,
@@ -3059,7 +3160,7 @@ fn prepared_dataset_sparse_rows_preserve_nested_union_schema() {
 
     let batch = decode_one(
         &view
-            .fetch_window_columns(0, 2, &[items, key])
+            .fetch_window_fields(0, 2, &field_paths(&reader, &[items, key]))
             .expect("nested sparse window"),
     );
     let schema = batch.schema();
@@ -3100,13 +3201,13 @@ fn prepared_dataset_view_offsets_are_relative_to_pruned_candidates() {
     let view = DataViewBuilder::for_dataset(
         &reader,
         &[DataFilter {
-            column_index: year,
+            field_path: field_path(&reader, year),
             operator: DataFilterOperator::Equals,
             values: vec!["2026".to_owned()],
             match_case: false,
         }],
         &[DataSort {
-            source_index: value,
+            field_path: field_path(&reader, value),
             direction: DataSortDirection::Ascending,
         }],
         DataViewMemoryLimit::Mb384,
@@ -3116,7 +3217,7 @@ fn prepared_dataset_view_offsets_are_relative_to_pruned_candidates() {
     .expect("prepared dataset view");
     let batch = decode_one(
         &view
-            .fetch_window_columns(0, 8, &[file, value])
+            .fetch_window_fields(0, 8, &field_paths(&reader, &[file, value]))
             .expect("pruned candidate window"),
     );
     assert_eq!(
@@ -3132,7 +3233,7 @@ fn prepared_dataset_view_offsets_are_relative_to_pruned_candidates() {
     let empty = DataViewBuilder::for_dataset(
         &reader,
         &[DataFilter {
-            column_index: year,
+            field_path: field_path(&reader, year),
             operator: DataFilterOperator::Equals,
             values: vec!["2099".to_owned()],
             match_case: false,
@@ -3170,7 +3271,7 @@ fn prepared_dataset_view_honors_cancellation_and_the_source_change_latch() {
         &reader,
         &[],
         &[DataSort {
-            source_index: 0,
+            field_path: field_path(&reader, 0),
             direction: DataSortDirection::Ascending,
         }],
         DataViewMemoryLimit::Mb384,
@@ -3185,7 +3286,7 @@ fn prepared_dataset_view_honors_cancellation_and_the_source_change_latch() {
     let invalid_filter = DataViewBuilder::for_dataset(
         &reader,
         &[DataFilter {
-            column_index: 0,
+            field_path: field_path(&reader, 0),
             operator: DataFilterOperator::TextContains,
             values: vec!["1".to_owned()],
             match_case: false,
@@ -3203,7 +3304,7 @@ fn prepared_dataset_view_honors_cancellation_and_the_source_change_latch() {
         &reader,
         &[],
         &[DataSort {
-            source_index: 0,
+            field_path: field_path(&reader, 0),
             direction: DataSortDirection::Ascending,
         }],
         DataViewMemoryLimit::Mb384,
@@ -3233,7 +3334,7 @@ fn prepared_dataset_view_checks_only_members_in_each_window() {
         &reader,
         &[],
         &[DataSort {
-            source_index: 0,
+            field_path: field_path(&reader, 0),
             direction: DataSortDirection::Ascending,
         }],
         DataViewMemoryLimit::Mb384,
@@ -3275,9 +3376,9 @@ fn prepared_grid_and_full_view_export_read_only_selected_source_row_groups() {
     let payload = column_index(&reader, "payload");
     let view = DataViewBuilder::for_dataset(
         &reader,
-        &[filter(key, DataFilterOperator::LessThan, &["8"])],
+        &[filter(&reader, key, DataFilterOperator::LessThan, &["8"])],
         &[DataSort {
-            source_index: key,
+            field_path: field_path(&reader, key),
             direction: DataSortDirection::Descending,
         }],
         DataViewMemoryLimit::Mb384,
@@ -3289,7 +3390,7 @@ fn prepared_grid_and_full_view_export_read_only_selected_source_row_groups() {
 
     let batch = decode_one(
         &view
-            .fetch_window_columns(0, 8, &[payload])
+            .fetch_window_fields(0, 8, &field_paths(&reader, &[payload]))
             .expect("selected row-group window"),
     );
     assert_eq!(
@@ -3301,7 +3402,7 @@ fn prepared_grid_and_full_view_export_read_only_selected_source_row_groups() {
     DataExportReader::for_dataset(
         &reader,
         target.clone(),
-        dataset_csv_request(vec![payload], Vec::new()),
+        dataset_csv_request(&reader, vec![payload], Vec::new()),
         Some(view.export_snapshot()),
     )
     .expect("prepared dataset export")
@@ -3334,6 +3435,7 @@ fn exports_whole_dataset_with_union_partition_and_file_columns_in_native_order()
         complete_reader(DatasetSource::open_folder(directory.path()).expect("folder dataset"));
     let target = directory.path().join("whole.csv");
     let request = dataset_csv_request(
+        &reader,
         [&reader, &reader, &reader, &reader]
             .into_iter()
             .zip(["value", "note", "year", "file"])
@@ -3362,6 +3464,7 @@ fn exports_whole_dataset_with_union_partition_and_file_columns_in_native_order()
         &reader,
         ranged_target.clone(),
         dataset_csv_request(
+            &reader,
             vec![
                 column_index(&reader, "value"),
                 column_index(&reader, "file"),
@@ -3391,13 +3494,13 @@ fn exports_dataset_view_ranges_in_exact_filtered_and_sorted_order() {
     let view = DataViewBuilder::for_dataset(
         &reader,
         &[DataFilter {
-            column_index: value,
+            field_path: field_path(&reader, value),
             operator: DataFilterOperator::LessThanOrEqual,
             values: vec!["2".to_owned()],
             match_case: false,
         }],
         &[DataSort {
-            source_index: value,
+            field_path: field_path(&reader, value),
             direction: DataSortDirection::Ascending,
         }],
         DataViewMemoryLimit::Mb384,
@@ -3406,7 +3509,11 @@ fn exports_dataset_view_ranges_in_exact_filtered_and_sorted_order() {
     .build()
     .expect("prepared dataset view");
     let target = directory.path().join("view.csv");
-    let request = dataset_csv_request(vec![file, value], vec![ExportRowRange { start: 1, end: 3 }]);
+    let request = dataset_csv_request(
+        &reader,
+        vec![file, value],
+        vec![ExportRowRange { start: 1, end: 3 }],
+    );
 
     DataExportReader::for_dataset(
         &reader,
@@ -3441,7 +3548,7 @@ fn dataset_export_rejects_foreign_views_member_targets_and_preserves_cancelled_t
         .expect("dataset view builder")
         .build()
         .expect("prepared dataset view");
-    let request = dataset_csv_request(vec![column_index(&first, "value")], vec![]);
+    let request = dataset_csv_request(&first, vec![column_index(&first, "value")], vec![]);
 
     assert!(matches!(
         DataExportReader::for_dataset(
@@ -3526,23 +3633,23 @@ fn dataset_statistics_and_suggestions_cover_union_partition_and_file_columns() {
 
     let label_statistics = ColumnStatisticsReader::for_dataset(&reader)
         .expect("dataset statistics reader")
-        .fetch("label", true)
+        .fetch(&FieldPath::from("label"), true)
         .expect("label statistics");
     assert_eq!(label_statistics.minimum.as_deref(), Some("alpha"));
     assert_eq!(label_statistics.maximum.as_deref(), Some("alpha"));
     assert_eq!(label_statistics.null_share, 2.0 / 3.0);
-    assert_eq!(label_statistics.approximate_distinct_count, 1);
+    assert_eq!(label_statistics.approximate_distinct_count, Some(1));
 
     let value_statistics = ColumnStatisticsReader::for_dataset(&reader)
         .expect("dataset statistics reader")
-        .fetch("value", true)
+        .fetch(&FieldPath::from("value"), true)
         .expect("promoted numeric statistics");
     assert_eq!(value_statistics.minimum.as_deref(), Some("1"));
     assert_eq!(value_statistics.maximum.as_deref(), Some("3"));
 
     let file_statistics = ColumnStatisticsReader::for_dataset(&reader)
         .expect("dataset statistics reader")
-        .fetch("file", true)
+        .fetch(&FieldPath::from("file"), true)
         .expect("file statistics");
     assert_eq!(
         file_statistics.minimum.as_deref(),
@@ -3556,28 +3663,28 @@ fn dataset_statistics_and_suggestions_cover_union_partition_and_file_columns() {
 
     let suggestions =
         TextValueSuggestionsReader::for_dataset(&reader).expect("dataset suggestion reader");
-    let label = reader
-        .summary()
-        .schema
-        .get(column_index(&reader, "label") as usize)
-        .expect("label schema");
     let handle = suggestions.interrupt_handle();
     assert_eq!(
         suggestions
-            .fetch("alp", label, DataFilterOperator::TextContains, &handle)
+            .fetch(
+                "alp",
+                &FieldPath::from("label"),
+                DataFilterOperator::TextContains,
+                &handle,
+            )
             .expect("label suggestions")
             .values,
         ["alpha"]
     );
-    let file = reader
-        .summary()
-        .schema
-        .get(column_index(&reader, "file") as usize)
-        .expect("file schema");
     let handle = suggestions.interrupt_handle();
     assert_eq!(
         suggestions
-            .fetch("2026", file, DataFilterOperator::TextContains, &handle)
+            .fetch(
+                "2026",
+                &FieldPath::from("file"),
+                DataFilterOperator::TextContains,
+                &handle,
+            )
             .expect("file suggestions")
             .values,
         ["year=2026/b.parquet"]
@@ -3590,13 +3697,23 @@ fn dataset_statistics_and_suggestions_cover_union_partition_and_file_columns() {
     assert_eq!(year.physical_type, "INT64");
     let handle = suggestions.interrupt_handle();
     assert_eq!(
-        suggestions.fetch("2025", year, DataFilterOperator::TextContains, &handle),
+        suggestions.fetch(
+            "2025",
+            &FieldPath::from("year"),
+            DataFilterOperator::TextContains,
+            &handle,
+        ),
         Err(DataWindowError::InvalidFilter)
     );
     let cancelled = suggestions.interrupt_handle();
     cancelled.interrupt();
     assert!(matches!(
-        suggestions.fetch("", file, DataFilterOperator::TextContains, &cancelled),
+        suggestions.fetch(
+            "",
+            &FieldPath::from("file"),
+            DataFilterOperator::TextContains,
+            &cancelled,
+        ),
         Err(DataWindowError::Cancelled)
     ));
 }
@@ -3612,7 +3729,7 @@ fn dataset_operations_diagnose_only_scanned_members_and_latch_selected_corruptio
     let year = column_index(&reader, "year");
     let view = DataViewBuilder::for_dataset(
         &reader,
-        &[equals(year, "2026")],
+        &[equals(&reader, year, "2026")],
         &[],
         DataViewMemoryLimit::Mb384,
     )
@@ -3625,7 +3742,7 @@ fn dataset_operations_diagnose_only_scanned_members_and_latch_selected_corruptio
         ColumnStatisticsReader::for_dataset(&reader).expect("dataset statistics reader");
     cancelled_statistics.interrupt_handle().interrupt();
     assert!(matches!(
-        cancelled_statistics.fetch("value", true),
+        cancelled_statistics.fetch(&FieldPath::from("value"), true),
         Err(viewda_data_engine::ColumnStatisticsError::QueryFailed)
     ));
 
@@ -3633,7 +3750,7 @@ fn dataset_operations_diagnose_only_scanned_members_and_latch_selected_corruptio
     DataExportReader::for_dataset(
         &reader,
         target.clone(),
-        dataset_csv_request(vec![column_index(&reader, "value")], vec![]),
+        dataset_csv_request(&reader, vec![column_index(&reader, "value")], vec![]),
         Some(view.export_snapshot()),
     )
     .expect("pruned view export reader")
@@ -3647,7 +3764,7 @@ fn dataset_operations_diagnose_only_scanned_members_and_latch_selected_corruptio
     assert!(matches!(
         ColumnStatisticsReader::for_dataset(&reader)
             .expect("dataset statistics reader")
-            .fetch("value", true),
+            .fetch(&FieldPath::from("value"), true),
         Err(viewda_data_engine::ColumnStatisticsError::CorruptSource)
     ));
     assert!(matches!(
@@ -3709,11 +3826,12 @@ fn selected_dataset_member_snapshot_is_stable_and_loads_structure_without_an_abs
 }
 
 fn dataset_csv_request(
+    reader: &DatasetWindowReader,
     column_indices: Vec<u32>,
     row_ranges: Vec<ExportRowRange>,
 ) -> DataExportRequest {
     DataExportRequest {
-        column_indices,
+        field_paths: field_paths(reader, &column_indices),
         row_ranges,
         output: DataExportFormat::Csv {
             options: CsvExportOptions::default(),

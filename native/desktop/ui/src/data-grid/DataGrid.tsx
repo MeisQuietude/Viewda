@@ -1,6 +1,7 @@
 import {
   useCallback,
   useEffect,
+  useId,
   useLayoutEffect,
   useMemo,
   useRef,
@@ -27,6 +28,7 @@ import {
   type DataExportScope,
   type DataExportStatus,
   type DataFilter,
+  type FieldPath,
   type DataViewSettings,
   type DataViewResourceDiagnostics,
   type SortColumn,
@@ -36,14 +38,16 @@ import {
 import { loadBundledEmojiFont } from "../fonts";
 import {
   decodeArrowWindow,
-  windowArrowValue,
+  windowArrowValueAt,
   windowContainsRow,
   windowDataType,
+  windowDataTypeAt,
   windowValue,
+  windowValueAt,
   type ArrowDataWindow,
 } from "./arrow-window";
 import { copyRowLimit } from "./copy-limit";
-import { projectedSourceIndices, projectionContains } from "./column-window";
+import { projectedFieldPaths, projectionContains } from "./column-window";
 import { exportSelectionShape } from "./export-selection";
 import {
   formatTypedScalarCopyData,
@@ -97,8 +101,16 @@ import {
   type RowRequest,
   type ScrollState,
 } from "./row-window";
-import { SchemaSidebar } from "./SchemaSidebar";
+import { formatDataTypeLabel, SchemaSidebar } from "./SchemaSidebar";
 import { nextSort } from "./sort";
+import {
+  fieldPathKey,
+  fieldPathStartsWith,
+  formatFieldPath,
+  formatFieldPathSegment,
+  resolveSchemaField,
+  sameFieldPath,
+} from "./field-path";
 import { ColumnPicker } from "./ColumnPicker";
 import { ValuePeek } from "./ValuePeek";
 import { arrowTypedValue, typedValue, type TypedValue } from "./value-format";
@@ -137,7 +149,7 @@ const PROJECTION_REQUEST_IDLE_MS = 120;
 // profiles if workloads eventually need different defaults.
 const SUPPLEMENT_WINDOW_MULTIPLIER = 2;
 const DEFAULT_DATA_VIEW_SETTINGS: DataViewSettings = { memoryLimit: "mb384" };
-const EMPTY_LOGICAL_DATA_TYPES: ReadonlyMap<number, DataType> = new Map();
+const EMPTY_LOGICAL_DATA_TYPES: ReadonlyMap<string, DataType> = new Map();
 const EMPTY_SOURCE_INDICES: ReadonlySet<number> = new Set();
 
 // Detect clipboard support once per webview so copy format stays consistent.
@@ -184,7 +196,10 @@ function fittedColumnWidth(
 }
 
 interface ColumnState {
+  key: string;
   sourceIndex: number;
+  fieldPath: FieldPath;
+  field: SchemaField;
   title: string;
   width: number;
   pinned: boolean;
@@ -192,7 +207,8 @@ interface ColumnState {
 }
 
 interface HeaderMenu {
-  sourceIndex: number;
+  columnKey: string;
+  fieldPath: FieldPath;
   left: number;
   top: number;
 }
@@ -201,7 +217,8 @@ interface GridMenu {
   bounds: Rectangle;
   column: number;
   row: number;
-  sourceIndex: number;
+  columnKey: string;
+  fieldPath: FieldPath;
   left: number;
   top: number;
 }
@@ -217,7 +234,7 @@ interface PeekValue {
 }
 
 interface ActiveCellValueCache {
-  sourceIndex: number;
+  fieldKey: string;
   row: number;
   dataWindow: ArrowDataWindow;
   value: TypedValue;
@@ -225,7 +242,7 @@ interface ActiveCellValueCache {
 }
 
 interface PeekValueCache {
-  sourceIndex: number;
+  fieldKey: string;
   row: number;
   dataWindow: ArrowDataWindow;
   label: string;
@@ -248,7 +265,7 @@ interface VersionedRowRequest {
   rows: RowRequest;
   revision: number;
   projectionRevision: number;
-  sourceIndices: readonly number[];
+  fieldPaths: readonly FieldPath[];
   // The row window owns the prefetched rows. The column supplement fills
   // columns absent from it for the much smaller mounted-row runway.
   cacheSlot: "rowWindow" | "columnSupplement";
@@ -261,7 +278,7 @@ interface DesiredRowRequest {
   supplementRows: RowRequest;
   revision: number;
   projectionRevision: number;
-  sourceIndices: readonly number[];
+  fieldPaths: readonly FieldPath[];
 }
 
 interface ActiveView {
@@ -292,7 +309,7 @@ function requestSatisfiesWindow(
     candidate.revision === requested.revision &&
     candidate.projectionRevision === requested.projectionRevision &&
     requestSatisfiesRequest(candidate.rows, requested.rows) &&
-    projectionContains(candidate.sourceIndices, requested.sourceIndices)
+    projectionContains(candidate.fieldPaths, requested.fieldPaths)
   );
 }
 
@@ -329,20 +346,20 @@ function requestCoversDesiredVisible(
   if (candidate.cacheSlot === "rowWindow") {
     return (
       requestContainsVisibleRows(candidate.rows, desired.rows) &&
-      projectionContains(candidate.sourceIndices, desired.sourceIndices)
+      projectionContains(candidate.fieldPaths, desired.fieldPaths)
     );
   }
   return (
     base !== null &&
     windowSatisfiesRequest(base.rowOffset, base.rowCount, desired.rows) &&
-    !projectionContains(base.sourceIndices, desired.sourceIndices) &&
+    !projectionContains(base.fieldPaths, desired.fieldPaths) &&
     candidate.rows.offset >= base.rowOffset &&
     candidate.rows.offset + candidate.rows.count <=
       base.rowOffset + base.rowCount &&
     requestSatisfiesRequest(candidate.rows, desired.supplementRows) &&
     projectionContains(
-      [...base.sourceIndices, ...candidate.sourceIndices],
-      desired.sourceIndices,
+      [...base.fieldPaths, ...candidate.fieldPaths],
+      desired.fieldPaths,
     )
   );
 }
@@ -360,7 +377,7 @@ function requestFullySatisfiesDesired(
     candidate.revision === desired.revision &&
     candidate.projectionRevision === desired.projectionRevision &&
     requestSatisfiesRequest(candidate.rows, desired.rows) &&
-    projectionContains(candidate.sourceIndices, desired.sourceIndices)
+    projectionContains(candidate.fieldPaths, desired.fieldPaths)
   );
 }
 
@@ -375,7 +392,7 @@ function windowsSatisfyDesired(
   ) {
     return false;
   }
-  if (projectionContains(base.sourceIndices, desired.sourceIndices)) {
+  if (projectionContains(base.fieldPaths, desired.fieldPaths)) {
     return true;
   }
   return (
@@ -386,8 +403,8 @@ function windowsSatisfyDesired(
       desired.supplementRows,
     ) &&
     projectionContains(
-      [...base.sourceIndices, ...supplement.sourceIndices],
-      desired.sourceIndices,
+      [...base.fieldPaths, ...supplement.fieldPaths],
+      desired.fieldPaths,
     )
   );
 }
@@ -440,7 +457,7 @@ function viewDefinitionEquals(
       const next = filters[index];
       return (
         next !== undefined &&
-        filter.columnIndex === next.columnIndex &&
+        sameFieldPath(filter.fieldPath, next.fieldPath) &&
         filter.operator === next.operator &&
         (filter.matchCase ?? false) === (next.matchCase ?? false) &&
         filter.values.length === next.values.length &&
@@ -454,7 +471,7 @@ function viewDefinitionEquals(
       const next = sort[index];
       return (
         next !== undefined &&
-        column.sourceIndex === next.sourceIndex &&
+        sameFieldPath(column.fieldPath, next.fieldPath) &&
         column.direction === next.direction
       );
     })
@@ -570,24 +587,28 @@ export function DataGrid({
   const schemaPageRequest = useRef(0);
   const schemaPageActive = useRef(false);
   const schemaSource = useMemo(() => ({ ...source, schema }), [schema, source]);
-  const [columnStates, setColumnStates] = useState<ColumnState[]>(() =>
-    source.schema.map((field, sourceIndex) => ({
-      sourceIndex,
-      title: field.name,
-      width: Math.min(
-        280,
-        Math.max(MIN_COLUMN_WIDTH, field.name.length * 8 + 48),
+  const [columnStates, setColumnStates] = useState<ColumnState[]>(() => {
+    const duplicateNames = duplicateTopLevelNames(source.schema);
+    return source.schema.map((field, sourceIndex) =>
+      sourceColumnState(
+        source.schema,
+        duplicateNames,
+        field,
+        sourceIndex,
+        defaultPinnedSourceIndices.has(sourceIndex),
       ),
-      pinned: defaultPinnedSourceIndices.has(sourceIndex),
-      hidden: false,
-    })),
-  );
-  const [monospaceColumns, setMonospaceColumns] = useState<ReadonlySet<number>>(
+    );
+  });
+  const [flattenedParents, setFlattenedParents] = useState<
+    ReadonlyMap<string, ColumnState>
+  >(() => new Map());
+  const [columnNotice, setColumnNotice] = useState<string | null>(null);
+  const [monospaceColumns, setMonospaceColumns] = useState<ReadonlySet<string>>(
     () => new Set(),
   );
   const [logicalSchema, setLogicalSchema] = useState<{
     generation: number;
-    dataTypes: ReadonlyMap<number, DataType>;
+    dataTypes: ReadonlyMap<string, DataType>;
   }>(() => ({ generation: source.generation, dataTypes: new Map() }));
   const logicalDataTypes =
     logicalSchema.generation === source.generation
@@ -636,9 +657,8 @@ export function DataGrid({
   const [sortPopupOpen, setSortPopupOpen] = useState(false);
   const [sortDraft, setSortDraft] = useState<SortColumn[]>([]);
   const [sidebarOpen, setSidebarOpen] = useState(false);
-  const [selectedSchemaColumn, setSelectedSchemaColumn] = useState<
-    number | null
-  >(null);
+  const [selectedSchemaPath, setSelectedSchemaPath] =
+    useState<FieldPath | null>(null);
   const [schemaFocusRequest, setSchemaFocusRequest] = useState(0);
   const gridRef = useRef<ViewdaGridHandle>(null);
   useEffect(() => {
@@ -655,7 +675,7 @@ export function DataGrid({
     appliedRequestedRow.current = requestedRow.request;
     gridRef.current?.scrollToRow(requestedRow.row);
   }, [requestedRow]);
-  const schemaFocusColumnRef = useRef<number | null>(null);
+  const schemaFocusPathRef = useRef<FieldPath | null>(null);
   const visibleColumnStatesRef = useRef<readonly ColumnState[]>([]);
   // The display cache holds one row window and one column supplement. The row
   // window owns the prefetch range. The supplement holds columns missing from
@@ -686,8 +706,8 @@ export function DataGrid({
   const contentIdentityRef = useRef(contentIdentity);
   const sourceSchemaRef = useRef(source.schema);
   const projectionRevisionRef = useRef(0);
-  const previousProjectionRef = useRef<readonly number[] | null>(null);
-  const requestedProjectionRef = useRef<readonly number[]>([]);
+  const previousProjectionRef = useRef<readonly FieldPath[] | null>(null);
+  const requestedProjectionRef = useRef<readonly FieldPath[]>([]);
   const desiredRequestRef = useRef<DesiredRowRequest | null>(null);
   const scrollStateRef = useRef<ScrollState>({ direction: 0, boundary: 0 });
   const aliveRef = useRef(true);
@@ -744,6 +764,20 @@ export function DataGrid({
     ],
     [columnStates],
   );
+  const ambiguousTopLevelNames = useMemo(
+    () => duplicateTopLevelNames(schema),
+    [schema],
+  );
+  const pathActionsAvailable = ambiguousTopLevelNames.size === 0;
+  const identitySchemaPending =
+    !pathActionsAvailable &&
+    source.schemaIsTruncated &&
+    (schemaTotal === null || schema.length < schemaTotal);
+  const duplicatePathActionsReasonId = useId();
+  const identityFieldPaths = useMemo(
+    () => schema.map((field) => [field.name]),
+    [schema],
+  );
   visibleColumnStatesRef.current = visibleColumnStates;
   const activeCell = selection.current?.cell;
   useLayoutEffect(() => {
@@ -756,64 +790,16 @@ export function DataGrid({
     activeCellRef.current = activeCell;
   }, [activeCell, activeCellRef]);
   const hiddenCount = columnStates.length - visibleColumnStates.length;
+  const selectIsIdentity =
+    hiddenCount === 0 &&
+    visibleColumnStates.length === schema.length &&
+    visibleColumnStates.every(
+      (column, index) =>
+        column.sourceIndex === index &&
+        column.fieldPath.length === 1 &&
+        column.fieldPath[0] === schema[index]?.name,
+    );
   activeViewRef.current = activeView;
-
-  const loadMoreSchema = useCallback(async () => {
-    if (schemaPageActive.current) {
-      return;
-    }
-    schemaPageActive.current = true;
-    const request = ++schemaPageRequest.current;
-    const offset = schema.length;
-    setSchemaPageLoading(true);
-    setSchemaPageError(false);
-    try {
-      const page = await getSourceSchemaPage(source.generation, offset, 256);
-      if (schemaPageRequest.current === request && page.offset === offset) {
-        setSchemaTotal(page.totalCount);
-        setSchema((current) =>
-          current.length === page.offset
-            ? [...current, ...page.columns]
-            : current,
-        );
-        setColumnStates((current) =>
-          current.length === page.offset
-            ? [
-                ...current,
-                ...page.columns.map((field, pageIndex) => {
-                  const sourceIndex = page.offset + pageIndex;
-                  return {
-                    sourceIndex,
-                    title: field.name,
-                    width: Math.min(
-                      280,
-                      Math.max(MIN_COLUMN_WIDTH, field.name.length * 8 + 48),
-                    ),
-                    pinned: defaultPinnedSourceIndices.has(sourceIndex),
-                    hidden: false,
-                  };
-                }),
-              ]
-            : current,
-        );
-      }
-    } catch {
-      if (schemaPageRequest.current === request) {
-        setSchemaPageError(true);
-      }
-    } finally {
-      if (schemaPageRequest.current === request) {
-        schemaPageActive.current = false;
-        setSchemaPageLoading(false);
-      }
-    }
-  }, [defaultPinnedSourceIndices, schema.length, source.generation]);
-
-  useEffect(() => {
-    if (active && source.schemaIsTruncated && schemaTotal === null) {
-      void loadMoreSchema();
-    }
-  }, [active, loadMoreSchema, schemaTotal, source.schemaIsTruncated]);
 
   const nextSuggestionRevision = useCallback(() => {
     nextSuggestionRevisionRef.current += 1;
@@ -823,37 +809,45 @@ export function DataGrid({
   const filters = activeView.filters;
   const sort = activeView.sort;
   const gridRowCount = activeView.rowCount;
-  const visibleSourceIndices = useMemo(
-    () => visibleColumnStates.map((column) => column.sourceIndex),
+  const visibleFieldPaths = useMemo(
+    () => visibleColumnStates.map((column) => column.fieldPath),
     [visibleColumnStates],
   );
-  const visibleProjectionKey = visibleSourceIndices.join(",");
+  const visibleProjectionKey = visibleFieldPaths.map(fieldPathKey).join("\0");
   const selectTitle = useMemo(() => {
-    if (hiddenCount === 0) {
+    if (selectIsIdentity) {
       return "*";
     }
-    if (visibleSourceIndices.length > SELECT_TOOLTIP_COLUMN_LIMIT) {
-      return `${visibleSourceIndices.length.toLocaleString("en-US")} of ${columnStates.length.toLocaleString("en-US")} columns visible`;
+    if (!pathActionsAvailable) {
+      return "All source columns in physical order";
     }
-    return formatSelectClause(visibleSourceIndices, schema);
-  }, [columnStates.length, hiddenCount, schema, visibleSourceIndices]);
+    if (visibleFieldPaths.length > SELECT_TOOLTIP_COLUMN_LIMIT) {
+      return `${visibleFieldPaths.length.toLocaleString("en-US")} of ${columnStates.length.toLocaleString("en-US")} columns visible`;
+    }
+    return formatSelectClause(visibleFieldPaths, schema);
+  }, [
+    columnStates.length,
+    pathActionsAvailable,
+    schema,
+    selectIsIdentity,
+    visibleFieldPaths,
+  ]);
   const pickerColumns = useMemo(
     () =>
       columnStates.map((column) => {
-        const field = schema[column.sourceIndex];
         return {
-          sourceIndex: column.sourceIndex,
+          id: column.key,
           name: column.title,
-          type: field?.logicalType ?? field?.physicalType ?? "Unknown",
+          type: column.field.logicalType ?? column.field.physicalType,
           visible: !column.hidden,
           pinned: column.pinned,
         };
       }),
-    [columnStates, schema],
+    [columnStates],
   );
   const selectedExport = useMemo(
-    () => exportSelectionShape(selection, visibleSourceIndices, gridRowCount),
-    [gridRowCount, selection, visibleSourceIndices],
+    () => exportSelectionShape(selection, visibleFieldPaths, gridRowCount),
+    [gridRowCount, selection, visibleFieldPaths],
   );
   const whereClause = useMemo(
     () => formatWhereClause(filters, schema),
@@ -882,20 +876,62 @@ export function DataGrid({
 
   const columns = useMemo<GridColumn[]>(
     () =>
-      visibleColumnStates.map((column) => {
+      visibleColumnStates.map((column, index) => {
         const displayedSort = pendingView?.sort ?? sort;
-        const sortIndex = displayedSort.findIndex(
-          (entry) => entry.sourceIndex === column.sourceIndex,
+        const sortIndex = displayedSort.findIndex((entry) =>
+          sameFieldPath(entry.fieldPath, column.fieldPath),
         );
+        const key = column.key;
+        const groupPath = flattenedRailPath(
+          column.fieldPath,
+          column.pinned,
+          flattenedParents,
+        );
+        const sameGroup = (candidate: ColumnState | undefined) =>
+          candidate !== undefined &&
+          candidate.pinned === column.pinned &&
+          groupPath !== null &&
+          sameFieldPath(
+            flattenedRailPath(
+              candidate.fieldPath,
+              candidate.pinned,
+              flattenedParents,
+            ) ?? [],
+            groupPath,
+          );
+        const groupType =
+          groupPath === null
+            ? undefined
+            : logicalDataTypes.get(fieldPathKey(groupPath));
+        const prefix = column.fieldPath.slice(0, -1);
         return {
-          id: String(column.sourceIndex),
+          id: key,
           title: column.title,
+          ...(prefix.length === 0
+            ? {}
+            : {
+                titlePrefix: `${prefix.map(formatFieldPathSegment).join(".")}.`,
+                titleLeaf: formatFieldPathSegment(column.fieldPath.at(-1)!),
+              }),
+          ...(groupPath === null
+            ? {}
+            : {
+                groupRail: {
+                  title: `${formatFieldPath(groupPath)} · ${
+                    groupType === undefined
+                      ? schemaRailType(resolveSchemaField(schema, groupPath))
+                      : formatDataTypeLabel(groupType)
+                  }`,
+                  start: !sameGroup(visibleColumnStates[index - 1]),
+                  end: !sameGroup(visibleColumnStates[index + 1]),
+                },
+              }),
           width: column.width,
-          monospace: monospaceColumns.has(column.sourceIndex),
+          monospace: monospaceColumns.has(key),
           pinned: column.pinned,
           pending: pendingView !== null && sortIndex >= 0,
-          sortable: true,
-          filterable: true,
+          sortable: pathActionsAvailable,
+          filterable: pathActionsAvailable,
           sort: {
             direction:
               sortIndex < 0
@@ -908,39 +944,53 @@ export function DataGrid({
           },
         };
       }),
-    [monospaceColumns, pendingView, sort, visibleColumnStates],
+    [
+      flattenedParents,
+      logicalDataTypes,
+      monospaceColumns,
+      pendingView,
+      pathActionsAvailable,
+      schema,
+      sort,
+      visibleColumnStates,
+    ],
   );
 
   const materializeCellValue = useCallback(
     (
       dataWindow: ArrowDataWindow,
-      sourceIndex: number,
+      column: ColumnState,
       row: number,
       useActiveCellCache: boolean,
     ): { value: TypedValue; dataType: DataType } | undefined => {
       const cache = activeCellValueCacheRef.current;
+      const fieldKey = column.key;
       if (
         useActiveCellCache &&
         cache !== null &&
-        cache.sourceIndex === sourceIndex &&
+        cache.fieldKey === fieldKey &&
         cache.row === row &&
         cache.dataWindow === dataWindow
       ) {
         return cache;
       }
-      const dataType = windowDataType(dataWindow, sourceIndex);
+      const columnOffset = pathActionsAvailable
+        ? dataWindow.fieldColumnOffsets.get(fieldKey)
+        : column.sourceIndex;
+      if (columnOffset === undefined) return undefined;
+      const dataType = windowDataTypeAt(dataWindow, columnOffset);
       if (dataType === undefined) return undefined;
-      const arrowValue = windowArrowValue(dataWindow, sourceIndex, row);
+      const arrowValue = windowArrowValueAt(dataWindow, columnOffset, row);
       const result = {
         value:
           arrowValue === undefined
-            ? typedValue(windowValue(dataWindow, sourceIndex, row), dataType)
+            ? typedValue(windowValueAt(dataWindow, columnOffset, row), dataType)
             : arrowTypedValue(arrowValue),
         dataType,
       };
       if (useActiveCellCache) {
         activeCellValueCacheRef.current = {
-          sourceIndex,
+          fieldKey,
           row,
           dataWindow,
           ...result,
@@ -948,7 +998,7 @@ export function DataGrid({
       }
       return result;
     },
-    [],
+    [pathActionsAvailable],
   );
 
   const readCell = useCallback(
@@ -970,7 +1020,7 @@ export function DataGrid({
         activeCell.row === row;
       const materialized = materializeCellValue(
         window,
-        column.sourceIndex,
+        column,
         row,
         cacheActiveCell,
       );
@@ -995,13 +1045,17 @@ export function DataGrid({
 
   const getCellContent = useCallback(
     ({ column, row }: GridAddress): GridCell => {
-      const sourceIndex = visibleColumnStatesRef.current[column]?.sourceIndex;
+      const visible = visibleColumnStatesRef.current[column];
       const supplement = supplementWindowRef.current;
       if (
-        sourceIndex !== undefined &&
+        visible !== undefined &&
         supplement !== null &&
         windowContainsRow(supplement, row) &&
-        supplement.sourceColumnOffsets.has(sourceIndex)
+        (pathActionsAvailable ||
+          supplement.table.schema.fields[visible.sourceIndex] !== undefined) &&
+        (pathActionsAvailable
+          ? supplement.fieldColumnOffsets.has(visible.key)
+          : true)
       ) {
         return readCell(supplement, column, row);
       }
@@ -1020,7 +1074,9 @@ export function DataGrid({
       const dataWindow =
         supplement !== null &&
         windowContainsRow(supplement, address.row) &&
-        supplement.sourceColumnOffsets.has(column.sourceIndex)
+        (pathActionsAvailable
+          ? supplement.fieldColumnOffsets.has(column.key)
+          : supplement.table.schema.fields[column.sourceIndex] !== undefined)
           ? supplement
           : base;
       if (dataWindow === null || !windowContainsRow(dataWindow, address.row)) {
@@ -1028,17 +1084,18 @@ export function DataGrid({
       }
       const materialized = materializeCellValue(
         dataWindow,
-        column.sourceIndex,
+        column,
         address.row,
         true,
       );
       if (materialized === undefined) return undefined;
-      const logicalType = schema[column.sourceIndex]?.logicalType;
+      const logicalType = column.field.logicalType;
+      const fieldKey = column.key;
       const cached = peekValueCacheRef.current;
       if (
         cached !== null &&
         cached.dataWindow === dataWindow &&
-        cached.sourceIndex === column.sourceIndex &&
+        cached.fieldKey === fieldKey &&
         cached.row === address.row &&
         cached.label === column.title &&
         cached.logicalType === logicalType
@@ -1059,7 +1116,7 @@ export function DataGrid({
               : materialized.value,
       };
       peekValueCacheRef.current = {
-        sourceIndex: column.sourceIndex,
+        fieldKey,
         row: address.row,
         dataWindow,
         label: column.title,
@@ -1068,7 +1125,7 @@ export function DataGrid({
       };
       return peekValue;
     },
-    [materializeCellValue, schema],
+    [materializeCellValue, pathActionsAvailable],
   );
 
   const openPeek = useCallback(
@@ -1100,8 +1157,8 @@ export function DataGrid({
         reason: request.reason,
         rowOffset: request.rows.offset,
         rowCount: request.rows.count,
-        projectionCount: request.sourceIndices.length,
-        projectionKey: projectionFingerprint(request.sourceIndices),
+        projectionCount: request.fieldPaths.length,
+        projectionKey: projectionFingerprint(request.fieldPaths),
         filtered: view.filters.length > 0,
         sorted: view.sort.length > 0,
       });
@@ -1169,6 +1226,139 @@ export function DataGrid({
     [clearDeferredProjection, diagnostics, replaceDataWindow],
   );
 
+  const loadMoreSchema = useCallback(async () => {
+    if (schemaPageActive.current) return;
+    schemaPageActive.current = true;
+    const request = ++schemaPageRequest.current;
+    const offset = schema.length;
+    setSchemaPageLoading(true);
+    setSchemaPageError(false);
+    try {
+      const page = await getSourceSchemaPage(source.generation, offset, 256);
+      if (schemaPageRequest.current === request && page.offset === offset) {
+        setSchemaTotal(page.totalCount);
+        setSchema((current) => {
+          const merged = [...current];
+          page.columns.forEach((field, pageIndex) => {
+            merged[page.offset + pageIndex] = field;
+          });
+          return merged;
+        });
+        const completeSchema = [...schema, ...page.columns];
+        const duplicateNames = duplicateTopLevelNames(completeSchema);
+        if (duplicateNames.size > 0) {
+          const currentView = pendingViewRef.current ?? activeViewRef.current;
+          if (
+            pendingViewRef.current !== null ||
+            currentView.revision !== 0 ||
+            currentView.filters.length > 0 ||
+            currentView.sort.length > 0
+          ) {
+            void cancelDataView(source.generation, currentView.revision).catch(
+              () => {
+                // Revision zero remains readable even if the prepared view has
+                // already finished and can no longer be cancelled.
+              },
+            );
+          }
+          projectionRevisionRef.current += 1;
+          promoteView(0, source.rowCount, [], []);
+          setFlattenedParents(new Map());
+          setColumnNotice(null);
+          setColumnStates((current) =>
+            completeSchema.map((field, sourceIndex) => {
+              const previous =
+                current.find(
+                  (column) =>
+                    column.sourceIndex === sourceIndex &&
+                    column.fieldPath.length === 1,
+                ) ??
+                current.find((column) => column.sourceIndex === sourceIndex);
+              const restored = sourceColumnState(
+                completeSchema,
+                duplicateNames,
+                field,
+                sourceIndex,
+                defaultPinnedSourceIndices.has(sourceIndex),
+              );
+              return previous === undefined
+                ? restored
+                : {
+                    ...restored,
+                    width: previous.width,
+                    pinned: previous.pinned,
+                    hidden: previous.hidden,
+                  };
+            }),
+          );
+        } else {
+          setColumnStates((current) => {
+            const loadedSourceIndices = new Set(
+              current.map((column) => column.sourceIndex),
+            );
+            const retained = current.map((column) => ({
+              ...column,
+              key:
+                column.fieldPath.length === 1
+                  ? sourceColumnKey(
+                      completeSchema,
+                      duplicateNames,
+                      column.sourceIndex,
+                    )
+                  : column.key,
+            }));
+            const added = page.columns.flatMap((field, pageIndex) => {
+              const sourceIndex = page.offset + pageIndex;
+              return loadedSourceIndices.has(sourceIndex)
+                ? []
+                : [
+                    sourceColumnState(
+                      completeSchema,
+                      duplicateNames,
+                      field,
+                      sourceIndex,
+                      defaultPinnedSourceIndices.has(sourceIndex),
+                    ),
+                  ];
+            });
+            return [...retained, ...added];
+          });
+        }
+      }
+    } catch {
+      if (schemaPageRequest.current === request) setSchemaPageError(true);
+    } finally {
+      if (schemaPageRequest.current === request) {
+        schemaPageActive.current = false;
+        setSchemaPageLoading(false);
+      }
+    }
+  }, [
+    defaultPinnedSourceIndices,
+    promoteView,
+    schema,
+    source.generation,
+    source.rowCount,
+  ]);
+
+  useEffect(() => {
+    if (
+      active &&
+      source.schemaIsTruncated &&
+      (schemaTotal === null ||
+        (!pathActionsAvailable && schema.length < schemaTotal))
+    ) {
+      void loadMoreSchema();
+    }
+  }, [
+    active,
+    loadMoreSchema,
+    pathActionsAvailable,
+    schema.length,
+    schemaTotal,
+    source.schemaIsTruncated,
+  ]);
+
   const drainRequests = useCallback(async () => {
     if (activeRequestRef.current !== null) {
       return;
@@ -1187,12 +1377,15 @@ export function DataGrid({
           request.revision,
           request.rows.offset,
           request.rows.count,
-          request.sourceIndices,
+          request.fieldPaths,
         );
         const decoded = decodeArrowWindow(
           bytes,
           request.rows.offset,
-          request.sourceIndices,
+          request.fieldPaths,
+          pathActionsAvailable
+            ? undefined
+            : { allowDuplicateTopLevelIdentity: true },
         );
         const desired = desiredRequestRef.current;
         const base = baseWindowRef.current;
@@ -1227,9 +1420,17 @@ export function DataGrid({
         setMonospaceColumns((current) => {
           const next = new Set(current);
           decoded.table.schema.fields.forEach((field, columnOffset) => {
-            const sourceIndex = decoded.sourceIndices[columnOffset];
-            if (sourceIndex !== undefined && usesMonospaceCells(field.type)) {
-              next.add(sourceIndex);
+            const fieldPath = decoded.fieldPaths[columnOffset];
+            if (fieldPath !== undefined && usesMonospaceCells(field.type)) {
+              next.add(
+                pathActionsAvailable
+                  ? fieldPathKey(fieldPath)
+                  : sourceColumnKey(
+                      schema,
+                      ambiguousTopLevelNames,
+                      columnOffset,
+                    ),
+              );
             }
           });
           return next.size === current.size ? current : next;
@@ -1241,8 +1442,10 @@ export function DataGrid({
               : EMPTY_LOGICAL_DATA_TYPES,
           );
           decoded.table.schema.fields.forEach((field, columnOffset) => {
-            const sourceIndex = decoded.sourceIndices[columnOffset];
-            if (sourceIndex !== undefined) next.set(sourceIndex, field.type);
+            const fieldPath = decoded.fieldPaths[columnOffset];
+            if (fieldPath !== undefined) {
+              next.set(fieldPathKey(fieldPath), field.type);
+            }
           });
           return { generation: source.generation, dataTypes: next };
         });
@@ -1316,7 +1519,7 @@ export function DataGrid({
                 rows: request.rows,
                 revision: active.revision,
                 projectionRevision: request.projectionRevision,
-                sourceIndices: request.sourceIndices,
+                fieldPaths: request.fieldPaths,
                 cacheSlot: request.cacheSlot,
                 reason: "retry",
                 traceId: null,
@@ -1372,6 +1575,8 @@ export function DataGrid({
     promoteView,
     queueRequestTrace,
     replaceDataWindow,
+    pathActionsAvailable,
+    schema,
     source.generation,
   ]);
 
@@ -1381,6 +1586,7 @@ export function DataGrid({
       visibleCount: number,
       planningRowCount = activeViewRef.current.rowCount,
     ) => {
+      if (identitySchemaPending) return;
       const scrollState = nextScrollState(scrollStateRef.current, visibleStart);
       scrollStateRef.current = scrollState;
       const request = rowRequest(
@@ -1390,20 +1596,19 @@ export function DataGrid({
         scrollState.direction,
       );
       const activeView = activeViewRef.current;
-      const sourceIndices = projectedSourceIndices(
-        visibleColumnStatesRef.current,
-        visibleViewportRef.current?.mountedColumnIndices ?? [],
-        GRID_INITIAL_COLUMNS,
-      );
-      if (sourceIndices.length === 0) {
+      const fieldPaths = pathActionsAvailable
+        ? projectedFieldPaths(
+            visibleColumnStatesRef.current,
+            visibleViewportRef.current?.mountedColumnIndices ?? [],
+            GRID_INITIAL_COLUMNS,
+          )
+        : identityFieldPaths;
+      if (fieldPaths.length === 0) {
         return;
       }
       const previousProjection = requestedProjectionRef.current;
-      const projectionChanged = !sameColumnSet(
-        previousProjection,
-        sourceIndices,
-      );
-      requestedProjectionRef.current = sourceIndices;
+      const projectionChanged = !sameColumnSet(previousProjection, fieldPaths);
+      requestedProjectionRef.current = fieldPaths;
       const base = baseWindowRef.current;
       const baseContainsRows =
         base !== null &&
@@ -1435,7 +1640,7 @@ export function DataGrid({
         supplementRows,
         revision: activeView.revision,
         projectionRevision: projectionRevisionRef.current,
-        sourceIndices,
+        fieldPaths,
       };
       // This is the sole authority for whether an async result still belongs on
       // screen. It is updated before any cache or in-flight early return so a
@@ -1452,9 +1657,10 @@ export function DataGrid({
       }
       const missingFromBase =
         base === null
-          ? sourceIndices
-          : sourceIndices.filter(
-              (sourceIndex) => !base.sourceColumnOffsets.has(sourceIndex),
+          ? fieldPaths
+          : fieldPaths.filter(
+              (fieldPath) =>
+                !base.fieldColumnOffsets.has(fieldPathKey(fieldPath)),
             );
       const supplement = supplementWindowRef.current;
       const supplementContainsRows =
@@ -1484,8 +1690,8 @@ export function DataGrid({
         rows: requestedRows,
         revision: activeView.revision,
         projectionRevision: projectionRevisionRef.current,
-        sourceIndices:
-          cacheSlot === "columnSupplement" ? missingFromBase : sourceIndices,
+        fieldPaths:
+          cacheSlot === "columnSupplement" ? missingFromBase : fieldPaths,
         cacheSlot,
         reason:
           base === null
@@ -1576,7 +1782,15 @@ export function DataGrid({
       pendingRequestRef.current = requestedWindow;
       void drainRequests();
     },
-    [clearDeferredProjection, diagnostics, drainRequests, queueRequestTrace],
+    [
+      clearDeferredProjection,
+      diagnostics,
+      drainRequests,
+      identityFieldPaths,
+      identitySchemaPending,
+      pathActionsAvailable,
+      queueRequestTrace,
+    ],
   );
 
   const retryWindow = useCallback(() => {
@@ -1636,15 +1850,15 @@ export function DataGrid({
 
   useEffect(() => {
     const previous = previousProjectionRef.current;
-    previousProjectionRef.current = visibleSourceIndices;
+    previousProjectionRef.current = visibleFieldPaths;
     if (previous === null) {
       return;
     }
     if (
-      previous.length === visibleSourceIndices.length &&
-      projectionContains(previous, visibleSourceIndices)
+      previous.length === visibleFieldPaths.length &&
+      projectionContains(previous, visibleFieldPaths)
     ) {
-      if (!sameColumnOrder(previous, visibleSourceIndices)) {
+      if (!sameColumnOrder(previous, visibleFieldPaths)) {
         setSelection(clearColumnSelection);
         setCopyLimit(null);
       }
@@ -1671,19 +1885,19 @@ export function DataGrid({
     clearDeferredProjection,
     diagnostics,
     replaceDataWindow,
-    visibleSourceIndices,
+    visibleFieldPaths,
   ]);
 
   useEffect(() => {
     setHeaderMenu((current) =>
       current !== null &&
-      visibleColumnIndex(current.sourceIndex, visibleColumnStates) >= 0
+      visibleColumnKeyIndex(current.columnKey, visibleColumnStates) >= 0
         ? current
         : null,
     );
     setGridMenu((current) =>
       current !== null &&
-      visibleColumnIndex(current.sourceIndex, visibleColumnStates) >= 0
+      visibleColumnKeyIndex(current.columnKey, visibleColumnStates) >= 0
         ? current
         : null,
     );
@@ -1691,7 +1905,7 @@ export function DataGrid({
       if (current?.gridAnchor === undefined) {
         return current;
       }
-      return visibleColumnIndex(current.sourceIndex, visibleColumnStates) >= 0
+      return visibleColumnIndex(current.fieldPath, visibleColumnStates) >= 0
         ? current
         : null;
     });
@@ -1812,6 +2026,7 @@ export function DataGrid({
   const startExport = useCallback(
     async (scope: DataExportScope) => {
       if (
+        !pathActionsAvailable ||
         !exportEnabled ||
         exportStarting ||
         exportStatus?.state === "running"
@@ -1823,9 +2038,9 @@ export function DataGrid({
         return;
       }
       const request: DataExportRequest = {
-        columnIndices:
-          shape?.columnIndices ??
-          visibleColumnStates.map(({ sourceIndex }) => sourceIndex),
+        fieldPaths:
+          shape?.fieldPaths ??
+          visibleColumnStates.map(({ fieldPath }) => fieldPath),
         rowRanges: shape?.rowRanges ?? [],
         output: { format: "csv", options: {} },
       };
@@ -1865,6 +2080,7 @@ export function DataGrid({
       exportStarting,
       exportEnabled,
       exportStatus?.state,
+      pathActionsAvailable,
       refreshExportStatus,
       selectedExport,
       source.generation,
@@ -2037,12 +2253,12 @@ export function DataGrid({
   }, [active, selectedExport, startExport]);
 
   useEffect(() => {
-    const sourceIndex = schemaFocusColumnRef.current;
-    if (sourceIndex === null) {
+    const fieldPath = schemaFocusPathRef.current;
+    if (fieldPath === null) {
       return;
     }
-    const visibleIndex = visibleColumnStatesRef.current.findIndex(
-      (column) => column.sourceIndex === sourceIndex,
+    const visibleIndex = visibleColumnStatesRef.current.findIndex((column) =>
+      sameFieldPath(column.fieldPath, fieldPath),
     );
     if (visibleIndex < 0) {
       return;
@@ -2185,51 +2401,105 @@ export function DataGrid({
   useEffect(() => {
     if (contentIdentityRef.current === contentIdentity) return;
     contentIdentityRef.current = contentIdentity;
+    schemaPageRequest.current += 1;
+    schemaPageActive.current = false;
+    setSchemaPageLoading(false);
+    setSchemaPageError(false);
+    setSchemaTotal(null);
+    setColumnNotice(null);
     const previousSchema = sourceSchemaRef.current;
     sourceSchemaRef.current = source.schema;
     const current = pendingViewRef.current ?? activeViewRef.current;
-    const columnStillMatches = (sourceIndex: number) =>
+    const fieldStillMatches = (fieldPath: FieldPath) =>
       sameFieldContract(
-        previousSchema[sourceIndex],
-        source.schema[sourceIndex],
+        resolveSchemaField(previousSchema, fieldPath),
+        resolveSchemaField(source.schema, fieldPath),
       );
-    const nextFilters = current.filters.filter(({ columnIndex }) =>
-      columnStillMatches(columnIndex),
+    const nextFilters = current.filters.filter(({ fieldPath }) =>
+      fieldStillMatches(fieldPath),
     );
-    const nextSort = current.sort.filter(({ sourceIndex }) =>
-      columnStillMatches(sourceIndex),
+    const nextSort = current.sort.filter(({ fieldPath }) =>
+      fieldStillMatches(fieldPath),
     );
     const viewContractChanged =
       nextFilters.length !== current.filters.length ||
       nextSort.length !== current.sort.length;
+    const matchingFlattenedParents = new Map<string, ColumnState>();
+    for (const [key, parent] of flattenedParents) {
+      const field = resolveSchemaField(source.schema, parent.fieldPath);
+      if (field !== undefined && fieldStillMatches(parent.fieldPath)) {
+        matchingFlattenedParents.set(key, { ...parent, field });
+      }
+    }
+    const retainedFlattenedParents = new Map(
+      [...matchingFlattenedParents].filter(([, parent]) =>
+        parent.fieldPath
+          .slice(0, -1)
+          .every((_, index) =>
+            matchingFlattenedParents.has(
+              fieldPathKey(parent.fieldPath.slice(0, index + 1)),
+            ),
+          ),
+      ),
+    );
+    const retainedFlattenedKeys = new Set(retainedFlattenedParents.keys());
+    const nextDuplicateNames = duplicateTopLevelNames(source.schema);
 
     setSchema(source.schema);
-    setSchemaTotal(null);
-    setColumnStates((previous) =>
-      source.schema.map((field, sourceIndex) => {
-        const existing = previous[sourceIndex];
-        const preserve = sameFieldContract(
-          previousSchema[sourceIndex],
-          source.schema[sourceIndex],
-        );
+    setFlattenedParents(retainedFlattenedParents);
+    setSelectedSchemaPath((selected) =>
+      selected !== null && fieldStillMatches(selected) ? selected : null,
+    );
+    setColumnStates((previous) => {
+      const retained = previous.flatMap((existing) => {
+        const field = resolveSchemaField(source.schema, existing.fieldPath);
+        const ancestorsRemainFlattened = existing.fieldPath
+          .slice(0, -1)
+          .every((_, index) =>
+            retainedFlattenedKeys.has(
+              fieldPathKey(existing.fieldPath.slice(0, index + 1)),
+            ),
+          );
+        if (
+          field === undefined ||
+          !fieldStillMatches(existing.fieldPath) ||
+          !ancestorsRemainFlattened
+        ) {
+          return [];
+        }
         return {
+          ...existing,
+          field,
+        };
+      });
+      const retainedKeys = new Set(retained.map((column) => column.key));
+      const added = source.schema.flatMap((field, sourceIndex) => {
+        const fieldPath = [field.name];
+        const key = sourceColumnKey(
+          source.schema,
+          nextDuplicateNames,
           sourceIndex,
-          title: field.name,
-          width:
-            preserve && existing !== undefined
-              ? existing.width
-              : Math.min(
+        );
+        return retainedKeys.has(key) || retainedFlattenedKeys.has(key)
+          ? []
+          : [
+              {
+                key,
+                sourceIndex,
+                fieldPath,
+                field,
+                title: formatFieldPath(fieldPath),
+                width: Math.min(
                   280,
                   Math.max(MIN_COLUMN_WIDTH, field.name.length * 8 + 48),
                 ),
-          pinned:
-            preserve && existing !== undefined
-              ? existing.pinned
-              : defaultPinnedSourceIndices.has(sourceIndex),
-          hidden: preserve && existing !== undefined ? existing.hidden : false,
-        };
-      }),
-    );
+                pinned: defaultPinnedSourceIndices.has(sourceIndex),
+                hidden: false,
+              },
+            ];
+      });
+      return [...retained, ...added];
+    });
     applyView(nextFilters, nextSort, true);
     if (viewContractChanged) {
       setViewError({
@@ -2237,7 +2507,13 @@ export function DataGrid({
           "Some preview filters or sort columns were reset because the complete schema changed.",
       });
     }
-  }, [applyView, contentIdentity, defaultPinnedSourceIndices, source.schema]);
+  }, [
+    applyView,
+    contentIdentity,
+    defaultPinnedSourceIndices,
+    flattenedParents,
+    source.schema,
+  ]);
 
   const changeFilters = useCallback(
     (nextFilters: DataFilter[]) =>
@@ -2255,6 +2531,127 @@ export function DataGrid({
         nextSort,
       ),
     [applyView],
+  );
+
+  const flattenPath = useCallback(
+    (fieldPath: FieldPath) => {
+      setColumnStates((current) => {
+        const index = current.findIndex((column) =>
+          sameFieldPath(column.fieldPath, fieldPath),
+        );
+        const parent = current[index];
+        if (parent === undefined || !isStructField(parent.field)) {
+          const parentPath = fieldPath.slice(0, -1);
+          setColumnNotice(
+            parent === undefined
+              ? flattenedParents.has(fieldPathKey(fieldPath))
+                ? `${formatFieldPath(fieldPath)} is already flattened.`
+                : `Flatten ${formatFieldPath(parentPath) || "the parent struct"} first.`
+              : `${formatFieldPath(fieldPath)} is not a struct field.`,
+          );
+          return current;
+        }
+        const duplicateChild = duplicateChildName(parent.field);
+        if (duplicateChild !== undefined) {
+          setColumnNotice(
+            `${formatFieldPath(fieldPath)} cannot be flattened because it contains multiple fields named ${formatFieldPathSegment(duplicateChild)}.`,
+          );
+          return current;
+        }
+        const children = parent.field.children.map((field) => {
+          const childPath = [...parent.fieldPath, field.name];
+          return {
+            ...parent,
+            key: fieldPathKey(childPath),
+            fieldPath: childPath,
+            field,
+            title: formatFieldPath(childPath),
+          };
+        });
+        setFlattenedParents((parents) => {
+          const next = new Map(parents);
+          next.set(fieldPathKey(parent.fieldPath), parent);
+          return next;
+        });
+        setColumnNotice(
+          `${formatFieldPath(fieldPath)} expanded to ${children.length.toLocaleString("en-US")} columns.`,
+        );
+        setSelection(clearColumnSelection);
+        setCopyLimit(null);
+        return [
+          ...current.slice(0, index),
+          ...children,
+          ...current.slice(index + 1),
+        ];
+      });
+      setHeaderMenu(null);
+    },
+    [flattenedParents],
+  );
+
+  const unflattenPath = useCallback(
+    (fieldPath: FieldPath) => {
+      const parent = flattenedParents.get(fieldPathKey(fieldPath));
+      if (parent === undefined) return;
+      setColumnStates((current) => {
+        const descendantIndices = current.flatMap((column, index) =>
+          fieldPathStartsWith(column.fieldPath, fieldPath) &&
+          column.fieldPath.length > fieldPath.length
+            ? [index]
+            : [],
+        );
+        const insertion = descendantIndices[0] ?? current.length;
+        const retained = current.filter(
+          (column) =>
+            !(
+              fieldPathStartsWith(column.fieldPath, fieldPath) &&
+              column.fieldPath.length > fieldPath.length
+            ),
+        );
+        return [
+          ...retained.slice(0, insertion),
+          parent,
+          ...retained.slice(insertion),
+        ];
+      });
+      setFlattenedParents((parents) => {
+        const next = new Map(parents);
+        for (const [key, flattened] of next) {
+          if (fieldPathStartsWith(flattened.fieldPath, fieldPath)) {
+            next.delete(key);
+          }
+        }
+        return next;
+      });
+      const current = pendingViewRef.current ?? activeViewRef.current;
+      const dependentFilter = (filter: DataFilter) =>
+        filter.fieldPath.length > fieldPath.length &&
+        fieldPathStartsWith(filter.fieldPath, fieldPath);
+      const dependentSort = (column: SortColumn) =>
+        column.fieldPath.length > fieldPath.length &&
+        fieldPathStartsWith(column.fieldPath, fieldPath);
+      const removedFilterPaths = current.filters
+        .filter(dependentFilter)
+        .map((filter) => filter.fieldPath);
+      const removedSortPaths = current.sort
+        .filter(dependentSort)
+        .map((column) => column.fieldPath);
+      if (removedFilterPaths.length + removedSortPaths.length > 0) {
+        applyView(
+          current.filters.filter((filter) => !dependentFilter(filter)),
+          current.sort.filter((column) => !dependentSort(column)),
+        );
+      }
+      setColumnNotice(
+        removedFilterPaths.length + removedSortPaths.length === 0
+          ? `${formatFieldPath(fieldPath)} restored as one column.`
+          : `${formatFieldPath(fieldPath)} restored; removed ${formatDroppedPathNotice(removedFilterPaths, removedSortPaths)}.`,
+      );
+      setSelection(clearColumnSelection);
+      setCopyLimit(null);
+      setHeaderMenu(null);
+    },
+    [applyView, flattenedParents],
   );
 
   const cancelPendingView = useCallback(() => {
@@ -2298,14 +2695,21 @@ export function DataGrid({
   const loadCopyWindow = useCallback(
     (
       row: number,
-      selectedSourceIndices: readonly number[],
+      selectedFieldPaths: readonly FieldPath[],
     ): Promise<ArrowDataWindow> => {
+      if (identitySchemaPending) {
+        return Promise.reject(
+          new Error("The complete source schema is still loading."),
+        );
+      }
       const offset = Math.floor(row / COPY_CHUNK_ROWS) * COPY_CHUNK_ROWS;
       const view = activeViewRef.current;
-      const sourceIndices = [...selectedSourceIndices].sort(
-        (left, right) => left - right,
-      );
-      const key = `${view.revision}:${offset}:${sourceIndices.join(",")}`;
+      const fieldPaths = pathActionsAvailable
+        ? [...selectedFieldPaths].sort((left, right) =>
+            fieldPathKey(left).localeCompare(fieldPathKey(right)),
+          )
+        : identityFieldPaths;
+      const key = `${view.revision}:${offset}:${fieldPaths.map(fieldPathKey).join("\0")}`;
       const existing = copyWindowsRef.current.get(key);
       if (existing !== undefined) {
         return existing;
@@ -2318,9 +2722,16 @@ export function DataGrid({
           view.revision,
           offset,
           count,
-          sourceIndices,
+          fieldPaths,
         );
-        return decodeArrowWindow(bytes, offset, sourceIndices);
+        return decodeArrowWindow(
+          bytes,
+          offset,
+          fieldPaths,
+          pathActionsAvailable
+            ? undefined
+            : { allowDuplicateTopLevelIdentity: true },
+        );
       });
       copyTailRef.current = request.then(
         () => undefined,
@@ -2337,7 +2748,12 @@ export function DataGrid({
       void request.then(release, release);
       return request;
     },
-    [source.generation],
+    [
+      identityFieldPaths,
+      identitySchemaPending,
+      pathActionsAvailable,
+      source.generation,
+    ],
   );
 
   const loadCopyContents = useCallback(
@@ -2350,7 +2766,7 @@ export function DataGrid({
         const column = visibleColumnStates[index];
         return column === undefined ? [] : [column];
       });
-      const sourceIndices = selectedColumns.map((column) => column.sourceIndex);
+      const fieldPaths = selectedColumns.map((column) => column.fieldPath);
       const scheduler = new ChunkScheduler();
       const buffer = new IncrementalCopyBuffer();
       return new Promise<{ textPlain: string; textHtml: string }>(
@@ -2398,7 +2814,7 @@ export function DataGrid({
                     Math.floor(row / COPY_CHUNK_ROWS) * COPY_CHUNK_ROWS;
                   if (dataWindow?.rowOffset !== expectedOffset) {
                     scheduler.pause();
-                    void loadCopyWindow(row, sourceIndices).then(
+                    void loadCopyWindow(row, fieldPaths).then(
                       (loaded) => {
                         if (abortSignal.aborted) {
                           cancel();
@@ -2462,12 +2878,7 @@ export function DataGrid({
                   const materialized =
                     selected === undefined
                       ? undefined
-                      : materializeCellValue(
-                          dataWindow,
-                          selected.sourceIndex,
-                          row,
-                          false,
-                        );
+                      : materializeCellValue(dataWindow, selected, row, false);
                   units += 1;
                   if (materialized === undefined) {
                     buffer.beginCell("", columnIndex === 0, rowIndex === 0);
@@ -2583,9 +2994,8 @@ export function DataGrid({
   );
 
   const resizeColumn = useCallback((visibleIndex: number, width: number) => {
-    const sourceIndex =
-      visibleColumnStatesRef.current[visibleIndex]?.sourceIndex;
-    if (sourceIndex === undefined) {
+    const key = visibleColumnStatesRef.current[visibleIndex]?.key;
+    if (key === undefined) {
       return;
     }
     const clampedWidth = Math.min(
@@ -2594,9 +3004,7 @@ export function DataGrid({
     );
     setColumnStates((current) =>
       current.map((column) =>
-        column.sourceIndex === sourceIndex
-          ? { ...column, width: clampedWidth }
-          : column,
+        column.key === key ? { ...column, width: clampedWidth } : column,
       ),
     );
   }, []);
@@ -2621,12 +3029,14 @@ export function DataGrid({
     ) => {
       const context = document.createElement("canvas").getContext("2d");
       const fonts = gridFontStrings(getComputedStyle(document.documentElement));
-      const widths = new Map<number, number>();
+      const widths = new Map<string, number>();
       for (const column of visibleColumns) {
         const dataType =
           dataWindow === null
             ? undefined
-            : windowDataType(dataWindow, column.sourceIndex);
+            : pathActionsAvailable
+              ? windowDataType(dataWindow, column.fieldPath)
+              : windowDataTypeAt(dataWindow, column.sourceIndex);
         const displayData: string[] = [];
         if (dataWindow !== null && dataType !== undefined) {
           const sampleEnd = Math.min(
@@ -2638,12 +3048,7 @@ export function DataGrid({
             row < sampleEnd;
             row += 1
           ) {
-            const value = materializeCellValue(
-              dataWindow,
-              column.sourceIndex,
-              row,
-              false,
-            );
+            const value = materializeCellValue(dataWindow, column, row, false);
             if (value !== undefined) {
               displayData.push(
                 formatTypedCellValue(value.value, false).displayData,
@@ -2652,7 +3057,7 @@ export function DataGrid({
           }
         }
         widths.set(
-          column.sourceIndex,
+          column.key,
           fittedColumnWidth(
             column.title,
             displayData,
@@ -2666,34 +3071,31 @@ export function DataGrid({
       }
       setColumnStates((current) =>
         current.map((column) => {
-          const width = widths.get(column.sourceIndex);
+          const width = widths.get(column.key);
           return width === undefined ? column : { ...column, width };
         }),
       );
     },
-    [materializeCellValue],
+    [materializeCellValue, pathActionsAvailable],
   );
 
-  const setColumnVisibility = useCallback(
-    (sourceIndex: number, visible: boolean) => {
-      setColumnStates((current) =>
-        current.map((column) =>
-          column.sourceIndex === sourceIndex
-            ? {
-                ...column,
-                hidden: !visible,
-                pinned: visible ? column.pinned : false,
-              }
-            : column,
-        ),
-      );
-    },
-    [],
-  );
+  const setColumnVisibility = useCallback((id: string, visible: boolean) => {
+    setColumnStates((current) =>
+      current.map((column) =>
+        column.key === id
+          ? {
+              ...column,
+              hidden: !visible,
+              pinned: visible ? column.pinned : false,
+            }
+          : column,
+      ),
+    );
+  }, []);
 
   const fitColumnWidths = useCallback(
     (visibleColumns: readonly ColumnState[]) => {
-      if (visibleColumns.length === 0) {
+      if (visibleColumns.length === 0 || identitySchemaPending) {
         return;
       }
       const view = activeViewRef.current;
@@ -2714,17 +3116,26 @@ export function DataGrid({
         Math.max(1, visibleRegion?.rowCount ?? GRID_INITIAL_ROWS),
         view.rowCount - sampleOffset,
       );
-      const sourceIndices = visibleColumns
-        .map((column) => column.sourceIndex)
-        .sort((left, right) => left - right);
+      const fieldPaths = pathActionsAvailable
+        ? visibleColumns.map((column) => column.fieldPath)
+        : identityFieldPaths;
       void getDataWindow(
         source.generation,
         view.revision,
         sampleOffset,
         sampleCount,
-        sourceIndices,
+        fieldPaths,
       )
-        .then((bytes) => decodeArrowWindow(bytes, sampleOffset, sourceIndices))
+        .then((bytes) =>
+          decodeArrowWindow(
+            bytes,
+            sampleOffset,
+            fieldPaths,
+            pathActionsAvailable
+              ? undefined
+              : { allowDuplicateTopLevelIdentity: true },
+          ),
+        )
         .then((dataWindow) => {
           if (
             aliveRef.current &&
@@ -2749,7 +3160,13 @@ export function DataGrid({
           }
         });
     },
-    [applyFittedColumnWidths, source.generation],
+    [
+      applyFittedColumnWidths,
+      identityFieldPaths,
+      identitySchemaPending,
+      pathActionsAvailable,
+      source.generation,
+    ],
   );
 
   const fitVisibleColumnWidths = useCallback(
@@ -2784,12 +3201,10 @@ export function DataGrid({
   }, []);
 
   const updateColumn = useCallback(
-    (sourceIndex: number, update: Partial<ColumnState>) => {
+    (id: string, update: Partial<ColumnState>) => {
       setColumnStates((current) =>
         current.map((column) =>
-          column.sourceIndex === sourceIndex
-            ? { ...column, ...update }
-            : column,
+          column.key === id ? { ...column, ...update } : column,
         ),
       );
       setHeaderMenu(null);
@@ -2798,12 +3213,12 @@ export function DataGrid({
     [],
   );
 
-  const selectSchemaColumn = useCallback((sourceIndex: number) => {
-    schemaFocusColumnRef.current = sourceIndex;
-    setSelectedSchemaColumn(sourceIndex);
+  const selectSchemaPath = useCallback((fieldPath: FieldPath) => {
+    schemaFocusPathRef.current = fieldPath;
+    setSelectedSchemaPath(fieldPath);
     setColumnStates((current) =>
       current.map((column) =>
-        column.sourceIndex === sourceIndex
+        sameFieldPath(column.fieldPath, fieldPath)
           ? { ...column, hidden: false }
           : column,
       ),
@@ -2812,14 +3227,14 @@ export function DataGrid({
   }, []);
 
   const openFilterForCell = useCallback(
-    (sourceIndex: number, row: number, bounds: Rectangle) => {
-      const field = schema[sourceIndex];
+    (fieldPath: FieldPath, row: number, bounds: Rectangle) => {
+      const field = resolveSchemaField(schema, fieldPath);
       const supplement = supplementWindowRef.current;
       const base = baseWindowRef.current;
       const current =
         supplement !== null &&
         windowContainsRow(supplement, row) &&
-        supplement.sourceColumnOffsets.has(sourceIndex)
+        supplement.fieldColumnOffsets.has(fieldPathKey(fieldPath))
           ? supplement
           : base;
       if (
@@ -2829,8 +3244,8 @@ export function DataGrid({
       ) {
         return;
       }
-      const value = windowValue(current, sourceIndex, row);
-      const dataType = windowDataType(current, sourceIndex);
+      const value = windowValue(current, fieldPath, row);
+      const dataType = windowDataType(current, fieldPath);
       const kind = columnFilterKind(field);
       const initialValue =
         value === null || value === undefined || dataType === undefined
@@ -2838,7 +3253,7 @@ export function DataGrid({
           : filterInputFromCell(value, dataType, field);
       setHeaderMenu(null);
       setFilterEditor({
-        sourceIndex,
+        fieldPath,
         left: Math.max(
           4,
           Math.min(bounds.x + bounds.width, window.innerWidth - 292),
@@ -2860,9 +3275,15 @@ export function DataGrid({
   const menuColumn =
     headerMenu === null
       ? undefined
-      : columnStates.find(
-          (column) => column.sourceIndex === headerMenu.sourceIndex,
-        );
+      : columnStates.find((column) => column.key === headerMenu.columnKey);
+  const menuUnflattenPaths =
+    menuColumn === undefined
+      ? []
+      : menuColumn.fieldPath
+          .slice(0, -1)
+          .map((_, index) => menuColumn.fieldPath.slice(0, index + 1))
+          .filter((path) => flattenedParents.has(fieldPathKey(path)))
+          .reverse();
   const peekValue = resolvedPeek?.value;
   const peekLoading =
     peek !== null &&
@@ -2882,10 +3303,13 @@ export function DataGrid({
     }
   }, [contentRevision, peek, readPeekValue]);
   const filterEditorField =
-    filterEditor === null ? undefined : schema[filterEditor.sourceIndex];
+    filterEditor === null
+      ? undefined
+      : resolveSchemaField(schema, filterEditor.fieldPath);
   const exportBusy = exportStarting || exportStatus?.state === "running";
-  const exportUnavailableLabel =
-    "Export is available after dataset inspection finishes";
+  const exportUnavailableLabel = pathActionsAvailable
+    ? "Export is available after dataset inspection finishes"
+    : "Export is unavailable because duplicate top-level names cannot be addressed by path";
   const runningExportLabel =
     exportStatus?.state === "running"
       ? `Exporting ${exportStatus.fileName} (${formatBytes(exportStatus.bytesWritten)})…`
@@ -2900,7 +3324,7 @@ export function DataGrid({
       const bounds = button.getBoundingClientRect();
       setWherePopupOpen(false);
       setFilterEditor({
-        sourceIndex: filter.columnIndex,
+        fieldPath: filter.fieldPath,
         filterIndex,
         initialFilter: filter,
         left: Math.max(4, Math.min(bounds.left, window.innerWidth - 292)),
@@ -2944,7 +3368,8 @@ export function DataGrid({
         >
           Schema
         </button>
-        {source.schemaIsTruncated &&
+        {!schemaPageError &&
+          source.schemaIsTruncated &&
           schemaTotal !== null &&
           schema.length < schemaTotal && (
             <button
@@ -2958,7 +3383,10 @@ export function DataGrid({
           )}
         {schemaPageError && (
           <span className="status-error" role="alert">
-            More columns could not be loaded.
+            More columns could not be loaded.{" "}
+            <button type="button" onClick={() => void loadMoreSchema()}>
+              Retry loading columns
+            </button>
           </span>
         )}
         <div className="query-expression">
@@ -2976,7 +3404,7 @@ export function DataGrid({
                 setSelectPopupOpen((open) => !open);
               }}
             >
-              {hiddenCount === 0
+              {selectIsIdentity
                 ? "*"
                 : `[${visibleColumnStates.length}/${columnStates.length} cols]`}
             </button>
@@ -2986,8 +3414,8 @@ export function DataGrid({
                 onHideAll={hideAllColumns}
                 onShowAll={showAllColumns}
                 onToggle={setColumnVisibility}
-                onTogglePinned={(sourceIndex, pinned) =>
-                  updateColumn(sourceIndex, { pinned, hidden: false })
+                onTogglePinned={(id, pinned) =>
+                  updateColumn(id, { pinned, hidden: false })
                 }
               />
             )}
@@ -2999,6 +3427,10 @@ export function DataGrid({
             <button
               className={`query-where ${whereClause.length === 0 ? "query-empty-slot" : ""}`}
               type="button"
+              disabled={!pathActionsAvailable}
+              aria-describedby={
+                pathActionsAvailable ? undefined : duplicatePathActionsReasonId
+              }
               aria-expanded={wherePopupOpen}
               onClick={toggleWherePopup}
             >
@@ -3010,6 +3442,10 @@ export function DataGrid({
             <button
               className={`query-order ${orderByClause.length === 0 ? "query-empty-slot" : ""}`}
               type="button"
+              disabled={!pathActionsAvailable}
+              aria-describedby={
+                pathActionsAvailable ? undefined : duplicatePathActionsReasonId
+              }
               aria-expanded={sortPopupOpen}
               onClick={() => {
                 setSelectPopupOpen(false);
@@ -3034,10 +3470,10 @@ export function DataGrid({
                 ) : (
                   <ol>
                     {sortDraft.map((column, index) => (
-                      <li key={column.sourceIndex}>
-                        <code>{schema[column.sourceIndex]?.name}</code>
+                      <li key={fieldPathKey(column.fieldPath)}>
+                        <code>{formatFieldPath(column.fieldPath)}</code>
                         <select
-                          aria-label={`Direction for ${schema[column.sourceIndex]?.name}`}
+                          aria-label={`Direction for ${formatFieldPath(column.fieldPath)}`}
                           value={column.direction}
                           onChange={(event) =>
                             setSortDraft((current) =>
@@ -3058,7 +3494,7 @@ export function DataGrid({
                         </select>
                         <button
                           type="button"
-                          aria-label={`Move ${schema[column.sourceIndex]?.name} earlier`}
+                          aria-label={`Move ${formatFieldPath(column.fieldPath)} earlier`}
                           disabled={index === 0}
                           onClick={() =>
                             setSortDraft((current) =>
@@ -3070,7 +3506,7 @@ export function DataGrid({
                         </button>
                         <button
                           type="button"
-                          aria-label={`Move ${schema[column.sourceIndex]?.name} later`}
+                          aria-label={`Move ${formatFieldPath(column.fieldPath)} later`}
                           disabled={index === sortDraft.length - 1}
                           onClick={() =>
                             setSortDraft((current) =>
@@ -3082,7 +3518,7 @@ export function DataGrid({
                         </button>
                         <button
                           type="button"
-                          aria-label={`Remove sort ${schema[column.sourceIndex]?.name}`}
+                          aria-label={`Remove sort ${formatFieldPath(column.fieldPath)}`}
                           onClick={() =>
                             setSortDraft((current) =>
                               current.filter(
@@ -3102,11 +3538,16 @@ export function DataGrid({
                   <select
                     value=""
                     onChange={(event) => {
-                      const sourceIndex = Number(event.target.value);
-                      if (Number.isInteger(sourceIndex)) {
+                      const column = columnStates.find(
+                        (candidate) => candidate.key === event.target.value,
+                      );
+                      if (column !== undefined) {
                         setSortDraft((current) => [
                           ...current,
-                          { sourceIndex, direction: "ascending" },
+                          {
+                            fieldPath: column.fieldPath,
+                            direction: "ascending",
+                          },
                         ]);
                       }
                     }}
@@ -3114,15 +3555,15 @@ export function DataGrid({
                     <option value="" disabled>
                       Select…
                     </option>
-                    {schema.map((field, sourceIndex) => (
+                    {columnStates.map((column) => (
                       <option
-                        key={sourceIndex}
-                        value={sourceIndex}
-                        disabled={sortDraft.some(
-                          (column) => column.sourceIndex === sourceIndex,
+                        key={column.key}
+                        value={column.key}
+                        disabled={sortDraft.some((sorted) =>
+                          sameFieldPath(sorted.fieldPath, column.fieldPath),
                         )}
                       >
-                        {field.name}
+                        {column.title}
                       </option>
                     ))}
                   </select>
@@ -3156,6 +3597,10 @@ export function DataGrid({
           type="button"
           aria-label="Fit column widths"
           title="Fit column widths"
+          disabled={identitySchemaPending}
+          aria-describedby={
+            identitySchemaPending ? duplicatePathActionsReasonId : undefined
+          }
           onClick={fitVisibleColumnWidths}
         >
           <svg
@@ -3186,10 +3631,30 @@ export function DataGrid({
         </button>
       </div>
       {((hiddenCount > 0 && visibleColumnStates.length > 0) ||
+        !pathActionsAvailable ||
+        columnNotice !== null ||
         copyLimit !== null ||
         copyingSelection) && (
         <div className="grid-controls">
           {copyingSelection && <span role="status">Preparing copy…</span>}
+          {columnNotice !== null && (
+            <span role="status">
+              {columnNotice}{" "}
+              <button type="button" onClick={() => setColumnNotice(null)}>
+                Dismiss
+              </button>
+            </span>
+          )}
+          {!pathActionsAvailable && (
+            <span id={duplicatePathActionsReasonId} role="status">
+              Duplicate top-level names require source-order column identity.
+              {identitySchemaPending &&
+                " The complete schema is loading before rows can be read."}
+              {
+                " Path-based filtering, sorting, flattening, statistics, and export are unavailable."
+              }
+            </span>
+          )}
           {copyLimit !== null && (
             <span role="status">
               {`This operation is limited to the first ${copyLimit.toLocaleString()} rows of the selection.`}
@@ -3242,10 +3707,15 @@ export function DataGrid({
         <SchemaSidebar
           key={`${source.generation}:${contentIdentity ?? "source"}`}
           open={sidebarOpen}
-          selectedColumn={selectedSchemaColumn}
+          selectedPath={selectedSchemaPath}
           source={schemaSource}
           dataTypes={logicalDataTypes}
-          onSelectColumn={selectSchemaColumn}
+          pathActionsEnabled={pathActionsAvailable}
+          pathActionsDisabledDescriptionId={
+            pathActionsAvailable ? undefined : duplicatePathActionsReasonId
+          }
+          onSelectPath={selectSchemaPath}
+          onFlattenPath={flattenPath}
         />
         {visibleColumnStates.length === 0 ? (
           <div className="filtered-empty-state">
@@ -3288,9 +3758,8 @@ export function DataGrid({
               }
               onScrollInteraction={() => setPeek(null)}
               onCellContextMenu={(cell, bounds) => {
-                const sourceIndex =
-                  visibleColumnStates[cell.column]?.sourceIndex;
-                if (sourceIndex === undefined) {
+                const column = visibleColumnStates[cell.column];
+                if (column === undefined) {
                   return;
                 }
                 setHeaderMenu(null);
@@ -3298,7 +3767,8 @@ export function DataGrid({
                   bounds,
                   column: cell.column,
                   row: cell.row,
-                  sourceIndex,
+                  columnKey: column.key,
+                  fieldPath: column.fieldPath,
                   left: Math.max(
                     4,
                     Math.min(bounds.x + bounds.width, window.innerWidth - 318),
@@ -3310,21 +3780,21 @@ export function DataGrid({
                 });
               }}
               onSort={(visibleIndex, additive) => {
-                const sourceIndex =
-                  visibleColumnStates[visibleIndex]?.sourceIndex;
-                if (sourceIndex !== undefined) {
+                if (!pathActionsAvailable) return;
+                const fieldPath = visibleColumnStates[visibleIndex]?.fieldPath;
+                if (fieldPath !== undefined) {
                   const currentSort =
                     pendingViewRef.current?.sort ?? activeViewRef.current.sort;
-                  changeSort(nextSort(currentSort, sourceIndex, additive));
+                  changeSort(nextSort(currentSort, fieldPath, additive));
                 }
               }}
               onFilter={(visibleIndex, bounds) => {
-                const sourceIndex =
-                  visibleColumnStates[visibleIndex]?.sourceIndex;
-                if (sourceIndex !== undefined) {
+                if (!pathActionsAvailable) return;
+                const fieldPath = visibleColumnStates[visibleIndex]?.fieldPath;
+                if (fieldPath !== undefined) {
                   setHeaderMenu(null);
                   setFilterEditor({
-                    sourceIndex,
+                    fieldPath,
                     left: Math.max(
                       4,
                       Math.min(bounds.x, window.innerWidth - 292),
@@ -3341,12 +3811,12 @@ export function DataGrid({
                 }
               }}
               onHeaderContextMenu={(visibleIndex, bounds) => {
-                const sourceIndex =
-                  visibleColumnStates[visibleIndex]?.sourceIndex;
-                if (sourceIndex !== undefined) {
+                const column = visibleColumnStates[visibleIndex];
+                if (column !== undefined) {
                   setGridMenu(null);
                   setHeaderMenu({
-                    sourceIndex,
+                    columnKey: column.key,
+                    fieldPath: column.fieldPath,
                     left: Math.max(
                       4,
                       Math.min(bounds.x, window.innerWidth - 164),
@@ -3367,10 +3837,11 @@ export function DataGrid({
                 setHeaderMenu((current) =>
                   current !== null &&
                   gridAnchorIsMounted(
-                    current.sourceIndex,
+                    current.fieldPath,
                     undefined,
                     visibleColumnStates,
                     viewport,
+                    current.columnKey,
                   )
                     ? current
                     : null,
@@ -3378,10 +3849,11 @@ export function DataGrid({
                 setGridMenu((current) =>
                   current !== null &&
                   gridAnchorIsMounted(
-                    current.sourceIndex,
+                    current.fieldPath,
                     current.row,
                     visibleColumnStates,
                     viewport,
+                    current.columnKey,
                   )
                     ? current
                     : null,
@@ -3395,7 +3867,7 @@ export function DataGrid({
                       ? current.gridAnchor.row
                       : undefined;
                   return gridAnchorIsMounted(
-                    current.sourceIndex,
+                    current.fieldPath,
                     row,
                     visibleColumnStates,
                     viewport,
@@ -3421,6 +3893,11 @@ export function DataGrid({
         <ValuePeek
           value={peekValue.value}
           label={peekValue.label}
+          fieldPath={
+            visibleColumnStates[peek.address.column]?.fieldPath ?? [
+              peekValue.label,
+            ]
+          }
           anchor={peek.bounds}
           focusRequest={peekFocusRequest}
           loading={peekLoading}
@@ -3444,13 +3921,13 @@ export function DataGrid({
           ) : (
             <ol>
               {filters.map((filter, index) => {
-                const field = schema[filter.columnIndex];
+                const field = resolveSchemaField(schema, filter.fieldPath);
                 if (field === undefined) {
                   return null;
                 }
                 const condition = formatFilterCondition(filter, field);
                 return (
-                  <li key={`${index}:${filter.columnIndex}`}>
+                  <li key={`${index}:${fieldPathKey(filter.fieldPath)}`}>
                     <code>{condition}</code>
                     <span className="where-condition-actions">
                       <button
@@ -3495,19 +3972,46 @@ export function DataGrid({
             type="button"
             role="menuitem"
             onClick={() =>
-              updateColumn(menuColumn.sourceIndex, {
+              updateColumn(menuColumn.key, {
                 pinned: !menuColumn.pinned,
               })
             }
           >
             {menuColumn.pinned ? "Unpin column" : "Pin column"}
           </button>
+          {pathActionsAvailable && isStructField(menuColumn.field) && (
+            <button
+              type="button"
+              role="menuitem"
+              disabled={duplicateChildName(menuColumn.field) !== undefined}
+              title={
+                duplicateChildName(menuColumn.field) === undefined
+                  ? undefined
+                  : "Flatten is unavailable because this struct contains duplicate child names."
+              }
+              onClick={() => flattenPath(menuColumn.fieldPath)}
+            >
+              {duplicateChildName(menuColumn.field) === undefined
+                ? "Flatten to columns"
+                : "Flatten unavailable: duplicate child names"}
+            </button>
+          )}
+          {menuUnflattenPaths.map((path) => (
+            <button
+              key={fieldPathKey(path)}
+              type="button"
+              role="menuitem"
+              onClick={() => unflattenPath(path)}
+            >
+              Unflatten {formatFieldPath(path)}
+            </button>
+          ))}
           <button
             type="button"
             role="menuitem"
             disabled={visibleColumnStates.length === 1}
             onClick={() =>
-              updateColumn(menuColumn.sourceIndex, {
+              updateColumn(menuColumn.key, {
                 hidden: true,
                 pinned: false,
               })
@@ -3539,36 +4043,40 @@ export function DataGrid({
             Peek
             <span className="menu-shortcut">Space</span>
           </button>
-          <button
-            type="button"
-            role="menuitem"
-            onClick={() => {
-              openFilterForCell(
-                gridMenu.sourceIndex,
-                gridMenu.row,
-                gridMenu.bounds,
-              );
-              setGridMenu(null);
-            }}
-          >
-            Filter by this value…
-          </button>
-          <div className="grid-menu-separator" role="separator" />
+          {pathActionsAvailable && (
+            <>
+              <button
+                type="button"
+                role="menuitem"
+                onClick={() => {
+                  openFilterForCell(
+                    gridMenu.fieldPath,
+                    gridMenu.row,
+                    gridMenu.bounds,
+                  );
+                  setGridMenu(null);
+                }}
+              >
+                Filter by this value…
+              </button>
+              <div className="grid-menu-separator" role="separator" />
+            </>
+          )}
           {selectedExport !== null && (
             <button
               type="button"
               role="menuitem"
-              disabled={!exportEnabled || exportBusy}
+              disabled={!exportEnabled || !pathActionsAvailable || exportBusy}
               onClick={() => void startExport("selection")}
             >
               <span>
-                {!exportEnabled
+                {!exportEnabled || !pathActionsAvailable
                   ? exportUnavailableLabel
                   : exportBusy
                     ? runningExportLabel
                     : `Export selection (${formatCount(selectedExport.rowCount)} × ${formatCount(selectedExport.columnCount)})…`}
               </span>
-              {exportEnabled && !exportBusy && (
+              {exportEnabled && pathActionsAvailable && !exportBusy && (
                 <span className="menu-shortcut">{shortcutModifier}Shift+E</span>
               )}
             </button>
@@ -3576,19 +4084,22 @@ export function DataGrid({
           <button
             type="button"
             role="menuitem"
-            disabled={!exportEnabled || exportBusy}
+            disabled={!exportEnabled || !pathActionsAvailable || exportBusy}
             onClick={() => void startExport("view")}
           >
             <span>
-              {!exportEnabled
+              {!exportEnabled || !pathActionsAvailable
                 ? exportUnavailableLabel
                 : exportBusy
                   ? runningExportLabel
                   : `Export current view (${formatCount(gridRowCount)} rows)…`}
             </span>
-            {exportEnabled && !exportBusy && selectedExport === null && (
-              <span className="menu-shortcut">{shortcutModifier}Shift+E</span>
-            )}
+            {exportEnabled &&
+              pathActionsAvailable &&
+              !exportBusy &&
+              selectedExport === null && (
+                <span className="menu-shortcut">{shortcutModifier}Shift+E</span>
+              )}
           </button>
         </div>
       )}
@@ -3907,13 +4418,142 @@ function isStreamingRawCopyType(dataType: DataType): boolean {
   );
 }
 
-function gridAnchorIsMounted(
+function duplicateTopLevelNames(
+  schema: readonly SchemaField[],
+): ReadonlySet<string> {
+  const seen = new Set<string>();
+  const duplicates = new Set<string>();
+  for (const field of schema) {
+    if (seen.has(field.name)) duplicates.add(field.name);
+    else seen.add(field.name);
+  }
+  return duplicates;
+}
+
+function sourceColumnKey(
+  schema: readonly SchemaField[],
+  duplicateNames: ReadonlySet<string>,
   sourceIndex: number,
+): string {
+  const name = schema[sourceIndex]?.name;
+  return name !== undefined && duplicateNames.has(name)
+    ? `source:${sourceIndex}`
+    : fieldPathKey(name === undefined ? [] : [name]);
+}
+
+function sourceColumnState(
+  schema: readonly SchemaField[],
+  duplicateNames: ReadonlySet<string>,
+  field: SchemaField,
+  sourceIndex: number,
+  pinned: boolean,
+): ColumnState {
+  const fieldPath = [field.name];
+  return {
+    key: sourceColumnKey(schema, duplicateNames, sourceIndex),
+    sourceIndex,
+    fieldPath,
+    field,
+    title: formatFieldPath(fieldPath),
+    width: Math.min(
+      280,
+      Math.max(MIN_COLUMN_WIDTH, field.name.length * 8 + 48),
+    ),
+    pinned,
+    hidden: false,
+  };
+}
+
+function isStructField(field: SchemaField): boolean {
+  return (
+    field.physicalType === "GROUP" &&
+    !field.logicalType?.startsWith("List") &&
+    !field.logicalType?.startsWith("Map") &&
+    field.children.length > 0
+  );
+}
+
+function duplicateChildName(field: SchemaField): string | undefined {
+  const names = new Set<string>();
+  for (const child of field.children) {
+    if (names.has(child.name)) return child.name;
+    names.add(child.name);
+  }
+  return undefined;
+}
+
+const NOTICE_PATH_LIMIT = 3;
+const NOTICE_PATH_CHARACTER_LIMIT = 56;
+
+function formatDroppedPathNotice(
+  filterPaths: readonly FieldPath[],
+  sortPaths: readonly FieldPath[],
+): string {
+  const category = (label: string, paths: readonly FieldPath[]) => {
+    const unique = new Map(paths.map((path) => [fieldPathKey(path), path]));
+    const visible = [...unique.values()]
+      .slice(0, NOTICE_PATH_LIMIT)
+      .map(boundedNoticePath);
+    const remaining = unique.size - visible.length;
+    return `${label}: ${visible.join(", ")}${remaining > 0 ? `, +${remaining.toLocaleString("en-US")} more` : ""}`;
+  };
+  return [
+    ...(filterPaths.length === 0 ? [] : [category("filters", filterPaths)]),
+    ...(sortPaths.length === 0 ? [] : [category("sorts", sortPaths)]),
+  ].join("; ");
+}
+
+function boundedNoticePath(path: FieldPath): string {
+  const characters = Array.from(formatFieldPath(path));
+  if (characters.length <= NOTICE_PATH_CHARACTER_LIMIT) {
+    return characters.join("");
+  }
+  const prefixLength = Math.floor((NOTICE_PATH_CHARACTER_LIMIT - 1) / 2);
+  const suffixLength = NOTICE_PATH_CHARACTER_LIMIT - prefixLength - 1;
+  return `${characters.slice(0, prefixLength).join("")}…${characters.slice(-suffixLength).join("")}`;
+}
+
+function outermostFlattenedPath(
+  fieldPath: readonly string[],
+  flattenedParents: ReadonlyMap<string, ColumnState>,
+): FieldPath | null {
+  for (let length = 1; length < fieldPath.length; length += 1) {
+    const candidate = fieldPath.slice(0, length);
+    if (flattenedParents.has(fieldPathKey(candidate))) return candidate;
+  }
+  return null;
+}
+
+function flattenedRailPath(
+  fieldPath: readonly string[],
+  pinned: boolean,
+  flattenedParents: ReadonlyMap<string, ColumnState>,
+): FieldPath | null {
+  const groupPath = outermostFlattenedPath(fieldPath, flattenedParents);
+  if (groupPath === null) return null;
+  return flattenedParents.get(fieldPathKey(groupPath))?.pinned === pinned
+    ? groupPath
+    : null;
+}
+
+function schemaRailType(field: SchemaField | undefined): string {
+  if (field === undefined) return "struct<…>";
+  return isStructField(field)
+    ? "struct<…>"
+    : (field.logicalType ?? field.physicalType);
+}
+
+function gridAnchorIsMounted(
+  fieldPath: FieldPath,
   row: number | undefined,
   visibleColumns: readonly ColumnState[],
   viewport: GridViewport,
+  columnKey?: string,
 ): boolean {
-  const visibleIndex = visibleColumnIndex(sourceIndex, visibleColumns);
+  const visibleIndex =
+    columnKey === undefined
+      ? visibleColumnIndex(fieldPath, visibleColumns)
+      : visibleColumnKeyIndex(columnKey, visibleColumns);
   if (visibleIndex < 0) {
     return false;
   }
@@ -3927,44 +4567,49 @@ function gridAnchorIsMounted(
   );
 }
 
-function visibleColumnIndex(
-  sourceIndex: number,
+function visibleColumnKeyIndex(
+  columnKey: string,
   visibleColumns: readonly ColumnState[],
 ): number {
-  return visibleColumns.findIndex(
-    (column) => column.sourceIndex === sourceIndex,
+  return visibleColumns.findIndex((column) => column.key === columnKey);
+}
+
+function visibleColumnIndex(
+  fieldPath: readonly string[],
+  visibleColumns: readonly ColumnState[],
+): number {
+  return visibleColumns.findIndex((column) =>
+    sameFieldPath(column.fieldPath, fieldPath),
   );
 }
 
 function sameColumnOrder(
-  previous: readonly number[],
-  current: readonly number[],
+  previous: readonly FieldPath[],
+  current: readonly FieldPath[],
 ): boolean {
-  return previous.every((sourceIndex, index) => sourceIndex === current[index]);
+  return previous.every((fieldPath, index) => {
+    const next = current[index];
+    return next !== undefined && sameFieldPath(fieldPath, next);
+  });
 }
 
 function sameColumnSet(
-  previous: readonly number[],
-  current: readonly number[],
+  previous: readonly FieldPath[],
+  current: readonly FieldPath[],
 ): boolean {
   return (
     previous.length === current.length && projectionContains(previous, current)
   );
 }
 
-function projectionFingerprint(sourceIndices: readonly number[]): string {
+function projectionFingerprint(fieldPaths: readonly FieldPath[]): string {
   let hash = 0x811c9dc5;
-  let contiguous = true;
-  for (let index = 0; index < sourceIndices.length; index += 1) {
-    const sourceIndex = sourceIndices[index] ?? 0;
-    hash = Math.imul(hash ^ sourceIndex, 0x01000193) >>> 0;
-    if (index > 0 && sourceIndex !== (sourceIndices[index - 1] ?? 0) + 1) {
-      contiguous = false;
+  for (const fieldPath of fieldPaths) {
+    for (const character of fieldPathKey(fieldPath)) {
+      hash = Math.imul(hash ^ character.charCodeAt(0), 0x01000193) >>> 0;
     }
   }
-  return `${sourceIndices[0] ?? "-"}:${sourceIndices.at(-1) ?? "-"}:${
-    contiguous ? "c" : "s"
-  }:${hash.toString(16).padStart(8, "0")}`;
+  return `${fieldPaths.length}:${hash.toString(16).padStart(8, "0")}`;
 }
 
 function loadingCell(): GridCell {

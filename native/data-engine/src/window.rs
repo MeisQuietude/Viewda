@@ -9,6 +9,8 @@ use serde::Serialize;
 use thiserror::Error;
 
 use crate::{
+    FieldPath,
+    field_path::{field_path_expression, validate_field_paths},
     filter::quote_identifier,
     source::{SchemaField, SourceError, inspect_local_source_for_query, open_local_source},
 };
@@ -87,15 +89,15 @@ impl DataWindowReader {
         self.fetch_projection(row_offset, row_count, None)
     }
 
-    /// Reads selected source columns in the requested order without changing file order.
-    pub fn fetch_columns(
+    /// Reads selected addressable fields in the requested order without changing file order.
+    pub fn fetch_fields(
         &mut self,
         row_offset: u64,
         row_count: u32,
-        source_indices: &[u32],
+        field_paths: &[FieldPath],
     ) -> Result<Vec<u8>, DataWindowError> {
         validate_window_size(row_count)?;
-        if source_indices.is_empty() {
+        if field_paths.is_empty() {
             return Err(DataWindowError::Unsupported);
         }
         let projection = {
@@ -107,8 +109,8 @@ impl DataWindowReader {
                         .schema,
                 ),
             };
-            let source_indices = validate_projection(schema, source_indices)?;
-            let projection = format_projection_clause(schema, &source_indices);
+            validate_field_paths(schema, field_paths).ok_or(DataWindowError::Unsupported)?;
+            let projection = format_projection_clause(schema, field_paths)?;
             (projection != "*").then_some(projection)
         };
 
@@ -175,17 +177,33 @@ impl DataWindowReader {
     }
 }
 
-fn format_projection_clause(schema: &[SchemaField], source_indices: &[usize]) -> String {
-    let identity_projection =
-        source_indices.len() == schema.len() && source_indices.iter().copied().eq(0..schema.len());
-    if identity_projection {
-        "*".to_owned()
-    } else {
-        source_indices
+fn format_projection_clause(
+    schema: &[SchemaField],
+    field_paths: &[FieldPath],
+) -> Result<String, DataWindowError> {
+    let identity_projection = field_paths.len() == schema.len()
+        && field_paths
             .iter()
-            .map(|source_index| quote_identifier(&schema[*source_index].name))
-            .collect::<Vec<_>>()
-            .join(", ")
+            .zip(schema)
+            .all(|(path, field)| path.segments() == [field.name.as_str()]);
+    if identity_projection {
+        Ok("*".to_owned())
+    } else {
+        field_paths
+            .iter()
+            .map(|path| {
+                let resolved = crate::field_path::resolve_field_path(schema, path)
+                    .ok_or(DataWindowError::Unsupported)?;
+                let root = quote_identifier(&schema[resolved.root_index].name);
+                let expression =
+                    field_path_expression(path, &root).ok_or(DataWindowError::Unsupported)?;
+                Ok(format!(
+                    "{expression} AS {}",
+                    quote_identifier(path.leaf_name().ok_or(DataWindowError::Unsupported)?)
+                ))
+            })
+            .collect::<Result<Vec<_>, DataWindowError>>()
+            .map(|expressions| expressions.join(", "))
     }
 }
 
@@ -195,29 +213,6 @@ fn validate_window_size(row_count: u32) -> Result<(), DataWindowError> {
     } else {
         Ok(())
     }
-}
-
-pub(crate) fn validate_projection(
-    schema: &[SchemaField],
-    source_indices: &[u32],
-) -> Result<Vec<usize>, DataWindowError> {
-    if source_indices.is_empty() {
-        return Err(DataWindowError::Unsupported);
-    }
-    let mut seen = vec![false; schema.len()];
-    let mut validated = Vec::with_capacity(source_indices.len());
-    for source_index in source_indices {
-        let source_index =
-            usize::try_from(*source_index).map_err(|_| DataWindowError::Unsupported)?;
-        let Some(slot) = seen.get_mut(source_index) else {
-            return Err(DataWindowError::Unsupported);
-        };
-        if std::mem::replace(slot, true) {
-            return Err(DataWindowError::Unsupported);
-        }
-        validated.push(source_index);
-    }
-    Ok(validated)
 }
 
 pub(crate) fn classify_query_error(error: DuckDbError, has_filters: bool) -> DataWindowError {
@@ -327,9 +322,22 @@ mod tests {
         ];
 
         assert_eq!(
-            format_projection_clause(&schema, &[1, 0]),
-            "\"label\", \"value\"\"quoted\""
+            format_projection_clause(
+                &schema,
+                &[FieldPath::from("label"), FieldPath::from("value\"quoted")]
+            ),
+            Ok("\"label\" AS \"label\", \"value\"\"quoted\" AS \"value\"\"quoted\"".to_owned())
         );
-        assert_eq!(format_projection_clause(&schema, &[0, 1, 2]), "*");
+        assert_eq!(
+            format_projection_clause(
+                &schema,
+                &[
+                    FieldPath::from("value\"quoted"),
+                    FieldPath::from("label"),
+                    FieldPath::from("amount")
+                ]
+            ),
+            Ok("*".to_owned())
+        );
     }
 }

@@ -149,6 +149,9 @@ export interface SchemaField {
   children: SchemaField[];
 }
 
+/** Stable engine address for a top-level or nested schema field. */
+export type FieldPath = string[];
+
 export interface SourceSchemaPage {
   offset: number;
   totalCount: number;
@@ -173,7 +176,7 @@ export type DataFilterOperator =
   | "isNotNull";
 
 export interface DataFilter {
-  columnIndex: number;
+  fieldPath: FieldPath;
   operator: DataFilterOperator;
   values: string[];
   matchCase?: boolean;
@@ -182,7 +185,7 @@ export interface DataFilter {
 export type SortDirection = "ascending" | "descending";
 
 export interface SortColumn {
-  sourceIndex: number;
+  fieldPath: FieldPath;
   direction: SortDirection;
 }
 
@@ -221,7 +224,7 @@ export interface ExportRowRange {
 }
 
 export interface DataExportRequest {
-  columnIndices: number[];
+  fieldPaths: FieldPath[];
   rowRanges: ExportRowRange[];
   output: { format: "csv"; options: Record<string, never> };
 }
@@ -265,7 +268,14 @@ export interface ColumnStatistics {
   maximum: string | null;
   minMaxComputed: boolean;
   nullShare: number;
-  approximateDistinctCount: number;
+  nullCount: number;
+  approximateDistinctCount: number | null;
+  containerCount: {
+    minimum: number | null;
+    average: number | null;
+    maximum: number | null;
+    emptyCount: number;
+  } | null;
 }
 
 export type StructureByteUnit = "compressed" | "uncompressed";
@@ -990,7 +1000,7 @@ export async function getDataWindow(
   viewRevision: number,
   rowOffset: number,
   rowCount: number,
-  sourceIndices: readonly number[],
+  fieldPaths: readonly FieldPath[],
 ): Promise<ArrayBuffer> {
   try {
     return await invoke<ArrayBuffer>("get_data_window", {
@@ -998,7 +1008,7 @@ export async function getDataWindow(
       viewRevision,
       rowOffset,
       rowCount,
-      sourceIndices,
+      fieldPaths,
     });
   } catch (error) {
     throw readDataWindowCommandError(error);
@@ -1091,7 +1101,7 @@ export async function revealDataExport(id: number): Promise<void> {
 export async function getTextValueSuggestions(
   generation: number,
   suggestionRevision: number,
-  columnIndex: number,
+  fieldPath: FieldPath,
   prefix: string,
   operator: DataFilterOperator,
 ): Promise<TextValueSuggestions> {
@@ -1099,7 +1109,7 @@ export async function getTextValueSuggestions(
     return await invoke<TextValueSuggestions>("get_text_value_suggestions", {
       generation,
       suggestionRevision,
-      columnIndex,
+      fieldPath,
       prefix,
       operator,
     });
@@ -1124,13 +1134,13 @@ export async function cancelTextValueSuggestions(
 
 export async function getColumnStatistics(
   generation: number,
-  columnIndex: number,
+  fieldPath: FieldPath,
   includeMinMax: boolean,
 ): Promise<ColumnStatistics> {
   try {
     return await invoke<ColumnStatistics>("get_column_statistics", {
       generation,
-      columnIndex,
+      fieldPath,
       includeMinMax,
     });
   } catch (error) {

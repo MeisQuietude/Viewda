@@ -4,7 +4,7 @@ use arrow_array::{
     Array, ArrayRef, BooleanArray, Date32Array, Decimal128Array, Float16Array, Float32Array,
     Float64Array, Int32Array, Int64Array, ListArray, RecordBatch, StringArray, StructArray,
     Time64MicrosecondArray, TimestampMicrosecondArray, TimestampMillisecondArray,
-    TimestampNanosecondArray, types::Int32Type,
+    TimestampNanosecondArray, builder::NullBufferBuilder, types::Int32Type,
 };
 use arrow_ipc::reader::StreamReader;
 use arrow_schema::{DataType, Field, Fields, Schema, TimeUnit};
@@ -22,8 +22,8 @@ use parquet::{
 use tempfile::{NamedTempFile, TempDir};
 use viewda_data_engine::{
     DataFilter, DataFilterOperator, DataSort, DataSortDirection, DataViewBuilder, DataViewError,
-    DataWindowError, DataWindowReader, PreparedDataView, SchemaField, TextValueSuggestionsReader,
-    inspect_local_source,
+    DataViewMemoryLimit, DataWindowError, DataWindowReader, DatasetSource, FieldPath,
+    PreparedDataView, TextValueSuggestionsReader, inspect_local_source,
 };
 
 #[test]
@@ -96,6 +96,162 @@ fn preserves_nested_values_in_the_arrow_window() {
 }
 
 #[test]
+fn projects_filters_and_sorts_nested_fields_with_ancestor_null_semantics() {
+    let source = write_addressable_nested_parquet();
+    let city = FieldPath::new(["profile.with.dot", "city\"name"]);
+    let postal = FieldPath::new(["profile.with.dot", "address", "postal.code"]);
+    let id = path("id");
+    let mut reader = DataWindowReader::new(source.path().to_owned());
+
+    let projected = decode(
+        reader
+            .fetch_fields(0, 8, &[postal.clone(), city.clone(), id.clone()])
+            .expect("nested projection"),
+    );
+    let batch = &projected[0];
+    assert_eq!(
+        batch
+            .schema()
+            .fields()
+            .iter()
+            .map(|field| (field.name().as_str(), field.is_nullable()))
+            .collect::<Vec<_>>(),
+        [("postal.code", true), ("city\"name", true), ("id", true)]
+    );
+    assert_eq!(
+        optional_int32_values(batch, 0),
+        [Some(100), None, None, Some(400)]
+    );
+    assert_eq!(
+        string_values(batch, 1),
+        [Some("A"), None, Some("C"), Some("D")]
+    );
+
+    let filtered = prepare_view(
+        source.path(),
+        &[DataFilter {
+            field_path: postal.clone(),
+            operator: DataFilterOperator::IsNull,
+            values: Vec::new(),
+            match_case: false,
+        }],
+        &[],
+    )
+    .expect("nested null filter");
+    let filtered = decode(
+        filtered
+            .fetch_window_fields(0, 8, std::slice::from_ref(&id))
+            .expect("filtered nested projection"),
+    );
+    assert_eq!(int64_values(&filtered[0], 0), [2, 3]);
+
+    let sorted = prepare_view(
+        source.path(),
+        &[],
+        &[DataSort {
+            field_path: postal.clone(),
+            direction: DataSortDirection::Ascending,
+        }],
+    )
+    .expect("nested sort");
+    let sorted = decode(
+        sorted
+            .fetch_window_fields(0, 8, &[id, city, postal])
+            .expect("sorted nested projection"),
+    );
+    assert_eq!(int64_values(&sorted[0], 0), [1, 4, 2, 3]);
+    assert_eq!(
+        string_values(&sorted[0], 1),
+        [Some("A"), Some("D"), None, Some("C")]
+    );
+}
+
+#[test]
+fn keeps_same_named_leaves_correlated_across_file_and_dataset_views() {
+    let source = write_addressable_nested_parquet();
+    let paths = [
+        FieldPath::new(["profile.with.dot", "city\"name"]),
+        FieldPath::new(["alternate", "city\"name"]),
+    ];
+    let mut reader = DataWindowReader::new(source.path().to_owned());
+    let direct_file = decode(
+        reader
+            .fetch_fields(0, 8, &paths)
+            .expect("direct file same-named leaves"),
+    )
+    .remove(0);
+    let file_view = DataViewBuilder::new(source.path().to_owned(), &[], &[])
+        .expect("file view builder")
+        .build()
+        .expect("file view");
+    let prepared_file = decode(
+        file_view
+            .fetch_window_fields(0, 8, &paths)
+            .expect("prepared file same-named leaves"),
+    )
+    .remove(0);
+
+    let directory = TempDir::new().expect("dataset directory");
+    fs::copy(source.path(), directory.path().join("part.parquet")).expect("dataset fixture member");
+    let dataset_source = DatasetSource::open_folder(directory.path()).expect("dataset source");
+    let mut inspector = dataset_source.inspector();
+    inspector.advance(1).expect("dataset inspection");
+    let mut dataset = inspector.into_window_reader().expect("dataset reader");
+    let direct_dataset = decode(
+        dataset
+            .fetch_fields(0, 8, &paths)
+            .expect("direct dataset same-named leaves"),
+    )
+    .remove(0);
+    let dataset_view = DataViewBuilder::for_dataset(&dataset, &[], &[], DataViewMemoryLimit::Mb384)
+        .expect("dataset view builder")
+        .build()
+        .expect("dataset view");
+    let prepared_dataset = decode(
+        dataset_view
+            .fetch_window_fields(0, 8, &paths)
+            .expect("prepared dataset same-named leaves"),
+    )
+    .remove(0);
+
+    for batch in [
+        &direct_file,
+        &prepared_file,
+        &direct_dataset,
+        &prepared_dataset,
+    ] {
+        assert_eq!(
+            batch
+                .schema()
+                .fields()
+                .iter()
+                .map(|field| field.name().as_str())
+                .collect::<Vec<_>>(),
+            ["city\"name", "city\"name"]
+        );
+        assert_eq!(
+            string_values(batch, 0),
+            [Some("A"), None, Some("C"), Some("D")]
+        );
+        assert_eq!(
+            string_values(batch, 1),
+            [Some("W"), Some("X"), Some("Y"), Some("Z")]
+        );
+    }
+}
+
+#[test]
+fn rejects_paths_that_traverse_list_elements() {
+    let source = write_nested_parquet();
+    let mut reader = DataWindowReader::new(source.path().to_owned());
+
+    assert_eq!(
+        reader.fetch_fields(0, 1, &[FieldPath::new(["tags", "element"])]),
+        Err(DataWindowError::Unsupported)
+    );
+}
+
+#[test]
 fn preserves_decimal128_integer_digits_across_the_arrow_window() {
     let source = write_decimal128_parquet();
     let mut reader = DataWindowReader::new(source.path().to_owned());
@@ -134,7 +290,17 @@ fn projects_five_columns_from_a_ten_thousand_column_source_in_requested_order() 
 
     let batches = decode(
         reader
-            .fetch_columns(1, 1, &[9_999, 0, 5_000, 42, 7_000])
+            .fetch_fields(
+                1,
+                1,
+                &[
+                    path("c09999"),
+                    path("c00000"),
+                    path("c05000"),
+                    path("c00042"),
+                    path("c07000"),
+                ],
+            )
             .expect("projected wide window"),
     );
     let batch = &batches[0];
@@ -165,7 +331,7 @@ fn projects_a_column_whose_name_exceeds_the_wire_summary_limit() {
 
     let batches = decode(
         reader
-            .fetch_columns(0, 1, &[0])
+            .fetch_fields(0, 1, &[FieldPath::new(vec![column_name.clone()])])
             .expect("query schema keeps the complete column name"),
     );
 
@@ -181,7 +347,7 @@ fn projected_direct_windows_preserve_deep_file_order_and_unusual_names() {
     let full = decode(reader.fetch(6, 2).expect("full deep window"));
     let projected = decode(
         reader
-            .fetch_columns(6, 2, &[1, 0])
+            .fetch_fields(6, 2, &[path("select"), path("id\"quoted")])
             .expect("projected deep window"),
     );
     let projected = &projected[0];
@@ -199,7 +365,17 @@ fn identity_projection_keeps_the_direct_window_wire_format() {
 
     let full = reader.fetch(2, 3).expect("full window");
     let identity = reader
-        .fetch_columns(2, 3, &[0, 1, 2, 3, 4])
+        .fetch_fields(
+            2,
+            3,
+            &[
+                path("id\"quoted"),
+                path("select"),
+                path("active"),
+                path("day"),
+                path("score"),
+            ],
+        )
         .expect("identity-projected window");
 
     assert_eq!(identity, full);
@@ -211,15 +387,15 @@ fn rejects_invalid_direct_projections() {
     let mut reader = DataWindowReader::new(source.path().to_owned());
 
     assert_eq!(
-        reader.fetch_columns(0, 1, &[]),
+        reader.fetch_fields(0, 1, &[]),
         Err(DataWindowError::Unsupported)
     );
     assert_eq!(
-        reader.fetch_columns(0, 1, &[1, 1]),
+        reader.fetch_fields(0, 1, &[path("select"), path("select")]),
         Err(DataWindowError::Unsupported)
     );
     assert_eq!(
-        reader.fetch_columns(0, 1, &[5]),
+        reader.fetch_fields(0, 1, &[path("missing")]),
         Err(DataWindowError::Unsupported)
     );
 }
@@ -234,7 +410,7 @@ fn maps_a_damaged_parquet_source_to_a_typed_error() {
     assert!(matches!(
         prepare_view(
             source.path(),
-            &[filter(0, DataFilterOperator::Equals, &["10"])],
+            &[filter("id\"quoted", DataFilterOperator::Equals, &["10"])],
             &[],
         ),
         Err(DataViewError::Engine(DataWindowError::CorruptSource))
@@ -248,7 +424,7 @@ fn rejects_an_unbounded_window_before_querying_duckdb() {
 
     assert_eq!(reader.fetch(0, 513), Err(DataWindowError::WindowTooLarge));
     assert_eq!(
-        reader.fetch_columns(0, 513, &[0]),
+        reader.fetch_fields(0, 513, &[path("id\"quoted")]),
         Err(DataWindowError::WindowTooLarge)
     );
 }
@@ -267,90 +443,108 @@ fn accepts_a_window_at_the_row_limit() {
 fn applies_every_operator_to_supported_scalar_types() {
     let source = write_basic_parquet();
     let cases = [
-        (filter(0, DataFilterOperator::Equals, &["12"]), vec![12]),
         (
-            filter(0, DataFilterOperator::NotEquals, &["12"]),
-            vec![10, 11, 13, 14, 15, 16, 17],
-        ),
-        (
-            filter(0, DataFilterOperator::GreaterThan, &["12"]),
-            vec![13, 14, 15, 16, 17],
-        ),
-        (
-            filter(0, DataFilterOperator::GreaterThanOrEqual, &["12"]),
-            vec![12, 13, 14, 15, 16, 17],
-        ),
-        (
-            filter(0, DataFilterOperator::LessThan, &["12"]),
-            vec![10, 11],
-        ),
-        (
-            filter(0, DataFilterOperator::LessThanOrEqual, &["12"]),
-            vec![10, 11, 12],
-        ),
-        (
-            filter(0, DataFilterOperator::OneOf, &["11", "14"]),
-            vec![11, 14],
-        ),
-        (
-            filter(0, DataFilterOperator::Range, &["12", "14"]),
-            vec![12, 13, 14],
-        ),
-        (filter(4, DataFilterOperator::IsNull, &[]), vec![15]),
-        (
-            filter(4, DataFilterOperator::IsNotNull, &[]),
-            vec![10, 11, 12, 13, 14, 16, 17],
-        ),
-        (filter(1, DataFilterOperator::Equals, &["row-2"]), vec![12]),
-        (
-            filter(1, DataFilterOperator::NotEquals, &["row-2"]),
-            vec![10, 13, 14, 15, 16, 17],
-        ),
-        (
-            filter(1, DataFilterOperator::OneOf, &["row-2", "row-4"]),
-            vec![12, 14],
-        ),
-        (
-            filter(1, DataFilterOperator::TextContains, &["row-"]),
-            vec![10, 12, 13, 14, 15, 16, 17],
-        ),
-        (filter(1, DataFilterOperator::IsNull, &[]), vec![11]),
-        (
-            filter(1, DataFilterOperator::IsNotNull, &[]),
-            vec![10, 12, 13, 14, 15, 16, 17],
-        ),
-        (
-            filter(2, DataFilterOperator::Equals, &["true"]),
-            vec![10, 12, 14, 16],
-        ),
-        (
-            filter(2, DataFilterOperator::NotEquals, &["true"]),
-            vec![11, 13, 15],
-        ),
-        (filter(2, DataFilterOperator::IsNull, &[]), vec![17]),
-        (
-            filter(2, DataFilterOperator::IsNotNull, &[]),
-            vec![10, 11, 12, 13, 14, 15, 16],
-        ),
-        (
-            filter(3, DataFilterOperator::Equals, &["1970-01-03"]),
+            filter("id\"quoted", DataFilterOperator::Equals, &["12"]),
             vec![12],
         ),
         (
-            filter(3, DataFilterOperator::NotEquals, &["1970-01-03"]),
-            vec![10, 11, 13, 14, 15, 17],
+            filter("id\"quoted", DataFilterOperator::NotEquals, &["12"]),
+            vec![10, 11, 13, 14, 15, 16, 17],
         ),
         (
-            filter(3, DataFilterOperator::OneOf, &["1970-01-02", "1970-01-05"]),
+            filter("id\"quoted", DataFilterOperator::GreaterThan, &["12"]),
+            vec![13, 14, 15, 16, 17],
+        ),
+        (
+            filter(
+                "id\"quoted",
+                DataFilterOperator::GreaterThanOrEqual,
+                &["12"],
+            ),
+            vec![12, 13, 14, 15, 16, 17],
+        ),
+        (
+            filter("id\"quoted", DataFilterOperator::LessThan, &["12"]),
+            vec![10, 11],
+        ),
+        (
+            filter("id\"quoted", DataFilterOperator::LessThanOrEqual, &["12"]),
+            vec![10, 11, 12],
+        ),
+        (
+            filter("id\"quoted", DataFilterOperator::OneOf, &["11", "14"]),
             vec![11, 14],
         ),
         (
-            filter(3, DataFilterOperator::Range, &["1970-01-03", "1970-01-05"]),
+            filter("id\"quoted", DataFilterOperator::Range, &["12", "14"]),
             vec![12, 13, 14],
         ),
-        (filter(3, DataFilterOperator::IsNull, &[]), vec![16]),
+        (filter("score", DataFilterOperator::IsNull, &[]), vec![15]),
         (
-            filter(3, DataFilterOperator::IsNotNull, &[]),
+            filter("score", DataFilterOperator::IsNotNull, &[]),
+            vec![10, 11, 12, 13, 14, 16, 17],
+        ),
+        (
+            filter("select", DataFilterOperator::Equals, &["row-2"]),
+            vec![12],
+        ),
+        (
+            filter("select", DataFilterOperator::NotEquals, &["row-2"]),
+            vec![10, 13, 14, 15, 16, 17],
+        ),
+        (
+            filter("select", DataFilterOperator::OneOf, &["row-2", "row-4"]),
+            vec![12, 14],
+        ),
+        (
+            filter("select", DataFilterOperator::TextContains, &["row-"]),
+            vec![10, 12, 13, 14, 15, 16, 17],
+        ),
+        (filter("select", DataFilterOperator::IsNull, &[]), vec![11]),
+        (
+            filter("select", DataFilterOperator::IsNotNull, &[]),
+            vec![10, 12, 13, 14, 15, 16, 17],
+        ),
+        (
+            filter("active", DataFilterOperator::Equals, &["true"]),
+            vec![10, 12, 14, 16],
+        ),
+        (
+            filter("active", DataFilterOperator::NotEquals, &["true"]),
+            vec![11, 13, 15],
+        ),
+        (filter("active", DataFilterOperator::IsNull, &[]), vec![17]),
+        (
+            filter("active", DataFilterOperator::IsNotNull, &[]),
+            vec![10, 11, 12, 13, 14, 15, 16],
+        ),
+        (
+            filter("day", DataFilterOperator::Equals, &["1970-01-03"]),
+            vec![12],
+        ),
+        (
+            filter("day", DataFilterOperator::NotEquals, &["1970-01-03"]),
+            vec![10, 11, 13, 14, 15, 17],
+        ),
+        (
+            filter(
+                "day",
+                DataFilterOperator::OneOf,
+                &["1970-01-02", "1970-01-05"],
+            ),
+            vec![11, 14],
+        ),
+        (
+            filter(
+                "day",
+                DataFilterOperator::Range,
+                &["1970-01-03", "1970-01-05"],
+            ),
+            vec![12, 13, 14],
+        ),
+        (filter("day", DataFilterOperator::IsNull, &[]), vec![16]),
+        (
+            filter("day", DataFilterOperator::IsNotNull, &[]),
             vec![10, 11, 12, 13, 14, 15, 17],
         ),
     ];
@@ -420,7 +614,7 @@ fn empty_string_equals_matches_empty_cells_but_not_nulls() {
     let source = write_text_parquet(vec![Some(String::new()), None, Some("value".to_owned())]);
     let view = prepare_view(
         source.path(),
-        &[filter(0, DataFilterOperator::Equals, &[""])],
+        &[filter("label", DataFilterOperator::Equals, &[""])],
         &[],
     )
     .expect("empty-string filtered view");
@@ -442,13 +636,9 @@ fn suggests_distinct_substring_matches_with_a_fixed_cap() {
     ]);
     let source = write_text_parquet(values);
 
-    let suggestions = fetch_text_suggestions(
-        source.path(),
-        "PHA",
-        &text_schema_field(),
-        DataFilterOperator::Equals,
-    )
-    .expect("suggestions");
+    let suggestions =
+        fetch_text_suggestions(source.path(), "PHA", "label", DataFilterOperator::Equals)
+            .expect("suggestions");
 
     assert_eq!(suggestions.values.len(), 20);
     assert!(suggestions.is_partial);
@@ -476,7 +666,7 @@ fn equals_and_not_equals_suggest_uuid_values_by_middle_fragments() {
     let uuid = &summary.schema[1];
 
     for operator in [DataFilterOperator::Equals, DataFilterOperator::NotEquals] {
-        let suggestions = fetch_text_suggestions(source.path(), "E89B-12D3", uuid, operator)
+        let suggestions = fetch_text_suggestions(source.path(), "E89B-12D3", &uuid.name, operator)
             .expect("UUID suggestions");
 
         assert_eq!(
@@ -503,8 +693,7 @@ fn positional_operators_keep_their_input_positions() {
         (DataFilterOperator::EndsWith, "bet", vec!["Alphabet"]),
     ] {
         let suggestions =
-            fetch_text_suggestions(source.path(), input, &text_schema_field(), operator)
-                .expect("suggestions");
+            fetch_text_suggestions(source.path(), input, "label", operator).expect("suggestions");
 
         assert_eq!(suggestions.values, expected);
         assert!(!suggestions.is_partial);
@@ -517,13 +706,9 @@ fn finds_a_match_beyond_ten_thousand_rows() {
     values.push(Some("late".to_owned()));
     let source = write_text_parquet(values);
 
-    let suggestions = fetch_text_suggestions(
-        source.path(),
-        "late",
-        &text_schema_field(),
-        DataFilterOperator::Equals,
-    )
-    .expect("suggestions");
+    let suggestions =
+        fetch_text_suggestions(source.path(), "late", "label", DataFilterOperator::Equals)
+            .expect("suggestions");
 
     assert_eq!(suggestions.values, ["late"]);
     assert!(!suggestions.is_partial);
@@ -537,13 +722,9 @@ fn marks_a_suggestion_scan_complete_when_the_column_ends_before_twenty_matches()
         None,
     ]);
 
-    let suggestions = fetch_text_suggestions(
-        source.path(),
-        "",
-        &text_schema_field(),
-        DataFilterOperator::Equals,
-    )
-    .expect("suggestions");
+    let suggestions =
+        fetch_text_suggestions(source.path(), "", "label", DataFilterOperator::Equals)
+            .expect("suggestions");
 
     assert_eq!(suggestions.values, vec!["Alpha", "Beta"]);
     assert!(!suggestions.is_partial);
@@ -559,12 +740,7 @@ fn cancels_text_value_suggestions_before_scanning() {
     interrupt.interrupt();
 
     assert_eq!(
-        reader.fetch(
-            "",
-            &text_schema_field(),
-            DataFilterOperator::Equals,
-            &interrupt,
-        ),
+        reader.fetch("", &path("label"), DataFilterOperator::Equals, &interrupt,),
         Err(DataWindowError::Cancelled)
     );
 }
@@ -572,21 +748,12 @@ fn cancels_text_value_suggestions_before_scanning() {
 fn fetch_text_suggestions(
     source_path: &std::path::Path,
     input: &str,
-    column: &SchemaField,
+    column_name: &str,
     operator: DataFilterOperator,
 ) -> Result<viewda_data_engine::TextValueSuggestions, DataWindowError> {
     let reader = TextValueSuggestionsReader::new(source_path.to_owned())?;
     let interrupt = reader.interrupt_handle();
-    reader.fetch(input, column, operator, &interrupt)
-}
-
-fn text_schema_field() -> SchemaField {
-    SchemaField {
-        name: "label".to_owned(),
-        physical_type: "BYTE_ARRAY".to_owned(),
-        logical_type: Some("String".to_owned()),
-        children: Vec::new(),
-    }
+    reader.fetch(input, &path(column_name), operator, &interrupt)
 }
 
 #[test]
@@ -598,15 +765,12 @@ fn applies_numeric_comparisons_to_each_numeric_storage_type() {
         (DataFilterOperator::LessThan, &[10, 11, 12][..]),
         (DataFilterOperator::LessThanOrEqual, &[10, 11, 12, 13][..]),
     ];
+    let column_names = ["id", "integer", "float", "double", "decimal", "half"];
 
-    for column_index in 1..=5 {
+    for (column_index, column_name) in column_names.iter().enumerate().skip(1) {
         for (operator, expected) in cases {
-            let view = prepare_view(
-                source.path(),
-                &[filter(column_index, operator, &["2"])],
-                &[],
-            )
-            .expect("filtered numeric view");
+            let view = prepare_view(source.path(), &[filter(column_name, operator, &["2"])], &[])
+                .expect("filtered numeric view");
             let batches = decode(view.fetch_window(0, 32).expect("filtered numeric window"));
 
             assert_eq!(
@@ -624,7 +788,7 @@ fn filters_uuid_and_json_columns_as_text() {
     let cases = [
         (
             filter(
-                1,
+                "uuid_value",
                 DataFilterOperator::Equals,
                 &["123e4567-e89b-12d3-a456-426614174001"],
             ),
@@ -632,7 +796,7 @@ fn filters_uuid_and_json_columns_as_text() {
         ),
         (
             filter(
-                1,
+                "uuid_value",
                 DataFilterOperator::OneOf,
                 &[
                     "123e4567-e89b-12d3-a456-426614174000",
@@ -642,11 +806,11 @@ fn filters_uuid_and_json_columns_as_text() {
             vec![1, 3],
         ),
         (
-            filter(1, DataFilterOperator::TextContains, &["e89b"]),
+            filter("uuid_value", DataFilterOperator::TextContains, &["e89b"]),
             vec![1, 2],
         ),
         (
-            filter(2, DataFilterOperator::TextContains, &["beta"]),
+            filter("json_value", DataFilterOperator::TextContains, &["beta"]),
             vec![2],
         ),
     ];
@@ -669,7 +833,11 @@ fn keeps_plain_binary_columns_null_only() {
     assert!(matches!(
         prepare_view(
             source.path(),
-            &[filter(3, DataFilterOperator::TextContains, &["alpha"],)],
+            &[filter(
+                "binary_value",
+                DataFilterOperator::TextContains,
+                &["alpha"],
+            )],
             &[],
         ),
         Err(DataViewError::Engine(DataWindowError::InvalidFilter))
@@ -677,7 +845,7 @@ fn keeps_plain_binary_columns_null_only() {
 
     let view = prepare_view(
         source.path(),
-        &[filter(3, DataFilterOperator::IsNotNull, &[])],
+        &[filter("binary_value", DataFilterOperator::IsNotNull, &[])],
         &[],
     )
     .expect("binary null-check view");
@@ -731,12 +899,14 @@ fn assert_temporal_comparisons(source: &NamedTempFile, cases: &[(u32, &str)]) {
         (DataFilterOperator::LessThan, &[0][..]),
         (DataFilterOperator::LessThanOrEqual, &[0, 1][..]),
     ];
+    let schema = inspect_local_source(source.path()).expect("temporal schema");
 
     for &(column_index, value) in cases {
+        let column_name = &schema.schema[column_index as usize].name;
         for (operator, expected) in operators {
             let view = prepare_view(
                 source.path(),
-                &[filter(column_index, operator, &[value])],
+                &[filter(column_name, operator, &[value])],
                 &[],
             )
             .unwrap_or_else(|error| {
@@ -759,7 +929,7 @@ fn accepts_an_explicit_offset_for_a_utc_timestamp_filter() {
     let view = prepare_view(
         source.path(),
         &[filter(
-            3,
+            "micros_utc",
             DataFilterOperator::Equals,
             &["1970-01-02T03:00:00.123456+03:00"],
         )],
@@ -779,7 +949,11 @@ fn accepts_a_timezone_free_value_for_a_utc_time_filter() {
     let source = write_raw_temporal_parquet();
     let view = prepare_view(
         source.path(),
-        &[filter(2, DataFilterOperator::Equals, &["12:00:00.123"])],
+        &[filter(
+            "time_ms_utc",
+            DataFilterOperator::Equals,
+            &["12:00:00.123"],
+        )],
         &[],
     )
     .expect("UTC time view without an offset");
@@ -797,7 +971,7 @@ fn uses_a_timestamp_filter_boundary_beyond_the_column_storage_precision() {
     let view = prepare_view(
         source.path(),
         &[filter(
-            2,
+            "millis",
             DataFilterOperator::GreaterThanOrEqual,
             &["1970-01-02T00:00:00.1234"],
         )],
@@ -892,8 +1066,12 @@ fn returns_duckdb_types_for_all_time_units_legacy_types_and_int96() {
 fn combines_conditions_and_offsets_the_filtered_view() {
     let source = write_basic_parquet();
     let filters = vec![
-        filter(0, DataFilterOperator::Range, &["11", "17"]),
-        filter(1, DataFilterOperator::OneOf, &["row-2", "row-4", "row-6"]),
+        filter("id\"quoted", DataFilterOperator::Range, &["11", "17"]),
+        filter(
+            "select",
+            DataFilterOperator::OneOf,
+            &["row-2", "row-4", "row-6"],
+        ),
     ];
     let view = prepare_view(source.path(), &filters, &[]).expect("filtered view");
 
@@ -908,7 +1086,7 @@ fn returns_a_schema_only_window_for_an_empty_filter_result() {
     let source = write_basic_parquet();
     let view = prepare_view(
         source.path(),
-        &[filter(0, DataFilterOperator::Equals, &["999"])],
+        &[filter("id\"quoted", DataFilterOperator::Equals, &["999"])],
         &[],
     )
     .expect("empty filtered view");
@@ -925,7 +1103,11 @@ fn rejects_an_operator_not_supported_by_the_column_type() {
     assert!(matches!(
         prepare_view(
             source.path(),
-            &[filter(0, DataFilterOperator::TextContains, &["1"])],
+            &[filter(
+                "id\"quoted",
+                DataFilterOperator::TextContains,
+                &["1"],
+            )],
             &[],
         ),
         Err(DataViewError::Engine(DataWindowError::InvalidFilter))
@@ -938,7 +1120,11 @@ fn rejects_bound_values_that_cannot_convert_to_the_column_type() {
     assert!(matches!(
         prepare_view(
             source.path(),
-            &[filter(0, DataFilterOperator::Equals, &["1 OR 1=1"])],
+            &[filter(
+                "id\"quoted",
+                DataFilterOperator::Equals,
+                &["1 OR 1=1"],
+            )],
             &[],
         ),
         Err(DataViewError::Engine(DataWindowError::InvalidFilter))
@@ -952,7 +1138,7 @@ fn sorts_large_mixed_type_sources_once_for_start_middle_and_end_windows() {
         source.path(),
         &[],
         &[DataSort {
-            source_index: 1,
+            field_path: path("number"),
             direction: DataSortDirection::Ascending,
         }],
     )
@@ -968,11 +1154,11 @@ fn sorts_large_mixed_type_sources_once_for_start_middle_and_end_windows() {
         &[],
         &[
             DataSort {
-                source_index: 2,
+                field_path: path("label"),
                 direction: DataSortDirection::Ascending,
             },
             DataSort {
-                source_index: 3,
+                field_path: path("recorded_at"),
                 direction: DataSortDirection::Descending,
             },
         ],
@@ -997,7 +1183,7 @@ fn reads_first_and_deep_sorted_windows_from_duckdb_nested_parquet() {
         &source,
         &[],
         &[DataSort {
-            source_index: 1,
+            field_path: path("int8_value"),
             direction: DataSortDirection::Ascending,
         }],
     )
@@ -1030,12 +1216,16 @@ fn reads_first_and_deep_sorted_windows_from_duckdb_nested_parquet() {
 #[test]
 fn combines_filter_sort_windows_and_exact_count_in_one_view() {
     let source = write_basic_parquet();
-    let filters = [filter(0, DataFilterOperator::Range, &["11", "16"])];
+    let filters = [filter(
+        "id\"quoted",
+        DataFilterOperator::Range,
+        &["11", "16"],
+    )];
     let view = prepare_view(
         source.path(),
         &filters,
         &[DataSort {
-            source_index: 1,
+            field_path: path("select"),
             direction: DataSortDirection::Descending,
         }],
     )
@@ -1046,7 +1236,7 @@ fn combines_filter_sort_windows_and_exact_count_in_one_view() {
     assert_eq!(view.row_count(), 6);
     assert_eq!(int64_values(&window[0], 0), vec![15, 14, 13]);
     let projected = decode(
-        view.fetch_window_columns(1, 3, &[2])
+        view.fetch_window_fields(1, 3, &[path("active")])
             .expect("window projected away from filter and sort columns"),
     );
     assert_eq!(projected[0].num_columns(), 1);
@@ -1086,7 +1276,7 @@ fn keeps_nulls_last_in_both_directions_and_direct_windows_in_file_order() {
             source.path(),
             &[],
             &[DataSort {
-                source_index: 1,
+                field_path: path("number"),
                 direction,
             }],
         )
@@ -1115,7 +1305,7 @@ fn cancelled_replacement_does_not_damage_the_completed_view() {
         source.path(),
         &[],
         &[DataSort {
-            source_index: 0,
+            field_path: path("file_order"),
             direction: DataSortDirection::Descending,
         }],
     )
@@ -1124,7 +1314,7 @@ fn cancelled_replacement_does_not_damage_the_completed_view() {
         source.path().to_owned(),
         &[],
         &[DataSort {
-            source_index: 0,
+            field_path: path("file_order"),
             direction: DataSortDirection::Ascending,
         }],
     )
@@ -1148,11 +1338,11 @@ fn rejects_duplicate_and_out_of_bounds_sort_columns() {
             &[],
             &[
                 DataSort {
-                    source_index: 0,
+                    field_path: path("id\"quoted"),
                     direction: DataSortDirection::Ascending,
                 },
                 DataSort {
-                    source_index: 0,
+                    field_path: path("id\"quoted"),
                     direction: DataSortDirection::Descending,
                 },
             ],
@@ -1164,7 +1354,7 @@ fn rejects_duplicate_and_out_of_bounds_sort_columns() {
             source.path(),
             &[],
             &[DataSort {
-                source_index: 5,
+                field_path: path("missing"),
                 direction: DataSortDirection::Ascending,
             }],
         ),
@@ -1179,7 +1369,7 @@ fn uses_file_order_as_a_stable_tie_break_across_row_groups() {
         source.path(),
         &[],
         &[DataSort {
-            source_index: 1,
+            field_path: path("group"),
             direction: DataSortDirection::Ascending,
         }],
     )
@@ -1200,7 +1390,7 @@ fn orders_nan_after_finite_values_ascending_and_before_them_descending() {
         source.path(),
         &[],
         &[DataSort {
-            source_index: 1,
+            field_path: path("value"),
             direction: DataSortDirection::Ascending,
         }],
     )
@@ -1209,7 +1399,7 @@ fn orders_nan_after_finite_values_ascending_and_before_them_descending() {
         source.path(),
         &[],
         &[DataSort {
-            source_index: 1,
+            field_path: path("value"),
             direction: DataSortDirection::Descending,
         }],
     )
@@ -1249,7 +1439,7 @@ fn distinguishes_a_physical_file_row_number_column_from_the_virtual_position() {
         source.path(),
         &[],
         &[DataSort {
-            source_index: 0,
+            field_path: path("file_row_number"),
             direction: DataSortDirection::Ascending,
         }],
     )
@@ -1308,9 +1498,9 @@ fn prepare_view(
     DataViewBuilder::new(source.to_owned(), filters, sort)?.build()
 }
 
-fn filter(column_index: u32, operator: DataFilterOperator, values: &[&str]) -> DataFilter {
+fn filter(column_name: &str, operator: DataFilterOperator, values: &[&str]) -> DataFilter {
     DataFilter {
-        column_index,
+        field_path: path(column_name),
         operator,
         values: values.iter().map(|value| (*value).to_owned()).collect(),
         match_case: false,
@@ -1319,11 +1509,15 @@ fn filter(column_index: u32, operator: DataFilterOperator, values: &[&str]) -> D
 
 fn text_filter(operator: DataFilterOperator, value: &str, match_case: bool) -> DataFilter {
     DataFilter {
-        column_index: 0,
+        field_path: path("label"),
         operator,
         values: vec![value.to_owned()],
         match_case,
     }
+}
+
+fn path(name: &str) -> FieldPath {
+    FieldPath::new(vec![name.to_owned()])
 }
 
 fn decode(bytes: Vec<u8>) -> Vec<RecordBatch> {
@@ -1361,6 +1555,17 @@ fn int32_value(batch: &RecordBatch, column: usize) -> i32 {
         .downcast_ref::<Int32Array>()
         .expect("int32 column")
         .value(0)
+}
+
+fn optional_int32_values(batch: &RecordBatch, column: usize) -> Vec<Option<i32>> {
+    let values = batch
+        .column(column)
+        .as_any()
+        .downcast_ref::<Int32Array>()
+        .expect("int32 column");
+    (0..values.len())
+        .map(|index| (!values.is_null(index)).then(|| values.value(index)))
+        .collect()
 }
 
 fn write_basic_parquet() -> NamedTempFile {
@@ -1613,6 +1818,58 @@ fn write_nested_parquet() -> NamedTempFile {
         vec![Arc::new(profile) as ArrayRef, Arc::new(tags) as ArrayRef],
     )
     .expect("nested record batch");
+    write_batch(&source, schema, &batch);
+    source
+}
+
+fn write_addressable_nested_parquet() -> NamedTempFile {
+    let source = NamedTempFile::new().expect("temporary source");
+    let address_fields = Fields::from(vec![Field::new("postal.code", DataType::Int32, false)]);
+    let mut address_validity = NullBufferBuilder::new(4);
+    for valid in [true, true, false, true] {
+        address_validity.append(valid);
+    }
+    let address = StructArray::new(
+        address_fields.clone(),
+        vec![Arc::new(Int32Array::from(vec![100, 200, 300, 400])) as ArrayRef],
+        address_validity.finish(),
+    );
+    let profile_fields = Fields::from(vec![
+        Field::new("city\"name", DataType::Utf8, false),
+        Field::new("address", DataType::Struct(address_fields), true),
+    ]);
+    let mut profile_validity = NullBufferBuilder::new(4);
+    for valid in [true, false, true, true] {
+        profile_validity.append(valid);
+    }
+    let profile = StructArray::new(
+        profile_fields.clone(),
+        vec![
+            Arc::new(StringArray::from(vec!["A", "masked", "C", "D"])) as ArrayRef,
+            Arc::new(address) as ArrayRef,
+        ],
+        profile_validity.finish(),
+    );
+    let alternate_fields = Fields::from(vec![Field::new("city\"name", DataType::Utf8, false)]);
+    let alternate = StructArray::new(
+        alternate_fields.clone(),
+        vec![Arc::new(StringArray::from(vec!["W", "X", "Y", "Z"])) as ArrayRef],
+        None,
+    );
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int64, false),
+        Field::new("profile.with.dot", DataType::Struct(profile_fields), true),
+        Field::new("alternate", DataType::Struct(alternate_fields), false),
+    ]));
+    let batch = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![
+            Arc::new(Int64Array::from(vec![1, 2, 3, 4])) as ArrayRef,
+            Arc::new(profile) as ArrayRef,
+            Arc::new(alternate) as ArrayRef,
+        ],
+    )
+    .expect("addressable nested record batch");
     write_batch(&source, schema, &batch);
     source
 }

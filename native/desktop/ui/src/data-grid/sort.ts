@@ -1,12 +1,13 @@
-import type { SortColumn } from "../desktop";
+import type { FieldPath, SortColumn } from "../desktop";
+import { sameFieldPath } from "./field-path";
 
 export function nextSort(
   current: readonly SortColumn[],
-  sourceIndex: number,
+  fieldPath: FieldPath,
   additive: boolean,
 ): SortColumn[] {
-  const existingIndex = current.findIndex(
-    (column) => column.sourceIndex === sourceIndex,
+  const existingIndex = current.findIndex((column) =>
+    sameFieldPath(column.fieldPath, fieldPath),
   );
   const direction =
     existingIndex < 0
@@ -16,25 +17,29 @@ export function nextSort(
         : null;
 
   if (!additive) {
-    return direction === null ? [] : [{ sourceIndex, direction }];
+    return direction === null ? [] : [{ fieldPath, direction }];
   }
   if (existingIndex < 0) {
-    return [...current, { sourceIndex, direction: "ascending" }];
+    return [...current, { fieldPath, direction: "ascending" }];
   }
   if (direction === null) {
-    return current.filter((column) => column.sourceIndex !== sourceIndex);
+    return current.filter(
+      (column) => !sameFieldPath(column.fieldPath, fieldPath),
+    );
   }
   return current.map((column) =>
-    column.sourceIndex === sourceIndex ? { ...column, direction } : column,
+    sameFieldPath(column.fieldPath, fieldPath)
+      ? { ...column, direction }
+      : column,
   );
 }
 
 export function sortedColumnIcon(
   sort: readonly SortColumn[],
-  sourceIndex: number,
+  fieldPath: FieldPath,
 ): string {
-  const ordinal = sort.findIndex(
-    (column) => column.sourceIndex === sourceIndex,
+  const ordinal = sort.findIndex((column) =>
+    sameFieldPath(column.fieldPath, fieldPath),
   );
   if (ordinal < 0) {
     return "viewda-sort-neutral";

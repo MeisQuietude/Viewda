@@ -51,7 +51,7 @@ describe("recursive value formatting", () => {
       "{price: 19.99, recorded_at: 2026-08-01T06:07:08.009Z, payload: binary · 3 B}",
     );
     expect(JSON.parse(valueToJson(input))).toEqual({
-      price: 19.99,
+      price: "19.99",
       recorded_at: Number(epoch),
       payload: "AQID",
     });
@@ -108,8 +108,11 @@ describe("recursive value formatting", () => {
     expect(child?.labelSearch).toEqual({ kind: "plain", text: key });
   });
 
-  it("quotes decimals whose text or scale cannot survive JSON parsing", () => {
+  it("serializes every decimal as its exact text string", () => {
     const wide = 12_345_678_901_234_567_890_123_456_789_012_345_678n;
+    expect(JSON.parse(valueToJson(typedValue(37n, decimal128(10, 0))))).toBe(
+      "37",
+    );
     expect(JSON.parse(valueToJson(typedValue(wide, decimal128(38, 2))))).toBe(
       "123456789012345678901234567890123456.78",
     );
@@ -117,7 +120,10 @@ describe("recursive value formatting", () => {
       "1.20",
     );
     expect(JSON.parse(valueToJson(typedValue(1999n, decimal128(9, 2))))).toBe(
-      19.99,
+      "19.99",
+    );
+    expect(JSON.parse(valueToJson(typedValue(1n, decimal128(38, 20))))).toBe(
+      "0.00000000000000000001",
     );
   });
 

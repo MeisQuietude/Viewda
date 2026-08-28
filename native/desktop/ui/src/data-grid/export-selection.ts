@@ -1,9 +1,9 @@
-import type { ExportRowRange } from "../desktop";
+import type { ExportRowRange, FieldPath } from "../desktop";
 import { boundedSelectionScope } from "./grid-selection";
 import type { GridSelection } from "./grid-model";
 
 export interface ExportSelectionShape {
-  columnIndices: number[];
+  fieldPaths: FieldPath[];
   columnCount: number;
   rowCount: number;
   rowRanges: ExportRowRange[];
@@ -12,24 +12,24 @@ export interface ExportSelectionShape {
 /** Compresses the grid's union selection without expanding contiguous large ranges. */
 export function exportSelectionShape(
   selection: GridSelection,
-  visibleSourceIndices: readonly number[],
+  visibleFieldPaths: readonly FieldPath[],
   viewRowCount: number,
 ): ExportSelectionShape | null {
   const scope = boundedSelectionScope(
     selection,
     viewRowCount,
-    visibleSourceIndices.length,
+    visibleFieldPaths.length,
   );
   if (scope === null) {
     return null;
   }
-  const columnIndices = scope.columnIndices
-    .map((visibleIndex) => visibleSourceIndices[visibleIndex])
-    .filter((sourceIndex): sourceIndex is number => sourceIndex !== undefined);
+  const fieldPaths = scope.columnIndices
+    .map((visibleIndex) => visibleFieldPaths[visibleIndex])
+    .filter((fieldPath): fieldPath is FieldPath => fieldPath !== undefined);
 
   return {
-    columnIndices,
-    columnCount: columnIndices.length,
+    fieldPaths,
+    columnCount: fieldPaths.length,
     rowCount: scope.rowCount,
     rowRanges: scope.rowRanges.map(([start, end]): ExportRowRange => ({
       start,

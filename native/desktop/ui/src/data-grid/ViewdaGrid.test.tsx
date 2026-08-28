@@ -753,6 +753,57 @@ describe("ViewdaGrid foundation", () => {
     ).toBeInTheDocument();
   });
 
+  it("keeps a nested leaf visible and exposes its flattened group rail", () => {
+    render(
+      <ViewdaGrid
+        {...props({
+          columns: [
+            {
+              ...column(0),
+              title: 'profile.address."postal code"',
+              titlePrefix: "profile.address.",
+              titleLeaf: '"postal code"',
+              groupRail: {
+                title: "profile · struct<…>",
+                start: true,
+                end: true,
+              },
+            },
+          ],
+          rowCount: 1,
+        })}
+      />,
+    );
+
+    const header = screen.getByRole("columnheader", {
+      name: 'profile.address."postal code"',
+    });
+    expect(header).toHaveClass("has-group-start", "has-group-end");
+    expect(
+      header.querySelector(".viewda-grid-header-prefix"),
+    ).toHaveTextContent("profile.address.");
+    expect(
+      header.querySelector(".viewda-grid-header-prefix-text"),
+    ).toHaveTextContent("profile.address");
+    expect(
+      header.querySelector(".viewda-grid-header-prefix-separator"),
+    ).toHaveTextContent(".");
+    expect(header.querySelector(".viewda-grid-header-leaf")).toHaveTextContent(
+      '"postal code"',
+    );
+    expect(header.querySelector(".viewda-grid-group-rail")).toHaveAttribute(
+      "title",
+      "profile · struct<…>",
+    );
+    expect(header.querySelector(".viewda-grid-header-title")).toHaveAttribute(
+      "title",
+      'profile.address."postal code"',
+    );
+    expect(header.querySelector(".viewda-grid-header-title")).toHaveClass(
+      "is-path",
+    );
+  });
+
   it("omits unavailable header actions and keeps the title and resize handle", () => {
     render(
       <ViewdaGrid
@@ -793,6 +844,9 @@ describe("ViewdaGrid foundation", () => {
     expect(
       descriptiveHeader.querySelector(".viewda-grid-header-title"),
     ).toHaveTextContent("Column 1");
+    expect(
+      descriptiveHeader.querySelector(".viewda-grid-header-title"),
+    ).toHaveClass("is-plain");
     expect(
       descriptiveHeader.querySelector(".viewda-grid-resize-handle"),
     ).toBeInTheDocument();

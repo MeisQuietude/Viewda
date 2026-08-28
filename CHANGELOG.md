@@ -8,6 +8,10 @@ Backward-incompatible entries start with **Breaking:**.
 
 ## Unreleased
 
+### Added
+
+- Flatten struct fields into regular Data grid columns at any depth. Nested columns retain grid controls, statistics, copy and CSV export behavior; nested JSON keeps decimals as exact strings and normalizes non-finite numbers; schema and column menus can restore any flattened ancestor without resetting the scroll position. Duplicate top-level names remain visible in source order, while actions that require an unambiguous name path are disabled with an explanation.
+
 ## 0.3.0 — 2026-08-26
 
 ### Added

@@ -131,6 +131,9 @@ export type GridCell = LoadingGridCell | TextGridCell;
 export interface GridColumn {
   id: string;
   title: string;
+  titlePrefix?: string;
+  titleLeaf?: string;
+  groupRail?: { title: string; start: boolean; end: boolean };
   width: number;
   monospace: boolean;
   pinned: boolean;

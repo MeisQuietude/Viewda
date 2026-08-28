@@ -23,6 +23,8 @@ import {
   ValueCopyLimitError,
 } from "./value-json-serializer";
 import { codePointSafePrefix } from "./unicode";
+import type { FieldPath } from "../desktop";
+import { formatFieldPath, formatFieldPathSegment } from "./field-path";
 import {
   BINARY_HEX_ROW_BYTES,
   binaryValueBytes,
@@ -74,6 +76,7 @@ interface TreeNode {
   ordinal: number;
   label: string;
   labelSearch?: ValueSearchText;
+  objectKey?: string;
   key: boolean;
   value: TypedValue;
   depth: number;
@@ -153,8 +156,12 @@ export const ValueTree = forwardRef<
   {
     value: TypedValue;
     label: string;
+    fieldPath?: FieldPath;
   } & ValueCopyHandlers
->(function ValueTree({ value, label, onCopy, onCopyIntent }, forwardedRef) {
+>(function ValueTree(
+  { value, label, fieldPath, onCopy, onCopyIntent },
+  forwardedRef,
+) {
   const treeRef = useRef<HTMLDivElement>(null);
   const treeId = useId();
   const [schedulerRef] = useState(() => ({ current: new ChunkScheduler() }));
@@ -1003,6 +1010,7 @@ export const ValueTree = forwardRef<
   const invalidOffset =
     preparedValue.kind === "invalidJson" ? preparedValue.errorOffset + 1 : null;
   const showToolbar =
+    fieldPath !== undefined ||
     parseStatus !== null ||
     preparedValue.kind === "invalidJson" ||
     preparedValue.kind === "rawJson" ||
@@ -1040,6 +1048,25 @@ export const ValueTree = forwardRef<
             }}
           />
           <div className="value-tree-toolbar-actions">
+            {fieldPath !== undefined && (
+              <button
+                type="button"
+                onClick={() => {
+                  if (activeNode === undefined) return;
+                  const text = valueNodePath(fieldPath, activeNode);
+                  const submit =
+                    onCopyIntent ??
+                    ((prepared: Promise<string>) =>
+                      prepared.then((result) => onCopy?.(result)));
+                  void Promise.resolve(submit(Promise.resolve(text))).then(
+                    () => setCopyMessage("Copied path."),
+                    () => setCopyError("The value path could not be copied."),
+                  );
+                }}
+              >
+                Copy path
+              </button>
+            )}
             <button
               type="button"
               disabled={
@@ -1587,11 +1614,33 @@ function childNode(parent: TreeNode, ordinal: number): TreeNode | undefined {
     ordinal,
     label: child.label,
     labelSearch: child.labelSearch,
+    objectKey: child.objectKey,
     key: child.key,
     value: child.value,
     depth: parent.depth + 1,
     siblingCount: valueChildCount(parent.value),
   };
+}
+
+function valueNodePath(fieldPath: FieldPath, node: TreeNode): string {
+  const descendants: TreeNode[] = [];
+  for (let current: TreeNode | null = node; current?.parent !== null;) {
+    descendants.push(current);
+    current = current.parent;
+  }
+  let path = formatFieldPath(fieldPath);
+  for (const descendant of descendants.reverse()) {
+    if (descendant.objectKey !== undefined) {
+      path += `.${formatFieldPathSegment(descendant.objectKey)}`;
+    } else if (/^\[\d+\]$/.test(descendant.label)) {
+      path += descendant.label;
+    } else if (descendant.key) {
+      path += `[${JSON.stringify(descendant.label)}]`;
+    } else {
+      path += `[${descendant.ordinal}]`;
+    }
+  }
+  return path;
 }
 
 function createRootNode(label: string, value: TypedValue): TreeNode {

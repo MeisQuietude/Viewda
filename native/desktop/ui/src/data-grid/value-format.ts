@@ -1102,11 +1102,8 @@ function jsonInteger(value: unknown): string {
 }
 
 function decimalToJson(value: unknown, scale: number): string {
-  const text = decimalToText(value, scale);
-  const number = Number(text);
-  return Number.isFinite(number) && String(number) === text
-    ? text
-    : JSON.stringify(text);
+  // JSON numbers cannot preserve decimal scale or every exact decimal value.
+  return JSON.stringify(decimalToText(value, scale));
 }
 
 function fitToken(token: string, limit: number): string {

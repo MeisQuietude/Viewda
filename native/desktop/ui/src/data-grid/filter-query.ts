@@ -1,6 +1,16 @@
 import { TimeUnit, Type, type DataType } from "@uwdata/flechette";
 
-import type { DataFilter, SchemaField, SortColumn } from "../desktop";
+import type {
+  DataFilter,
+  FieldPath,
+  SchemaField,
+  SortColumn,
+} from "../desktop";
+import {
+  formatSqlFieldPath,
+  resolveSchemaField,
+  sameFieldPath,
+} from "./field-path";
 
 export type ColumnFilterKind =
   "boolean" | "number" | "text" | "temporal" | "nullOnly";
@@ -153,7 +163,7 @@ export function formatWhereClause(
 ): string {
   return filters
     .map((filter) => {
-      const field = schema[filter.columnIndex];
+      const field = resolveSchemaField(schema, filter.fieldPath);
       return field === undefined ? "" : formatFilterCondition(filter, field);
     })
     .filter((condition) => condition.length > 0)
@@ -161,19 +171,21 @@ export function formatWhereClause(
 }
 
 export function formatSelectClause(
-  sourceIndices: readonly number[],
+  fieldPaths: readonly FieldPath[],
   schema: readonly SchemaField[],
 ): string {
-  const fields = sourceIndices.flatMap((sourceIndex) => {
-    const field = schema[sourceIndex];
-    return field === undefined ? [] : [[sourceIndex, field] as const];
+  const fields = fieldPaths.flatMap((fieldPath) => {
+    const field = resolveSchemaField(schema, fieldPath);
+    return field === undefined ? [] : [[fieldPath, field] as const];
   });
   const identityProjection =
     fields.length === schema.length &&
-    fields.every(([sourceIndex], index) => sourceIndex === index);
+    fields.every(([fieldPath], index) =>
+      sameFieldPath(fieldPath, [schema[index]!.name]),
+    );
   return identityProjection
     ? "*"
-    : fields.map(([, field]) => quoteIdentifier(field.name)).join(", ");
+    : fields.map(([fieldPath]) => formatSqlFieldPath(fieldPath)).join(", ");
 }
 
 export function formatOrderByClause(
@@ -182,12 +194,12 @@ export function formatOrderByClause(
 ): string {
   return sort
     .map((column) => {
-      const field = schema[column.sourceIndex];
+      const field = resolveSchemaField(schema, column.fieldPath);
       if (field === undefined) {
         return "";
       }
       const direction = column.direction === "ascending" ? "ASC" : "DESC";
-      return `${quoteIdentifier(field.name)} ${direction}`;
+      return `${formatSqlFieldPath(column.fieldPath)} ${direction}`;
     })
     .filter((condition) => condition.length > 0)
     .join(", ");
@@ -197,7 +209,7 @@ export function formatFilterCondition(
   filter: DataFilter,
   field: SchemaField,
 ): string {
-  const identifier = quoteIdentifier(field.name);
+  const identifier = formatSqlFieldPath(filter.fieldPath);
   const literal = (value: string | undefined) =>
     formatFilterLiteral(value ?? "", field, identifier);
   switch (filter.operator) {
@@ -269,10 +281,6 @@ function formatFilterLiteral(
     return value;
   }
   return quoteString(value);
-}
-
-function quoteIdentifier(identifier: string): string {
-  return `"${identifier.replaceAll('"', '""')}"`;
 }
 
 function quoteString(value: string): string {

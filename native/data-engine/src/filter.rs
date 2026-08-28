@@ -5,17 +5,21 @@ use serde::Deserialize;
 use thiserror::Error;
 
 use crate::source::SchemaField;
+use crate::{
+    FieldPath,
+    field_path::{field_path_expression, resolve_field_path},
+};
 
 const MAX_FILTERS: usize = 32;
 const MAX_ONE_OF_VALUES: usize = 100;
 const MAX_VALUE_BYTES: usize = 4_096;
 
-/// One typed condition applied to a top-level Parquet column.
+/// One typed condition applied to an addressable Parquet field.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DataFilter {
-    /// Zero-based top-level column index from the source summary.
-    pub column_index: u32,
+    /// Field-name segments from the top-level column through struct fields.
+    pub field_path: FieldPath,
     /// Operation valid for the column's filter family.
     pub operator: DataFilterOperator,
     /// Text representations converted by DuckDB to the column's exact type.
@@ -81,15 +85,16 @@ pub(crate) fn build_filter_predicate_with_names(
     let mut clauses = Vec::with_capacity(filters.len());
     let mut parameters = Vec::new();
     for filter in filters {
-        let column = schema
-            .get(filter.column_index as usize)
-            .ok_or(FilterBuildError::Invalid)?;
-        validate_filter(filter, column_filter_kind(column))?;
-        let identifier = quote_identifier(
+        let resolved =
+            resolve_field_path(schema, &filter.field_path).ok_or(FilterBuildError::Invalid)?;
+        validate_filter(filter, column_filter_kind(resolved.field))?;
+        let root = quote_identifier(
             column_names
-                .get(filter.column_index as usize)
+                .get(resolved.root_index)
                 .ok_or(FilterBuildError::Invalid)?,
         );
+        let identifier =
+            field_path_expression(&filter.field_path, &root).ok_or(FilterBuildError::Invalid)?;
         let clause = match filter.operator {
             DataFilterOperator::Equals => {
                 parameters.push(Value::Text(filter.values[0].clone()));
@@ -327,9 +332,9 @@ mod tests {
         }
     }
 
-    fn text_filter(operator: DataFilterOperator, values: &[&str]) -> DataFilter {
+    fn text_filter(field_name: &str, operator: DataFilterOperator, values: &[&str]) -> DataFilter {
         DataFilter {
-            column_index: 0,
+            field_path: FieldPath::from(field_name),
             operator,
             values: values.iter().map(|value| (*value).to_owned()).collect(),
             match_case: false,
@@ -340,13 +345,13 @@ mod tests {
     fn builds_parameterized_and_conditions_with_quoted_identifiers() {
         let filters = vec![
             DataFilter {
-                column_index: 0,
+                field_path: FieldPath::from("value\"quoted"),
                 operator: DataFilterOperator::Range,
                 values: vec!["10".to_owned(), "20".to_owned()],
                 match_case: false,
             },
             DataFilter {
-                column_index: 1,
+                field_path: FieldPath::from("label"),
                 operator: DataFilterOperator::TextContains,
                 values: vec!["quiet".to_owned()],
                 match_case: false,
@@ -379,7 +384,7 @@ mod tests {
     #[test]
     fn rejects_operators_outside_the_column_filter_family() {
         let filter = DataFilter {
-            column_index: 0,
+            field_path: FieldPath::from("label"),
             operator: DataFilterOperator::Range,
             values: vec!["a".to_owned(), "z".to_owned()],
             match_case: false,
@@ -387,6 +392,22 @@ mod tests {
 
         assert!(
             build_filter_predicate(&[field("label", ColumnFilterKind::Text)], &[filter]).is_err()
+        );
+    }
+
+    #[test]
+    fn rejects_an_empty_field_path_at_the_filter_boundary() {
+        let schema = [field("label", ColumnFilterKind::Text)];
+        let filter = DataFilter {
+            field_path: FieldPath::new(Vec::<String>::new()),
+            operator: DataFilterOperator::Equals,
+            values: vec!["alpha".to_owned()],
+            match_case: false,
+        };
+
+        assert_eq!(
+            build_filter_predicate_with_names(&schema, &[filter], &["label"]).err(),
+            Some(FilterBuildError::Invalid)
         );
     }
 
@@ -409,7 +430,7 @@ mod tests {
         for (operator, sql_operator) in operators {
             for (kind, supported) in kinds {
                 let filter = DataFilter {
-                    column_index: 0,
+                    field_path: FieldPath::from("value"),
                     operator,
                     values: vec!["1".to_owned()],
                     match_case: false,
@@ -441,7 +462,7 @@ mod tests {
             for kind in [ColumnFilterKind::Number, ColumnFilterKind::Temporal] {
                 for values in [Vec::new(), vec!["1".to_owned(), "2".to_owned()]] {
                     let filter = DataFilter {
-                        column_index: 0,
+                        field_path: FieldPath::from("value"),
                         operator,
                         values,
                         match_case: false,
@@ -458,17 +479,16 @@ mod tests {
             schema_field("uuid_value", "FIXED_LEN_BYTE_ARRAY", Some("UUID")),
             schema_field("json_value", "BYTE_ARRAY", Some("JSON")),
         ];
-        let filters = [
-            text_filter(DataFilterOperator::Equals, &["alpha"]),
-            text_filter(DataFilterOperator::NotEquals, &["alpha"]),
-            text_filter(DataFilterOperator::OneOf, &["alpha", "beta"]),
-            text_filter(DataFilterOperator::TextContains, &["pha"]),
-            text_filter(DataFilterOperator::NotContains, &["pha"]),
-            text_filter(DataFilterOperator::StartsWith, &["alpha"]),
-            text_filter(DataFilterOperator::EndsWith, &["alpha"]),
-        ];
-
         for column in columns {
+            let filters = [
+                text_filter(&column.name, DataFilterOperator::Equals, &["alpha"]),
+                text_filter(&column.name, DataFilterOperator::NotEquals, &["alpha"]),
+                text_filter(&column.name, DataFilterOperator::OneOf, &["alpha", "beta"]),
+                text_filter(&column.name, DataFilterOperator::TextContains, &["pha"]),
+                text_filter(&column.name, DataFilterOperator::NotContains, &["pha"]),
+                text_filter(&column.name, DataFilterOperator::StartsWith, &["alpha"]),
+                text_filter(&column.name, DataFilterOperator::EndsWith, &["alpha"]),
+            ];
             for filter in &filters {
                 assert!(
                     build_filter_predicate(
@@ -513,15 +533,14 @@ mod tests {
                 Some("Geography (spherical)"),
             ),
         ];
-        let text_filters = [
-            text_filter(DataFilterOperator::Equals, &["alpha"]),
-            text_filter(DataFilterOperator::NotEquals, &["alpha"]),
-            text_filter(DataFilterOperator::OneOf, &["alpha", "beta"]),
-            text_filter(DataFilterOperator::TextContains, &["pha"]),
-        ];
-        let null_filter = text_filter(DataFilterOperator::IsNull, &[]);
-
         for column in columns {
+            let text_filters = [
+                text_filter(&column.name, DataFilterOperator::Equals, &["alpha"]),
+                text_filter(&column.name, DataFilterOperator::NotEquals, &["alpha"]),
+                text_filter(&column.name, DataFilterOperator::OneOf, &["alpha", "beta"]),
+                text_filter(&column.name, DataFilterOperator::TextContains, &["pha"]),
+            ];
+            let null_filter = text_filter(&column.name, DataFilterOperator::IsNull, &[]);
             for filter in &text_filters {
                 assert_eq!(
                     build_filter_predicate(
@@ -552,7 +571,7 @@ mod tests {
         let column = field("value", ColumnFilterKind::Number);
         let filters = (0..=MAX_FILTERS)
             .map(|_| DataFilter {
-                column_index: 0,
+                field_path: FieldPath::from("value"),
                 operator: DataFilterOperator::IsNotNull,
                 values: Vec::new(),
                 match_case: false,
@@ -564,7 +583,7 @@ mod tests {
         );
 
         let one_of = DataFilter {
-            column_index: 0,
+            field_path: FieldPath::from("value"),
             operator: DataFilterOperator::OneOf,
             values: vec!["1".to_owned(); MAX_ONE_OF_VALUES + 1],
             match_case: false,
@@ -579,7 +598,7 @@ mod tests {
     fn accepts_a_value_at_the_byte_limit_and_rejects_the_next_byte() {
         let column = field("label", ColumnFilterKind::Text);
         let filter_with_value = |value: String| DataFilter {
-            column_index: 0,
+            field_path: FieldPath::from("label"),
             operator: DataFilterOperator::Equals,
             values: vec![value],
             match_case: false,
@@ -612,7 +631,7 @@ mod tests {
             DataFilterOperator::EndsWith,
         ] {
             let valid = DataFilter {
-                column_index: 0,
+                field_path: FieldPath::from("label"),
                 operator,
                 values: vec!["value".to_owned()],
                 match_case: true,
@@ -620,7 +639,7 @@ mod tests {
             assert!(build_filter_predicate(std::slice::from_ref(&column), &[valid]).is_ok());
 
             let invalid = DataFilter {
-                column_index: 0,
+                field_path: FieldPath::from("label"),
                 operator,
                 values: Vec::new(),
                 match_case: false,
@@ -632,7 +651,7 @@ mod tests {
         }
 
         let invalid_flag = DataFilter {
-            column_index: 0,
+            field_path: FieldPath::from("label"),
             operator: DataFilterOperator::Equals,
             values: vec!["value".to_owned()],
             match_case: true,

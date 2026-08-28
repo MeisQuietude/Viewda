@@ -15,9 +15,11 @@ use duckdb::{Config, Connection, Error as DuckDbError, InterruptHandle};
 use serde::Serialize;
 
 use crate::{
+    FieldPath,
     dataset::{DatasetError, DatasetQuerySource, DatasetSetupError, DatasetWindowReader},
+    field_path::{field_path_expression, resolve_field_path},
     filter::{ColumnFilterKind, DataFilterOperator, column_filter_kind, quote_identifier},
-    source::{SchemaField, open_local_source},
+    source::{SchemaField, inspect_local_source_for_query, open_local_source},
     window::{DataWindowError, classify_query_error},
 };
 
@@ -66,14 +68,20 @@ pub struct TextValueSuggestionsReader {
 }
 
 enum TextValueSuggestionsSource {
-    File(PathBuf),
+    File {
+        path: PathBuf,
+        schema: Mutex<Option<Vec<SchemaField>>>,
+    },
     Dataset(Box<DatasetQuerySource>),
 }
 
 impl TextValueSuggestionsReader {
     /// Creates a reader whose isolated connection cannot block grid windows.
     pub fn new(source_path: PathBuf) -> Result<Self, DataWindowError> {
-        Self::with_source(TextValueSuggestionsSource::File(source_path))
+        Self::with_source(TextValueSuggestionsSource::File {
+            path: source_path,
+            schema: Mutex::new(None),
+        })
     }
 
     /// Creates a suggestion reader for one completed fixed dataset.
@@ -154,17 +162,17 @@ impl TextValueSuggestionsReader {
     pub fn fetch(
         &self,
         input: &str,
-        column: &SchemaField,
+        field_path: &FieldPath,
         operator: DataFilterOperator,
         interrupt: &TextValueSuggestionsInterruptHandle,
     ) -> Result<TextValueSuggestions, DataWindowError> {
-        self.fetch_checked(input, column, operator, interrupt, || {})
+        self.fetch_checked(input, field_path, operator, interrupt, || {})
     }
 
     fn fetch_checked(
         &self,
         input: &str,
-        column: &SchemaField,
+        field_path: &FieldPath,
         operator: DataFilterOperator,
         interrupt: &TextValueSuggestionsInterruptHandle,
         before_prepare: impl FnOnce(),
@@ -174,7 +182,8 @@ impl TextValueSuggestionsReader {
         }
         debug_assert!(Arc::ptr_eq(&self.interrupt, &interrupt.inner));
         Self::require_active(interrupt)?;
-        if column_filter_kind(column) != ColumnFilterKind::Text {
+        let column = self.resolve_field(field_path)?;
+        if column_filter_kind(&column) != ColumnFilterKind::Text {
             return Err(DataWindowError::InvalidFilter);
         }
         let match_function = match operator {
@@ -197,13 +206,15 @@ impl TextValueSuggestionsReader {
                 &connection,
                 dataset,
                 input,
-                column,
+                field_path,
                 match_function,
                 interrupt,
             );
         }
         let (relation, mut parameters) = match &self.source {
-            TextValueSuggestionsSource::File(source_path) => {
+            TextValueSuggestionsSource::File {
+                path: source_path, ..
+            } => {
                 let (source, _) = open_local_source(source_path).map_err(DataWindowError::from)?;
                 drop(source);
                 let path = source_path.to_str().ok_or(DataWindowError::Unsupported)?;
@@ -217,7 +228,15 @@ impl TextValueSuggestionsReader {
         before_prepare();
         Self::require_active(interrupt)?;
         parameters.push(duckdb::types::Value::Text(input.to_owned()));
-        let query = suggestion_query(&column.name, match_function, &relation);
+        let root = quote_identifier(
+            field_path
+                .segments()
+                .first()
+                .ok_or(DataWindowError::InvalidFilter)?,
+        );
+        let expression =
+            field_path_expression(field_path, &root).ok_or(DataWindowError::InvalidFilter)?;
+        let query = suggestion_query(&expression, match_function, &relation);
         let mut statement = connection
             .prepare_cached(&query)
             .map_err(|error| self.classify_error(error, interrupt))?;
@@ -259,7 +278,9 @@ impl TextValueSuggestionsReader {
                 return Err(DataWindowError::Cancelled);
             }
             Err(panic) => match &self.source {
-                TextValueSuggestionsSource::File(_) => return Err(DataWindowError::QueryFailed),
+                TextValueSuggestionsSource::File { .. } => {
+                    return Err(DataWindowError::QueryFailed);
+                }
                 TextValueSuggestionsSource::Dataset(dataset) => {
                     return Err(dataset_suggestion_error(
                         dataset.classify_lazy_query_failure(panic.as_ref()),
@@ -271,23 +292,55 @@ impl TextValueSuggestionsReader {
         Ok(values)
     }
 
+    fn resolve_field(&self, field_path: &FieldPath) -> Result<SchemaField, DataWindowError> {
+        let field = match &self.source {
+            TextValueSuggestionsSource::File { path, schema } => {
+                let mut schema = schema
+                    .lock()
+                    .map_err(|_| DataWindowError::QueryEngineUnavailable)?;
+                if schema.is_none() {
+                    *schema = Some(
+                        inspect_local_source_for_query(path)
+                            .map_err(DataWindowError::from)?
+                            .schema,
+                    );
+                }
+                resolve_field_path(
+                    schema.as_deref().ok_or(DataWindowError::InvalidFilter)?,
+                    field_path,
+                )
+                .map(|resolved| resolved.field.clone())
+            }
+            TextValueSuggestionsSource::Dataset(dataset) => {
+                resolve_field_path(dataset.schema(), field_path)
+                    .map(|resolved| resolved.field.clone())
+            }
+        };
+        field.ok_or(DataWindowError::InvalidFilter)
+    }
+
     fn fetch_dataset_batches(
         &self,
         connection: &Connection,
         dataset: &DatasetQuerySource,
         input: &str,
-        column: &SchemaField,
+        field_path: &FieldPath,
         match_function: &str,
         interrupt: &TextValueSuggestionsInterruptHandle,
     ) -> Result<TextValueSuggestions, DataWindowError> {
-        if !dataset.schema().contains(column) {
-            return Err(DataWindowError::InvalidFilter);
-        }
         dataset
             .require_active_while(|| !interrupt.cancelled.load(Ordering::Acquire))
             .map_err(dataset_suggestion_error)?;
         let mut cursor = dataset.candidate_batches(&[]);
-        let query = suggestion_query(&column.name, match_function, &dataset.relation_sql());
+        let root = quote_identifier(
+            field_path
+                .segments()
+                .first()
+                .ok_or(DataWindowError::InvalidFilter)?,
+        );
+        let expression =
+            field_path_expression(field_path, &root).ok_or(DataWindowError::InvalidFilter)?;
+        let query = suggestion_query(&expression, match_function, &dataset.relation_sql());
         let parameters = [duckdb::types::Value::Text(input.to_owned())];
         let mut seen = HashSet::with_capacity(MAX_TEXT_VALUE_SUGGESTIONS);
         let mut values = Vec::with_capacity(MAX_TEXT_VALUE_SUGGESTIONS);
@@ -372,7 +425,7 @@ impl TextValueSuggestionsReader {
             DataWindowError::Cancelled
         } else {
             match &self.source {
-                TextValueSuggestionsSource::File(_) => classify_query_error(error, false),
+                TextValueSuggestionsSource::File { .. } => classify_query_error(error, false),
                 TextValueSuggestionsSource::Dataset(dataset) => {
                     dataset_suggestion_error(dataset.classify_query_failure(error, false))
                 }
@@ -381,8 +434,7 @@ impl TextValueSuggestionsReader {
     }
 }
 
-fn suggestion_query(column_name: &str, match_function: &str, relation: &str) -> String {
-    let identifier = quote_identifier(column_name);
+fn suggestion_query(identifier: &str, match_function: &str, relation: &str) -> String {
     format!(
         "SELECT value \
          FROM (\
@@ -463,6 +515,59 @@ mod tests {
     }
 
     #[test]
+    fn file_and_dataset_suggestions_resolve_only_struct_paths_from_their_schema() {
+        let directory = tempdir().expect("nested source directory");
+        let path = directory.path().join("nested.parquet");
+        let path_text = path.to_str().expect("UTF-8 nested path");
+        let fixture = Connection::open_in_memory().expect("fixture connection");
+        fixture
+            .execute("SET VARIABLE __test_path = ?", params![path_text])
+            .expect("fixture path");
+        fixture
+            .execute(
+                "COPY (SELECT struct_pack(name := 'Ada', tags := ['alpha']) AS profile) \
+                 TO (getvariable('__test_path')) (FORMAT PARQUET)",
+                [],
+            )
+            .expect("nested fixture");
+
+        let file_reader = TextValueSuggestionsReader::new(path).expect("file suggestions reader");
+        let source = DatasetSource::open_folder(directory.path()).expect("dataset source");
+        let mut inspector = source.inspector();
+        inspector.advance(1).expect("dataset inspection");
+        let dataset = inspector.into_window_reader().expect("dataset reader");
+        let dataset_reader =
+            TextValueSuggestionsReader::for_dataset(&dataset).expect("dataset suggestions reader");
+
+        for reader in [&file_reader, &dataset_reader] {
+            let handle = reader.interrupt_handle();
+            assert_eq!(
+                reader
+                    .fetch(
+                        "ad",
+                        &FieldPath::new(["profile", "name"]),
+                        DataFilterOperator::TextContains,
+                        &handle,
+                    )
+                    .expect("nested struct suggestions")
+                    .values,
+                ["Ada"]
+            );
+            for invalid_path in [
+                FieldPath::new(Vec::<String>::new()),
+                FieldPath::new(["profile", "missing"]),
+                FieldPath::new(["profile", "tags", "element"]),
+            ] {
+                let handle = reader.interrupt_handle();
+                assert_eq!(
+                    reader.fetch("", &invalid_path, DataFilterOperator::TextContains, &handle,),
+                    Err(DataWindowError::InvalidFilter)
+                );
+            }
+        }
+    }
+
+    #[test]
     fn dataset_suggestions_reuse_static_member_metadata_across_fetches() {
         let directory = tempdir().expect("dataset directory");
         let fixture = Connection::open_in_memory().expect("fixture connection");
@@ -486,7 +591,6 @@ mod tests {
         let mut inspector = source.inspector();
         inspector.advance(2).expect("dataset inspection");
         let dataset = inspector.into_window_reader().expect("dataset reader");
-        let label = dataset.summary().schema[0].clone();
         let identity_checks = source.identity_check_count();
         let reader =
             TextValueSuggestionsReader::for_dataset(&dataset).expect("dataset suggestions reader");
@@ -495,7 +599,12 @@ mod tests {
         let first = reader.interrupt_handle();
         assert_eq!(
             reader
-                .fetch("alp", &label, DataFilterOperator::Equals, &first)
+                .fetch(
+                    "alp",
+                    &FieldPath::from("label"),
+                    DataFilterOperator::Equals,
+                    &first,
+                )
                 .expect("first suggestions")
                 .values,
             ["alpha"]
@@ -514,7 +623,12 @@ mod tests {
         let second = reader.interrupt_handle();
         assert_eq!(
             reader
-                .fetch("bet", &label, DataFilterOperator::Equals, &second)
+                .fetch(
+                    "bet",
+                    &FieldPath::from("label"),
+                    DataFilterOperator::Equals,
+                    &second,
+                )
                 .expect("second suggestions")
                 .values,
             ["beta"]
@@ -538,7 +652,7 @@ mod tests {
         assert_eq!(
             reader.fetch_checked(
                 "alp",
-                &label,
+                &FieldPath::from("label"),
                 DataFilterOperator::Equals,
                 &cancelled,
                 || cancelled.interrupt(),
@@ -548,7 +662,12 @@ mod tests {
         let retry = reader.interrupt_handle();
         assert_eq!(
             reader
-                .fetch("alp", &label, DataFilterOperator::Equals, &retry)
+                .fetch(
+                    "alp",
+                    &FieldPath::from("label"),
+                    DataFilterOperator::Equals,
+                    &retry,
+                )
                 .expect("retry after setup-boundary cancellation")
                 .values,
             ["alpha"]
@@ -576,13 +695,6 @@ mod tests {
         let interrupt = Arc::new(reader.interrupt_handle());
         let scan_reader = Arc::clone(&reader);
         let scan_interrupt = Arc::clone(&interrupt);
-        let column = SchemaField {
-            name: "label".to_owned(),
-            physical_type: "BYTE_ARRAY".to_owned(),
-            logical_type: Some("String".to_owned()),
-            children: Vec::new(),
-        };
-        let scan_column = column.clone();
         let (started_sender, started_receiver) = mpsc::sync_channel(0);
         let (finished_sender, finished_receiver) = mpsc::sync_channel(1);
         let scan = thread::spawn(move || {
@@ -590,7 +702,7 @@ mod tests {
             finished_sender
                 .send(scan_reader.fetch(
                     "not-present",
-                    &scan_column,
+                    &FieldPath::from("label"),
                     DataFilterOperator::Equals,
                     &scan_interrupt,
                 ))
@@ -614,7 +726,12 @@ mod tests {
 
         let retry = reader.interrupt_handle();
         let suggestions = reader
-            .fetch("value-1", &column, DataFilterOperator::Equals, &retry)
+            .fetch(
+                "value-1",
+                &FieldPath::from("label"),
+                DataFilterOperator::Equals,
+                &retry,
+            )
             .expect("the reused connection should accept the next scan");
         assert_eq!(suggestions.values.len(), MAX_TEXT_VALUE_SUGGESTIONS);
         assert!(suggestions.is_partial);

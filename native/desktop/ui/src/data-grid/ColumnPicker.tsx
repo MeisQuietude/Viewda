@@ -5,7 +5,7 @@ const VIEWPORT_HEIGHT = 288;
 const OVERSCAN_ROWS = 3;
 
 export interface ColumnPickerColumn {
-  sourceIndex: number;
+  id: string;
   name: string;
   type: string;
   visible: boolean;
@@ -22,14 +22,14 @@ export function ColumnPicker({
   columns: readonly ColumnPickerColumn[];
   onHideAll: () => void;
   onShowAll: () => void;
-  onToggle: (sourceIndex: number, visible: boolean) => void;
-  onTogglePinned: (sourceIndex: number, pinned: boolean) => void;
+  onToggle: (id: string, visible: boolean) => void;
+  onTogglePinned: (id: string, pinned: boolean) => void;
 }) {
   const [query, setQuery] = useState("");
   const [scrollTop, setScrollTop] = useState(0);
   const searchRef = useRef<HTMLInputElement>(null);
   const listRef = useRef<HTMLDivElement>(null);
-  const optionRefs = useRef(new Map<number, HTMLInputElement>());
+  const optionRefs = useRef(new Map<string, HTMLInputElement>());
   const normalizedQuery = query.trim().toLocaleLowerCase();
   const filteredColumns = useMemo(
     () =>
@@ -85,14 +85,12 @@ export function ColumnPicker({
       }
       setScrollTop(nextScrollTop);
     }
-    const current = optionRefs.current.get(column.sourceIndex);
+    const current = optionRefs.current.get(column.id);
     if (current !== undefined) {
       current.focus();
       return;
     }
-    requestAnimationFrame(() =>
-      optionRefs.current.get(column.sourceIndex)?.focus(),
-    );
+    requestAnimationFrame(() => optionRefs.current.get(column.id)?.focus());
   };
 
   return (
@@ -146,7 +144,7 @@ export function ColumnPicker({
               return (
                 <div
                   className="column-picker-row"
-                  key={column.sourceIndex}
+                  key={column.id}
                   role="listitem"
                   style={{
                     height: ROW_HEIGHT,
@@ -161,22 +159,22 @@ export function ColumnPicker({
                     ) {
                       return;
                     }
-                    onToggle(column.sourceIndex, !column.visible);
+                    onToggle(column.id, !column.visible);
                   }}
                 >
                   <input
                     ref={(input) => {
                       if (input === null) {
-                        optionRefs.current.delete(column.sourceIndex);
+                        optionRefs.current.delete(column.id);
                       } else {
-                        optionRefs.current.set(column.sourceIndex, input);
+                        optionRefs.current.set(column.id, input);
                       }
                     }}
                     type="checkbox"
                     aria-label={`Show ${column.name}`}
                     checked={column.visible}
                     onChange={(event) =>
-                      onToggle(column.sourceIndex, event.target.checked)
+                      onToggle(column.id, event.target.checked)
                     }
                     onKeyDown={(event) => {
                       if (event.key === "ArrowDown") {
@@ -187,7 +185,7 @@ export function ColumnPicker({
                         focusOption(filteredIndex - 1);
                       } else if (event.key === " ") {
                         event.preventDefault();
-                        onToggle(column.sourceIndex, !column.visible);
+                        onToggle(column.id, !column.visible);
                       }
                     }}
                   />
@@ -199,7 +197,7 @@ export function ColumnPicker({
                     title={`${column.pinned ? "Unpin" : "Pin"} column`}
                     onClick={(event) => {
                       event.stopPropagation();
-                      onTogglePinned(column.sourceIndex, !column.pinned);
+                      onTogglePinned(column.id, !column.pinned);
                     }}
                   >
                     <PinIcon />

@@ -73,10 +73,10 @@ use viewda_data_engine::{
     ColumnStatistics, ColumnStatisticsError, ColumnStatisticsReader, DataFilter,
     DataFilterOperator, DataSort, DataViewBuilder, DataViewError, DataViewInterruptHandle,
     DataViewResourceDiagnostics, DataWindowError, DataWindowReader, DatasetError,
-    DatasetWindowReader, EngineError, EngineStatus, PreparedDataView, SchemaField, SourceError,
-    SourceIdentity, SourceOpenPhase, SourceSnapshot, SourceSummary, StatisticsInterruptHandle,
-    TextValueSuggestions, TextValueSuggestionsInterruptHandle, TextValueSuggestionsReader,
-    engine_status, inspect_local_source_snapshot_cancellable,
+    DatasetWindowReader, EngineError, EngineStatus, FieldPath, PreparedDataView, SchemaField,
+    SourceError, SourceIdentity, SourceOpenPhase, SourceSnapshot, SourceSummary,
+    StatisticsInterruptHandle, TextValueSuggestions, TextValueSuggestionsInterruptHandle,
+    TextValueSuggestionsReader, engine_status, inspect_local_source_snapshot_cancellable,
 };
 
 const OPEN_SOURCE_MENU_ID: &str = "open-local-source";
@@ -328,7 +328,7 @@ struct OpenedSourceSessionState {
     view_interrupt: Option<DataViewInterruptHandle>,
     reader: SessionWindowReader,
     text_suggestion_reader: Option<Arc<TextValueSuggestionsReader>>,
-    statistics_cache: HashMap<usize, ColumnStatistics>,
+    statistics_cache: HashMap<FieldPath, ColumnStatistics>,
     data_view_jobs: DataViewJobsState,
     text_suggestion_jobs: TextValueSuggestionJobsState,
     statistics_job: Option<Arc<ColumnStatisticsJob>>,
@@ -773,8 +773,25 @@ fn cancel_text_value_suggestion_job(
 #[derive(Debug, PartialEq)]
 enum ColumnStatisticsRequest {
     Cached(ColumnStatistics),
-    Scan { path: PathBuf, column_name: String },
-    DatasetScan { column_name: String },
+    Scan {
+        path: PathBuf,
+        field_path: FieldPath,
+    },
+    DatasetScan {
+        field_path: FieldPath,
+    },
+}
+
+fn schema_field_at_path<'a>(
+    schema: &'a [SchemaField],
+    field_path: &FieldPath,
+) -> Option<&'a SchemaField> {
+    let (root, descendants) = field_path.segments().split_first()?;
+    let mut field = schema.iter().find(|field| field.name == *root)?;
+    for segment in descendants {
+        field = field.children.iter().find(|child| child.name == *segment)?;
+    }
+    Some(field)
 }
 
 struct ColumnStatisticsJob {
@@ -1608,7 +1625,7 @@ async fn get_data_window(
     view_revision: u64,
     row_offset: u64,
     row_count: u32,
-    source_indices: Vec<u32>,
+    field_paths: Vec<FieldPath>,
     opened_source: tauri::State<'_, OpenedSource>,
 ) -> Result<tauri::ipc::Response, DataWindowCommandError> {
     let session = {
@@ -1621,13 +1638,7 @@ async fn get_data_window(
     };
     let _work = session.begin_work()?;
     let bytes = tauri::async_runtime::spawn_blocking(move || {
-        fetch_opened_source_window(
-            &session,
-            view_revision,
-            row_offset,
-            row_count,
-            &source_indices,
-        )
+        fetch_opened_source_window(&session, view_revision, row_offset, row_count, &field_paths)
     })
     .await
     .map_err(|_| DataWindowError::QueryEngineUnavailable)??;
@@ -1640,14 +1651,14 @@ fn fetch_opened_source_window(
     view_revision: u64,
     row_offset: u64,
     row_count: u32,
-    source_indices: &[u32],
+    field_paths: &[FieldPath],
 ) -> Result<Vec<u8>, DataWindowCommandError> {
     fetch_opened_source_window_core(
         session,
         view_revision,
         row_offset,
         row_count,
-        source_indices,
+        field_paths,
         #[cfg(test)]
         || {},
     )
@@ -1658,7 +1669,7 @@ fn fetch_opened_source_window_core(
     view_revision: u64,
     row_offset: u64,
     row_count: u32,
-    source_indices: &[u32],
+    field_paths: &[FieldPath],
     #[cfg(test)] prepared_view_state_released: impl FnOnce(),
 ) -> Result<Vec<u8>, DataWindowCommandError> {
     let mut state = session.lock_state()?;
@@ -1668,7 +1679,7 @@ fn fetch_opened_source_window_core(
         ));
     }
     session.validate_source_identity()?;
-    let schema_len = session_query_facts(session, &state)?.0.len();
+    let schema = session_query_facts(session, &state)?.0;
     let dataset_reader = match &state.reader {
         SessionWindowReader::Dataset(dataset) => Some(dataset_query_reader(dataset)?),
         SessionWindowReader::File(_) => None,
@@ -1677,12 +1688,12 @@ fn fetch_opened_source_window_core(
         && let SessionWindowReader::Dataset(dataset) = &state.reader
     {
         let reader = dataset_query_reader(dataset)?;
-        let identity_projection = !source_indices.is_empty()
-            && source_indices.len() == schema_len
-            && source_indices
+        let identity_projection = !field_paths.is_empty()
+            && field_paths.len() == schema.len()
+            && field_paths
                 .iter()
                 .enumerate()
-                .all(|(index, source_index)| usize::try_from(*source_index) == Ok(index));
+                .all(|(index, field_path)| field_path.segments() == [schema[index].name.as_str()]);
         let lifecycle = Arc::clone(&session.lifecycle);
         drop(state);
         let result = {
@@ -1695,7 +1706,7 @@ fn fetch_opened_source_window_core(
                     .map_err(dataset_window_command_error)
             } else {
                 reader
-                    .fetch_columns_while(row_offset, row_count, source_indices, || {
+                    .fetch_fields_while(row_offset, row_count, field_paths, || {
                         lifecycle.wants_work()
                     })
                     .map_err(dataset_window_command_error)
@@ -1718,7 +1729,7 @@ fn fetch_opened_source_window_core(
         let result = view
             .lock()
             .map_err(|_| DataWindowError::QueryEngineUnavailable)?
-            .fetch_window_columns(row_offset, row_count, source_indices)
+            .fetch_window_fields(row_offset, row_count, field_paths)
             .map_err(Into::into);
         session.with_open_state(|current| {
             if current.view_revision != view_revision
@@ -1736,14 +1747,14 @@ fn fetch_opened_source_window_core(
         return map_dataset_window_result(session, result, dataset_reader.as_ref());
     }
     // The session installs its schema and reader from the same source generation.
-    // Keep this predicate aligned with DataWindowReader::fetch_columns: this fast path
+    // Keep this predicate aligned with DataWindowReader::fetch_fields: this fast path
     // avoids parsing the footer, while the reader still protects direct library callers.
-    let identity_projection = !source_indices.is_empty()
-        && source_indices.len() == schema_len
-        && source_indices
+    let identity_projection = !field_paths.is_empty()
+        && field_paths.len() == schema.len()
+        && field_paths
             .iter()
             .enumerate()
-            .all(|(index, source_index)| usize::try_from(*source_index) == Ok(index));
+            .all(|(index, field_path)| field_path.segments() == [schema[index].name.as_str()]);
     let SessionWindowReader::File(reader) = &mut state.reader else {
         unreachable!("dataset queries return through their direct or prepared-view path")
     };
@@ -1751,7 +1762,7 @@ fn fetch_opened_source_window_core(
         reader.fetch(row_offset, row_count).map_err(Into::into)
     } else {
         reader
-            .fetch_columns(row_offset, row_count, source_indices)
+            .fetch_fields(row_offset, row_count, field_paths)
             .map_err(Into::into)
     };
     drop(state);
@@ -2033,7 +2044,7 @@ fn cancel_data_view(
 async fn get_text_value_suggestions(
     generation: u64,
     suggestion_revision: u64,
-    column_index: usize,
+    field_path: FieldPath,
     prefix: String,
     operator: DataFilterOperator,
     opened_source: tauri::State<'_, OpenedSource>,
@@ -2048,19 +2059,14 @@ async fn get_text_value_suggestions(
     };
     let _work = session.begin_work()?;
     session.validate_source_identity()?;
-    let (column, cached_reader, dataset_reader) = {
+    let (cached_reader, dataset_reader) = {
         let state = session.lock_state()?;
-        let column = session_query_facts(&session, &state)?
-            .0
-            .get(column_index)
-            .cloned()
-            .ok_or(DataWindowError::InvalidFilter)?;
+        session_query_facts(&session, &state)?;
         let dataset_reader = match &state.reader {
             SessionWindowReader::File(_) => None,
             SessionWindowReader::Dataset(dataset) => Some(dataset_query_reader(dataset)?),
         };
         (
-            column,
             state.text_suggestion_reader.as_ref().map(Arc::clone),
             dataset_reader,
         )
@@ -2134,7 +2140,7 @@ async fn get_text_value_suggestions(
 
     let request_interrupt = Arc::clone(&interrupt);
     let result = tauri::async_runtime::spawn_blocking(move || {
-        reader.fetch(&prefix, &column, operator, &request_interrupt)
+        reader.fetch(&prefix, &field_path, operator, &request_interrupt)
     })
     .await;
     let cancelled = interrupt.is_cancelled();
@@ -2195,7 +2201,7 @@ fn cancel_text_value_suggestions(
 #[tauri::command]
 async fn get_column_statistics(
     generation: u64,
-    column_index: usize,
+    field_path: FieldPath,
     include_min_max: bool,
     opened_source: tauri::State<'_, OpenedSource>,
 ) -> Result<ColumnStatistics, ColumnStatisticsCommandError> {
@@ -2214,7 +2220,7 @@ async fn get_column_statistics(
     let _work = session
         .begin_work()
         .map_err(ColumnStatisticsCommandError::from)?;
-    let request = statistics_request(&session, column_index, include_min_max)?;
+    let request = statistics_request(&session, &field_path, include_min_max)?;
     let (construction, previous) = session
         .with_open_state(|state| {
             if let Some(previous) = state.statistics_construction.take() {
@@ -2228,7 +2234,7 @@ async fn get_column_statistics(
     if let Some(previous) = previous {
         previous.cancel();
     }
-    let (reader, column_name, dataset_reader) = match request {
+    let (reader, field_path, dataset_reader) = match request {
         ColumnStatisticsRequest::Cached(statistics) => {
             construction.store(true, Ordering::Release);
             session
@@ -2238,10 +2244,10 @@ async fn get_column_statistics(
                 .map_err(ColumnStatisticsCommandError::from)?;
             return Ok(statistics);
         }
-        ColumnStatisticsRequest::Scan { path, column_name } => {
-            (ColumnStatisticsReader::new(path)?, column_name, None)
+        ColumnStatisticsRequest::Scan { path, field_path } => {
+            (ColumnStatisticsReader::new(path)?, field_path, None)
         }
-        ColumnStatisticsRequest::DatasetScan { column_name } => {
+        ColumnStatisticsRequest::DatasetScan { field_path } => {
             let dataset_reader = {
                 let state = session
                     .lock_state()
@@ -2325,7 +2331,7 @@ async fn get_column_statistics(
                     return Err(ColumnStatisticsCommandError::QueryEngineUnavailable);
                 }
             };
-            (reader, column_name, Some(recovery_reader))
+            (reader, field_path, Some(recovery_reader))
         }
     };
     let job = Arc::new(ColumnStatisticsJob {
@@ -2351,9 +2357,11 @@ async fn get_column_statistics(
         return Err(ColumnStatisticsCommandError::Cancelled);
     }
 
-    let result =
-        tauri::async_runtime::spawn_blocking(move || reader.fetch(&column_name, include_min_max))
-            .await;
+    let scanned_field_path = field_path.clone();
+    let result = tauri::async_runtime::spawn_blocking(move || {
+        reader.fetch(&scanned_field_path, include_min_max)
+    })
+    .await;
     {
         let mut state = session
             .lock_state()
@@ -2384,7 +2392,7 @@ async fn get_column_statistics(
             return Err(error.into());
         }
     };
-    cache_statistics(&session, column_index, statistics.clone())?;
+    cache_statistics(&session, &field_path, statistics.clone())?;
     Ok(statistics)
 }
 
@@ -2399,7 +2407,7 @@ fn column_statistics_dataset_error(error: ColumnStatisticsError) -> Option<DataW
 
 fn statistics_request(
     session: &OpenedSourceSession,
-    column_index: usize,
+    field_path: &FieldPath,
     include_min_max: bool,
 ) -> Result<ColumnStatisticsRequest, ColumnStatisticsCommandError> {
     let state = session
@@ -2407,7 +2415,7 @@ fn statistics_request(
         .map_err(ColumnStatisticsCommandError::from)?;
     if let Some(statistics) = state
         .statistics_cache
-        .get(&column_index)
+        .get(field_path)
         .filter(|statistics| !include_min_max || statistics.min_max_computed)
     {
         return Ok(ColumnStatisticsRequest::Cached(statistics.clone()));
@@ -2421,23 +2429,22 @@ fn statistics_request(
         }
         _ => ColumnStatisticsCommandError::Unsupported,
     })?;
-    let column_name = schema
-        .get(column_index)
-        .ok_or(ColumnStatisticsCommandError::UnsupportedColumn)?
-        .name
-        .clone();
+    schema_field_at_path(schema, field_path)
+        .ok_or(ColumnStatisticsCommandError::UnsupportedColumn)?;
     Ok(match &state.reader {
         SessionWindowReader::File(_) => ColumnStatisticsRequest::Scan {
             path: session.path.clone(),
-            column_name,
+            field_path: field_path.clone(),
         },
-        SessionWindowReader::Dataset(_) => ColumnStatisticsRequest::DatasetScan { column_name },
+        SessionWindowReader::Dataset(_) => ColumnStatisticsRequest::DatasetScan {
+            field_path: field_path.clone(),
+        },
     })
 }
 
 fn cache_statistics(
     session: &OpenedSourceSession,
-    column_index: usize,
+    field_path: &FieldPath,
     statistics: ColumnStatistics,
 ) -> Result<(), ColumnStatisticsCommandError> {
     let mut state = session
@@ -2445,12 +2452,12 @@ fn cache_statistics(
         .map_err(ColumnStatisticsCommandError::from)?;
     if session_query_facts(session, &state)
         .ok()
-        .and_then(|(schema, _, _)| schema.get(column_index))
+        .and_then(|(schema, _, _)| schema_field_at_path(schema, field_path))
         .is_none()
     {
         return Err(ColumnStatisticsCommandError::UnsupportedColumn);
     }
-    match state.statistics_cache.entry(column_index) {
+    match state.statistics_cache.entry(field_path.clone()) {
         Entry::Vacant(entry) => {
             entry.insert(statistics);
         }
@@ -4486,15 +4493,19 @@ mod tests {
     }
 
     #[test]
-    fn data_filter_accepts_the_camel_case_match_case_flag() {
+    fn data_filter_keeps_structured_paths_and_camel_case_on_the_wire() {
         let filter: DataFilter = serde_json::from_value(serde_json::json!({
-            "columnIndex": 0,
+            "fieldPath": ["profile", "quoted.name"],
             "operator": "textContains",
             "values": ["Alpha"],
             "matchCase": true
         }))
         .expect("camelCase filter JSON");
 
+        assert_eq!(
+            filter.field_path,
+            FieldPath::new(["profile", "quoted.name"])
+        );
         assert!(filter.match_case);
     }
 
@@ -5348,7 +5359,7 @@ mod tests {
             Err(DataWindowCommandError::Engine(DataWindowError::Unsupported))
         );
         assert_eq!(
-            fetch_opened_source_window(&session, 0, 0, 1, &[1]),
+            fetch_opened_source_window(&session, 0, 0, 1, &[FieldPath::from("other")],),
             Err(DataWindowCommandError::Engine(DataWindowError::NotFound))
         );
     }
@@ -5696,16 +5707,17 @@ mod tests {
             .expect("source is accepted");
         let state = opened_source.state.lock().expect("opened source state");
         let session = state.session(opened.generation).expect("opened session");
+        let trusted_path = FieldPath::from("trusted_name");
 
         assert_eq!(
-            statistics_request(&session, 0, true),
+            statistics_request(&session, &trusted_path, true),
             Ok(ColumnStatisticsRequest::Scan {
                 path: PathBuf::from("source.parquet"),
-                column_name: "trusted_name".to_owned(),
+                field_path: trusted_path,
             })
         );
         assert_eq!(
-            statistics_request(&session, 1, true),
+            statistics_request(&session, &FieldPath::from("missing"), true),
             Err(ColumnStatisticsCommandError::UnsupportedColumn)
         );
         assert!(state.session(opened.generation + 1).is_none());
@@ -5741,22 +5753,25 @@ mod tests {
             .expect("source is accepted");
         let state = opened_source.state.lock().expect("opened source state");
         let session = state.session(opened.generation).expect("opened session");
+        let label_path = FieldPath::from("label");
         let summary_statistics = ColumnStatistics {
             minimum: None,
             maximum: None,
             min_max_computed: false,
             null_share: 0.25,
-            approximate_distinct_count: 31_300_000,
+            null_count: 1,
+            approximate_distinct_count: Some(31_300_000),
+            container_count: None,
         };
 
-        cache_statistics(&session, 0, summary_statistics.clone())
+        cache_statistics(&session, &label_path, summary_statistics.clone())
             .expect("summary statistics should be cached");
         assert_eq!(
-            statistics_request(&session, 0, false),
+            statistics_request(&session, &label_path, false),
             Ok(ColumnStatisticsRequest::Cached(summary_statistics))
         );
         assert!(matches!(
-            statistics_request(&session, 0, true),
+            statistics_request(&session, &label_path, true),
             Ok(ColumnStatisticsRequest::Scan { .. })
         ));
 
@@ -5765,12 +5780,14 @@ mod tests {
             maximum: Some("z".into()),
             min_max_computed: true,
             null_share: 0.25,
-            approximate_distinct_count: 31_300_000,
+            null_count: 1,
+            approximate_distinct_count: Some(31_300_000),
+            container_count: None,
         };
-        cache_statistics(&session, 0, full_statistics.clone())
+        cache_statistics(&session, &label_path, full_statistics.clone())
             .expect("full statistics should replace the summary");
         assert_eq!(
-            statistics_request(&session, 0, true),
+            statistics_request(&session, &label_path, true),
             Ok(ColumnStatisticsRequest::Cached(full_statistics))
         );
 
@@ -5793,7 +5810,7 @@ mod tests {
         assert!(state.session(opened.generation).is_none());
         let second_session = state.session(second.generation).expect("second session");
         assert!(matches!(
-            statistics_request(&second_session, 0, false),
+            statistics_request(&second_session, &label_path, false),
             Ok(ColumnStatisticsRequest::Scan { .. })
         ));
     }

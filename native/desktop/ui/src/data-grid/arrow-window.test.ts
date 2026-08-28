@@ -19,10 +19,11 @@ import {
 import { describe, expect, it, vi } from "vitest";
 
 import {
-  decodeArrowWindow,
-  windowArrowValue,
-  windowDataType,
-  windowValue,
+  decodeArrowWindow as decodeFieldWindow,
+  windowArrowValue as windowFieldArrowValue,
+  windowDataType as windowFieldDataType,
+  windowValueAt,
+  windowValue as windowFieldValue,
 } from "./arrow-window";
 import { formatCellValue, formatTypedCellValue } from "./format-cell";
 import { arrowBinaryBytes } from "./arrow-value";
@@ -47,7 +48,96 @@ import {
 } from "./value-json-serializer";
 import { ChunkScheduler } from "./chunk-scheduler";
 
+type ArrowWindow = ReturnType<typeof decodeFieldWindow>;
+
+const fieldPath = (index: number) => [`column_${index}`];
+
+function decodeArrowWindow(
+  buffer: ArrayBuffer,
+  rowOffset: number,
+  sourceIndices: readonly number[],
+): ArrowWindow {
+  return decodeFieldWindow(buffer, rowOffset, sourceIndices.map(fieldPath));
+}
+
+function windowArrowValue(
+  window: ArrowWindow,
+  sourceIndex: number,
+  rowIndex: number,
+) {
+  return windowFieldArrowValue(window, fieldPath(sourceIndex), rowIndex);
+}
+
+function windowDataType(window: ArrowWindow, sourceIndex: number) {
+  return windowFieldDataType(window, fieldPath(sourceIndex));
+}
+
+function windowValue(
+  window: ArrowWindow,
+  sourceIndex: number,
+  rowIndex: number,
+) {
+  return windowFieldValue(window, fieldPath(sourceIndex), rowIndex);
+}
+
 describe("decodeArrowWindow", () => {
+  it("keeps nested field paths as structured projection identities", () => {
+    const bytes = tableToIPC(tableFromArrays({ leaf: [7] }), {
+      format: "stream",
+    });
+    const fieldPaths = [["root.with.dot", 'leaf"quoted']];
+
+    const window = decodeFieldWindow(
+      Uint8Array.from(bytes!).buffer,
+      0,
+      fieldPaths,
+    );
+
+    expect(window.fieldPaths).toEqual(fieldPaths);
+    expect(windowFieldValue(window, fieldPaths[0]!, 0)).toBe(7);
+  });
+
+  it("keeps duplicate identity columns available by physical source offset", () => {
+    const bytes = tableToIPC(tableFromArrays({ first: [7], second: [11] }), {
+      format: "stream",
+    });
+    const duplicatePaths = [["duplicate"], ["duplicate"]];
+
+    const window = decodeFieldWindow(
+      Uint8Array.from(bytes!).buffer,
+      0,
+      duplicatePaths,
+      { allowDuplicateTopLevelIdentity: true },
+    );
+
+    expect(windowFieldValue(window, duplicatePaths[0]!, 0)).toBe(7);
+    expect(windowValueAt(window, 1, 0)).toBe(11);
+  });
+
+  it("rejects duplicate paths outside the explicit top-level identity fallback", () => {
+    const bytes = tableToIPC(tableFromArrays({ first: [7], second: [11] }), {
+      format: "stream",
+    });
+
+    expect(() =>
+      decodeFieldWindow(Uint8Array.from(bytes!).buffer, 0, [
+        ["duplicate"],
+        ["duplicate"],
+      ]),
+    ).toThrow("The data window projection contains a duplicate column.");
+    expect(() =>
+      decodeFieldWindow(
+        Uint8Array.from(bytes!).buffer,
+        0,
+        [
+          ["root", "duplicate"],
+          ["root", "duplicate"],
+        ],
+        { allowDuplicateTopLevelIdentity: true },
+      ),
+    ).toThrow("The data window projection contains a duplicate column.");
+  });
+
   it("keeps null UTF-8 and binary distinct from empty values", () => {
     const bytes = tableToIPC(
       tableFromArrays(

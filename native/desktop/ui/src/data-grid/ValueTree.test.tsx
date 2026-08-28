@@ -89,6 +89,35 @@ describe("ValueTree", () => {
     expect(onCopy).toHaveBeenLastCalledWith('"d"');
   });
 
+  it("copies the structured column path through the active nested value", async () => {
+    const onCopy = vi.fn();
+    render(
+      <ValueTree
+        label="profile"
+        fieldPath={["profile", "root.name"]}
+        value={typedValue(
+          { addr: { "weird name": ["first"] } },
+          struct({ addr: struct({ "weird name": list(utf8()) }) }),
+        )}
+        onCopy={onCopy}
+      />,
+    );
+    const tree = screen.getByRole("tree", { name: "profile value" });
+    tree.focus();
+    fireEvent.keyDown(tree, { key: "ArrowDown" });
+    fireEvent.keyDown(tree, { key: "ArrowRight" });
+    fireEvent.keyDown(tree, { key: "ArrowDown" });
+    fireEvent.keyDown(tree, { key: "ArrowRight" });
+    fireEvent.keyDown(tree, { key: "ArrowDown" });
+
+    fireEvent.click(screen.getByRole("button", { name: "Copy path" }));
+    await act(async () => Promise.resolve());
+
+    expect(onCopy).toHaveBeenCalledWith(
+      'profile."root.name".addr."weird name"[0]',
+    );
+  });
+
   it("renders an empty field name explicitly", () => {
     render(
       <ValueTree
@@ -174,11 +203,14 @@ describe("ValueTree", () => {
       tableFromArrays({ text: [text] }, { types: { text: utf8() } }),
       { format: "stream" },
     );
-    const window = decodeArrowWindow(Uint8Array.from(bytes!).buffer, 0, [0]);
+    const fieldPath = ["text"];
+    const window = decodeArrowWindow(Uint8Array.from(bytes!).buffer, 0, [
+      fieldPath,
+    ]);
     const { container } = render(
       <ValueTree
         label="text"
-        value={arrowTypedValue(windowArrowValue(window, 0, 0)!)}
+        value={arrowTypedValue(windowArrowValue(window, fieldPath, 0)!)}
         onCopy={vi.fn()}
       />,
     );
@@ -655,8 +687,14 @@ describe("ValueTree", () => {
       tableFromArrays({ json: [source] }, { types: { json: utf8() } }),
       { format: "stream" },
     );
-    const window = decodeArrowWindow(Uint8Array.from(bytes!).buffer, 0, [0]);
-    const value = arrowTypedValue(windowArrowValue(window, 0, 0)!, "JSON");
+    const fieldPath = ["json"];
+    const window = decodeArrowWindow(Uint8Array.from(bytes!).buffer, 0, [
+      fieldPath,
+    ]);
+    const value = arrowTypedValue(
+      windowArrowValue(window, fieldPath, 0)!,
+      "JSON",
+    );
     render(<ValueTree label="json_value" value={value} onCopy={vi.fn()} />);
 
     await act(async () => vi.runOnlyPendingTimersAsync());
