@@ -574,6 +574,12 @@ describe("schema field layout", () => {
       "line-height": "1.35",
     });
     expectDeclarations(".schema-path-menu", { width: "292px" });
+    expectDeclarations(".column-menu:not(.schema-path-menu) button", {
+      display: "flex",
+      "align-items": "center",
+      "justify-content": "space-between",
+      gap: "18px",
+    });
     expect(styles).not.toContain("schema-flatten-action");
   });
 });

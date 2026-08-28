@@ -1671,6 +1671,13 @@ button {
   text-align: left;
 }
 
+.column-menu:not(.schema-path-menu) button {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 18px;
+}
+
 .schema-path-menu {
   width: 292px;
 }
