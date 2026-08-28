@@ -152,6 +152,13 @@ export interface ValueTreeHandle {
   focus(): void;
 }
 
+export interface ValueTreeLayout {
+  rowCount: number;
+  showToolbar: boolean;
+  hasDetail: boolean;
+  ready: boolean;
+}
+
 export type ValueCopyHandlers =
   | {
       onCopy: (text: string) => void | Promise<void>;
@@ -170,6 +177,7 @@ export const ValueTree = forwardRef<
     fieldPath?: FieldPath;
     onPromoteField?: (fieldPath: FieldPath) => void;
     onFilterJsonField?: (target: JsonFieldTarget) => void;
+    onLayoutChange?: (layout: ValueTreeLayout) => void;
   } & ValueCopyHandlers
 >(function ValueTree(
   {
@@ -178,12 +186,15 @@ export const ValueTree = forwardRef<
     fieldPath,
     onPromoteField,
     onFilterJsonField,
+    onLayoutChange,
     onCopy,
     onCopyIntent,
   },
   forwardedRef,
 ) {
+  const wrapRef = useRef<HTMLDivElement>(null);
   const treeRef = useRef<HTMLDivElement>(null);
+  const contextMenuRef = useRef<HTMLDivElement>(null);
   const treeId = useId();
   const [schedulerRef] = useState(() => ({ current: new ChunkScheduler() }));
   const [copySchedulerRef] = useState(() => ({
@@ -217,6 +228,11 @@ export const ValueTree = forwardRef<
   const [copying, setCopying] = useState(false);
   const [copyError, setCopyError] = useState<string | null>(null);
   const [copyMessage, setCopyMessage] = useState<string | null>(null);
+  const [contextMenu, setContextMenu] = useState<{
+    nodeId: string;
+    left: number;
+    top: number;
+  } | null>(null);
   const [currentMatch, setCurrentMatch] = useState<CurrentSearchMatch | null>(
     null,
   );
@@ -360,6 +376,7 @@ export const ValueTree = forwardRef<
     setCopying(false);
     setCopyError(null);
     setCopyMessage(null);
+    setContextMenu(null);
     const arrowJson = value.kind === "arrow" && value.logicalType === "JSON";
     if (!firstValue || value.kind === "jsonText" || arrowJson) {
       setPreparedValue(value);
@@ -398,6 +415,30 @@ export const ValueTree = forwardRef<
     },
     [],
   );
+
+  useEffect(() => {
+    if (copyMessage === null) return;
+    const timeout = window.setTimeout(() => setCopyMessage(null), 1_400);
+    return () => window.clearTimeout(timeout);
+  }, [copyMessage]);
+
+  useEffect(() => {
+    if (contextMenu === null) return;
+    const menu = contextMenuRef.current;
+    const firstAction = menu?.querySelector<HTMLButtonElement>(
+      "button:not(:disabled)",
+    );
+    (firstAction ?? menu)?.focus();
+    const closeOutside = (event: PointerEvent) => {
+      if (!contextMenuRef.current?.contains(event.target as Node)) {
+        setContextMenu(null);
+      }
+    };
+    document.addEventListener("pointerdown", closeOutside);
+    return () => {
+      document.removeEventListener("pointerdown", closeOutside);
+    };
+  }, [contextMenu]);
 
   useImperativeHandle(
     forwardedRef,
@@ -908,18 +949,18 @@ export const ValueTree = forwardRef<
     );
   };
 
-  const copyNodeJson = () => {
+  const copyNodeJson = (node = activeNode) => {
     if (parseStatus !== null) {
       setCopyError("Wait for JSON parsing to finish before copying.");
       return;
     }
-    if (activeNode === undefined || copyWritingGenerationRef.current !== null) {
+    if (node === undefined || copyWritingGenerationRef.current !== null) {
       return;
     }
     copyIntentRef.current?.reject(copyAbortError());
     copyIntentRef.current = null;
     const generation = ++copyGenerationRef.current;
-    const serializer = createValueJsonSerializer(activeNode.value);
+    const serializer = createValueJsonSerializer(node.value);
     copySchedulerRef.current.cancel();
     setCopyError(null);
     setCopyMessage(null);
@@ -952,7 +993,7 @@ export const ValueTree = forwardRef<
         rejectText(error);
       }
       setCopying(false);
-      if (copied) setCopyMessage("Copied JSON.");
+      if (copied) setCopyMessage("Copied content.");
       else {
         setCopyError(
           error instanceof ValueCopyLimitError
@@ -990,11 +1031,58 @@ export const ValueTree = forwardRef<
       },
     });
   };
+  const copyNodePath = (node = activeNode) => {
+    if (fieldPath === undefined || node === undefined) return;
+    const path = valueNodePath(fieldPath, node);
+    if (path === undefined) return;
+    const submit =
+      onCopyIntent ??
+      ((prepared: Promise<string>) =>
+        prepared.then((result) => onCopy?.(result)));
+    setCopyError(null);
+    setCopyMessage(null);
+    void Promise.resolve(submit(Promise.resolve(path))).then(
+      () => setCopyMessage("Copied path."),
+      () => setCopyError("The value path could not be copied."),
+    );
+  };
   const handleKeyDown = (event: KeyboardEvent<HTMLDivElement>) => {
     const primary = event.metaKey || event.ctrlKey;
     if (primary && !event.altKey && event.key.toLowerCase() === "c") {
+      if (
+        event.shiftKey &&
+        (fieldPath === undefined ||
+          activeNode === undefined ||
+          valueNodePath(fieldPath, activeNode) === undefined)
+      ) {
+        return;
+      }
       event.preventDefault();
-      copyNodeJson();
+      event.stopPropagation();
+      if (event.shiftKey) copyNodePath();
+      else copyNodeJson();
+      return;
+    }
+    if (
+      !primary &&
+      event.shiftKey &&
+      !event.altKey &&
+      event.key.toLowerCase() === "c"
+    ) {
+      event.stopPropagation();
+      return;
+    }
+    if (
+      event.key === "ContextMenu" ||
+      (event.shiftKey && event.key === "F10")
+    ) {
+      event.preventDefault();
+      event.stopPropagation();
+      if (activeNode !== undefined) {
+        const row = document.getElementById(treeRowId(treeId, activeNode.id));
+        const bounds = row?.getBoundingClientRect();
+        openContextMenu(activeNode, bounds?.left ?? 0, bounds?.bottom ?? 0);
+      }
       return;
     }
     if (event.key === " ") {
@@ -1035,27 +1123,89 @@ export const ValueTree = forwardRef<
     preparedValue.kind === "invalidJson" ||
     preparedValue.kind === "rawJson" ||
     valueChildCount(root.value) > 0;
-  const showToolbar = fieldPath !== undefined || showTreeControls;
+  const showToolbar = showTreeControls;
   const progressText = operationText(operation, parseStatus);
   const progressRunning =
     parseStatus?.phase === "running" ||
     operation?.phase === "running" ||
     operation?.phase === "locating";
-  const promoteFieldPath =
+  const showStatus =
+    progressText !== null ||
+    preparedValue.kind === "rawJson" ||
+    invalidOffset !== null;
+  const layoutReady =
+    parseStatus === null &&
+    preparedValue.kind !== "jsonText" &&
+    !(preparedValue.kind === "arrow" && preparedValue.logicalType === "JSON");
+  const copyFeedback =
+    copyError ??
+    copyMessage ??
+    (copying ? "Preparing content for copy…" : null);
+  const menuNode =
+    contextMenu === null ? undefined : nodeForId(root, contextMenu.nodeId);
+  const menuValuePath =
+    fieldPath === undefined || menuNode === undefined
+      ? undefined
+      : valueNodePath(fieldPath, menuNode);
+  const menuPromoteFieldPath =
     fieldPath === undefined || onPromoteField === undefined
       ? undefined
-      : schemaNodeFieldPath(fieldPath, activeNode);
-  const activeValuePath =
-    fieldPath === undefined || activeNode === undefined
-      ? undefined
-      : valueNodePath(fieldPath, activeNode);
-  const jsonFieldTarget =
+      : schemaNodeFieldPath(fieldPath, menuNode);
+  const menuJsonFieldTarget =
     fieldPath === undefined || onFilterJsonField === undefined
       ? undefined
-      : jsonFieldTargetForNode(activeNode);
+      : jsonFieldTargetForNode(menuNode);
+
+  useEffect(() => {
+    onLayoutChange?.({
+      rowCount,
+      showToolbar,
+      hasDetail,
+      ready: layoutReady,
+    });
+  }, [hasDetail, layoutReady, onLayoutChange, rowCount, showToolbar]);
+
+  const openContextMenu = useCallback(
+    (node: TreeNode, clientX: number, clientY: number) => {
+      const bounds = wrapRef.current?.getBoundingClientRect();
+      if (bounds === undefined) return;
+      const width = 228;
+      const itemCount =
+        1 +
+        (fieldPath === undefined ? 0 : 1) +
+        (onPromoteField !== undefined &&
+        fieldPath !== undefined &&
+        schemaNodeFieldPath(fieldPath, node) !== undefined
+          ? 1
+          : 0) +
+        (onFilterJsonField !== undefined &&
+        jsonFieldTargetForNode(node) !== undefined
+          ? 1
+          : 0);
+      const height = itemCount * 30 + 20;
+      setActiveId(node.id);
+      setContextMenu({
+        nodeId: node.id,
+        left: clamp(
+          clientX - bounds.left,
+          4,
+          Math.max(4, bounds.width - width - 4),
+        ),
+        top: clamp(
+          clientY - bounds.top,
+          4,
+          Math.max(4, bounds.height - height - 4),
+        ),
+      });
+    },
+    [fieldPath, onFilterJsonField, onPromoteField],
+  );
 
   return (
-    <div className={`value-tree-wrap${hasDetail ? " has-detail" : ""}`}>
+    <div
+      ref={wrapRef}
+      className={`value-tree-wrap${hasDetail ? " has-detail" : ""}${showStatus ? " has-status" : ""}`}
+    >
       {showToolbar && (
         <div className="value-tree-toolbar">
           {showTreeControls && (
@@ -1083,47 +1233,13 @@ export const ValueTree = forwardRef<
             />
           )}
           <div className="value-tree-toolbar-actions">
-            {jsonFieldTarget !== undefined && (
-              <button
-                type="button"
-                onClick={() => onFilterJsonField?.(jsonFieldTarget)}
-              >
-                Filter by this field
-              </button>
-            )}
-            {promoteFieldPath !== undefined && (
-              <button
-                type="button"
-                onClick={() => onPromoteField?.(promoteFieldPath)}
-              >
-                Promote to column
-              </button>
-            )}
-            {fieldPath !== undefined && (
-              <button
-                type="button"
-                disabled={activeValuePath === undefined}
-                onClick={() => {
-                  if (activeValuePath === undefined) return;
-                  const submit =
-                    onCopyIntent ??
-                    ((prepared: Promise<string>) =>
-                      prepared.then((result) => onCopy?.(result)));
-                  void Promise.resolve(
-                    submit(Promise.resolve(activeValuePath)),
-                  ).then(
-                    () => setCopyMessage("Copied path."),
-                    () => setCopyError("The value path could not be copied."),
-                  );
-                }}
-              >
-                Copy path
-              </button>
-            )}
             {showTreeControls && (
               <div className="value-tree-toolbar-action-group">
                 <button
+                  className="value-tree-icon-action"
                   type="button"
+                  aria-label="Expand all"
+                  title="Expand all"
                   disabled={
                     parseStatus !== null ||
                     preparedValue.kind === "invalidJson" ||
@@ -1133,10 +1249,13 @@ export const ValueTree = forwardRef<
                   }
                   onClick={expandAll}
                 >
-                  Expand all
+                  <TreeExpansionIcon expanded />
                 </button>
                 <button
+                  className="value-tree-icon-action"
                   type="button"
+                  aria-label="Collapse all"
+                  title="Collapse all"
                   disabled={
                     parseStatus !== null ||
                     valueChildCount(root.value) === 0 ||
@@ -1144,7 +1263,7 @@ export const ValueTree = forwardRef<
                   }
                   onClick={collapseAll}
                 >
-                  Collapse all
+                  <TreeExpansionIcon />
                 </button>
               </div>
             )}
@@ -1181,35 +1300,118 @@ export const ValueTree = forwardRef<
           </div>
         </div>
       )}
-      {(copying ||
-        copyError !== null ||
-        copyMessage !== null ||
-        progressText !== null ||
-        preparedValue.kind === "rawJson" ||
-        invalidOffset !== null) && (
+      {contextMenu !== null && menuNode !== undefined && (
+        <div
+          ref={contextMenuRef}
+          className="value-tree-context-menu"
+          role="menu"
+          aria-label={`${menuNode.label} value actions`}
+          tabIndex={-1}
+          style={{ left: contextMenu.left, top: contextMenu.top }}
+          onKeyDown={(event) => {
+            if (event.key === "Escape") {
+              event.preventDefault();
+              event.stopPropagation();
+              setContextMenu(null);
+              treeRef.current?.focus();
+              return;
+            }
+            if (event.key !== "ArrowDown" && event.key !== "ArrowUp") return;
+            event.preventDefault();
+            const buttons = Array.from(
+              event.currentTarget.querySelectorAll<HTMLButtonElement>(
+                "button:not(:disabled)",
+              ),
+            );
+            const current = buttons.indexOf(
+              document.activeElement as HTMLButtonElement,
+            );
+            const direction = event.key === "ArrowDown" ? 1 : -1;
+            buttons[
+              (current + direction + buttons.length) % buttons.length
+            ]?.focus();
+          }}
+        >
+          <button
+            type="button"
+            role="menuitem"
+            aria-label="Copy content"
+            disabled={parseStatus !== null || copying}
+            onClick={() => {
+              setContextMenu(null);
+              treeRef.current?.focus();
+              copyNodeJson(menuNode);
+            }}
+          >
+            <span>Copy content</span>
+            <span className="menu-shortcut">Ctrl/⌘C</span>
+          </button>
+          {fieldPath !== undefined && (
+            <button
+              type="button"
+              role="menuitem"
+              aria-label="Copy path"
+              disabled={menuValuePath === undefined}
+              onClick={() => {
+                setContextMenu(null);
+                treeRef.current?.focus();
+                copyNodePath(menuNode);
+              }}
+            >
+              <span>Copy path</span>
+              <span className="menu-shortcut">Ctrl/⌘⇧C</span>
+            </button>
+          )}
+          {(menuJsonFieldTarget !== undefined ||
+            menuPromoteFieldPath !== undefined) && (
+            <div className="grid-menu-separator" role="separator" />
+          )}
+          {menuJsonFieldTarget !== undefined && (
+            <button
+              type="button"
+              role="menuitem"
+              onClick={() => {
+                setContextMenu(null);
+                treeRef.current?.focus();
+                onFilterJsonField?.(menuJsonFieldTarget);
+              }}
+            >
+              Filter by this field
+            </button>
+          )}
+          {menuPromoteFieldPath !== undefined && (
+            <button
+              type="button"
+              role="menuitem"
+              onClick={() => {
+                setContextMenu(null);
+                treeRef.current?.focus();
+                onPromoteField?.(menuPromoteFieldPath);
+              }}
+            >
+              Promote to column
+            </button>
+          )}
+        </div>
+      )}
+      <div
+        className={`value-tree-copy-feedback${copyFeedback === null ? "" : " is-visible"}`}
+        role="status"
+        aria-live="polite"
+        aria-atomic="true"
+      >
+        {copyFeedback ?? ""}
+      </div>
+      {showStatus && (
         <div
           className="value-tree-status"
           aria-live={progressRunning ? "off" : "polite"}
         >
-          {copyError !== null
-            ? copyError
-            : copyMessage !== null
-              ? copyMessage
-              : preparedValue.kind === "rawJson"
-                ? `JSON tree is too large; showing raw source with literal-source search.${
-                    copying ? " · Preparing JSON for copy…" : ""
-                  }${progressText === null ? "" : ` · ${progressText}`}`
-                : invalidOffset === null
-                  ? copying
-                    ? "Preparing JSON for copy…"
-                    : progressText
-                  : `Invalid JSON at character ${invalidOffset}. Showing raw text.${
-                      copying
-                        ? " · Preparing JSON for copy…"
-                        : progressText === null
-                          ? ""
-                          : ` · ${progressText}`
-                    }`}
+          {preparedValue.kind === "rawJson"
+            ? `JSON tree is too large; showing raw source with literal-source search.${progressText === null ? "" : ` · ${progressText}`}`
+            : invalidOffset === null
+              ? progressText
+              : `Invalid JSON at character ${invalidOffset}. Showing raw text.${progressText === null ? "" : ` · ${progressText}`}`}
         </div>
       )}
       <div
@@ -1234,6 +1436,7 @@ export const ValueTree = forwardRef<
             isOpen={isOpen}
             onActivate={activateRow}
             onToggle={toggleRow}
+            onOpenContextMenu={openContextMenu}
           />
         </div>
       </div>
@@ -1254,6 +1457,7 @@ const ValueTreeRows = memo(function ValueTreeRows({
   isOpen,
   onActivate,
   onToggle,
+  onOpenContextMenu,
 }: {
   treeId: string;
   rows: readonly { index: number; node: TreeNode }[];
@@ -1262,6 +1466,7 @@ const ValueTreeRows = memo(function ValueTreeRows({
   isOpen: (node: TreeNode) => boolean;
   onActivate: (node: TreeNode) => void;
   onToggle: (node: TreeNode) => void;
+  onOpenContextMenu: (node: TreeNode, clientX: number, clientY: number) => void;
 }) {
   return rows.map(({ index, node }) => {
     const childCount = valueChildCount(node.value);
@@ -1289,6 +1494,11 @@ const ValueTreeRows = memo(function ValueTreeRows({
         }}
         onClick={() => onActivate(node)}
         onDoubleClick={() => onToggle(node)}
+        onContextMenu={(event) => {
+          event.preventDefault();
+          event.stopPropagation();
+          onOpenContextMenu(node, event.clientX, event.clientY);
+        }}
       >
         <button
           className="value-tree-chevron"
@@ -1318,6 +1528,19 @@ const ValueTreeRows = memo(function ValueTreeRows({
     );
   });
 });
+
+function TreeExpansionIcon({ expanded = false }: { expanded?: boolean }) {
+  return (
+    <svg viewBox="0 0 16 16" aria-hidden="true">
+      <path d={expanded ? "M3 5h10M5 8h6M7 11h2" : "M3 11h10M5 8h6M7 5h2"} />
+      <path d={expanded ? "m11 8 2-2 2 2" : "m11 8 2 2 2-2"} />
+    </svg>
+  );
+}
+
+function clamp(value: number, minimum: number, maximum: number): number {
+  return Math.max(minimum, Math.min(value, maximum));
+}
 
 function operationText(
   operation: OperationStatus | null,

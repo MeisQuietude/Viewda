@@ -2315,9 +2315,14 @@ export function DataGrid({
     if (fieldPath === null) {
       return;
     }
-    const visibleIndex = visibleColumnStatesRef.current.findIndex((column) =>
+    let visibleIndex = visibleColumnStatesRef.current.findIndex((column) =>
       sameFieldPath(column.fieldPath, fieldPath),
     );
+    if (visibleIndex < 0) {
+      visibleIndex = visibleColumnStatesRef.current.findIndex((column) =>
+        fieldPathStartsWith(column.fieldPath, fieldPath),
+      );
+    }
     if (visibleIndex < 0) {
       return;
     }

@@ -111,12 +111,84 @@ describe("ValueTree", () => {
     fireEvent.keyDown(tree, { key: "ArrowRight" });
     fireEvent.keyDown(tree, { key: "ArrowDown" });
 
-    fireEvent.click(screen.getByRole("button", { name: "Copy path" }));
+    fireEvent.keyDown(tree, { key: "c", ctrlKey: true, shiftKey: true });
     await act(async () => Promise.resolve());
 
     expect(onCopy).toHaveBeenCalledWith(
       'profile."root.name".addr."weird name"[0]',
     );
+  });
+
+  it("opens active-node actions from the keyboard and ignores Shift+C", () => {
+    const onCopy = vi.fn();
+    render(
+      <ValueTree
+        label="profile"
+        fieldPath={["profile"]}
+        value={typedValue({ name: "Ada" }, struct({ name: utf8() }))}
+        onCopy={onCopy}
+      />,
+    );
+    const tree = screen.getByRole("tree", { name: "profile value" });
+    tree.focus();
+    fireEvent.keyDown(tree, { key: "ArrowDown" });
+    const activeId = tree.getAttribute("aria-activedescendant");
+
+    fireEvent.keyDown(tree, { key: "c", shiftKey: true });
+    expect(onCopy).not.toHaveBeenCalled();
+    expect(tree).toHaveAttribute("aria-activedescendant", activeId);
+
+    fireEvent.keyDown(tree, { key: "F10", shiftKey: true });
+    expect(
+      screen.getByRole("menu", { name: "name value actions" }),
+    ).toBeVisible();
+    expect(
+      screen.getByRole("menuitem", { name: "Copy content" }),
+    ).toHaveFocus();
+  });
+
+  it("leaves the path shortcut unhandled when path actions are unavailable", () => {
+    const onCopy = vi.fn();
+    render(
+      <ValueTree
+        label="profile"
+        value={typedValue("Ada", utf8())}
+        onCopy={onCopy}
+      />,
+    );
+    const tree = screen.getByRole("tree", { name: "profile value" });
+
+    expect(
+      fireEvent.keyDown(tree, {
+        key: "c",
+        ctrlKey: true,
+        shiftKey: true,
+      }),
+    ).toBe(true);
+    expect(onCopy).not.toHaveBeenCalled();
+  });
+
+  it("keeps an all-disabled context menu keyboard-contained", () => {
+    vi.useFakeTimers();
+    render(
+      <ValueTree
+        label="payload"
+        value={typedValue("x".repeat(8 * 1024 * 1024), utf8())}
+        onCopy={vi.fn()}
+      />,
+    );
+    const tree = screen.getByRole("tree", { name: "payload value" });
+    fireEvent.keyDown(tree, { key: "c", ctrlKey: true });
+    fireEvent.keyDown(tree, { key: "F10", shiftKey: true });
+
+    const menu = screen.getByRole("menu", { name: "payload value actions" });
+    expect(menu).toHaveFocus();
+    expect(
+      screen.getByRole("menuitem", { name: "Copy content" }),
+    ).toBeDisabled();
+    fireEvent.keyDown(menu, { key: "Escape" });
+    expect(screen.queryByRole("menu")).not.toBeInTheDocument();
+    expect(tree).toHaveFocus();
   });
 
   it("promotes active struct and leaf fields with their column paths", () => {
@@ -133,27 +205,28 @@ describe("ValueTree", () => {
         onCopy={vi.fn()}
       />,
     );
-    expect(
-      screen.queryByRole("button", { name: "Promote to column" }),
-    ).toBeNull();
-
-    fireEvent.keyDown(screen.getByRole("tree", { name: "profile value" }), {
+    const tree = screen.getByRole("tree", { name: "profile value" });
+    fireEvent.keyDown(tree, {
       key: "ArrowDown",
     });
     const actionGroups = document.querySelectorAll(
       ".value-tree-toolbar-actions > .value-tree-toolbar-action-group",
     );
     expect(actionGroups).toHaveLength(1);
-    expect(actionGroups[0]).toHaveTextContent("Expand allCollapse all");
     expect(actionGroups[0]?.querySelectorAll("button")).toHaveLength(2);
-    fireEvent.click(screen.getByRole("button", { name: "Promote to column" }));
+    fireEvent.contextMenu(screen.getByRole("treeitem", { selected: true }));
+    fireEvent.click(
+      screen.getByRole("menuitem", { name: "Promote to column" }),
+    );
 
     expect(onPromoteField).toHaveBeenNthCalledWith(1, ["profile", "address"]);
 
-    const tree = screen.getByRole("tree", { name: "profile value" });
     fireEvent.keyDown(tree, { key: "ArrowRight" });
     fireEvent.keyDown(tree, { key: "ArrowDown" });
-    fireEvent.click(screen.getByRole("button", { name: "Promote to column" }));
+    fireEvent.contextMenu(screen.getByRole("treeitem", { selected: true }));
+    fireEvent.click(
+      screen.getByRole("menuitem", { name: "Promote to column" }),
+    );
 
     expect(onPromoteField).toHaveBeenNthCalledWith(2, [
       "profile",
@@ -194,19 +267,17 @@ describe("ValueTree", () => {
     for (let step = 0; step < 4; step += 1) {
       fireEvent.keyDown(tree, { key: "ArrowRight" });
     }
+    fireEvent.contextMenu(screen.getByRole("treeitem", { selected: true }));
     fireEvent.click(
-      screen.getByRole("button", { name: "Filter by this field" }),
+      screen.getByRole("menuitem", { name: "Filter by this field" }),
     );
 
     expect(onFilterJsonField).toHaveBeenCalledWith({
       path,
       valueType: "number",
     });
-    expect(
-      screen.queryByRole("button", { name: "Promote to column" }),
-    ).toBeNull();
-
-    fireEvent.click(screen.getByRole("button", { name: "Copy path" }));
+    fireEvent.contextMenu(screen.getByRole("treeitem", { selected: true }));
+    fireEvent.click(screen.getByRole("menuitem", { name: "Copy path" }));
     await act(async () => Promise.resolve());
     expect(onCopy).toHaveBeenCalledWith(
       formatJsonFieldTarget(["payload"], path),
@@ -238,10 +309,11 @@ describe("ValueTree", () => {
     tree.focus();
     fireEvent.keyDown(tree, { key: "ArrowDown" });
 
+    fireEvent.contextMenu(screen.getByRole("treeitem", { selected: true }));
     expect(
-      screen.queryByRole("button", { name: "Filter by this field" }),
+      screen.queryByRole("menuitem", { name: "Filter by this field" }),
     ).toBeNull();
-    const copyPath = screen.getByRole("button", { name: "Copy path" });
+    const copyPath = screen.getByRole("menuitem", { name: "Copy path" });
     expect(copyPath).toBeEnabled();
     fireEvent.click(copyPath);
     await act(async () => Promise.resolve());
@@ -270,7 +342,8 @@ describe("ValueTree", () => {
       fireEvent.keyDown(screen.getByRole("tree", { name: "payload value" }), {
         key: "ArrowDown",
       });
-      return screen.getByRole("button", { name: "Copy path" });
+      fireEvent.contextMenu(screen.getByRole("treeitem", { selected: true }));
+      return screen.getByRole("menuitem", { name: "Copy path" });
     };
 
     const fittingKey = "\\\u202e".repeat(8_190);
@@ -325,7 +398,7 @@ describe("ValueTree", () => {
       ctrlKey: true,
     });
 
-    expect(screen.getByText("Preparing JSON for copy…")).toBeInTheDocument();
+    expect(screen.getByText("Preparing content for copy…")).toBeInTheDocument();
     expect(onCopy).not.toHaveBeenCalled();
     view.rerender(
       <ValueTree
@@ -338,7 +411,7 @@ describe("ValueTree", () => {
 
     expect(onCopy).not.toHaveBeenCalled();
     expect(
-      screen.queryByText("Preparing JSON for copy…"),
+      screen.queryByText("Preparing content for copy…"),
     ).not.toBeInTheDocument();
   });
 
@@ -458,7 +531,7 @@ describe("ValueTree", () => {
     fireEvent.keyDown(tree, { key: "c", ctrlKey: true });
     await act(async () => vi.runOnlyPendingTimersAsync());
     expect(onCopy).toHaveBeenCalledOnce();
-    expect(screen.getByText("Preparing JSON for copy…")).toBeInTheDocument();
+    expect(screen.getByText("Preparing content for copy…")).toBeInTheDocument();
 
     await act(async () => finishFirstWrite());
     fireEvent.keyDown(tree, { key: "c", ctrlKey: true });
@@ -650,7 +723,7 @@ describe("ValueTree", () => {
     await act(async () => vi.runAllTimersAsync());
 
     expect(onCopy).toHaveBeenCalledWith('"QQD/"');
-    expect(screen.getByText("Copied JSON.")).toBeInTheDocument();
+    expect(screen.getByText("Copied content.")).toBeInTheDocument();
   });
 
   it("reports a rejected clipboard write without false success feedback", async () => {
@@ -672,7 +745,7 @@ describe("ValueTree", () => {
     expect(
       screen.getByText("The JSON value could not be copied."),
     ).toBeInTheDocument();
-    expect(screen.queryByText("Copied JSON.")).not.toBeInTheDocument();
+    expect(screen.queryByText("Copied content.")).not.toBeInTheDocument();
   });
 
   it("renders a null binary as null rather than an empty hex dump", () => {
@@ -716,6 +789,12 @@ describe("ValueTree", () => {
     expect(document.querySelector(".cell-preview-number")).toBeInTheDocument();
     expect(document.querySelector(".cell-preview-boolean")).toBeInTheDocument();
     expect(document.querySelector(".cell-preview-null")).toBeInTheDocument();
+    expect(document.querySelector(".value-tree-type")).toHaveTextContent(
+      "object",
+    );
+    expect(document.querySelector(".value-tree-type")).not.toHaveTextContent(
+      "JSON",
+    );
     const tree = screen.getByRole("tree", { name: "json_value value" });
     fireEvent.keyDown(tree, { key: "c", ctrlKey: true });
     await act(async () => vi.runAllTimersAsync());
@@ -750,11 +829,12 @@ describe("ValueTree", () => {
     });
     await act(async () => vi.advanceTimersToNextTimerAsync());
     expect(onCopy).toHaveBeenCalledWith('"ready"');
-    expect(screen.getByText("Preparing JSON for copy…")).toBeInTheDocument();
+    expect(screen.getByText("Preparing content for copy…")).toBeInTheDocument();
+    expect(document.querySelector(".value-tree-status")).toBeNull();
 
     await act(async () => finishWrite());
     expect(
-      screen.queryByText("Preparing JSON for copy…"),
+      screen.queryByText("Preparing content for copy…"),
     ).not.toBeInTheDocument();
   });
 

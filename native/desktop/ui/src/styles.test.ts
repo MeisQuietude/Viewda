@@ -416,6 +416,18 @@ describe("grid layout containment", () => {
       cursor: "nwse-resize",
       "touch-action": "none",
     });
+    expect(declaration(".value-peek-resize-hint:hover", "border-color")).toBe(
+      "var(--grid-text)",
+    );
+    expect(
+      declaration(
+        ".value-tree:focus-visible .value-tree-row.is-active",
+        "outline",
+      ),
+    ).toBe("2px solid var(--grid-selection-strong)");
+    expect(() => declaration(".value-tree:focus-visible", "outline")).toThrow(
+      "Missing outline",
+    );
   });
 
   it("reserves default-width space for ordinary Peek leaf types", () => {
@@ -432,15 +444,23 @@ describe("grid layout containment", () => {
     });
   });
 
-  it("wraps Peek toolbar actions only between related groups", () => {
+  it("keeps Peek toolbar actions on one stable row", () => {
+    expectDeclarations(".value-tree-toolbar", {
+      display: "flex",
+      "flex-wrap": "nowrap",
+    });
     expectDeclarations(".value-tree-toolbar-actions", {
       display: "flex",
-      "flex-wrap": "wrap",
+      "flex-wrap": "nowrap",
     });
     expectDeclarations(".value-tree-toolbar-action-group", {
       display: "flex",
       flex: "0 0 auto",
       "flex-wrap": "nowrap",
+    });
+    expectDeclarations(".value-tree-wrap > .value-tree-status", {
+      position: "absolute",
+      bottom: "8px",
     });
   });
 
@@ -521,13 +541,13 @@ describe("schema field layout", () => {
 
     expect(
       declaration(
-        ".sidebar-schema-tree button.schema-field:hover:not(:disabled)",
+        ".sidebar-schema-tree .schema-field:enabled:hover:not([aria-disabled])",
         "background",
       ),
     ).toBe("var(--grid-selection)");
     expect(
       declaration(
-        '.sidebar-schema-tree button.schema-field[aria-pressed="true"]:not(:disabled)',
+        '.sidebar-schema-tree [aria-pressed="true"]:not([aria-disabled])',
         "background",
       ),
     ).toBe("var(--grid-selection)");
@@ -547,25 +567,14 @@ describe("schema field layout", () => {
         "color",
       ),
     ).toBe("inherit");
-    expectDeclarations(".sidebar-schema-tree .schema-flatten-action:disabled", {
+    expectDeclarations(".sidebar-schema-tree .schema-continuation", {
+      margin: "1px 10px 5px 12px",
       color: "var(--grid-text-faint)",
-      cursor: "default",
+      "font-size": "9px",
+      "line-height": "1.35",
     });
-    expectDeclarations(".sidebar-schema-tree .schema-flatten-action", {
-      display: "grid",
-      "justify-items": "start",
-      "line-height": "1.2",
-    });
-    expectDeclarations(
-      ".sidebar-schema-tree .schema-flatten-action .menu-shortcut",
-      { "font-size": "9px" },
-    );
-    expect(
-      declaration(
-        ".sidebar-schema-tree .schema-flatten-action:hover:not(:disabled)",
-        "background",
-      ),
-    ).toBe("var(--grid-selection)");
+    expectDeclarations(".schema-path-menu", { width: "292px" });
+    expect(styles).not.toContain("schema-flatten-action");
   });
 });
 

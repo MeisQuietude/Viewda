@@ -15,6 +15,15 @@ export interface RenderedSchemaField extends SchemaField {
   children: RenderedSchemaField[];
 }
 
+export interface SchemaPathMenuRequest {
+  fieldPath: FieldPath;
+  flattened: boolean;
+  disabledReason?: string;
+  trigger: HTMLElement;
+  clientX: number;
+  clientY: number;
+}
+
 // Physical wrapper nodes are part of the inspected Parquet schema. Keep them
 // visible instead of collapsing the tree into a lossy notation such as List<T>.
 export function SchemaTreeNode({
@@ -30,8 +39,7 @@ export function SchemaTreeNode({
   pathActionDisabledReason,
   flattenedPathKeys,
   onSelectPath,
-  onFlattenPath,
-  onUnflattenPath,
+  onOpenPathMenu,
 }: {
   field: RenderedSchemaField;
   selected?: boolean;
@@ -45,8 +53,7 @@ export function SchemaTreeNode({
   pathActionDisabledReason?: string;
   flattenedPathKeys?: ReadonlySet<string>;
   onSelectPath?: (fieldPath: FieldPath, field: SchemaField) => void;
-  onFlattenPath?: (fieldPath: FieldPath) => void;
-  onUnflattenPath?: (fieldPath: FieldPath) => void;
+  onOpenPathMenu?: (request: SchemaPathMenuRequest) => void;
 }) {
   const isLeaf = field.children.length === 0 && !field.hasUnloadedChildren;
   const duplicateChildren = duplicateFieldNames(field.children);
@@ -56,17 +63,6 @@ export function SchemaTreeNode({
     (!flattened && duplicateChildren.size > 0
       ? "Flatten is unavailable because this struct contains duplicate child names."
       : undefined);
-  const flattenAccessibleReason =
-    pathActionDisabledReason ??
-    (!flattened && duplicateChildren.size > 0
-      ? "Unavailable: duplicate child names."
-      : undefined);
-  const flattenSecondaryLabel =
-    pathActionDisabledReason !== undefined
-      ? "Duplicate column names"
-      : !flattened && duplicateChildren.size > 0
-        ? "Duplicate child names"
-        : undefined;
   const pathActionUnavailable =
     onSelectPath !== undefined && pathActionDisabledReason !== undefined;
   const leafIndex = field.leafIndex ?? leafOffset;
@@ -88,6 +84,22 @@ export function SchemaTreeNode({
       </span>
     </>
   );
+  const pathMenuAvailable =
+    addressable && isStructField(field) && onOpenPathMenu !== undefined;
+  const openPathMenu = (
+    trigger: HTMLElement,
+    clientX: number,
+    clientY: number,
+  ) => {
+    onOpenPathMenu?.({
+      fieldPath,
+      flattened,
+      disabledReason: flattenDisabledReason,
+      trigger,
+      clientX,
+      clientY,
+    });
+  };
 
   return (
     <li>
@@ -97,7 +109,8 @@ export function SchemaTreeNode({
         <button
           className="schema-field"
           type="button"
-          disabled={pathActionUnavailable}
+          disabled={pathActionUnavailable && !pathMenuAvailable}
+          aria-disabled={pathActionUnavailable || undefined}
           title={pathActionDisabledReason}
           aria-label={
             pathActionUnavailable
@@ -111,32 +124,30 @@ export function SchemaTreeNode({
               selectedPath !== undefined &&
               sameFieldPath(selectedPath, fieldPath))
           }
-          onClick={selectable}
+          onClick={pathActionUnavailable ? undefined : selectable}
+          onContextMenu={(event) => {
+            if (!pathMenuAvailable) return;
+            event.preventDefault();
+            event.stopPropagation();
+            openPathMenu(event.currentTarget, event.clientX, event.clientY);
+          }}
+          onKeyDown={(event) => {
+            if (
+              !pathMenuAvailable ||
+              (event.key !== "ContextMenu" &&
+                !(event.shiftKey && event.key === "F10"))
+            ) {
+              return;
+            }
+            event.preventDefault();
+            event.stopPropagation();
+            const bounds = event.currentTarget.getBoundingClientRect();
+            openPathMenu(event.currentTarget, bounds.left, bounds.bottom);
+          }}
         >
           {content}
         </button>
       )}
-      {addressable &&
-        isStructField(field) &&
-        (onFlattenPath !== undefined || onUnflattenPath !== undefined) && (
-          <button
-            className="schema-flatten-action"
-            type="button"
-            disabled={flattenDisabledReason !== undefined}
-            title={flattenDisabledReason}
-            aria-label={`${flattened ? "Unflatten" : "Flatten"} ${formatFieldPath(fieldPath)}${flattenAccessibleReason === undefined ? "" : `. ${flattenAccessibleReason}`}`}
-            onClick={() =>
-              flattened
-                ? onUnflattenPath?.(fieldPath)
-                : onFlattenPath?.(fieldPath)
-            }
-          >
-            <span>{flattened ? "Unflatten" : "Flatten"}</span>
-            {flattenSecondaryLabel !== undefined && (
-              <span className="menu-shortcut">{flattenSecondaryLabel}</span>
-            )}
-          </button>
-        )}
       {addressable && isListOrMapField(field) && field.children.length > 0 && (
         <p className="schema-continuation">{LIST_MAP_COLUMN_REASON}</p>
       )}
@@ -168,8 +179,7 @@ export function SchemaTreeNode({
                 }
                 flattenedPathKeys={flattenedPathKeys}
                 onSelectPath={onSelectPath}
-                onFlattenPath={onFlattenPath}
-                onUnflattenPath={onUnflattenPath}
+                onOpenPathMenu={onOpenPathMenu}
               />
             );
           })}

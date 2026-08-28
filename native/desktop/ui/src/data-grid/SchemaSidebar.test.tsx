@@ -192,11 +192,9 @@ describe("SchemaSidebar logical schema", () => {
       ["duplicate", "physical_child"],
       true,
     );
+    fireEvent.contextMenu(screen.getByText("duplicate").closest("button")!);
     fireEvent.click(
-      screen
-        .getByText("duplicate")
-        .closest("li")!
-        .querySelector(".schema-flatten-action")!,
+      screen.getByRole("menuitem", { name: "Flatten duplicate" }),
     );
     expect(onFlattenPath).toHaveBeenCalledWith(["duplicate"]);
   });
@@ -250,14 +248,19 @@ describe("SchemaSidebar logical schema", () => {
       true,
     );
 
-    const flatten = within(parent).getByRole("button", {
-      name: "Flatten profile. Unavailable: duplicate child names.",
+    fireEvent.contextMenu(
+      within(parent).getByText("profile").closest("button")!,
+    );
+    const flatten = screen.getByRole("menuitem", {
+      name: "Flatten profile. Flatten is unavailable because this struct contains duplicate child names.",
     });
     expect(flatten).toBeDisabled();
     expect(flatten).toHaveAccessibleName(
-      "Flatten profile. Unavailable: duplicate child names.",
+      "Flatten profile. Flatten is unavailable because this struct contains duplicate child names.",
     );
-    expect(flatten).toHaveTextContent("FlattenDuplicate child names");
+    expect(flatten).toHaveTextContent(
+      "Flatten profileFlatten is unavailable because this struct contains duplicate child names.",
+    );
     const ambiguousFields = within(parent)
       .getAllByText("city")
       .map((name) => name.closest("button"));
@@ -288,9 +291,14 @@ describe("SchemaSidebar logical schema", () => {
         onFlattenPath={onFlattenPath}
       />,
     );
+    fireEvent.contextMenu(
+      screen
+        .getByText("profile", { selector: ".schema-name" })
+        .closest("button")!,
+    );
     expect(
-      screen.getByRole("button", {
-        name: "Flatten profile. Unavailable: duplicate child names.",
+      screen.getByRole("menuitem", {
+        name: "Flatten profile. Flatten is unavailable because this struct contains duplicate child names.",
       }),
     ).toBeDisabled();
   });
@@ -320,17 +328,16 @@ describe("SchemaSidebar logical schema", () => {
       />,
     );
 
-    const flatten = screen.getByRole("button", {
-      name: "Flatten empty. Unavailable: no child fields.",
+    fireEvent.contextMenu(screen.getByText("empty").closest("button")!);
+    const flatten = screen.getByRole("menuitem", {
+      name: "Flatten empty. Flatten is unavailable because this struct has no child fields.",
     });
     expect(flatten).toBeDisabled();
     expect(flatten).toHaveAccessibleName(
-      "Flatten empty. Unavailable: no child fields.",
+      "Flatten empty. Flatten is unavailable because this struct has no child fields.",
     );
-    expect(flatten).toHaveTextContent("FlattenNo child fields");
-    expect(flatten).toHaveAttribute(
-      "title",
-      "Flatten is unavailable because this struct has no child fields.",
+    expect(flatten).toHaveTextContent(
+      "Flatten emptyFlatten is unavailable because this struct has no child fields.",
     );
   });
 
@@ -349,11 +356,14 @@ describe("SchemaSidebar logical schema", () => {
 
     const accessibleName =
       "Flatten duplicate. Unavailable because this source has duplicate column names.";
-    const physicalFlatten = screen.getByRole("button", {
+    fireEvent.contextMenu(screen.getByText("duplicate").closest("button")!);
+    const physicalFlatten = screen.getByRole("menuitem", {
       name: accessibleName,
     });
     expect(physicalFlatten).toBeDisabled();
-    expect(physicalFlatten).toHaveTextContent("FlattenDuplicate column names");
+    expect(physicalFlatten).toHaveTextContent(
+      "Flatten duplicateUnavailable because this source has duplicate column names.",
+    );
 
     view.rerender(
       <SchemaSidebar
@@ -368,15 +378,18 @@ describe("SchemaSidebar logical schema", () => {
         onFlattenPath={vi.fn()}
       />,
     );
-    const logicalFlatten = screen.getByRole("button", {
+    fireEvent.contextMenu(screen.getByText("duplicate").closest("button")!);
+    const logicalFlatten = screen.getByRole("menuitem", {
       name: "Flatten duplicate. Unavailable because this source has duplicate column names.",
     });
     expect(logicalFlatten).toBeDisabled();
     expect(logicalFlatten).toHaveAccessibleName(accessibleName);
-    expect(logicalFlatten).toHaveTextContent("FlattenDuplicate column names");
+    expect(logicalFlatten).toHaveTextContent(
+      "Flatten duplicateUnavailable because this source has duplicate column names.",
+    );
   });
 
-  it("uses one keyboard-focusable action to toggle Flatten and Unflatten", () => {
+  it("opens one keyboard-focusable action to toggle Flatten and Unflatten", () => {
     readyStatistics();
     const onFlattenPath = vi.fn();
     const onUnflattenPath = vi.fn();
@@ -391,11 +404,16 @@ describe("SchemaSidebar logical schema", () => {
       />,
     );
 
-    const flatten = screen.getByRole("button", { name: "Flatten duplicate" });
-    flatten.focus();
+    const field = screen.getByText("duplicate").closest("button")!;
+    field.focus();
+    fireEvent.keyDown(field, { key: "F10", shiftKey: true });
+    const flatten = screen.getByRole("menuitem", {
+      name: "Flatten duplicate",
+    });
     expect(document.activeElement).toBe(flatten);
     fireEvent.click(flatten);
     expect(onFlattenPath).toHaveBeenCalledWith(["duplicate"]);
+    expect(field).toHaveFocus();
 
     view.rerender(
       <SchemaSidebar
@@ -408,10 +426,13 @@ describe("SchemaSidebar logical schema", () => {
         onUnflattenPath={onUnflattenPath}
       />,
     );
+    const flattenedField = screen.getByText("duplicate").closest("button")!;
+    fireEvent.keyDown(flattenedField, { key: "ContextMenu" });
     fireEvent.click(
-      screen.getByRole("button", { name: "Unflatten duplicate" }),
+      screen.getByRole("menuitem", { name: "Unflatten duplicate" }),
     );
     expect(onUnflattenPath).toHaveBeenCalledWith(["duplicate"]);
+    expect(flattenedField).toHaveFocus();
   });
 
   it("labels list lengths and map pair counts without offering scalar min and max", async () => {

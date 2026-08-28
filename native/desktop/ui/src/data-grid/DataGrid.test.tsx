@@ -1885,16 +1885,21 @@ describe("DataGrid window rendering", () => {
     });
     const addressNode = within(sidebar).getByText("address").closest("li");
     if (addressNode === null) throw new Error("address schema node is missing");
+    fireEvent.contextMenu(
+      within(addressNode).getByText("address").closest("button")!,
+    );
     fireEvent.click(
-      within(addressNode).getAllByRole("button", {
-        name: "Flatten profile.address",
-      })[0]!,
+      screen.getByRole("menuitem", { name: "Flatten profile.address" }),
+    );
+    fireEvent.contextMenu(
+      within(addressNode).getByText("address").closest("button")!,
     );
     expect(
-      within(addressNode).getByRole("button", {
+      screen.getByRole("menuitem", {
         name: "Unflatten profile.address",
       }),
     ).toBeInTheDocument();
+    fireEvent.keyDown(document, { key: "Escape" });
     await waitFor(() =>
       expect(gridMock.scrollToColumn).toHaveBeenLastCalledWith(0, 16),
     );
@@ -1933,6 +1938,14 @@ describe("DataGrid window rendering", () => {
         ["tail"],
       ]),
     );
+    gridMock.scrollToColumn.mockClear();
+    fireEvent.click(
+      within(sidebar)
+        .getByText("profile", { selector: ".schema-name" })
+        .closest("button")!,
+    );
+    expect(gridMock.scrollToColumn).toHaveBeenLastCalledWith(0, 16);
+    expect(gridMock.props?.selection.columns.hasIndex(0)).toBe(true);
 
     act(() => gridMock.props?.onSort(0, false));
     await waitFor(() =>
@@ -2535,7 +2548,10 @@ describe("DataGrid window rendering", () => {
     fireEvent.keyDown(tree, { key: "ArrowDown" });
     fireEvent.keyDown(tree, { key: "ArrowRight" });
     fireEvent.keyDown(tree, { key: "ArrowDown" });
-    fireEvent.click(screen.getByRole("button", { name: "Promote to column" }));
+    fireEvent.contextMenu(screen.getByRole("treeitem", { selected: true }));
+    fireEvent.click(
+      screen.getByRole("menuitem", { name: "Promote to column" }),
+    );
 
     await waitFor(() =>
       expect(desktop.prepareDataView).toHaveBeenLastCalledWith(
@@ -2564,10 +2580,11 @@ describe("DataGrid window rendering", () => {
     const addressNode = within(sidebar).getByText("address").closest("li");
     if (addressNode === null) throw new Error("address schema node is missing");
 
+    fireEvent.contextMenu(
+      within(addressNode).getByText("address").closest("button")!,
+    );
     fireEvent.click(
-      within(addressNode).getByRole("button", {
-        name: "Flatten profile.address",
-      }),
+      screen.getByRole("menuitem", { name: "Flatten profile.address" }),
     );
 
     expect(screen.getByText("Flatten profile first.")).toBeVisible();
@@ -2653,18 +2670,20 @@ describe("DataGrid window rendering", () => {
     };
 
     const originalIndex = openPathPeek();
-    expect(screen.getByRole("button", { name: "Copy path" })).toBeVisible();
+    fireEvent.contextMenu(screen.getByRole("treeitem", { selected: true }));
+    expect(screen.getByRole("menuitem", { name: "Copy path" })).toBeVisible();
     openColumnMenu(originalIndex);
     fireEvent.click(screen.getByRole("menuitem", { name: "Pin column" }));
     expect(
-      screen.queryByRole("button", { name: "Copy path" }),
+      screen.queryByRole("menuitem", { name: "Copy path" }),
     ).not.toBeInTheDocument();
 
     const reorderedIndex = openPathPeek();
     expect(reorderedIndex).toBe(0);
     const headerTitle = gridMock.props?.columns[reorderedIndex]?.title;
     expect(headerTitle).toBe(formatFieldPath(fieldPath));
-    fireEvent.click(screen.getByRole("button", { name: "Copy path" }));
+    fireEvent.contextMenu(screen.getByRole("treeitem", { selected: true }));
+    fireEvent.click(screen.getByRole("menuitem", { name: "Copy path" }));
 
     await waitFor(() =>
       expect(clipboardWrite).toHaveBeenCalledWith(headerTitle),
@@ -4738,8 +4757,9 @@ describe("DataGrid window rendering", () => {
     for (let step = 0; step < 4; step += 1) {
       fireEvent.keyDown(tree, { key: "ArrowRight" });
     }
+    fireEvent.contextMenu(screen.getByRole("treeitem", { selected: true }));
     fireEvent.click(
-      screen.getByRole("button", { name: "Filter by this field" }),
+      screen.getByRole("menuitem", { name: "Filter by this field" }),
     );
 
     const editor = screen.getByRole("form", {
@@ -7281,7 +7301,10 @@ describe("DataGrid window rendering", () => {
     );
     const tree = await screen.findByRole("tree", { name: "profile value" });
     fireEvent.keyDown(tree, { key: "ArrowDown" });
-    fireEvent.click(screen.getByRole("button", { name: "Promote to column" }));
+    fireEvent.contextMenu(screen.getByRole("treeitem", { selected: true }));
+    fireEvent.click(
+      screen.getByRole("menuitem", { name: "Promote to column" }),
+    );
     expect(gridMock.props?.columns.map((column) => column.id)).toEqual([
       '["profile"]',
     ]);

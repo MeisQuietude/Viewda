@@ -18,7 +18,11 @@ import {
   type SchemaField,
   type SourceSummary,
 } from "../desktop";
-import { LIST_MAP_COLUMN_REASON, SchemaTreeNode } from "../SchemaTree";
+import {
+  LIST_MAP_COLUMN_REASON,
+  SchemaTreeNode,
+  type SchemaPathMenuRequest,
+} from "../SchemaTree";
 import {
   fieldPathKey,
   formatFieldPath,
@@ -73,7 +77,58 @@ export function SchemaSidebar({
   const [statistics, setStatistics] = useState<StatisticsState>({
     kind: "idle",
   });
+  const [pathMenu, setPathMenu] = useState<
+    (SchemaPathMenuRequest & { left: number; top: number }) | null
+  >(null);
+  const pathMenuRef = useRef<HTMLDivElement>(null);
   const requestVersion = useRef(0);
+
+  const openPathMenu = (request: SchemaPathMenuRequest) => {
+    const width = 292;
+    const height = request.disabledReason === undefined ? 38 : 58;
+    setPathMenu({
+      ...request,
+      left: Math.max(
+        4,
+        Math.min(request.clientX, window.innerWidth - width - 4),
+      ),
+      top: Math.max(
+        4,
+        Math.min(request.clientY, window.innerHeight - height - 4),
+      ),
+    });
+  };
+
+  useEffect(() => {
+    if (pathMenu === null) return;
+    const menu = pathMenuRef.current;
+    menu?.querySelector<HTMLButtonElement>("button:not(:disabled)")?.focus();
+    if (document.activeElement !== menu?.querySelector("button")) {
+      menu?.focus();
+    }
+    const close = (returnFocus: boolean) => {
+      setPathMenu(null);
+      if (returnFocus) pathMenu.trigger.focus();
+    };
+    const closeOutside = (event: PointerEvent) => {
+      if (!menu?.contains(event.target as Node)) close(false);
+    };
+    const closeOnEscape = (event: KeyboardEvent) => {
+      if (event.key !== "Escape") return;
+      event.preventDefault();
+      close(true);
+    };
+    document.addEventListener("pointerdown", closeOutside);
+    document.addEventListener("keydown", closeOnEscape);
+    return () => {
+      document.removeEventListener("pointerdown", closeOutside);
+      document.removeEventListener("keydown", closeOnEscape);
+    };
+  }, [pathMenu]);
+
+  useEffect(() => {
+    if (!open) setPathMenu(null);
+  }, [open]);
 
   useEffect(
     () => () => {
@@ -207,8 +262,7 @@ export function SchemaSidebar({
                   onSelectPath={(path, selectedField) =>
                     void selectField(path, selectedField)
                   }
-                  onFlattenPath={onFlattenPath}
-                  onUnflattenPath={onUnflattenPath}
+                  onOpenPathMenu={openPathMenu}
                 />
               ) : (
                 <LogicalSchemaNode
@@ -221,8 +275,7 @@ export function SchemaSidebar({
                   pathActionsEnabled={pathActionsEnabled}
                   flattenedPathKeys={flattenedPathKeys}
                   onSelect={selectField}
-                  onFlatten={onFlattenPath}
-                  onUnflatten={onUnflattenPath}
+                  onOpenPathMenu={openPathMenu}
                 />
               );
             })}
@@ -235,6 +288,43 @@ export function SchemaSidebar({
                 </li>
               )}
           </ul>
+          {pathMenu !== null && (
+            <div
+              ref={pathMenuRef}
+              className="column-menu schema-path-menu"
+              role="menu"
+              aria-label="Schema field actions"
+              tabIndex={-1}
+              style={{ left: pathMenu.left, top: pathMenu.top }}
+            >
+              <button
+                type="button"
+                role="menuitem"
+                disabled={pathMenu.disabledReason !== undefined}
+                aria-label={`${pathMenu.flattened ? "Unflatten" : "Flatten"} ${formatFieldPath(pathMenu.fieldPath)}${pathMenu.disabledReason === undefined ? "" : `. ${pathMenu.disabledReason}`}`}
+                onClick={() => {
+                  const trigger = pathMenu.trigger;
+                  setPathMenu(null);
+                  trigger.focus();
+                  if (pathMenu.flattened) {
+                    onUnflattenPath?.(pathMenu.fieldPath);
+                  } else {
+                    onFlattenPath(pathMenu.fieldPath);
+                  }
+                }}
+              >
+                <span>
+                  {pathMenu.flattened ? "Unflatten" : "Flatten"}{" "}
+                  {formatFieldPath(pathMenu.fieldPath)}
+                </span>
+                {pathMenu.disabledReason !== undefined && (
+                  <span className="menu-shortcut">
+                    {pathMenu.disabledReason}
+                  </span>
+                )}
+              </button>
+            </div>
+          )}
           <StatisticsPanel
             state={statistics}
             schema={source.schema}
@@ -256,8 +346,7 @@ function LogicalSchemaNode({
   pathActionsEnabled,
   flattenedPathKeys,
   onSelect,
-  onFlatten,
-  onUnflatten,
+  onOpenPathMenu,
 }: {
   name: string;
   field: SchemaField;
@@ -267,8 +356,7 @@ function LogicalSchemaNode({
   pathActionsEnabled: boolean;
   flattenedPathKeys: ReadonlySet<string>;
   onSelect: (fieldPath: FieldPath, field: SchemaField) => void;
-  onFlatten?: (fieldPath: FieldPath) => void;
-  onUnflatten?: (fieldPath: FieldPath) => void;
+  onOpenPathMenu: (request: SchemaPathMenuRequest) => void;
 }) {
   const projection = useMemo(
     () => _projectLogicalSchema(name, dataType),
@@ -279,23 +367,29 @@ function LogicalSchemaNode({
   const pathActionDisabledReason = pathActionsEnabled
     ? undefined
     : DUPLICATE_PATH_ACTION_REASON;
-  const flattenAccessibleReason =
-    pathActionDisabledReason ??
-    (!flattened && flattenDisabledReason !== undefined
-      ? `Unavailable: ${flattenUnavailableLabel(field).toLowerCase()}.`
-      : undefined);
-  const flattenSecondaryLabel =
-    pathActionDisabledReason !== undefined
-      ? "Duplicate column names"
-      : !flattened && flattenDisabledReason !== undefined
-        ? flattenUnavailableLabel(field)
-        : undefined;
+  const openPathMenu = (
+    path: FieldPath,
+    isFlattened: boolean,
+    disabledReason: string | undefined,
+    trigger: HTMLElement,
+    clientX: number,
+    clientY: number,
+  ) => {
+    onOpenPathMenu({
+      fieldPath: path,
+      flattened: isFlattened,
+      disabledReason,
+      trigger,
+      clientX,
+      clientY,
+    });
+  };
   return (
     <li>
       <button
         className="schema-field"
         type="button"
-        disabled={!pathActionsEnabled}
+        aria-disabled={!pathActionsEnabled || undefined}
         title={pathActionDisabledReason}
         aria-label={
           pathActionDisabledReason === undefined
@@ -305,37 +399,50 @@ function LogicalSchemaNode({
         aria-pressed={
           selectedPath !== null && sameFieldPath(selectedPath, fieldPath)
         }
-        onClick={() => onSelect(fieldPath, field)}
+        onClick={() => {
+          if (pathActionsEnabled) onSelect(fieldPath, field);
+        }}
+        onContextMenu={(event) => {
+          if (dataType.typeId !== Type.Struct) return;
+          event.preventDefault();
+          event.stopPropagation();
+          openPathMenu(
+            fieldPath,
+            flattened,
+            pathActionDisabledReason ??
+              (flattened ? undefined : flattenDisabledReason),
+            event.currentTarget,
+            event.clientX,
+            event.clientY,
+          );
+        }}
+        onKeyDown={(event) => {
+          if (
+            dataType.typeId !== Type.Struct ||
+            (event.key !== "ContextMenu" &&
+              !(event.shiftKey && event.key === "F10"))
+          ) {
+            return;
+          }
+          event.preventDefault();
+          event.stopPropagation();
+          const bounds = event.currentTarget.getBoundingClientRect();
+          openPathMenu(
+            fieldPath,
+            flattened,
+            pathActionDisabledReason ??
+              (flattened ? undefined : flattenDisabledReason),
+            event.currentTarget,
+            bounds.left,
+            bounds.bottom,
+          );
+        }}
       >
         <span className="schema-name">{projection.name}</span>
         <span className="schema-type" title={projection.type}>
           {projection.type}
         </span>
       </button>
-      {dataType.typeId === Type.Struct &&
-        (onFlatten !== undefined || onUnflatten !== undefined) && (
-          <button
-            className="schema-flatten-action"
-            type="button"
-            disabled={
-              pathActionDisabledReason !== undefined ||
-              (!flattened && flattenDisabledReason !== undefined)
-            }
-            title={
-              pathActionDisabledReason ??
-              (flattened ? undefined : flattenDisabledReason)
-            }
-            aria-label={`${flattened ? "Unflatten" : "Flatten"} ${formatFieldPath(fieldPath)}${flattenAccessibleReason === undefined ? "" : `. ${flattenAccessibleReason}`}`}
-            onClick={() =>
-              flattened ? onUnflatten?.(fieldPath) : onFlatten?.(fieldPath)
-            }
-          >
-            <span>{flattened ? "Unflatten" : "Flatten"}</span>
-            {flattenSecondaryLabel !== undefined && (
-              <span className="menu-shortcut">{flattenSecondaryLabel}</span>
-            )}
-          </button>
-        )}
       {projection.rows.some(
         (row) => !row.addressable && row.segments.length > 0,
       ) && <p className="schema-continuation">{LIST_MAP_COLUMN_REASON}</p>}
@@ -360,21 +467,6 @@ function LogicalSchemaNode({
                 ? undefined
                 : flattenUnavailableReason(rowField);
             const rowFlattened = flattenedPathKeys.has(fieldPathKey(rowPath));
-            const rowFlattenAccessibleReason =
-              pathActionDisabledReason ??
-              (!rowFlattened &&
-              rowFlattenDisabledReason !== undefined &&
-              rowField !== undefined
-                ? `Unavailable: ${flattenUnavailableLabel(rowField).toLowerCase()}.`
-                : undefined);
-            const rowFlattenSecondaryLabel =
-              pathActionDisabledReason !== undefined
-                ? "Duplicate column names"
-                : !rowFlattened &&
-                    rowFlattenDisabledReason !== undefined &&
-                    rowField !== undefined
-                  ? flattenUnavailableLabel(rowField)
-                  : undefined;
             return (
               <li
                 key={`${index}:${row.name}`}
@@ -384,7 +476,10 @@ function LogicalSchemaNode({
                 <button
                   className="schema-field"
                   type="button"
-                  disabled={!pathActionsEnabled || !selectable}
+                  disabled={!selectable}
+                  aria-disabled={
+                    !pathActionsEnabled || !selectable || undefined
+                  }
                   title={rowPathDisabledReason}
                   aria-label={
                     rowPathDisabledReason === undefined
@@ -396,7 +491,47 @@ function LogicalSchemaNode({
                     sameFieldPath(selectedPath, rowPath)
                   }
                   onClick={() => {
-                    if (rowField !== undefined) onSelect(rowPath, rowField);
+                    if (pathActionsEnabled && rowField !== undefined) {
+                      onSelect(rowPath, rowField);
+                    }
+                  }}
+                  onContextMenu={(event) => {
+                    if (!selectable || row.dataType.typeId !== Type.Struct) {
+                      return;
+                    }
+                    event.preventDefault();
+                    event.stopPropagation();
+                    openPathMenu(
+                      rowPath,
+                      rowFlattened,
+                      pathActionDisabledReason ??
+                        (rowFlattened ? undefined : rowFlattenDisabledReason),
+                      event.currentTarget,
+                      event.clientX,
+                      event.clientY,
+                    );
+                  }}
+                  onKeyDown={(event) => {
+                    if (
+                      !selectable ||
+                      row.dataType.typeId !== Type.Struct ||
+                      (event.key !== "ContextMenu" &&
+                        !(event.shiftKey && event.key === "F10"))
+                    ) {
+                      return;
+                    }
+                    event.preventDefault();
+                    event.stopPropagation();
+                    const bounds = event.currentTarget.getBoundingClientRect();
+                    openPathMenu(
+                      rowPath,
+                      rowFlattened,
+                      pathActionDisabledReason ??
+                        (rowFlattened ? undefined : rowFlattenDisabledReason),
+                      event.currentTarget,
+                      bounds.left,
+                      bounds.bottom,
+                    );
                   }}
                 >
                   <span className="schema-name">{row.name}</span>
@@ -404,36 +539,6 @@ function LogicalSchemaNode({
                     {row.type}
                   </span>
                 </button>
-                {selectable &&
-                  row.dataType.typeId === Type.Struct &&
-                  (onFlatten !== undefined || onUnflatten !== undefined) && (
-                    <button
-                      className="schema-flatten-action"
-                      type="button"
-                      disabled={
-                        pathActionDisabledReason !== undefined ||
-                        (!rowFlattened &&
-                          rowFlattenDisabledReason !== undefined)
-                      }
-                      title={
-                        pathActionDisabledReason ??
-                        (rowFlattened ? undefined : rowFlattenDisabledReason)
-                      }
-                      aria-label={`${rowFlattened ? "Unflatten" : "Flatten"} ${formatFieldPath(rowPath)}${rowFlattenAccessibleReason === undefined ? "" : `. ${rowFlattenAccessibleReason}`}`}
-                      onClick={() =>
-                        rowFlattened
-                          ? onUnflatten?.(rowPath)
-                          : onFlatten?.(rowPath)
-                      }
-                    >
-                      <span>{rowFlattened ? "Unflatten" : "Flatten"}</span>
-                      {rowFlattenSecondaryLabel !== undefined && (
-                        <span className="menu-shortcut">
-                          {rowFlattenSecondaryLabel}
-                        </span>
-                      )}
-                    </button>
-                  )}
               </li>
             );
           })}
@@ -866,11 +971,6 @@ function flattenUnavailableReason(field: SchemaField): string | undefined {
     names.add(child.name);
   }
   return undefined;
-}
-
-function flattenUnavailableLabel(field: SchemaField): string {
-  if (field.children.length === 0) return "No child fields";
-  return "Duplicate child names";
 }
 
 function formatApproximateCount(value: number): string {

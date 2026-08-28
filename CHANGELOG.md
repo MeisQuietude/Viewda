@@ -10,7 +10,7 @@ Backward-incompatible entries start with **Breaking:**.
 
 ### Added
 
-- Select nested struct leaves as regular Data columns from a searchable schema tree, or use Flatten, Unflatten, and Peek's Promote to column shortcuts. Filter and sort logical JSON columns by sample-derived fields or manually entered object keys and array indices; Viewda labels the sample bound, warns that extraction scans the JSON column, and keeps the scan cancellable. Nested columns can be filtered, sorted, pinned, resized, inspected, copied, and exported; list and map fields stay intact, their statistics report container sizes, and Grid Copy and CSV use matching JSON text. Sources with duplicate names remain readable while ambiguous actions explain why they are unavailable.
+- Select nested struct leaves as regular Data columns from a searchable schema tree, or right-click schema and grid fields to Flatten or Unflatten them. Peek sizes itself for the active value, keeps its layout stable while selecting and copying fields, and offers field actions by right-click plus keyboard shortcuts for copying content or paths. Filter and sort logical JSON columns by sample-derived fields or manually entered object keys and array indices; Viewda labels the sample bound, warns that extraction scans the JSON column, and keeps the scan cancellable. Nested columns, including fields with quoted or empty names, can be filtered, sorted, pinned, resized, inspected, copied, and exported; list and map fields stay intact, their statistics report container sizes, and Grid Copy and CSV use matching JSON text. Sources with duplicate names remain readable while ambiguous actions explain why they are unavailable.
 
 ## 0.3.0 — 2026-08-26
 
