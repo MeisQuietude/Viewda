@@ -2181,12 +2181,14 @@ pub(crate) mod tests {
                 &reader,
                 &[DataFilter {
                     field_path: viewda_data_engine::FieldPath::from("value"),
+                    json_target: None,
                     operator: DataFilterOperator::Equals,
                     values: vec!["1".to_owned()],
                     match_case: false,
                 }],
                 &[DataSort {
                     field_path: viewda_data_engine::FieldPath::from("value"),
+                    json_target: None,
                     direction: viewda_data_engine::DataSortDirection::Descending,
                 }],
                 viewda_data_engine::DataViewMemoryLimit::Mb384,
@@ -3005,12 +3007,14 @@ pub(crate) mod tests {
                 &reader,
                 &[DataFilter {
                     field_path: viewda_data_engine::FieldPath::from("value"),
+                    json_target: None,
                     operator: DataFilterOperator::Equals,
                     values: vec!["1".to_owned()],
                     match_case: false,
                 }],
                 &[DataSort {
                     field_path: viewda_data_engine::FieldPath::from("value"),
+                    json_target: None,
                     direction: DataSortDirection::Descending,
                 }],
                 DataViewMemoryLimit::Mb384,

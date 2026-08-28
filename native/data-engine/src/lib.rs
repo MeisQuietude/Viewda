@@ -8,6 +8,8 @@ mod export;
 mod field_path;
 #[cfg(feature = "query-engine")]
 mod filter;
+#[cfg(feature = "query-engine")]
+mod json_path;
 mod source;
 #[cfg(feature = "query-engine")]
 mod statistics;
@@ -43,6 +45,14 @@ pub use export::{
 pub use field_path::FieldPath;
 #[cfg(feature = "query-engine")]
 pub use filter::{DataFilter, DataFilterOperator};
+#[cfg(feature = "query-engine")]
+pub use json_path::{
+    JSON_SCHEMA_SAMPLE_ARROW_BYTE_LIMIT, JSON_SCHEMA_SAMPLE_ROW_LIMIT,
+    JSON_SCHEMA_SAMPLE_TOTAL_BYTE_LIMIT, JSON_SCHEMA_SAMPLE_VALUE_BYTE_LIMIT,
+    JSON_SCHEMA_SAMPLE_VALUE_CHARACTER_LIMIT, JsonFieldTarget, JsonObservedType, JsonPath,
+    JsonPathSegment, JsonSchemaInference, JsonSchemaNode, JsonValueType,
+    infer_json_schema_from_arrow,
+};
 pub use source::{
     SchemaField, SourceError, SourceIdentity, SourceOpenPhase, SourceSnapshot, SourceSummary,
     inspect_local_source, inspect_local_source_snapshot, inspect_local_source_snapshot_cancellable,

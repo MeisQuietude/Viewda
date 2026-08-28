@@ -29,7 +29,7 @@ use serde::{Deserialize, Serialize};
 use tempfile::TempDir;
 
 use crate::{
-    FieldPath,
+    FieldPath, JsonFieldTarget,
     dataset::{
         DatasetError, DatasetQuerySource, DatasetRowPosition, DatasetSessionToken,
         DatasetSetupError, DatasetSparseRows, DatasetWindowReader, redact_path_aliases,
@@ -39,6 +39,7 @@ use crate::{
         field_path_expression, project_arrow_field_paths, resolve_field_path, validate_field_paths,
     },
     filter::{DataFilter, FilterPredicate, build_filter_predicate_with_names, quote_identifier},
+    json_path::{JsonFieldExpression, field_is_json, json_field_expression},
     source::{inspect_local_source, inspect_local_source_for_query, open_local_source},
     window::{DataWindowError, MAX_WINDOW_ROWS, classify_query_error, set_utc_session_timezone},
 };
@@ -108,6 +109,9 @@ impl DataViewMemoryLimit {
 pub struct DataSort {
     /// Field-name segments from the top-level column through struct fields.
     pub field_path: FieldPath,
+    /// Optional extraction below a Parquet column explicitly annotated as JSON.
+    #[serde(default)]
+    pub json_target: Option<JsonFieldTarget>,
     /// Direction applied before the stable file-order tie-break.
     pub direction: DataSortDirection,
 }
@@ -428,10 +432,18 @@ impl DataViewBuilder {
 
     /// Builds one position index shared by counts and all subsequent windows.
     pub fn build(self) -> Result<PreparedDataView, DataViewError> {
-        self.build_inner(|| {})
+        self.build_inner(
+            #[cfg(test)]
+            || {},
+            || {},
+        )
     }
 
-    fn build_inner(self, before_publish: impl FnOnce()) -> Result<PreparedDataView, DataViewError> {
+    fn build_inner(
+        self,
+        #[cfg(test)] before_execute: impl FnOnce(),
+        before_publish: impl FnOnce(),
+    ) -> Result<PreparedDataView, DataViewError> {
         let facts = self.source.facts()?;
         self.require_active()?;
         validate_sort(&facts.schema, &self.sort)?;
@@ -483,6 +495,8 @@ impl DataViewBuilder {
         );
         let mut parameters = prepared_relation.parameters;
         parameters.extend(predicate.parameters);
+        #[cfg(test)]
+        before_execute();
         self.connection
             .execute(&query, params_from_iter(parameters.iter()))
             .map_err(|error| {
@@ -1154,13 +1168,19 @@ fn validate_sort(
     }
     let mut seen = Vec::with_capacity(sort.len());
     for column in sort {
-        if resolve_field_path(schema, &column.field_path).is_none() {
+        let resolved =
+            resolve_field_path(schema, &column.field_path).ok_or(DataWindowError::InvalidSort)?;
+        if column.json_target.is_some() && !field_is_json(resolved.field) {
             return Err(DataWindowError::InvalidSort);
         }
-        if seen.contains(&column.field_path) {
+        let identity = (
+            &column.field_path,
+            column.json_target.as_ref().map(|target| &target.path),
+        );
+        if seen.contains(&identity) {
             return Err(DataWindowError::InvalidSort);
         }
-        seen.push(column.field_path.clone());
+        seen.push(identity);
     }
     Ok(())
 }
@@ -1200,9 +1220,25 @@ fn build_order_clause_with_names(
                 .get(resolved.root_index)
                 .ok_or(DataWindowError::InvalidSort)?,
         );
-        let expression = field_path_expression(&sort_column.field_path, &root)
+        let field = field_path_expression(&sort_column.field_path, &root)
             .ok_or(DataWindowError::InvalidSort)?;
-        order.push(format!("{expression} {direction} NULLS LAST"));
+        let expression = match &sort_column.json_target {
+            Some(target) if field_is_json(resolved.field) => json_field_expression(&field, target),
+            Some(_) => None,
+            None => Some(JsonFieldExpression::Scalar(field)),
+        }
+        .ok_or(DataWindowError::InvalidSort)?;
+        match expression {
+            JsonFieldExpression::Scalar(expression) => {
+                order.push(format!("{expression} {direction} NULLS LAST"));
+            }
+            JsonFieldExpression::Number(number) => {
+                // DOUBLE defines the common numeric bucket. The DECIMAL key preserves exact
+                // integers and orders collisions without coercing them back to DOUBLE.
+                order.push(format!("{} {direction} NULLS LAST", number.finite));
+                order.push(format!("{} {direction} NULLS LAST", number.bucket_tie));
+            }
+        }
     }
     order.push(format!("{source_position} ASC"));
     Ok(order.join(", "))
@@ -1663,7 +1699,7 @@ mod tests {
         arrow::ArrowWriter,
         file::reader::{FileReader, SerializedFileReader},
     };
-    use tempfile::NamedTempFile;
+    use tempfile::{NamedTempFile, TempDir};
 
     use super::*;
     use crate::DataFilterOperator;
@@ -1676,6 +1712,7 @@ mod tests {
             &[],
             &[DataSort {
                 field_path: field("label"),
+                json_target: None,
                 direction: DataSortDirection::Ascending,
             }],
         )
@@ -1708,6 +1745,7 @@ mod tests {
             &[],
             &[DataSort {
                 field_path: field("id"),
+                json_target: None,
                 direction: DataSortDirection::Ascending,
             }],
             DataViewMemoryLimit::Mb384,
@@ -1753,6 +1791,7 @@ mod tests {
         let (_directory, reader) = write_dataset_fixture();
         let filters = [DataFilter {
             field_path: field("id"),
+            json_target: None,
             operator: crate::DataFilterOperator::Equals,
             values: vec!["1".to_owned()],
             match_case: false,
@@ -1762,6 +1801,7 @@ mod tests {
             &filters,
             &[DataSort {
                 field_path: field("id"),
+                json_target: None,
                 direction: DataSortDirection::Ascending,
             }],
             DataViewMemoryLimit::Mb384,
@@ -1805,6 +1845,7 @@ mod tests {
             &[],
             &[DataSort {
                 field_path: field("id"),
+                json_target: None,
                 direction: DataSortDirection::Ascending,
             }],
             DataViewMemoryLimit::Mb384,
@@ -1844,6 +1885,7 @@ mod tests {
             &[],
             &[DataSort {
                 field_path: field("label"),
+                json_target: None,
                 direction: DataSortDirection::Descending,
             }],
         )
@@ -1919,6 +1961,7 @@ mod tests {
             &[],
             &[DataSort {
                 field_path: field("id"),
+                json_target: None,
                 direction: DataSortDirection::Ascending,
             }],
         )
@@ -1964,6 +2007,7 @@ mod tests {
             &[],
             &[DataSort {
                 field_path: field("id"),
+                json_target: None,
                 direction: DataSortDirection::Ascending,
             }],
         )
@@ -2002,6 +2046,7 @@ mod tests {
             &[],
             &[DataSort {
                 field_path: field("id"),
+                json_target: None,
                 direction: DataSortDirection::Ascending,
             }],
         )
@@ -2062,6 +2107,7 @@ mod tests {
             &[],
             &[DataSort {
                 field_path: field("sort_key"),
+                json_target: None,
                 direction: DataSortDirection::Ascending,
             }],
         )
@@ -2154,6 +2200,7 @@ mod tests {
             &[],
             &[DataSort {
                 field_path: field("label"),
+                json_target: None,
                 direction: DataSortDirection::Ascending,
             }],
         )
@@ -2190,7 +2237,62 @@ mod tests {
         let builder = DataViewBuilder::new(source.path().to_owned(), &[], &[]).expect("builder");
         let interrupt = builder.interrupt_handle();
         assert!(matches!(
-            builder.build_inner(|| interrupt.interrupt()),
+            builder.build_inner(|| {}, || interrupt.interrupt()),
+            Err(DataViewError::Engine(DataWindowError::Cancelled))
+        ));
+    }
+
+    #[test]
+    fn interrupt_stops_an_executing_json_filter_scan() {
+        let (_directory, source) = write_large_json_fixture();
+        let builder = DataViewBuilder::new(
+            source,
+            &[DataFilter {
+                field_path: field("payload"),
+                json_target: Some(crate::JsonFieldTarget {
+                    path: crate::JsonPath::new([crate::JsonPathSegment::Field("value".to_owned())]),
+                    value_type: crate::JsonValueType::Number,
+                }),
+                operator: DataFilterOperator::GreaterThanOrEqual,
+                values: vec!["0".to_owned()],
+                match_case: false,
+            }],
+            &[],
+        )
+        .expect("JSON view builder");
+        let position_index = builder.temporary_directory.path().join("positions.parquet");
+        let interrupt = Arc::new(builder.interrupt_handle());
+        let (execute_tx, execute_rx) = mpsc::sync_channel(0);
+        let scan = thread::spawn(move || {
+            builder.build_inner(
+                move || execute_tx.send(()).expect("report JSON query execution"),
+                || {},
+            )
+        });
+        execute_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("JSON query reaches execution");
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !position_index.exists() {
+            assert!(
+                !scan.is_finished(),
+                "JSON scan finished before interruption"
+            );
+            assert!(
+                std::time::Instant::now() < deadline,
+                "JSON scan did not start writing its position index"
+            );
+            thread::yield_now();
+        }
+        assert!(
+            !scan.is_finished(),
+            "JSON scan finished before interruption"
+        );
+
+        interrupt.interrupt();
+
+        assert!(matches!(
+            scan.join().expect("JSON scan thread"),
             Err(DataViewError::Engine(DataWindowError::Cancelled))
         ));
     }
@@ -2203,6 +2305,7 @@ mod tests {
             &[],
             &[DataSort {
                 field_path: field("label"),
+                json_target: None,
                 direction: DataSortDirection::Descending,
             }],
         )
@@ -2290,6 +2393,7 @@ mod tests {
             source.path().to_owned(),
             &[DataFilter {
                 field_path: field("id"),
+                json_target: None,
                 operator: crate::DataFilterOperator::Equals,
                 values: vec!["1".to_owned()],
                 match_case: false,
@@ -2449,6 +2553,7 @@ mod tests {
             &[],
             &[DataSort {
                 field_path: field("label"),
+                json_target: None,
                 direction: DataSortDirection::Ascending,
             }],
             DataViewMemoryLimit::Mb768,
@@ -2656,10 +2761,12 @@ mod tests {
                 &[
                     DataSort {
                         field_path: field("label"),
+                        json_target: None,
                         direction: DataSortDirection::Descending,
                     },
                     DataSort {
                         field_path: field("value\"quoted"),
+                        json_target: None,
                         direction: DataSortDirection::Ascending,
                     },
                 ],
@@ -2669,6 +2776,103 @@ mod tests {
                 "\"label\" DESC NULLS LAST, \"value\"\"quoted\" ASC NULLS LAST, \"file_row_number\" ASC"
                     .to_owned()
             )
+        );
+    }
+
+    #[test]
+    fn json_sort_uses_text_for_mixed_values_and_requires_a_json_annotation() {
+        let json = crate::SchemaField {
+            name: "payload".to_owned(),
+            physical_type: "BYTE_ARRAY".to_owned(),
+            logical_type: Some("JSON".to_owned()),
+            children: Vec::new(),
+        };
+        let target = crate::JsonFieldTarget {
+            path: crate::JsonPath::new([crate::JsonPathSegment::Field("value".to_owned())]),
+            value_type: crate::JsonValueType::Mixed,
+        };
+        let sort = DataSort {
+            field_path: field("payload"),
+            json_target: Some(target),
+            direction: DataSortDirection::Ascending,
+        };
+
+        assert_eq!(
+            build_order_clause(std::slice::from_ref(&json), std::slice::from_ref(&sort), "row"),
+            Ok("json_extract_string(TRY_CAST(\"payload\" AS JSON), '$.\"value\"') ASC NULLS LAST, row ASC".to_owned())
+        );
+        assert_eq!(
+            validate_sort(std::slice::from_ref(&json), std::slice::from_ref(&sort)),
+            Ok(())
+        );
+
+        let text = crate::SchemaField {
+            logical_type: Some("String".to_owned()),
+            ..json
+        };
+        assert_eq!(
+            validate_sort(&[text], &[sort]),
+            Err(DataWindowError::InvalidSort)
+        );
+    }
+
+    #[test]
+    fn json_number_sort_uses_finite_order_with_an_exact_tie_breaker() {
+        let schema = [crate::SchemaField {
+            name: "payload".to_owned(),
+            physical_type: "BYTE_ARRAY".to_owned(),
+            logical_type: Some("JSON".to_owned()),
+            children: Vec::new(),
+        }];
+        let sort = [DataSort {
+            field_path: field("payload"),
+            json_target: Some(crate::JsonFieldTarget {
+                path: crate::JsonPath::new([crate::JsonPathSegment::Field("value".to_owned())]),
+                value_type: crate::JsonValueType::Number,
+            }),
+            direction: DataSortDirection::Ascending,
+        }];
+
+        let order = build_order_clause(&schema, &sort, "row").expect("JSON numeric order");
+
+        assert!(order.contains("isfinite"));
+        assert!(order.contains("DECIMAL(38, 18)"));
+        assert!(order.find("isfinite").unwrap() < order.find("DECIMAL(38, 18)").unwrap());
+        assert!(!order.contains("COALESCE"));
+        assert!(order.ends_with("row ASC"));
+    }
+
+    #[test]
+    fn json_sort_identity_ignores_the_requested_value_type() {
+        let schema = [crate::SchemaField {
+            name: "payload".to_owned(),
+            physical_type: "BYTE_ARRAY".to_owned(),
+            logical_type: Some("JSON".to_owned()),
+            children: Vec::new(),
+        }];
+        let path = crate::JsonPath::new([crate::JsonPathSegment::Field("value".to_owned())]);
+        let sort = [
+            DataSort {
+                field_path: field("payload"),
+                json_target: Some(crate::JsonFieldTarget {
+                    path: path.clone(),
+                    value_type: crate::JsonValueType::Number,
+                }),
+                direction: DataSortDirection::Ascending,
+            },
+            DataSort {
+                field_path: field("payload"),
+                json_target: Some(crate::JsonFieldTarget {
+                    path,
+                    value_type: crate::JsonValueType::Text,
+                }),
+                direction: DataSortDirection::Descending,
+            },
+        ];
+
+        assert_eq!(
+            validate_sort(&schema, &sort),
+            Err(DataWindowError::InvalidSort)
         );
     }
 
@@ -2697,6 +2901,21 @@ mod tests {
         writer.write(&batch).expect("write batch");
         writer.close().expect("write footer");
         source
+    }
+
+    fn write_large_json_fixture() -> (TempDir, PathBuf) {
+        let directory = tempfile::tempdir().expect("JSON fixture directory");
+        let path = directory.path().join("large-json.parquet");
+        let connection = Connection::open_in_memory().expect("JSON fixture connection");
+        connection
+            .execute_batch(&format!(
+                "COPY (SELECT range AS id, \
+                 CAST(concat('{{\"value\":', CAST(range AS VARCHAR), '}}') AS JSON) AS payload \
+                 FROM range(1000000)) TO {} (FORMAT PARQUET, COMPRESSION ZSTD)",
+                quote_string_literal(path.to_str().expect("UTF-8 JSON fixture path")),
+            ))
+            .expect("large JSON fixture");
+        (directory, path)
     }
 
     fn write_dataset_fixture() -> (tempfile::TempDir, DatasetWindowReader) {
@@ -2743,12 +2962,14 @@ mod tests {
             &reader,
             &[DataFilter {
                 field_path: field("year"),
+                json_target: None,
                 operator: DataFilterOperator::Equals,
                 values: vec!["2025".to_owned()],
                 match_case: false,
             }],
             &[DataSort {
                 field_path: field("id"),
+                json_target: None,
                 direction: DataSortDirection::Ascending,
             }],
             DataViewMemoryLimit::Mb384,
@@ -2767,6 +2988,7 @@ mod tests {
                 &reader,
                 &[DataFilter {
                     field_path: field("year"),
+                    json_target: None,
                     operator: DataFilterOperator::Equals,
                     values: vec!["2026".to_owned()],
                     match_case: false,

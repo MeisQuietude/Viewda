@@ -91,6 +91,7 @@ fn opening_and_reading_sources_does_not_modify_source_mtimes() {
         &[],
         &[DataSort {
             field_path: FieldPath::from("value"),
+            json_target: None,
             direction: DataSortDirection::Ascending,
         }],
     )
@@ -112,6 +113,7 @@ fn opening_and_reading_sources_does_not_modify_source_mtimes() {
         &[],
         &[DataSort {
             field_path: FieldPath::from("value"),
+            json_target: None,
             direction: DataSortDirection::Ascending,
         }],
         DataViewMemoryLimit::Mb384,
@@ -1227,6 +1229,7 @@ fn preview_reader_supports_windows_and_prepared_views_over_only_its_fixed_sample
         &[],
         &[DataSort {
             field_path: FieldPath::from("id"),
+            json_target: None,
             direction: DataSortDirection::Ascending,
         }],
         DataViewMemoryLimit::Mb384,
@@ -1568,6 +1571,7 @@ fn infers_canonical_integer_hive_columns_across_query_surfaces() {
         &[filter(&reader, year, DataFilterOperator::IsNotNull, &[])],
         &[DataSort {
             field_path: field_path(&reader, year),
+            json_target: None,
             direction: DataSortDirection::Ascending,
         }],
         DataViewMemoryLimit::Mb384,
@@ -1750,12 +1754,14 @@ fn unions_nested_fields_and_qualifies_nested_conflicts() {
         &reader,
         &[DataFilter {
             field_path: city_path.clone(),
+            json_target: None,
             operator: DataFilterOperator::Equals,
             values: vec!["Riga".to_owned()],
             match_case: false,
         }],
         &[DataSort {
             field_path: zip_path.clone(),
+            json_target: None,
             direction: DataSortDirection::Descending,
         }],
         DataViewMemoryLimit::Mb384,
@@ -2058,6 +2064,7 @@ fn suffixes_colliding_virtual_columns_without_renaming_physical_columns() {
         &[],
         &[DataSort {
             field_path: field_path(&reader, virtual_year),
+            json_target: None,
             direction: DataSortDirection::Ascending,
         }],
         DataViewMemoryLimit::Mb384,
@@ -2146,6 +2153,7 @@ fn widens_numeric_schema_across_the_catalog_page_boundary() {
         &[],
         &[DataSort {
             field_path: FieldPath::from("value"),
+            json_target: None,
             direction: DataSortDirection::Descending,
         }],
         DataViewMemoryLimit::Mb384,
@@ -2272,6 +2280,7 @@ fn keeps_producer_types_and_values_across_dataset_query_paths() {
         )],
         &[DataSort {
             field_path: field_path(&reader, alias),
+            json_target: None,
             direction: DataSortDirection::Ascending,
         }],
         DataViewMemoryLimit::Mb384,
@@ -2573,6 +2582,7 @@ fn preserves_physical_filename_and_file_row_number_columns() {
         &[],
         &[DataSort {
             field_path: FieldPath::from("filename"),
+            json_target: None,
             direction: DataSortDirection::Ascending,
         }],
         DataViewMemoryLimit::Mb384,
@@ -2792,6 +2802,7 @@ fn filter(
 ) -> DataFilter {
     DataFilter {
         field_path: field_path(reader, column_index),
+        json_target: None,
         operator,
         values: values.iter().map(|value| (*value).to_owned()).collect(),
         match_case: false,
@@ -2876,6 +2887,7 @@ fn prepared_dataset_view_sorts_stably_and_projects_partition_and_file_columns() 
         &[],
         &[DataSort {
             field_path: field_path(&reader, value),
+            json_target: None,
             direction: DataSortDirection::Ascending,
         }],
         DataViewMemoryLimit::Mb384,
@@ -2925,6 +2937,7 @@ fn prepared_window_reads_512_distinct_one_row_members() {
         &[],
         &[DataSort {
             field_path: field_path(&reader, value),
+            json_target: None,
             direction: DataSortDirection::Ascending,
         }],
         DataViewMemoryLimit::Mb384,
@@ -2963,6 +2976,7 @@ fn prepared_dataset_filters_and_sorts_virtual_columns() {
         &[equals(&reader, year, "2026")],
         &[DataSort {
             field_path: field_path(&reader, file),
+            json_target: None,
             direction: DataSortDirection::Ascending,
         }],
         DataViewMemoryLimit::Mb384,
@@ -2984,12 +2998,14 @@ fn prepared_dataset_filters_and_sorts_virtual_columns() {
         &reader,
         &[DataFilter {
             field_path: field_path(&reader, file),
+            json_target: None,
             operator: DataFilterOperator::TextContains,
             values: vec![".parquet".to_owned()],
             match_case: true,
         }],
         &[DataSort {
             field_path: field_path(&reader, year),
+            json_target: None,
             direction: DataSortDirection::Descending,
         }],
         DataViewMemoryLimit::Mb384,
@@ -3033,6 +3049,7 @@ fn prepared_filter_prunes_a_nonmatching_damaged_member_before_staging_scan() {
         &[equals(&reader, year, "2025")],
         &[DataSort {
             field_path: field_path(&reader, value),
+            json_target: None,
             direction: DataSortDirection::Ascending,
         }],
         DataViewMemoryLimit::Mb384,
@@ -3084,6 +3101,7 @@ fn prepared_dataset_view_preserves_native_order_across_parallel_row_group_scans(
         &[],
         &[DataSort {
             field_path: field_path(&reader, key),
+            json_target: None,
             direction: DataSortDirection::Ascending,
         }],
         DataViewMemoryLimit::Mb768,
@@ -3153,6 +3171,7 @@ fn prepared_dataset_view_preserves_union_schema_after_partition_pruning() {
     let year = column_index(&reader, "year");
     let filter = DataFilter {
         field_path: field_path(&reader, year),
+        json_target: None,
         operator: DataFilterOperator::Equals,
         values: vec!["2025".to_owned()],
         match_case: false,
@@ -3162,6 +3181,7 @@ fn prepared_dataset_view_preserves_union_schema_after_partition_pruning() {
         &[filter],
         &[DataSort {
             field_path: field_path(&reader, value),
+            json_target: None,
             direction: DataSortDirection::Ascending,
         }],
         DataViewMemoryLimit::Mb384,
@@ -3205,6 +3225,7 @@ fn prepared_dataset_sparse_rows_preserve_nested_union_schema() {
         &[],
         &[DataSort {
             field_path: field_path(&reader, key),
+            json_target: None,
             direction: DataSortDirection::Ascending,
         }],
         DataViewMemoryLimit::Mb384,
@@ -3257,12 +3278,14 @@ fn prepared_dataset_view_offsets_are_relative_to_pruned_candidates() {
         &reader,
         &[DataFilter {
             field_path: field_path(&reader, year),
+            json_target: None,
             operator: DataFilterOperator::Equals,
             values: vec!["2026".to_owned()],
             match_case: false,
         }],
         &[DataSort {
             field_path: field_path(&reader, value),
+            json_target: None,
             direction: DataSortDirection::Ascending,
         }],
         DataViewMemoryLimit::Mb384,
@@ -3289,6 +3312,7 @@ fn prepared_dataset_view_offsets_are_relative_to_pruned_candidates() {
         &reader,
         &[DataFilter {
             field_path: field_path(&reader, year),
+            json_target: None,
             operator: DataFilterOperator::Equals,
             values: vec!["2099".to_owned()],
             match_case: false,
@@ -3327,6 +3351,7 @@ fn prepared_dataset_view_honors_cancellation_and_the_source_change_latch() {
         &[],
         &[DataSort {
             field_path: field_path(&reader, 0),
+            json_target: None,
             direction: DataSortDirection::Ascending,
         }],
         DataViewMemoryLimit::Mb384,
@@ -3342,6 +3367,7 @@ fn prepared_dataset_view_honors_cancellation_and_the_source_change_latch() {
         &reader,
         &[DataFilter {
             field_path: field_path(&reader, 0),
+            json_target: None,
             operator: DataFilterOperator::TextContains,
             values: vec!["1".to_owned()],
             match_case: false,
@@ -3360,6 +3386,7 @@ fn prepared_dataset_view_honors_cancellation_and_the_source_change_latch() {
         &[],
         &[DataSort {
             field_path: field_path(&reader, 0),
+            json_target: None,
             direction: DataSortDirection::Ascending,
         }],
         DataViewMemoryLimit::Mb384,
@@ -3390,6 +3417,7 @@ fn prepared_dataset_view_checks_only_members_in_each_window() {
         &[],
         &[DataSort {
             field_path: field_path(&reader, 0),
+            json_target: None,
             direction: DataSortDirection::Ascending,
         }],
         DataViewMemoryLimit::Mb384,
@@ -3434,6 +3462,7 @@ fn prepared_grid_and_full_view_export_read_only_selected_source_row_groups() {
         &[filter(&reader, key, DataFilterOperator::LessThan, &["8"])],
         &[DataSort {
             field_path: field_path(&reader, key),
+            json_target: None,
             direction: DataSortDirection::Descending,
         }],
         DataViewMemoryLimit::Mb384,
@@ -3550,12 +3579,14 @@ fn exports_dataset_view_ranges_in_exact_filtered_and_sorted_order() {
         &reader,
         &[DataFilter {
             field_path: field_path(&reader, value),
+            json_target: None,
             operator: DataFilterOperator::LessThanOrEqual,
             values: vec!["2".to_owned()],
             match_case: false,
         }],
         &[DataSort {
             field_path: field_path(&reader, value),
+            json_target: None,
             direction: DataSortDirection::Ascending,
         }],
         DataViewMemoryLimit::Mb384,

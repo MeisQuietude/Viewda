@@ -47,6 +47,7 @@ use crate::{
         field_path_expression, project_arrow_field_paths, resolve_field_path, validate_field_paths,
     },
     filter::quote_identifier,
+    json_path::{field_is_json, json_schema_sample_expression},
     source::{
         SourceError, SourceSnapshot, SourceSummary, inspect_local_source,
         inspect_local_source_for_dataset,
@@ -1408,6 +1409,13 @@ struct DatasetQueryRows {
     batches: Vec<RecordBatch>,
 }
 
+#[derive(Clone, Copy)]
+enum DatasetWindowProjection<'a> {
+    All,
+    Fields(&'a [FieldPath]),
+    JsonSample(&'a FieldPath),
+}
+
 /// Cancels the active direct dataset query without taking its reader lock.
 #[derive(Clone)]
 pub struct DatasetWindowInterruptHandle {
@@ -2555,7 +2563,12 @@ impl DatasetWindowReader {
         row_count: u32,
         keep_going: impl FnMut() -> bool,
     ) -> Result<Vec<u8>, DatasetError> {
-        self.fetch_projection(row_offset, row_count, None, keep_going)
+        self.fetch_projection(
+            row_offset,
+            row_count,
+            DatasetWindowProjection::All,
+            keep_going,
+        )
     }
 
     /// Reads selected addressable union-schema fields in the requested order.
@@ -2578,14 +2591,39 @@ impl DatasetWindowReader {
     ) -> Result<Vec<u8>, DatasetError> {
         validate_field_paths(&self.summary.schema, field_paths)
             .ok_or(DataWindowError::Unsupported)?;
-        self.fetch_projection(row_offset, row_count, Some(field_paths), keep_going)
+        self.fetch_projection(
+            row_offset,
+            row_count,
+            DatasetWindowProjection::Fields(field_paths),
+            keep_going,
+        )
+    }
+
+    /// Reads the first bounded, size-limited values from one Parquet JSON column.
+    pub fn fetch_json_schema_sample_while(
+        &mut self,
+        field_path: &FieldPath,
+        keep_going: impl FnMut() -> bool,
+    ) -> Result<Vec<u8>, DatasetError> {
+        let resolved = resolve_field_path(&self.summary.schema, field_path)
+            .filter(|resolved| field_is_json(resolved.field))
+            .ok_or(DataWindowError::Unsupported)?;
+        if resolved.root_index >= self.physical_column_count {
+            return Err(DataWindowError::Unsupported.into());
+        }
+        self.fetch_projection(
+            0,
+            crate::JSON_SCHEMA_SAMPLE_ROW_LIMIT,
+            DatasetWindowProjection::JsonSample(field_path),
+            keep_going,
+        )
     }
 
     fn fetch_projection(
         &mut self,
         row_offset: u64,
         row_count: u32,
-        field_paths: Option<&[FieldPath]>,
+        projection: DatasetWindowProjection<'_>,
         mut keep_going: impl FnMut() -> bool,
     ) -> Result<Vec<u8>, DatasetError> {
         let interrupted = Arc::clone(&self.interrupted);
@@ -2594,12 +2632,17 @@ impl DatasetWindowReader {
             return Err(DataWindowError::WindowTooLarge.into());
         }
         self.source.require_active()?;
-        let projected_schema = field_paths
-            .map(|paths| {
+        let projected_schema = match projection {
+            DatasetWindowProjection::All => None,
+            DatasetWindowProjection::Fields(paths) => Some(
                 project_arrow_field_paths(&self.arrow_schema, paths)
-                    .ok_or(DataWindowError::Unsupported)
-            })
-            .transpose()?;
+                    .ok_or(DataWindowError::Unsupported)?,
+            ),
+            DatasetWindowProjection::JsonSample(path) => Some(
+                project_arrow_field_paths(&self.arrow_schema, std::slice::from_ref(path))
+                    .ok_or(DataWindowError::Unsupported)?,
+            ),
+        };
         let expected_schema = projected_schema.as_ref().unwrap_or(&self.arrow_schema);
         let mut writer: Option<(SchemaRef, StreamWriter<Vec<u8>>)> = None;
         let active_limit = self
@@ -2651,7 +2694,7 @@ impl DatasetWindowReader {
                         &candidates,
                         remaining_offset,
                         remaining_count,
-                        field_paths,
+                        projection,
                     )?;
                     validate_produced_arrow_schema(expected_schema, &rows.schema)?;
                     let writer = match &mut writer {
@@ -2694,6 +2737,11 @@ impl DatasetWindowReader {
         let encoded = writer
             .into_inner()
             .map_err(|_| DataWindowError::EncodingFailed)?;
+        if matches!(projection, DatasetWindowProjection::JsonSample(_))
+            && encoded.len() > crate::JSON_SCHEMA_SAMPLE_ARROW_BYTE_LIMIT
+        {
+            return Err(DataWindowError::WindowTooLarge.into());
+        }
         Ok(encoded)
     }
 
@@ -2702,9 +2750,9 @@ impl DatasetWindowReader {
         candidates: &[DatasetMember],
         row_offset: u64,
         row_count: u64,
-        field_paths: Option<&[FieldPath]>,
+        projection: DatasetWindowProjection<'_>,
     ) -> Result<DatasetQueryRows, DatasetError> {
-        let query = self.query_sql(field_paths)?;
+        let query = self.query_sql(projection)?;
         let parameters = [
             Value::BigInt(i64::try_from(row_count).map_err(|_| DataWindowError::Unsupported)?),
             Value::BigInt(i64::try_from(row_offset).map_err(|_| DataWindowError::Unsupported)?),
@@ -2752,7 +2800,7 @@ impl DatasetWindowReader {
 
     #[cfg(test)]
     fn query_schema(&self, candidates: &[DatasetMember]) -> Result<SchemaRef, DatasetError> {
-        let query = self.query_sql(None)?;
+        let query = self.query_sql(DatasetWindowProjection::All)?;
         let mut statement = self
             .connection
             .prepare(&query)
@@ -2794,7 +2842,7 @@ impl DatasetWindowReader {
         Ok(())
     }
 
-    fn query_sql(&self, field_paths: Option<&[FieldPath]>) -> Result<String, DatasetError> {
+    fn query_sql(&self, projection: DatasetWindowProjection<'_>) -> Result<String, DatasetError> {
         let relation = dataset_relation_sql(
             &self.summary,
             self.physical_column_count,
@@ -2802,15 +2850,15 @@ impl DatasetWindowReader {
             None,
             self.schema_seed.is_some(),
         );
-        let projection = match field_paths {
-            None => self
+        let projection = match projection {
+            DatasetWindowProjection::All => self
                 .summary
                 .schema
                 .iter()
                 .map(|field| quote_identifier(&field.name))
                 .collect::<Vec<_>>()
                 .join(", "),
-            Some(paths) => paths
+            DatasetWindowProjection::Fields(paths) => paths
                 .iter()
                 .map(|path| {
                     let resolved = resolve_field_path(&self.summary.schema, path)
@@ -2825,6 +2873,19 @@ impl DatasetWindowReader {
                 })
                 .collect::<Result<Vec<_>, DataWindowError>>()?
                 .join(", "),
+            DatasetWindowProjection::JsonSample(path) => {
+                let resolved = resolve_field_path(&self.summary.schema, path)
+                    .filter(|resolved| field_is_json(resolved.field))
+                    .ok_or(DataWindowError::Unsupported)?;
+                let root = quote_identifier(&self.summary.schema[resolved.root_index].name);
+                let field =
+                    field_path_expression(path, &root).ok_or(DataWindowError::Unsupported)?;
+                format!(
+                    "{} AS {}",
+                    json_schema_sample_expression(&field),
+                    quote_identifier(path.leaf_name().ok_or(DataWindowError::Unsupported)?),
+                )
+            }
         };
         Ok(format!(
             "SELECT {projection} FROM {relation} LIMIT ? OFFSET ?"
@@ -4824,6 +4885,7 @@ mod tests {
             &[],
             &[crate::DataSort {
                 field_path: FieldPath::from("value"),
+                json_target: None,
                 direction: crate::DataSortDirection::Ascending,
             }],
             crate::DataViewMemoryLimit::Mb384,
@@ -5198,6 +5260,7 @@ mod tests {
         };
         let filters = [DataFilter {
             field_path: FieldPath::from("year"),
+            json_target: None,
             operator: DataFilterOperator::Equals,
             values: vec!["2026".to_owned()],
             match_case: false,
@@ -5310,7 +5373,9 @@ mod tests {
             interrupted: Arc::new(AtomicBool::new(false)),
         };
 
-        let query = reader.query_sql(None).expect("dataset query");
+        let query = reader
+            .query_sql(DatasetWindowProjection::All)
+            .expect("dataset query");
 
         assert!(query.len() < 1_500);
         assert!(!query.contains("part-0000.parquet"));

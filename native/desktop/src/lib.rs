@@ -73,10 +73,11 @@ use viewda_data_engine::{
     ColumnStatistics, ColumnStatisticsError, ColumnStatisticsReader, DataFilter,
     DataFilterOperator, DataSort, DataViewBuilder, DataViewError, DataViewInterruptHandle,
     DataViewResourceDiagnostics, DataWindowError, DataWindowReader, DatasetError,
-    DatasetWindowReader, EngineError, EngineStatus, FieldPath, PreparedDataView, SchemaField,
-    SourceError, SourceIdentity, SourceOpenPhase, SourceSnapshot, SourceSummary,
-    StatisticsInterruptHandle, TextValueSuggestions, TextValueSuggestionsInterruptHandle,
-    TextValueSuggestionsReader, engine_status, inspect_local_source_snapshot_cancellable,
+    DatasetWindowReader, EngineError, EngineStatus, FieldPath, JsonSchemaInference,
+    PreparedDataView, SchemaField, SourceError, SourceIdentity, SourceOpenPhase, SourceSnapshot,
+    SourceSummary, StatisticsInterruptHandle, TextValueSuggestions,
+    TextValueSuggestionsInterruptHandle, TextValueSuggestionsReader, engine_status,
+    infer_json_schema_from_arrow, inspect_local_source_snapshot_cancellable,
 };
 
 const OPEN_SOURCE_MENU_ID: &str = "open-local-source";
@@ -1673,6 +1674,77 @@ fn fetch_opened_source_window(
         #[cfg(test)]
         || {},
     )
+}
+
+/// Infers a bounded path tree from the first rows of one Parquet JSON column.
+#[tauri::command]
+async fn infer_json_schema(
+    generation: u64,
+    field_path: FieldPath,
+    opened_source: tauri::State<'_, OpenedSource>,
+) -> Result<JsonSchemaInference, DataWindowCommandError> {
+    let session = {
+        let state = opened_source
+            .state
+            .lock()
+            .map_err(|_| DataWindowError::Unsupported)?;
+        let missing = missing_data_window_session(&state);
+        state.session(generation).ok_or(missing)?
+    };
+    let _work = session.begin_work()?;
+    tauri::async_runtime::spawn_blocking(move || infer_opened_json_schema(&session, &field_path))
+        .await
+        .map_err(|_| DataWindowError::QueryEngineUnavailable)?
+}
+
+fn infer_opened_json_schema(
+    session: &OpenedSourceSession,
+    field_path: &FieldPath,
+) -> Result<JsonSchemaInference, DataWindowCommandError> {
+    infer_opened_json_schema_core(
+        session,
+        field_path,
+        #[cfg(test)]
+        || {},
+    )
+}
+
+fn infer_opened_json_schema_core(
+    session: &OpenedSourceSession,
+    field_path: &FieldPath,
+    #[cfg(test)] session_state_released: impl FnOnce(),
+) -> Result<JsonSchemaInference, DataWindowCommandError> {
+    session.validate_source_identity()?;
+    let (field, source_row_count, dataset_reader) = {
+        let state = session.lock_state()?;
+        let (schema, _, source_row_count) = session_query_facts(session, &state)?;
+        let field = schema_field_at_path(schema, field_path)
+            .filter(|field| field.logical_type.as_deref() == Some("JSON"))
+            .cloned()
+            .ok_or(DataWindowError::Unsupported)?;
+        let dataset_reader = match &state.reader {
+            SessionWindowReader::Dataset(dataset) => Some(dataset_query_reader(dataset)?),
+            SessionWindowReader::File(_) => None,
+        };
+        (field, source_row_count, dataset_reader)
+    };
+    #[cfg(test)]
+    session_state_released();
+    let bytes = match dataset_reader {
+        None => DataWindowReader::new(session.path.clone()).fetch_json_schema_sample(field_path)?,
+        Some(reader) => {
+            let lifecycle = Arc::clone(&session.lifecycle);
+            let result = reader
+                .lock()
+                .map_err(|_| DataWindowError::QueryEngineUnavailable)?
+                .fetch_json_schema_sample_while(field_path, || lifecycle.wants_work())
+                .map_err(dataset_window_command_error);
+            map_dataset_window_result(session, result, Some(&reader))?
+        }
+    };
+    let inference = infer_json_schema_from_arrow(&field, &bytes, source_row_count)?;
+    session.validate_source_identity()?;
+    Ok(inference)
 }
 
 fn fetch_opened_source_window_core(
@@ -3765,6 +3837,7 @@ pub fn run() {
             get_default_application_status,
             set_default_application,
             get_data_window,
+            infer_json_schema,
             get_source_schema_page,
             prepare_data_view,
             get_data_view_status,
@@ -4092,6 +4165,51 @@ mod tests {
         );
         drop(view_guard);
         let _ = fetching.join().expect("fetch thread completes");
+    }
+
+    #[test]
+    fn json_schema_inference_releases_session_state_before_source_io() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let path = directory.path().join("missing.parquet");
+        let mut summary = test_summary("missing.parquet");
+        summary.column_count = 1;
+        summary.schema_node_count = 1;
+        summary.schema = vec![SchemaField {
+            name: "payload".to_owned(),
+            physical_type: "BYTE_ARRAY".to_owned(),
+            logical_type: Some("JSON".to_owned()),
+            children: Vec::new(),
+        }];
+        let opened_source = OpenedSource::default();
+        let opened = opened_source
+            .install(None, path, summary, SourceOpenIntent::Explicit)
+            .expect("source install")
+            .expect("source publishes");
+        let session = opened_source
+            .state
+            .lock()
+            .expect("opened source state")
+            .session(opened.generation)
+            .expect("opened session");
+        let state_released = std::cell::Cell::new(false);
+
+        let result = infer_opened_json_schema_core(
+            &session,
+            &FieldPath::new(vec!["payload".to_owned()]),
+            || {
+                assert!(
+                    session.state.try_lock().is_ok(),
+                    "JSON inference must release session state before opening the source"
+                );
+                state_released.set(true);
+            },
+        );
+
+        assert!(state_released.get());
+        assert!(
+            result.is_err(),
+            "the intentionally missing source must fail"
+        );
     }
 
     fn session_is_closing(opened_source: &OpenedSource, generation: u64) -> bool {
@@ -4518,6 +4636,32 @@ mod tests {
             FieldPath::new(["profile", "quoted.name"])
         );
         assert!(filter.match_case);
+        assert_eq!(filter.json_target, None);
+    }
+
+    #[test]
+    fn data_filter_keeps_json_target_separate_from_field_path_on_the_wire() {
+        let filter: DataFilter = serde_json::from_value(serde_json::json!({
+            "fieldPath": ["payload"],
+            "jsonTarget": {
+                "path": [{ "field": "items" }, { "index": 0 }, { "field": "price" }],
+                "valueType": "number"
+            },
+            "operator": "greaterThan",
+            "values": ["10"]
+        }))
+        .expect("JSON-target filter wire");
+
+        assert_eq!(filter.field_path, FieldPath::from("payload"));
+        let target = filter.json_target.expect("JSON target");
+        assert_eq!(
+            serde_json::to_value(target.path).expect("JSON path wire"),
+            serde_json::json!([
+                { "field": "items" },
+                { "index": 0 },
+                { "field": "price" }
+            ])
+        );
     }
 
     #[test]

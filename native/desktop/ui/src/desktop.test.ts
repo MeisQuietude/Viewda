@@ -26,6 +26,7 @@ import {
   getStructureLoadProgress,
   getStructureSummary,
   getTextValueSuggestions,
+  inferJsonSchema,
   installPendingUpdate,
   listOpenedSources,
   openLocalFolder,
@@ -671,6 +672,80 @@ describe("desktop seam", () => {
       rowOffset: 10,
       rowCount: 20,
       fieldPaths: [["record.with.dot", 'label"quoted']],
+    });
+  });
+
+  it("keeps JSON object keys and array indices unchanged at the Tauri boundary", async () => {
+    const inference = {
+      isSampleDerived: true,
+      sampleRowLimit: 512,
+      sampleValueByteLimit: 8192,
+      sampleValueCharacterLimit: 2048,
+      sampleTotalByteLimit: 4_194_304,
+      sampleArrowByteLimit: 5_719_040,
+      sampledRowCount: 12,
+      sampledValueBytes: 240,
+      hasMoreRows: true,
+      isTruncated: false,
+      invalidValueCount: 0,
+      oversizedValueCount: 0,
+      nodes: [],
+    };
+    const jsonTarget = {
+      path: [{ field: "items.with.dot" }, { index: 2 }],
+      valueType: "number" as const,
+    };
+    invokeMock
+      .mockResolvedValueOnce(inference)
+      .mockResolvedValueOnce({ revision: 4, rowCount: 3 });
+
+    await expect(inferJsonSchema(7, ["payload"])).resolves.toEqual(inference);
+    await expect(
+      prepareDataView(
+        7,
+        4,
+        [
+          {
+            fieldPath: ["payload"],
+            jsonTarget,
+            operator: "greaterThan",
+            values: ["10"],
+          },
+        ],
+        [
+          {
+            fieldPath: ["payload"],
+            jsonTarget,
+            direction: "ascending",
+          },
+        ],
+        { memoryLimit: "mb384" },
+      ),
+    ).resolves.toEqual({ revision: 4, rowCount: 3 });
+
+    expect(invokeMock).toHaveBeenNthCalledWith(1, "infer_json_schema", {
+      generation: 7,
+      fieldPath: ["payload"],
+    });
+    expect(invokeMock).toHaveBeenNthCalledWith(2, "prepare_data_view", {
+      generation: 7,
+      viewRevision: 4,
+      filters: [
+        {
+          fieldPath: ["payload"],
+          jsonTarget,
+          operator: "greaterThan",
+          values: ["10"],
+        },
+      ],
+      sort: [
+        {
+          fieldPath: ["payload"],
+          jsonTarget,
+          direction: "ascending",
+        },
+      ],
+      settings: { memoryLimit: "mb384" },
     });
   });
 

@@ -152,6 +152,44 @@ export interface SchemaField {
 /** Stable engine address for a top-level or nested schema field. */
 export type FieldPath = string[];
 
+export type JsonPathSegment = { field: string } | { index: number };
+
+/** Address inside a logical JSON column; independent from FieldPath. */
+export type JsonPath = JsonPathSegment[];
+
+export type JsonValueType = "boolean" | "number" | "text" | "mixed";
+
+export interface JsonFieldTarget {
+  path: JsonPath;
+  valueType: JsonValueType;
+}
+
+export type JsonObservedType =
+  "null" | "boolean" | "number" | "string" | "object" | "array";
+
+export interface JsonSchemaNode {
+  segment: JsonPathSegment;
+  observedTypes: JsonObservedType[];
+  effectiveType: JsonValueType | null;
+  children: JsonSchemaNode[];
+}
+
+export interface JsonSchemaInference {
+  isSampleDerived: boolean;
+  sampleRowLimit: number;
+  sampleValueByteLimit: number;
+  sampleValueCharacterLimit: number;
+  sampleTotalByteLimit: number;
+  sampleArrowByteLimit: number;
+  sampledRowCount: number;
+  sampledValueBytes: number;
+  hasMoreRows: boolean;
+  isTruncated: boolean;
+  invalidValueCount: number;
+  oversizedValueCount: number;
+  nodes: JsonSchemaNode[];
+}
+
 export interface SourceSchemaPage {
   offset: number;
   totalCount: number;
@@ -177,6 +215,7 @@ export type DataFilterOperator =
 
 export interface DataFilter {
   fieldPath: FieldPath;
+  jsonTarget?: JsonFieldTarget;
   operator: DataFilterOperator;
   values: string[];
   matchCase?: boolean;
@@ -186,6 +225,7 @@ export type SortDirection = "ascending" | "descending";
 
 export interface SortColumn {
   fieldPath: FieldPath;
+  jsonTarget?: JsonFieldTarget;
   direction: SortDirection;
 }
 
@@ -1009,6 +1049,20 @@ export async function getDataWindow(
       rowOffset,
       rowCount,
       fieldPaths,
+    });
+  } catch (error) {
+    throw readDataWindowCommandError(error);
+  }
+}
+
+export async function inferJsonSchema(
+  generation: number,
+  fieldPath: FieldPath,
+): Promise<JsonSchemaInference> {
+  try {
+    return await invoke<JsonSchemaInference>("infer_json_schema", {
+      generation,
+      fieldPath,
     });
   } catch (error) {
     throw readDataWindowCommandError(error);

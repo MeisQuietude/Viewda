@@ -1322,6 +1322,7 @@ mod tests {
             source.path().to_owned(),
             &[DataFilter {
                 field_path: field("id"),
+                json_target: None,
                 operator: DataFilterOperator::Range,
                 values: vec!["2".to_owned(), "3".to_owned()],
                 match_case: false,
@@ -1411,6 +1412,7 @@ mod tests {
             source.path().to_owned(),
             &[DataFilter {
                 field_path: field("id"),
+                json_target: None,
                 operator: DataFilterOperator::Equals,
                 values: vec!["1".to_owned()],
                 match_case: false,
@@ -1447,12 +1449,14 @@ mod tests {
             source.path().to_owned(),
             &[DataFilter {
                 field_path: field("id"),
+                json_target: None,
                 operator: DataFilterOperator::GreaterThanOrEqual,
                 values: vec!["2".to_owned()],
                 match_case: false,
             }],
             &[DataSort {
                 field_path: field("id"),
+                json_target: None,
                 direction: DataSortDirection::Descending,
             }],
         )
@@ -1644,6 +1648,7 @@ mod tests {
             &[],
             &[DataSort {
                 field_path: field("id"),
+                json_target: None,
                 direction: DataSortDirection::Ascending,
             }],
         )
@@ -1731,6 +1736,7 @@ mod tests {
             &reader,
             &[DataFilter {
                 field_path: field("id"),
+                json_target: None,
                 operator: DataFilterOperator::Equals,
                 values: vec!["999".to_owned()],
                 match_case: false,
@@ -1808,6 +1814,7 @@ mod tests {
         let mut reader = inspector.into_window_reader().expect("dataset reader");
         let filter = DataFilter {
             field_path: field("year"),
+            json_target: None,
             operator: DataFilterOperator::Equals,
             values: vec!["2025".to_owned()],
             match_case: false,

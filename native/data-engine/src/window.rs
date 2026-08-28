@@ -12,6 +12,7 @@ use crate::{
     FieldPath,
     field_path::{field_path_expression, validate_field_paths},
     filter::quote_identifier,
+    json_path::{field_is_json, json_schema_sample_expression},
     source::{
         SchemaField, SourceError, SourceSummary, inspect_local_source_for_query, open_local_source,
     },
@@ -150,6 +151,58 @@ impl DataWindowReader {
                     (projection.as_str(), aliases.as_str(), *source_row_count)
                 }),
         )
+    }
+
+    /// Reads the first bounded, size-limited values from one Parquet JSON column.
+    pub fn fetch_json_schema_sample(
+        &mut self,
+        field_path: &FieldPath,
+    ) -> Result<Vec<u8>, DataWindowError> {
+        let (projection, aliases) = {
+            let summary = match &self.summary {
+                Some(summary) => summary,
+                None => self.summary.insert(
+                    inspect_local_source_for_query(&self.source_path)
+                        .map_err(DataWindowError::from)?,
+                ),
+            };
+            let resolved = crate::field_path::resolve_field_path(&summary.schema, field_path)
+                .filter(|resolved| field_is_json(resolved.field))
+                .ok_or(DataWindowError::Unsupported)?;
+            let source_columns = (0..summary.schema.len())
+                .map(|index| format!("__viewda_column_{index}"))
+                .collect::<Vec<_>>();
+            let root = format!(
+                "{}.{}",
+                quote_identifier("__viewda_source"),
+                quote_identifier(&source_columns[resolved.root_index])
+            );
+            let field =
+                field_path_expression(field_path, &root).ok_or(DataWindowError::Unsupported)?;
+            let projection = format!(
+                "{} AS {}",
+                json_schema_sample_expression(&field),
+                quote_identifier(field_path.leaf_name().ok_or(DataWindowError::Unsupported)?),
+            );
+            let aliases = source_columns
+                .iter()
+                .map(|column| quote_identifier(column))
+                .collect::<Vec<_>>()
+                .join(", ");
+            (projection, aliases)
+        };
+
+        // A JSON sample is row-bounded, so it must not install the full-row-count range used to
+        // protect ordinary nested leaf windows from projection widening.
+        let sample = self.fetch_projection(
+            0,
+            crate::JSON_SCHEMA_SAMPLE_ROW_LIMIT,
+            Some((&projection, &aliases, None)),
+        )?;
+        if sample.len() > crate::JSON_SCHEMA_SAMPLE_ARROW_BYTE_LIMIT {
+            return Err(DataWindowError::WindowTooLarge);
+        }
+        Ok(sample)
     }
 
     fn fetch_projection(
@@ -415,6 +468,21 @@ mod tests {
 
         assert!(plan.contains("__viewda_column_1.wanted"), "{plan}");
         assert!(!plan.contains("ignored"), "{plan}");
+
+        let sample_query = projected_window_query(&projection, &aliases, false);
+        assert!(!sample_query.contains("range("), "{sample_query}");
+        let sample_plan = connection
+            .prepare(&format!("EXPLAIN {sample_query}"))
+            .expect("explain bounded nested sample")
+            .query_map(params![path_text, 1_i64, 0_i64], |row| {
+                row.get::<_, String>(1)
+            })
+            .expect("explain bounded nested sample rows")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("bounded nested sample physical plan")
+            .join("\n");
+        assert!(sample_plan.contains("STREAMING_LIMIT"), "{sample_plan}");
+        assert!(!sample_plan.contains("POSITIONAL_SCAN"), "{sample_plan}");
 
         let projection = format_projection_expressions(
             &schema,
