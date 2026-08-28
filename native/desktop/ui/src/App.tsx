@@ -1723,12 +1723,12 @@ function OpenFilePanels({
     const requestPreview = (source: SourceSummary) => {
       if (previewRequested.current) return;
       previewRequested.current = true;
-      const indices = source.schema.map((_, index) => index);
+      const fieldPaths = source.schema.map((field) => [field.name]);
       setPreviewFailed(false);
       void getDatasetPreview(generation).then(
         (bytes) => {
           if (!active) return;
-          setPreview(decodeArrowWindow(bytes, 0, indices));
+          setPreview(decodeArrowWindow(bytes, 0, fieldPaths));
         },
         () => {
           if (active) setPreviewFailed(true);

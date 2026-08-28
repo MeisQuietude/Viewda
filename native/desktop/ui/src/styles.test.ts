@@ -176,6 +176,106 @@ describe("grid performance status", () => {
 });
 
 describe("color theme", () => {
+  it("keeps plain header ellipsis and isolates the trailing path separator", () => {
+    expectDeclarations(".viewda-grid-header-title", {
+      flex: "1 1 auto",
+      "min-width": "0px",
+      overflow: "hidden",
+    });
+    expectDeclarations(".viewda-grid-header-title.is-plain", {
+      display: "block",
+      "text-overflow": "ellipsis",
+    });
+    expectDeclarations(".viewda-grid-header-prefix-text", {
+      direction: "rtl",
+      "text-overflow": "ellipsis",
+    });
+    expectDeclarations(".viewda-grid-header-prefix-content", {
+      direction: "ltr",
+      "unicode-bidi": "isolate",
+    });
+    expectDeclarations(".viewda-grid-header-bidi-control", {
+      display: "none",
+    });
+    expectDeclarations(".viewda-grid-header-prefix-separator", {
+      direction: "ltr",
+      "unicode-bidi": "isolate",
+      flex: "0 0 auto",
+    });
+    expect(() => declaration(".viewda-grid-header-leaf", "color")).toThrow(
+      "Missing color",
+    );
+  });
+
+  it("keeps flattened group rails continuous and visible in both themes", () => {
+    expectDeclarations(".viewda-grid-group-rail", {
+      right: "-1px",
+      height: "2px",
+      background: "var(--grid-selection-strong)",
+      "pointer-events": "none",
+    });
+    expect(() => declaration(".viewda-grid-group-rail", "opacity")).toThrow(
+      "Missing opacity",
+    );
+    expectDeclarations(
+      ".viewda-grid-column-header.has-group-start .viewda-grid-group-rail",
+      { left: "4px" },
+    );
+    expectDeclarations(
+      ".viewda-grid-column-header.has-group-end .viewda-grid-group-rail",
+      { right: "4px" },
+    );
+
+    const lightRoot = styles.match(/:root \{([^}]*)\}/s)?.[1];
+    const darkRoot = styles.match(
+      /:root\[data-theme="dark"\] \{([^}]*)\}/s,
+    )?.[1];
+    expect(lightRoot).toBeDefined();
+    expect(darkRoot).toBeDefined();
+    if (lightRoot === undefined || darkRoot === undefined) {
+      throw new Error("Theme variables are missing.");
+    }
+    for (const root of [lightRoot, darkRoot]) {
+      expect(
+        contrastRatio(
+          readColorVariable(root, "grid-selection-strong"),
+          readColorVariable(root, "grid-header"),
+        ),
+      ).toBeGreaterThanOrEqual(3);
+    }
+  });
+
+  it("truncates schema-tree prefixes while preserving the distinguishing leaf", () => {
+    expectDeclarations(".column-picker-name.is-path", {
+      display: "flex",
+    });
+    expect(declaration(".column-picker-name", "overflow")).toBe("hidden");
+    expectDeclarations(".column-picker-prefix-text", {
+      overflow: "hidden",
+      direction: "rtl",
+      "text-overflow": "ellipsis",
+    });
+    expectDeclarations(".column-picker-prefix-content", {
+      direction: "ltr",
+      "unicode-bidi": "isolate",
+    });
+    expectDeclarations(".column-picker-prefix-separator", {
+      direction: "ltr",
+      "unicode-bidi": "isolate",
+      flex: "0 0 auto",
+    });
+    expect(declaration(".column-picker-leaf", "flex")).toBe("0 0 auto");
+  });
+
+  it("keeps column-picker rows compact while reserving the reason line", () => {
+    expect(declaration(".column-picker-row", "gap")).toBe("6px");
+    expectDeclarations(".column-picker-pin", {
+      width: "20px",
+      height: "20px",
+    });
+    expect(declaration(".column-picker-reason", "line-height")).toBe("1.2");
+  });
+
   it("does not let pinned positioning hide selection colors", () => {
     expect(() =>
       declaration(".viewda-grid-cell.is-pinned", "background"),
@@ -283,6 +383,27 @@ describe("grid layout containment", () => {
     });
   });
 
+  it("reserves a stable notice lane outside the interactive grid", () => {
+    expectDeclarations(".data-grid-view::before", {
+      "min-height": "32px",
+      flex: "0 0 32px",
+      order: "1",
+    });
+    expectDeclarations(
+      ".data-grid-view > :not(.query-row):not(.grid-controls)",
+      { order: "2" },
+    );
+    expectDeclarations(".grid-controls", {
+      position: "absolute",
+      top: "34px",
+      right: "0px",
+      left: "0px",
+      height: "32px",
+      "min-height": "32px",
+    });
+    expectDeclarations(".query-row", { flex: "0 0 34px" });
+  });
+
   it("lets tiny viewport placement override Peek's normal resize floor", () => {
     expectDeclarations(".value-peek", {
       "min-width": "0px",
@@ -295,6 +416,18 @@ describe("grid layout containment", () => {
       cursor: "nwse-resize",
       "touch-action": "none",
     });
+    expect(declaration(".value-peek-resize-hint:hover", "border-color")).toBe(
+      "var(--grid-text)",
+    );
+    expect(
+      declaration(
+        ".value-tree:focus-visible .value-tree-row.is-active",
+        "outline",
+      ),
+    ).toBe("2px solid var(--grid-selection-strong)");
+    expect(() => declaration(".value-tree:focus-visible", "outline")).toThrow(
+      "Missing outline",
+    );
   });
 
   it("reserves default-width space for ordinary Peek leaf types", () => {
@@ -308,6 +441,26 @@ describe("grid layout containment", () => {
     expectDeclarations(".value-tree-type", {
       overflow: "hidden",
       "text-overflow": "ellipsis",
+    });
+  });
+
+  it("keeps Peek toolbar actions on one stable row", () => {
+    expectDeclarations(".value-tree-toolbar", {
+      display: "flex",
+      "flex-wrap": "nowrap",
+    });
+    expectDeclarations(".value-tree-toolbar-actions", {
+      display: "flex",
+      "flex-wrap": "nowrap",
+    });
+    expectDeclarations(".value-tree-toolbar-action-group", {
+      display: "flex",
+      flex: "0 0 auto",
+      "flex-wrap": "nowrap",
+    });
+    expectDeclarations(".value-tree-wrap > .value-tree-status", {
+      position: "absolute",
+      bottom: "8px",
     });
   });
 
@@ -388,13 +541,13 @@ describe("schema field layout", () => {
 
     expect(
       declaration(
-        ".sidebar-schema-tree button.schema-field:hover",
+        ".sidebar-schema-tree .schema-field:enabled:hover:not([aria-disabled])",
         "background",
       ),
     ).toBe("var(--grid-selection)");
     expect(
       declaration(
-        '.sidebar-schema-tree button.schema-field[aria-pressed="true"]',
+        '.sidebar-schema-tree [aria-pressed="true"]:not([aria-disabled])',
         "background",
       ),
     ).toBe("var(--grid-selection)");
@@ -404,6 +557,30 @@ describe("schema field layout", () => {
         "outline",
       ),
     ).toBe("2px solid var(--grid-selection-strong)");
+    expectDeclarations(".sidebar-schema-tree button.schema-field:disabled", {
+      color: "var(--grid-text-faint)",
+      cursor: "default",
+    });
+    expect(
+      declaration(
+        ".sidebar-schema-tree button.schema-field:disabled .schema-type",
+        "color",
+      ),
+    ).toBe("inherit");
+    expectDeclarations(".sidebar-schema-tree .schema-continuation", {
+      margin: "1px 10px 5px 12px",
+      color: "var(--grid-text-faint)",
+      "font-size": "9px",
+      "line-height": "1.35",
+    });
+    expectDeclarations(".schema-path-menu", { width: "292px" });
+    expectDeclarations(".column-menu:not(.schema-path-menu) button", {
+      display: "flex",
+      "align-items": "center",
+      "justify-content": "space-between",
+      gap: "18px",
+    });
+    expect(styles).not.toContain("schema-flatten-action");
   });
 });
 

@@ -8,18 +8,23 @@ import {
 } from "react";
 
 import type { Rectangle } from "./grid-model";
+import type { FieldPath, JsonFieldTarget } from "../desktop";
 import {
   ValueTree,
   type ValueCopyHandlers,
+  type ValueTreeLayout,
   type ValueTreeHandle,
 } from "./ValueTree";
-import type { TypedValue } from "./value-format";
+import {
+  binaryValueBytes,
+  formatValuePreview,
+  valueChildCount,
+  type TypedValue,
+} from "./value-format";
 
-const DEFAULT_SIZE = { width: 360, height: 480 };
-const MIN_SIZE = { width: 280, height: 220 };
+const MIN_SIZE = { width: 280, height: 132 };
 const VIEWPORT_MARGIN = 8;
 const ANCHOR_GAP = 8;
-const SIZE_STORAGE_KEY = "viewda.value-peek.size";
 
 export interface PeekPlacement {
   left: number;
@@ -42,26 +47,38 @@ interface ResizeGesture {
 export function ValuePeek({
   value,
   label,
+  fieldPath = [label],
   anchor,
   focusRequest = 0,
   loading = false,
+  showCopyPath = true,
   onClose,
   onReturnFocus,
+  onPromoteField,
+  onFilterJsonField,
   onCopy,
   onCopyIntent,
 }: {
   value: TypedValue;
   label: string;
+  fieldPath?: FieldPath;
   anchor: Rectangle;
   focusRequest?: number;
   loading?: boolean;
+  showCopyPath?: boolean;
   onClose: () => void;
   onReturnFocus: () => void;
+  onPromoteField?: (fieldPath: FieldPath) => void;
+  onFilterJsonField?: (target: JsonFieldTarget) => void;
 } & ValueCopyHandlers) {
   const popoverRef = useRef<HTMLDivElement>(null);
   const treeRef = useRef<ValueTreeHandle>(null);
-  const [initialSize] = useState(readRememberedSize);
+  const [initialSize] = useState(() => preferredPeekSize(value, label));
   const requestedSizeRef = useRef(initialSize);
+  const manuallySizedRef = useRef(false);
+  const autoSizePendingRef = useRef(needsPreparedTreeLayout(value));
+  const ignoreNextLayoutRef = useRef(false);
+  const previousValueRef = useRef(value);
   const [viewport, setViewport] = useState(readViewportSize);
   const viewportRef = useRef(viewport);
   const [placement, setPlacement] = useState(() =>
@@ -82,6 +99,27 @@ export function ValuePeek({
   useEffect(() => {
     if (focusRequest > 0 && !loading) treeRef.current?.focus();
   }, [focusRequest, loading]);
+
+  useLayoutEffect(() => {
+    if (previousValueRef.current === value) return;
+    previousValueRef.current = value;
+    manuallySizedRef.current = false;
+    autoSizePendingRef.current = needsPreparedTreeLayout(value);
+    ignoreNextLayoutRef.current = true;
+    const requested = preferredPeekSize(value, label);
+    requestedSizeRef.current = requested;
+    const currentViewport = viewportRef.current;
+    setPlacement((current) =>
+      placeFollowingPeek(
+        anchorRef.current,
+        previousAnchorRef.current,
+        current,
+        requested,
+        currentViewport.width,
+        currentViewport.height,
+      ),
+    );
+  }, [label, value]);
 
   useEffect(() => {
     const closeOutside = (event: PointerEvent) => {
@@ -174,9 +212,9 @@ export function ValuePeek({
         : requested;
     if (nextRequested !== requested) {
       requestedSizeRef.current = nextRequested;
-      rememberSize(nextRequested);
+      manuallySizedRef.current = true;
     }
-    if (commit || placementPendingRef.current) {
+    if (commit && placementPendingRef.current) {
       placementPendingRef.current = false;
       const currentViewport = viewportRef.current;
       setPlacement(
@@ -187,7 +225,20 @@ export function ValuePeek({
           currentViewport.height,
         ),
       );
-    } else if (!commit) {
+    } else if (commit) {
+      setPlacement(gesture.current);
+    } else if (placementPendingRef.current) {
+      placementPendingRef.current = false;
+      const currentViewport = viewportRef.current;
+      setPlacement(
+        placePeek(
+          anchorRef.current,
+          nextRequested,
+          currentViewport.width,
+          currentViewport.height,
+        ),
+      );
+    } else {
       setPlacement(gesture.origin);
     }
   }, []);
@@ -207,10 +258,11 @@ export function ValuePeek({
     return () => window.removeEventListener("resize", updateViewport);
   }, [finishResize]);
 
-  const resize = (event: ReactPointerEvent<HTMLSpanElement>) => {
+  const resize = (event: ReactPointerEvent<HTMLButtonElement>) => {
     const gesture = resizeGestureRef.current;
     if (gesture === null || gesture.pointerId !== event.pointerId) return;
     event.preventDefault();
+    event.stopPropagation();
     const currentViewport = viewportRef.current;
     const maxWidth = Math.max(
       0,
@@ -236,6 +288,64 @@ export function ValuePeek({
     gesture.changedHeight ||= height !== gesture.origin.height;
     setPlacement(next);
   };
+
+  const applyKeyboardResize = (widthDelta: number, heightDelta: number) => {
+    const currentViewport = viewportRef.current;
+    setPlacement((current) => {
+      const width = clamp(
+        current.width + widthDelta,
+        Math.min(MIN_SIZE.width, currentViewport.width - VIEWPORT_MARGIN * 2),
+        Math.max(0, currentViewport.width - VIEWPORT_MARGIN - current.left),
+      );
+      const height = clamp(
+        current.height + heightDelta,
+        Math.min(MIN_SIZE.height, currentViewport.height - VIEWPORT_MARGIN * 2),
+        Math.max(0, currentViewport.height - VIEWPORT_MARGIN - current.top),
+      );
+      const next = { ...current, width, height };
+      requestedSizeRef.current = { width, height };
+      manuallySizedRef.current = true;
+      return next;
+    });
+  };
+
+  const updateAutoSize = useCallback(
+    (layout: ValueTreeLayout) => {
+      if (ignoreNextLayoutRef.current) {
+        ignoreNextLayoutRef.current = false;
+        return;
+      }
+      if (
+        manuallySizedRef.current ||
+        !autoSizePendingRef.current ||
+        !layout.ready
+      ) {
+        return;
+      }
+      autoSizePendingRef.current = false;
+      const requested = preferredPeekSize(value, label, layout);
+      const current = requestedSizeRef.current;
+      if (
+        current.width === requested.width &&
+        current.height === requested.height
+      ) {
+        return;
+      }
+      requestedSizeRef.current = requested;
+      const currentViewport = viewportRef.current;
+      setPlacement((currentPlacement) =>
+        placeFollowingPeek(
+          anchorRef.current,
+          anchorRef.current,
+          currentPlacement,
+          requested,
+          currentViewport.width,
+          currentViewport.height,
+        ),
+      );
+    },
+    [label, value],
+  );
 
   return (
     <div
@@ -266,7 +376,11 @@ export function ValuePeek({
           event.shiftKey &&
           (event.target as HTMLElement).closest('[role="tree"]') !== null
         ) {
-          const previous = focusable.at(-2);
+          const tree = (event.target as HTMLElement).closest<HTMLElement>(
+            '[role="tree"]',
+          );
+          const treeIndex = tree === null ? -1 : focusable.indexOf(tree);
+          const previous = treeIndex > 0 ? focusable[treeIndex - 1] : first;
           if (previous !== undefined) {
             event.preventDefault();
             previous.focus();
@@ -316,15 +430,21 @@ export function ValuePeek({
             ref={treeRef}
             value={value}
             label={label}
+            fieldPath={showCopyPath ? fieldPath : undefined}
+            onPromoteField={onPromoteField}
+            onFilterJsonField={onFilterJsonField}
+            onLayoutChange={updateAutoSize}
             {...(onCopyIntent === undefined
               ? { onCopy: onCopy! }
               : { onCopyIntent })}
           />
         )}
       </div>
-      <span
+      <button
+        type="button"
         className="value-peek-resize-hint"
-        aria-hidden="true"
+        aria-label="Resize Peek"
+        title="Resize Peek"
         onPointerDown={(event) => {
           if (event.button !== 0) return;
           event.preventDefault();
@@ -343,9 +463,33 @@ export function ValuePeek({
           setResizing(true);
         }}
         onPointerMove={resize}
-        onPointerUp={(event) => finishResize(event.pointerId, true)}
-        onPointerCancel={(event) => finishResize(event.pointerId, false)}
+        onPointerUp={(event) => {
+          event.preventDefault();
+          event.stopPropagation();
+          finishResize(event.pointerId, true);
+        }}
+        onPointerCancel={(event) => {
+          event.preventDefault();
+          event.stopPropagation();
+          finishResize(event.pointerId, false);
+        }}
         onLostPointerCapture={(event) => finishResize(event.pointerId, false)}
+        onKeyDown={(event) => {
+          const step = event.shiftKey ? 32 : 8;
+          const delta =
+            event.key === "ArrowRight" || event.key === "ArrowDown"
+              ? step
+              : event.key === "ArrowLeft" || event.key === "ArrowUp"
+                ? -step
+                : 0;
+          if (delta === 0) return;
+          event.preventDefault();
+          event.stopPropagation();
+          applyKeyboardResize(
+            event.key === "ArrowLeft" || event.key === "ArrowRight" ? delta : 0,
+            event.key === "ArrowUp" || event.key === "ArrowDown" ? delta : 0,
+          );
+        }}
       />
     </div>
   );
@@ -505,32 +649,46 @@ function chooseFollowingSide(
   return afterSpace >= beforeSpace;
 }
 
-function readRememberedSize(): { width: number; height: number } {
-  try {
-    const stored = localStorage.getItem(SIZE_STORAGE_KEY);
-    if (stored === null) return DEFAULT_SIZE;
-    const parsed = JSON.parse(stored) as { width?: unknown; height?: unknown };
-    return typeof parsed.width === "number" && typeof parsed.height === "number"
-      ? {
-          width: Math.max(MIN_SIZE.width, parsed.width),
-          height: Math.max(MIN_SIZE.height, parsed.height),
-        }
-      : DEFAULT_SIZE;
-  } catch {
-    return DEFAULT_SIZE;
-  }
-}
-
-function rememberSize(size: { width: number; height: number }): void {
-  try {
-    localStorage.setItem(SIZE_STORAGE_KEY, JSON.stringify(size));
-  } catch {
-    // Resizing remains available when storage is disabled.
-  }
-}
-
 function readViewportSize(): { width: number; height: number } {
   return { width: window.innerWidth, height: window.innerHeight };
+}
+
+export function preferredPeekSize(
+  value: TypedValue,
+  label: string,
+  layout?: ValueTreeLayout,
+): { width: number; height: number } {
+  const json =
+    value.kind === "jsonText" ||
+    value.kind === "rawJson" ||
+    value.kind === "invalidJson" ||
+    value.kind === "json" ||
+    (value.kind === "arrow" && value.logicalType === "JSON");
+  const binary = binaryValueBytes(value) !== null;
+  const childCount = valueChildCount(value);
+  const structured = json || childCount > 0;
+  const previewLength = formatValuePreview(value, 96).length;
+  const width = binary
+    ? 520
+    : structured
+      ? 560
+      : clamp(280 + Math.max(label.length, previewLength) * 3, 300, 480);
+  const rows = layout?.rowCount ?? (json ? 8 : childCount + 1);
+  const toolbarHeight = (layout?.showToolbar ?? structured) ? 38 : 0;
+  const detailHeight = (layout?.hasDetail ?? !structured) ? 72 : 0;
+  const contentHeight =
+    38 + toolbarHeight + Math.min(rows, 14) * 28 + detailHeight;
+  const height = binary
+    ? 340
+    : clamp(contentHeight, structured ? 188 : MIN_SIZE.height, 520);
+  return { width, height };
+}
+
+function needsPreparedTreeLayout(value: TypedValue): boolean {
+  return (
+    value.kind === "jsonText" ||
+    (value.kind === "arrow" && value.logicalType === "JSON")
+  );
 }
 
 function samePlacement(left: PeekPlacement, right: PeekPlacement): boolean {

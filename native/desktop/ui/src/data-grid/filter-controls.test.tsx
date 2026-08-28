@@ -19,6 +19,9 @@ import type { SchemaField } from "../desktop";
 import { FilterEditor } from "./filter-controls";
 import { filterInputFromCell } from "./filter-query";
 
+const TEST_FIELD_PATH = ["record", "value"];
+const TEST_FIELD_LABEL = "record.value";
+
 beforeEach(() => {
   vi.spyOn(desktop, "getTextValueSuggestions").mockResolvedValue(
     suggestionResult([]),
@@ -47,7 +50,7 @@ describe("FilterEditor", () => {
     expect(apply).toBeEnabled();
     fireEvent.click(apply);
     expect(onApply).toHaveBeenCalledWith({
-      columnIndex: 0,
+      fieldPath: TEST_FIELD_PATH,
       operator: "equals",
       values: ["-1.25e3"],
     });
@@ -75,7 +78,7 @@ describe("FilterEditor", () => {
     expect(apply).toBeEnabled();
     fireEvent.click(apply);
     expect(onApply).toHaveBeenCalledWith({
-      columnIndex: 0,
+      fieldPath: TEST_FIELD_PATH,
       operator: "equals",
       values: ["12"],
     });
@@ -98,7 +101,7 @@ describe("FilterEditor", () => {
     );
 
     expect(onApply).toHaveBeenCalledWith({
-      columnIndex: 0,
+      fieldPath: TEST_FIELD_PATH,
       operator: "oneOf",
       values: ["1", "2"],
     });
@@ -123,7 +126,7 @@ describe("FilterEditor", () => {
     fireEvent.click(apply);
 
     expect(onApply).toHaveBeenCalledWith({
-      columnIndex: 0,
+      fieldPath: TEST_FIELD_PATH,
       operator: "range",
       values: ["-2", "9"],
     });
@@ -157,7 +160,7 @@ describe("FilterEditor", () => {
       );
 
       expect(onApply).toHaveBeenCalledWith({
-        columnIndex: 0,
+        fieldPath: TEST_FIELD_PATH,
         operator,
         values: ["2.5"],
       });
@@ -168,7 +171,7 @@ describe("FilterEditor", () => {
     const onApply = vi.fn();
     render(
       <FilterEditor
-        request={{ sourceIndex: 0, left: 0, top: 0 }}
+        request={{ fieldPath: TEST_FIELD_PATH, left: 0, top: 0 }}
         field={{
           name: "half",
           physicalType: "FIXED_LEN_BYTE_ARRAY",
@@ -181,7 +184,9 @@ describe("FilterEditor", () => {
         onCancel={vi.fn()}
       />,
     );
-    const editor = screen.getByRole("form", { name: "Filter half" });
+    const editor = screen.getByRole("form", {
+      name: `Filter ${TEST_FIELD_LABEL}`,
+    });
     fireEvent.change(
       within(editor).getByRole("combobox", { name: "Condition" }),
       { target: { value: "greaterThan" } },
@@ -194,7 +199,7 @@ describe("FilterEditor", () => {
     );
 
     expect(onApply).toHaveBeenCalledWith({
-      columnIndex: 0,
+      fieldPath: TEST_FIELD_PATH,
       operator: "greaterThan",
       values: ["1.5"],
     });
@@ -216,7 +221,7 @@ describe("FilterEditor", () => {
     );
 
     expect(onApply).toHaveBeenCalledWith({
-      columnIndex: 0,
+      fieldPath: TEST_FIELD_PATH,
       operator: "isNull",
       values: [],
     });
@@ -227,12 +232,12 @@ describe("FilterEditor", () => {
     render(
       <FilterEditor
         request={{
-          sourceIndex: 0,
+          fieldPath: TEST_FIELD_PATH,
           left: 0,
           top: 0,
           filterIndex: 0,
           initialFilter: {
-            columnIndex: 0,
+            fieldPath: TEST_FIELD_PATH,
             operator: "isNull",
             values: [],
           },
@@ -249,7 +254,9 @@ describe("FilterEditor", () => {
         onCancel={vi.fn()}
       />,
     );
-    const editor = screen.getByRole("form", { name: "Filter active" });
+    const editor = screen.getByRole("form", {
+      name: `Filter ${TEST_FIELD_LABEL}`,
+    });
 
     fireEvent.change(
       within(editor).getByRole("combobox", { name: "Condition" }),
@@ -265,7 +272,7 @@ describe("FilterEditor", () => {
     expect(apply).toBeEnabled();
     fireEvent.click(apply);
     expect(onApply).toHaveBeenCalledWith({
-      columnIndex: 0,
+      fieldPath: TEST_FIELD_PATH,
       operator: "equals",
       values: ["true"],
     });
@@ -302,7 +309,7 @@ describe("FilterEditor", () => {
     });
     fireEvent.click(apply);
     expect(onApply).toHaveBeenCalledWith({
-      columnIndex: 0,
+      fieldPath: TEST_FIELD_PATH,
       operator: "greaterThan",
       values: ["2026-08-01T06:07:08Z"],
     });
@@ -378,7 +385,7 @@ describe("FilterEditor", () => {
         within(editor).getByRole("button", { name: "Add condition" }),
       );
       expect(onApply).toHaveBeenCalledWith({
-        columnIndex: 0,
+        fieldPath: TEST_FIELD_PATH,
         operator: "equals",
         values: [enteredValue],
       });
@@ -512,7 +519,7 @@ describe("FilterEditor", () => {
     });
     fireEvent.click(apply);
     expect(onApply).toHaveBeenCalledWith({
-      columnIndex: 0,
+      fieldPath: TEST_FIELD_PATH,
       operator: "range",
       values: ["2026-08-07T12:34:56", "2026-08-08T12:34:56.1234"],
     });
@@ -557,7 +564,7 @@ describe("FilterEditor", () => {
     });
     fireEvent.click(apply);
     expect(onApply).toHaveBeenCalledWith({
-      columnIndex: 0,
+      fieldPath: TEST_FIELD_PATH,
       operator: "oneOf",
       values: ["00:00:00", "23:59:59.9"],
     });
@@ -705,7 +712,7 @@ describe("FilterEditor", () => {
       expect(apply).toBeEnabled();
       fireEvent.click(apply);
       expect(onApply).toHaveBeenCalledWith({
-        columnIndex: 0,
+        fieldPath: TEST_FIELD_PATH,
         operator: "equals",
         values: [expected],
       });
@@ -714,7 +721,9 @@ describe("FilterEditor", () => {
   it("offers every text operator and applies Match case to substring operators", () => {
     const onApply = vi.fn();
     renderTextEditor(onApply);
-    const editor = screen.getByRole("form", { name: "Filter label" });
+    const editor = screen.getByRole("form", {
+      name: `Filter ${TEST_FIELD_LABEL}`,
+    });
     const condition = within(editor).getByRole("combobox", {
       name: "Condition",
     });
@@ -758,7 +767,7 @@ describe("FilterEditor", () => {
     );
 
     expect(onApply).toHaveBeenCalledWith({
-      columnIndex: 0,
+      fieldPath: TEST_FIELD_PATH,
       operator: "startsWith",
       values: ["View"],
       matchCase: true,
@@ -767,7 +776,9 @@ describe("FilterEditor", () => {
 
   it("disables host text correction and explains Match case", () => {
     renderTextEditor(vi.fn());
-    const editor = screen.getByRole("form", { name: "Filter label" });
+    const editor = screen.getByRole("form", {
+      name: `Filter ${TEST_FIELD_LABEL}`,
+    });
     const input = within(editor).getByLabelText("Value");
 
     expect(input).toHaveAttribute("autocomplete", "off");
@@ -791,7 +802,9 @@ describe("FilterEditor", () => {
   it("requires intent before applying an empty text equality condition", () => {
     const onApply = vi.fn();
     renderTextEditor(onApply);
-    const editor = screen.getByRole("form", { name: "Filter label" });
+    const editor = screen.getByRole("form", {
+      name: `Filter ${TEST_FIELD_LABEL}`,
+    });
     const input = within(editor).getByLabelText("Value");
     const apply = within(editor).getByRole("button", {
       name: "Add condition",
@@ -807,7 +820,7 @@ describe("FilterEditor", () => {
     fireEvent.click(apply);
 
     expect(onApply).toHaveBeenCalledWith({
-      columnIndex: 0,
+      fieldPath: TEST_FIELD_PATH,
       operator: "equals",
       values: [""],
     });
@@ -816,7 +829,9 @@ describe("FilterEditor", () => {
   it("applies an empty text value prefilled from a cell", () => {
     const onApply = vi.fn();
     renderTextEditor(onApply, "");
-    const editor = screen.getByRole("form", { name: "Filter label" });
+    const editor = screen.getByRole("form", {
+      name: `Filter ${TEST_FIELD_LABEL}`,
+    });
     const apply = within(editor).getByRole("button", {
       name: "Add condition",
     });
@@ -824,7 +839,7 @@ describe("FilterEditor", () => {
     expect(apply).toBeEnabled();
     fireEvent.click(apply);
     expect(onApply).toHaveBeenCalledWith({
-      columnIndex: 0,
+      fieldPath: TEST_FIELD_PATH,
       operator: "equals",
       values: [""],
     });
@@ -835,7 +850,9 @@ describe("FilterEditor", () => {
     const request = deferred<desktop.TextValueSuggestions>();
     vi.mocked(desktop.getTextValueSuggestions).mockReturnValue(request.promise);
     renderTextEditor(vi.fn());
-    const editor = screen.getByRole("form", { name: "Filter label" });
+    const editor = screen.getByRole("form", {
+      name: `Filter ${TEST_FIELD_LABEL}`,
+    });
     const input = within(editor).getByLabelText("Value");
 
     fireEvent.focus(input);
@@ -853,7 +870,7 @@ describe("FilterEditor", () => {
     expect(desktop.getTextValueSuggestions).toHaveBeenCalledWith(
       7,
       1,
-      0,
+      TEST_FIELD_PATH,
       "",
       "equals",
     );
@@ -961,7 +978,7 @@ describe("FilterEditor", () => {
     expect(desktop.getTextValueSuggestions).toHaveBeenCalledWith(
       7,
       1,
-      0,
+      TEST_FIELD_PATH,
       "a",
       "equals",
     );
@@ -972,7 +989,7 @@ describe("FilterEditor", () => {
     expect(desktop.getTextValueSuggestions).toHaveBeenLastCalledWith(
       7,
       2,
-      0,
+      TEST_FIELD_PATH,
       "al",
       "equals",
     );
@@ -1046,7 +1063,7 @@ describe("FilterEditor", () => {
       expect(desktop.getTextValueSuggestions).toHaveBeenCalledWith(
         7,
         1,
-        0,
+        TEST_FIELD_PATH,
         value,
         operator,
       );
@@ -1199,7 +1216,7 @@ describe("FilterEditor", () => {
 
     fireEvent.keyDown(input, { key: "Escape" });
     expect(
-      screen.getByRole("form", { name: "Filter label" }),
+      screen.getByRole("form", { name: `Filter ${TEST_FIELD_LABEL}` }),
     ).toBeInTheDocument();
     expect(input).toHaveFocus();
     expect(input).toHaveValue("a");
@@ -1240,7 +1257,7 @@ function renderNumberEditor(
   const onCancel = vi.fn();
   render(
     <FilterEditor
-      request={{ sourceIndex: 0, left: 0, top: 0 }}
+      request={{ fieldPath: TEST_FIELD_PATH, left: 0, top: 0 }}
       field={field}
       sourceGeneration={7}
       nextSuggestionRevision={revisionCounter()}
@@ -1249,7 +1266,9 @@ function renderNumberEditor(
     />,
   );
   return {
-    editor: screen.getByRole("form", { name: `Filter ${field.name}` }),
+    editor: screen.getByRole("form", {
+      name: `Filter ${TEST_FIELD_LABEL}`,
+    }),
     onApply,
     onCancel,
   };
@@ -1263,7 +1282,7 @@ function renderTemporalEditor(
   const onCancel = vi.fn();
   render(
     <FilterEditor
-      request={{ sourceIndex: 0, left: 0, top: 0, initialValue }}
+      request={{ fieldPath: TEST_FIELD_PATH, left: 0, top: 0, initialValue }}
       field={field}
       sourceGeneration={7}
       nextSuggestionRevision={revisionCounter()}
@@ -1272,7 +1291,9 @@ function renderTemporalEditor(
     />,
   );
   return {
-    editor: screen.getByRole("form", { name: `Filter ${field.name}` }),
+    editor: screen.getByRole("form", {
+      name: `Filter ${TEST_FIELD_LABEL}`,
+    }),
     onApply,
     onCancel,
   };
@@ -1285,7 +1306,7 @@ function renderTextEditor(
 ) {
   render(
     <FilterEditor
-      request={{ sourceIndex: 0, left: 0, top: 0, initialValue }}
+      request={{ fieldPath: TEST_FIELD_PATH, left: 0, top: 0, initialValue }}
       field={{
         name: "label",
         physicalType: "BYTE_ARRAY",

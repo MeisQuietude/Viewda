@@ -24,6 +24,7 @@ import { arrowTypedValue, rawJsonValue, typedValue } from "./value-format";
 import { decodeArrowWindow, windowArrowValue } from "./arrow-window";
 import { VALUE_COPY_CHARACTER_LIMIT } from "./value-json-serializer";
 import { ChunkedJsonSource, JSON_NODE_METADATA_LIMIT } from "./json-value";
+import { formatJsonFieldTarget, JSON_PATH_BYTE_LIMIT } from "./json-path";
 
 afterEach(() => {
   cleanup();
@@ -89,6 +90,286 @@ describe("ValueTree", () => {
     expect(onCopy).toHaveBeenLastCalledWith('"d"');
   });
 
+  it("copies the structured column path through the active nested value", async () => {
+    const onCopy = vi.fn();
+    render(
+      <ValueTree
+        label="profile"
+        fieldPath={["profile", "root.name"]}
+        value={typedValue(
+          { addr: { "weird name": ["first"] } },
+          struct({ addr: struct({ "weird name": list(utf8()) }) }),
+        )}
+        onCopy={onCopy}
+      />,
+    );
+    const tree = screen.getByRole("tree", { name: "profile value" });
+    tree.focus();
+    fireEvent.keyDown(tree, { key: "ArrowDown" });
+    fireEvent.keyDown(tree, { key: "ArrowRight" });
+    fireEvent.keyDown(tree, { key: "ArrowDown" });
+    fireEvent.keyDown(tree, { key: "ArrowRight" });
+    fireEvent.keyDown(tree, { key: "ArrowDown" });
+
+    fireEvent.keyDown(tree, { key: "c", ctrlKey: true, shiftKey: true });
+    await act(async () => Promise.resolve());
+
+    expect(onCopy).toHaveBeenCalledWith(
+      'profile."root.name".addr."weird name"[0]',
+    );
+  });
+
+  it("opens active-node actions from the keyboard and ignores Shift+C", () => {
+    const onCopy = vi.fn();
+    render(
+      <ValueTree
+        label="profile"
+        fieldPath={["profile"]}
+        value={typedValue({ name: "Ada" }, struct({ name: utf8() }))}
+        onCopy={onCopy}
+      />,
+    );
+    const tree = screen.getByRole("tree", { name: "profile value" });
+    tree.focus();
+    fireEvent.keyDown(tree, { key: "ArrowDown" });
+    const activeId = tree.getAttribute("aria-activedescendant");
+
+    fireEvent.keyDown(tree, { key: "c", shiftKey: true });
+    expect(onCopy).not.toHaveBeenCalled();
+    expect(tree).toHaveAttribute("aria-activedescendant", activeId);
+
+    fireEvent.keyDown(tree, { key: "F10", shiftKey: true });
+    expect(
+      screen.getByRole("menu", { name: "name value actions" }),
+    ).toBeVisible();
+    expect(
+      screen.getByRole("menuitem", { name: "Copy content" }),
+    ).toHaveFocus();
+  });
+
+  it("leaves the path shortcut unhandled when path actions are unavailable", () => {
+    const onCopy = vi.fn();
+    render(
+      <ValueTree
+        label="profile"
+        value={typedValue("Ada", utf8())}
+        onCopy={onCopy}
+      />,
+    );
+    const tree = screen.getByRole("tree", { name: "profile value" });
+
+    expect(
+      fireEvent.keyDown(tree, {
+        key: "c",
+        ctrlKey: true,
+        shiftKey: true,
+      }),
+    ).toBe(true);
+    expect(onCopy).not.toHaveBeenCalled();
+  });
+
+  it("keeps an all-disabled context menu keyboard-contained", () => {
+    vi.useFakeTimers();
+    render(
+      <ValueTree
+        label="payload"
+        value={typedValue("x".repeat(8 * 1024 * 1024), utf8())}
+        onCopy={vi.fn()}
+      />,
+    );
+    const tree = screen.getByRole("tree", { name: "payload value" });
+    fireEvent.keyDown(tree, { key: "c", ctrlKey: true });
+    fireEvent.keyDown(tree, { key: "F10", shiftKey: true });
+
+    const menu = screen.getByRole("menu", { name: "payload value actions" });
+    expect(menu).toHaveFocus();
+    expect(
+      screen.getByRole("menuitem", { name: "Copy content" }),
+    ).toBeDisabled();
+    fireEvent.keyDown(menu, { key: "Escape" });
+    expect(screen.queryByRole("menu")).not.toBeInTheDocument();
+    expect(tree).toHaveFocus();
+  });
+
+  it("promotes active struct and leaf fields with their column paths", () => {
+    const onPromoteField = vi.fn();
+    render(
+      <ValueTree
+        label="profile"
+        fieldPath={["profile"]}
+        value={typedValue(
+          { address: { city: "Utrecht" }, name: "Ada" },
+          struct({ address: struct({ city: utf8() }), name: utf8() }),
+        )}
+        onPromoteField={onPromoteField}
+        onCopy={vi.fn()}
+      />,
+    );
+    const tree = screen.getByRole("tree", { name: "profile value" });
+    fireEvent.keyDown(tree, {
+      key: "ArrowDown",
+    });
+    const actionGroups = document.querySelectorAll(
+      ".value-tree-toolbar-actions > .value-tree-toolbar-action-group",
+    );
+    expect(actionGroups).toHaveLength(1);
+    expect(actionGroups[0]?.querySelectorAll("button")).toHaveLength(2);
+    fireEvent.contextMenu(screen.getByRole("treeitem", { selected: true }));
+    fireEvent.click(
+      screen.getByRole("menuitem", { name: "Promote to column" }),
+    );
+
+    expect(onPromoteField).toHaveBeenNthCalledWith(1, ["profile", "address"]);
+
+    fireEvent.keyDown(tree, { key: "ArrowRight" });
+    fireEvent.keyDown(tree, { key: "ArrowDown" });
+    fireEvent.contextMenu(screen.getByRole("treeitem", { selected: true }));
+    fireEvent.click(
+      screen.getByRole("menuitem", { name: "Promote to column" }),
+    );
+
+    expect(onPromoteField).toHaveBeenNthCalledWith(2, [
+      "profile",
+      "address",
+      "city",
+    ]);
+  });
+
+  it("filters and copies an exact JSON path without using bounded labels", async () => {
+    vi.useFakeTimers();
+    const longKey = `prefix.${"x".repeat(180)}"quoted`;
+    const path = [
+      { field: longKey },
+      { index: 0 },
+      { field: "unit.price" },
+    ] as const;
+    const onFilterJsonField = vi.fn();
+    const onCopy = vi.fn();
+    render(
+      <ValueTree
+        label="payload"
+        fieldPath={["payload"]}
+        value={typedValue(
+          JSON.stringify({ [longKey]: [{ "unit.price": 12 }] }),
+          utf8(),
+          "JSON",
+        )}
+        onFilterJsonField={onFilterJsonField}
+        onPromoteField={vi.fn()}
+        onCopy={onCopy}
+      />,
+    );
+    await act(async () => vi.runAllTimersAsync());
+
+    const tree = screen.getByRole("tree", { name: "payload value" });
+    tree.focus();
+    fireEvent.keyDown(tree, { key: "ArrowDown" });
+    for (let step = 0; step < 4; step += 1) {
+      fireEvent.keyDown(tree, { key: "ArrowRight" });
+    }
+    fireEvent.contextMenu(screen.getByRole("treeitem", { selected: true }));
+    fireEvent.click(
+      screen.getByRole("menuitem", { name: "Filter by this field" }),
+    );
+
+    expect(onFilterJsonField).toHaveBeenCalledWith({
+      path,
+      valueType: "number",
+    });
+    fireEvent.contextMenu(screen.getByRole("treeitem", { selected: true }));
+    fireEvent.click(screen.getByRole("menuitem", { name: "Copy path" }));
+    await act(async () => Promise.resolve());
+    expect(onCopy).toHaveBeenCalledWith(
+      formatJsonFieldTarget(["payload"], path),
+    );
+    vi.useRealTimers();
+  });
+
+  it("copies a safe exact path beyond the wire limit without invisible bidi controls", async () => {
+    vi.useFakeTimers();
+    const onFilterJsonField = vi.fn();
+    const onCopy = vi.fn();
+    const oversizedKey = `${"x".repeat(JSON_PATH_BYTE_LIMIT + 1)}\u202etrail`;
+    render(
+      <ValueTree
+        label="payload"
+        fieldPath={["payload"]}
+        value={typedValue(
+          JSON.stringify({ [oversizedKey]: 12 }),
+          utf8(),
+          "JSON",
+        )}
+        onFilterJsonField={onFilterJsonField}
+        onCopy={onCopy}
+      />,
+    );
+    await act(async () => vi.runAllTimersAsync());
+
+    const tree = screen.getByRole("tree", { name: "payload value" });
+    tree.focus();
+    fireEvent.keyDown(tree, { key: "ArrowDown" });
+
+    fireEvent.contextMenu(screen.getByRole("treeitem", { selected: true }));
+    expect(
+      screen.queryByRole("menuitem", { name: "Filter by this field" }),
+    ).toBeNull();
+    const copyPath = screen.getByRole("menuitem", { name: "Copy path" });
+    expect(copyPath).toBeEnabled();
+    fireEvent.click(copyPath);
+    await act(async () => Promise.resolve());
+    expect(onFilterJsonField).not.toHaveBeenCalled();
+    expect(onCopy).toHaveBeenCalledOnce();
+    const copied = onCopy.mock.calls[0]?.[0] as string;
+    expect(copied).not.toContain("\u202e");
+    expect(copied).toContain("\\u202e");
+    expect(copied).toBe(
+      formatJsonFieldTarget(["payload"], [{ field: oversizedKey }]),
+    );
+  });
+
+  it("caps the final copied path after escaping expands object keys", async () => {
+    vi.useFakeTimers();
+    const renderKey = async (key: string, onCopy: (text: string) => void) => {
+      render(
+        <ValueTree
+          label="payload"
+          fieldPath={["payload"]}
+          value={typedValue(JSON.stringify({ [key]: 12 }), utf8(), "JSON")}
+          onCopy={onCopy}
+        />,
+      );
+      await act(async () => vi.runAllTimersAsync());
+      fireEvent.keyDown(screen.getByRole("tree", { name: "payload value" }), {
+        key: "ArrowDown",
+      });
+      fireEvent.contextMenu(screen.getByRole("treeitem", { selected: true }));
+      return screen.getByRole("menuitem", { name: "Copy path" });
+    };
+
+    const fittingKey = "\\\u202e".repeat(8_190);
+    const fittingCopy = vi.fn();
+    const fittingButton = await renderKey(fittingKey, fittingCopy);
+    expect(fittingButton).toBeEnabled();
+    fireEvent.click(fittingButton);
+    await act(async () => Promise.resolve());
+    const copied = fittingCopy.mock.calls[0]?.[0] as string;
+    expect(copied).toHaveLength(65_530);
+    expect(copied).not.toContain("\u202e");
+    expect(copied).toBe(
+      formatJsonFieldTarget(["payload"], [{ field: fittingKey }]),
+    );
+
+    cleanup();
+    const oversizedCopy = vi.fn();
+    const oversizedButton = await renderKey(
+      "\\\u202e".repeat(8_191),
+      oversizedCopy,
+    );
+    expect(oversizedButton).toBeDisabled();
+    fireEvent.click(oversizedButton);
+    expect(oversizedCopy).not.toHaveBeenCalled();
+  });
+
   it("renders an empty field name explicitly", () => {
     render(
       <ValueTree
@@ -117,7 +398,7 @@ describe("ValueTree", () => {
       ctrlKey: true,
     });
 
-    expect(screen.getByText("Preparing JSON for copy…")).toBeInTheDocument();
+    expect(screen.getByText("Preparing content for copy…")).toBeInTheDocument();
     expect(onCopy).not.toHaveBeenCalled();
     view.rerender(
       <ValueTree
@@ -130,7 +411,7 @@ describe("ValueTree", () => {
 
     expect(onCopy).not.toHaveBeenCalled();
     expect(
-      screen.queryByText("Preparing JSON for copy…"),
+      screen.queryByText("Preparing content for copy…"),
     ).not.toBeInTheDocument();
   });
 
@@ -174,11 +455,14 @@ describe("ValueTree", () => {
       tableFromArrays({ text: [text] }, { types: { text: utf8() } }),
       { format: "stream" },
     );
-    const window = decodeArrowWindow(Uint8Array.from(bytes!).buffer, 0, [0]);
+    const fieldPath = ["text"];
+    const window = decodeArrowWindow(Uint8Array.from(bytes!).buffer, 0, [
+      fieldPath,
+    ]);
     const { container } = render(
       <ValueTree
         label="text"
-        value={arrowTypedValue(windowArrowValue(window, 0, 0)!)}
+        value={arrowTypedValue(windowArrowValue(window, fieldPath, 0)!)}
         onCopy={vi.fn()}
       />,
     );
@@ -247,7 +531,7 @@ describe("ValueTree", () => {
     fireEvent.keyDown(tree, { key: "c", ctrlKey: true });
     await act(async () => vi.runOnlyPendingTimersAsync());
     expect(onCopy).toHaveBeenCalledOnce();
-    expect(screen.getByText("Preparing JSON for copy…")).toBeInTheDocument();
+    expect(screen.getByText("Preparing content for copy…")).toBeInTheDocument();
 
     await act(async () => finishFirstWrite());
     fireEvent.keyDown(tree, { key: "c", ctrlKey: true });
@@ -439,7 +723,7 @@ describe("ValueTree", () => {
     await act(async () => vi.runAllTimersAsync());
 
     expect(onCopy).toHaveBeenCalledWith('"QQD/"');
-    expect(screen.getByText("Copied JSON.")).toBeInTheDocument();
+    expect(screen.getByText("Copied content.")).toBeInTheDocument();
   });
 
   it("reports a rejected clipboard write without false success feedback", async () => {
@@ -461,7 +745,7 @@ describe("ValueTree", () => {
     expect(
       screen.getByText("The JSON value could not be copied."),
     ).toBeInTheDocument();
-    expect(screen.queryByText("Copied JSON.")).not.toBeInTheDocument();
+    expect(screen.queryByText("Copied content.")).not.toBeInTheDocument();
   });
 
   it("renders a null binary as null rather than an empty hex dump", () => {
@@ -505,6 +789,12 @@ describe("ValueTree", () => {
     expect(document.querySelector(".cell-preview-number")).toBeInTheDocument();
     expect(document.querySelector(".cell-preview-boolean")).toBeInTheDocument();
     expect(document.querySelector(".cell-preview-null")).toBeInTheDocument();
+    expect(document.querySelector(".value-tree-type")).toHaveTextContent(
+      "object",
+    );
+    expect(document.querySelector(".value-tree-type")).not.toHaveTextContent(
+      "JSON",
+    );
     const tree = screen.getByRole("tree", { name: "json_value value" });
     fireEvent.keyDown(tree, { key: "c", ctrlKey: true });
     await act(async () => vi.runAllTimersAsync());
@@ -539,11 +829,12 @@ describe("ValueTree", () => {
     });
     await act(async () => vi.advanceTimersToNextTimerAsync());
     expect(onCopy).toHaveBeenCalledWith('"ready"');
-    expect(screen.getByText("Preparing JSON for copy…")).toBeInTheDocument();
+    expect(screen.getByText("Preparing content for copy…")).toBeInTheDocument();
+    expect(document.querySelector(".value-tree-status")).toBeNull();
 
     await act(async () => finishWrite());
     expect(
-      screen.queryByText("Preparing JSON for copy…"),
+      screen.queryByText("Preparing content for copy…"),
     ).not.toBeInTheDocument();
   });
 
@@ -655,8 +946,14 @@ describe("ValueTree", () => {
       tableFromArrays({ json: [source] }, { types: { json: utf8() } }),
       { format: "stream" },
     );
-    const window = decodeArrowWindow(Uint8Array.from(bytes!).buffer, 0, [0]);
-    const value = arrowTypedValue(windowArrowValue(window, 0, 0)!, "JSON");
+    const fieldPath = ["json"];
+    const window = decodeArrowWindow(Uint8Array.from(bytes!).buffer, 0, [
+      fieldPath,
+    ]);
+    const value = arrowTypedValue(
+      windowArrowValue(window, fieldPath, 0)!,
+      "JSON",
+    );
     render(<ValueTree label="json_value" value={value} onCopy={vi.fn()} />);
 
     await act(async () => vi.runOnlyPendingTimersAsync());

@@ -67,6 +67,10 @@ const PROBE_TRIGGER_HEIGHT = 1_000_000;
 // The probe writes an unreachable scroll position and reads the clamp back.
 // This sentinel only needs to exceed every supported webview's native extent.
 const OVERSIZED_PROBE_EXTENT = 1_000_000_000;
+// Field names retain bidi controls for identity and copy, but those controls
+// must not reorder adjacent path text in a grid header.
+const BIDI_CONTROL_CHARACTER =
+  /([\u061c\u200e\u200f\u202a-\u202e\u2066-\u2069])/u;
 
 // Selection starts auto-scroll within two row heights of an edge. Small
 // viewports cap the zone at one quarter of their height. Settings can offer slow
@@ -2600,9 +2604,14 @@ function GridHeader({
   left: number;
   pinned: boolean;
 }) {
+  const groupDescriptionId = useId();
   if (details === undefined) {
     return null;
   }
+  const groupDescription =
+    details.groupRail === undefined
+      ? undefined
+      : `Flattened column group: ${details.groupRail.title}`;
   const sortLabel =
     details.sort.direction === "ascending"
       ? `${details.title} sorted ascending`
@@ -2611,9 +2620,12 @@ function GridHeader({
         : `Sort ${details.title}`;
   return (
     <div
-      className={`viewda-grid-column-header${pinned ? " is-pinned" : ""}${details.pending ? " is-pending" : ""}${details.filterable ? " has-filter" : ""}`}
+      className={`viewda-grid-column-header${pinned ? " is-pinned" : ""}${details.pending ? " is-pending" : ""}${details.filterable ? " has-filter" : ""}${details.groupRail?.start ? " has-group-start" : ""}${details.groupRail?.end ? " has-group-end" : ""}`}
       role="columnheader"
       aria-label={details.title}
+      aria-describedby={
+        groupDescription === undefined ? undefined : groupDescriptionId
+      }
       aria-colindex={ariaColumnIndex}
       aria-sort={
         details.sortable
@@ -2624,6 +2636,11 @@ function GridHeader({
       }
       data-grid-kind="header"
       data-column={column}
+      title={
+        groupDescription === undefined
+          ? undefined
+          : safeNativeTooltipTitle(groupDescription)
+      }
       style={{ left, width: details.width }}
     >
       {details.sortable && (
@@ -2644,7 +2661,51 @@ function GridHeader({
           )}
         </button>
       )}
-      <span className="viewda-grid-header-title">{details.title}</span>
+      {details.groupRail !== undefined && (
+        <>
+          <span className="viewda-grid-group-rail" aria-hidden="true" />
+          <span className="visually-hidden" id={groupDescriptionId}>
+            {groupDescription}
+          </span>
+        </>
+      )}
+      <span
+        className={`viewda-grid-header-title${details.titlePrefix === undefined ? " is-plain" : " is-path"}`}
+        title={
+          groupDescription === undefined
+            ? safeNativeTooltipTitle(details.title)
+            : undefined
+        }
+      >
+        {details.titlePrefix === undefined ? (
+          safeVisualPathText(details.title)
+        ) : (
+          <>
+            <span className="viewda-grid-header-prefix">
+              <span className="viewda-grid-header-prefix-text">
+                <span className="viewda-grid-header-prefix-content" dir="ltr">
+                  {safeVisualPathText(
+                    details.titlePrefix.endsWith(".")
+                      ? details.titlePrefix.slice(0, -1)
+                      : details.titlePrefix,
+                  )}
+                </span>
+              </span>
+              {details.titlePrefix.endsWith(".") && (
+                <span
+                  className="viewda-grid-header-prefix-separator"
+                  aria-hidden="true"
+                >
+                  .
+                </span>
+              )}
+            </span>
+            <span className="viewda-grid-header-leaf">
+              {safeVisualPathText(details.titleLeaf ?? "")}
+            </span>
+          </>
+        )}
+      </span>
       {details.filterable && (
         <button
           className="viewda-grid-filter"
@@ -2672,6 +2733,22 @@ function GridHeader({
       />
     </div>
   );
+}
+
+function safeVisualPathText(text: string) {
+  return text.split(BIDI_CONTROL_CHARACTER).map((part, index) =>
+    BIDI_CONTROL_CHARACTER.test(part) ? (
+      <span className="viewda-grid-header-bidi-control" key={index}>
+        {part}
+      </span>
+    ) : (
+      part
+    ),
+  );
+}
+
+function safeNativeTooltipTitle(text: string): string | undefined {
+  return BIDI_CONTROL_CHARACTER.test(text) ? undefined : text;
 }
 
 function SortGlyph({

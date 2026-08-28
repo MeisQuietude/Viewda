@@ -4,6 +4,8 @@ import { exportSelectionShape } from "./export-selection";
 import { CompactSelection, type GridSelection } from "./grid-model";
 
 describe("exportSelectionShape", () => {
+  const paths = ["seven", "three", "five", "one", "four"].map((name) => [name]);
+
   it("exports the union of multi-rect rows by the union of their columns", () => {
     const selection: GridSelection = {
       columns: CompactSelection.empty(),
@@ -15,8 +17,8 @@ describe("exportSelectionShape", () => {
       },
     };
 
-    expect(exportSelectionShape(selection, [7, 3, 5, 1, 4], 100)).toEqual({
-      columnIndices: [7, 3, 5, 1, 4],
+    expect(exportSelectionShape(selection, paths, 100)).toEqual({
+      fieldPaths: paths,
       columnCount: 5,
       rowCount: 5,
       rowRanges: [{ start: 1, end: 6 }],
@@ -29,8 +31,9 @@ describe("exportSelectionShape", () => {
       rows: CompactSelection.fromSingleSelection([0, 1_200_000]),
     };
 
-    expect(exportSelectionShape(selection, [2, 0, 1], 1_200_000)).toEqual({
-      columnIndices: [2, 0, 1],
+    const fieldPaths = [["two"], ["zero"], ["one"]];
+    expect(exportSelectionShape(selection, fieldPaths, 1_200_000)).toEqual({
+      fieldPaths,
       columnCount: 3,
       rowCount: 1_200_000,
       rowRanges: [{ start: 0, end: 1_200_000 }],
@@ -43,8 +46,8 @@ describe("exportSelectionShape", () => {
       rows: CompactSelection.empty(),
     };
 
-    expect(exportSelectionShape(selection, [4, 3, 2, 1], 42)).toEqual({
-      columnIndices: [3, 1],
+    expect(exportSelectionShape(selection, paths.slice(1), 42)).toEqual({
+      fieldPaths: [paths[2], paths[4]],
       columnCount: 2,
       rowCount: 42,
       rowRanges: [{ start: 0, end: 42 }],
@@ -58,7 +61,7 @@ describe("exportSelectionShape", () => {
           columns: CompactSelection.empty(),
           rows: CompactSelection.empty(),
         },
-        [0, 1],
+        [["zero"], ["one"]],
         10,
       ),
     ).toBeNull();

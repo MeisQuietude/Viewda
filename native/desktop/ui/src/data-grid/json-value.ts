@@ -823,7 +823,7 @@ export function jsonNodeRaw(source: JsonSource, node: JsonNode): string {
 }
 
 export function jsonNodeType(node: JsonNode): string {
-  return `JSON ${node.kind}`;
+  return node.kind;
 }
 
 export interface JsonStringCursor {

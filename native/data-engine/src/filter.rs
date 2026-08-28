@@ -5,17 +5,28 @@ use serde::Deserialize;
 use thiserror::Error;
 
 use crate::source::SchemaField;
+use crate::{
+    FieldPath, JsonFieldTarget, JsonValueType,
+    field_path::{field_path_expression, resolve_field_path},
+    json_path::{
+        JSON_NUMBER_SQL_TYPE, JsonFieldExpression, JsonNumberExpression, field_is_json,
+        json_field_expression, json_number_is_exact_integer_bound,
+    },
+};
 
 const MAX_FILTERS: usize = 32;
 const MAX_ONE_OF_VALUES: usize = 100;
 const MAX_VALUE_BYTES: usize = 4_096;
 
-/// One typed condition applied to a top-level Parquet column.
+/// One typed condition applied to an addressable Parquet field.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DataFilter {
-    /// Zero-based top-level column index from the source summary.
-    pub column_index: u32,
+    /// Field-name segments from the top-level column through struct fields.
+    pub field_path: FieldPath,
+    /// Optional extraction below a Parquet column explicitly annotated as JSON.
+    #[serde(default)]
+    pub json_target: Option<JsonFieldTarget>,
     /// Operation valid for the column's filter family.
     pub operator: DataFilterOperator,
     /// Text representations converted by DuckDB to the column's exact type.
@@ -81,74 +92,33 @@ pub(crate) fn build_filter_predicate_with_names(
     let mut clauses = Vec::with_capacity(filters.len());
     let mut parameters = Vec::new();
     for filter in filters {
-        let column = schema
-            .get(filter.column_index as usize)
-            .ok_or(FilterBuildError::Invalid)?;
-        validate_filter(filter, column_filter_kind(column))?;
-        let identifier = quote_identifier(
+        let resolved =
+            resolve_field_path(schema, &filter.field_path).ok_or(FilterBuildError::Invalid)?;
+        let kind = match &filter.json_target {
+            Some(target) if field_is_json(resolved.field) => json_filter_kind(target.value_type),
+            Some(_) => return Err(FilterBuildError::Invalid),
+            None => column_filter_kind(resolved.field),
+        };
+        validate_filter(filter, kind)?;
+        let root = quote_identifier(
             column_names
-                .get(filter.column_index as usize)
+                .get(resolved.root_index)
                 .ok_or(FilterBuildError::Invalid)?,
         );
-        let clause = match filter.operator {
-            DataFilterOperator::Equals => {
-                parameters.push(Value::Text(filter.values[0].clone()));
-                format!("{identifier} = cast_to_type(?, {identifier})")
+        let field = field_path_expression(schema, &filter.field_path, &root)
+            .ok_or(FilterBuildError::Invalid)?;
+        let expression = match &filter.json_target {
+            Some(target) => json_field_expression(&field, target),
+            None => Some(JsonFieldExpression::Scalar(field)),
+        }
+        .ok_or(FilterBuildError::Invalid)?;
+        let clause = match expression {
+            JsonFieldExpression::Scalar(identifier) => {
+                scalar_filter_clause(filter, &identifier, &mut parameters)
             }
-            DataFilterOperator::NotEquals => {
-                parameters.push(Value::Text(filter.values[0].clone()));
-                format!("{identifier} <> cast_to_type(?, {identifier})")
+            JsonFieldExpression::Number(number) => {
+                json_number_filter_clause(filter, &number, &mut parameters)?
             }
-            DataFilterOperator::GreaterThan => {
-                parameters.push(Value::Text(filter.values[0].clone()));
-                format!("{identifier} > cast_to_type(?, {identifier})")
-            }
-            DataFilterOperator::GreaterThanOrEqual => {
-                parameters.push(Value::Text(filter.values[0].clone()));
-                format!("{identifier} >= cast_to_type(?, {identifier})")
-            }
-            DataFilterOperator::LessThan => {
-                parameters.push(Value::Text(filter.values[0].clone()));
-                format!("{identifier} < cast_to_type(?, {identifier})")
-            }
-            DataFilterOperator::LessThanOrEqual => {
-                parameters.push(Value::Text(filter.values[0].clone()));
-                format!("{identifier} <= cast_to_type(?, {identifier})")
-            }
-            DataFilterOperator::OneOf => {
-                parameters.extend(filter.values.iter().cloned().map(Value::Text));
-                let values = std::iter::repeat_n(
-                    format!("cast_to_type(?, {identifier})"),
-                    filter.values.len(),
-                )
-                .collect::<Vec<_>>()
-                .join(", ");
-                format!("{identifier} IN ({values})")
-            }
-            DataFilterOperator::Range => {
-                parameters.extend(filter.values.iter().cloned().map(Value::Text));
-                format!(
-                    "{identifier} BETWEEN cast_to_type(?, {identifier}) AND cast_to_type(?, {identifier})"
-                )
-            }
-            DataFilterOperator::TextContains => {
-                parameters.push(Value::Text(filter.values[0].clone()));
-                text_predicate("contains", &identifier, filter.match_case, false)
-            }
-            DataFilterOperator::NotContains => {
-                parameters.push(Value::Text(filter.values[0].clone()));
-                text_predicate("contains", &identifier, filter.match_case, true)
-            }
-            DataFilterOperator::StartsWith => {
-                parameters.push(Value::Text(filter.values[0].clone()));
-                text_predicate("starts_with", &identifier, filter.match_case, false)
-            }
-            DataFilterOperator::EndsWith => {
-                parameters.push(Value::Text(filter.values[0].clone()));
-                text_predicate("ends_with", &identifier, filter.match_case, false)
-            }
-            DataFilterOperator::IsNull => format!("{identifier} IS NULL"),
-            DataFilterOperator::IsNotNull => format!("{identifier} IS NOT NULL"),
         };
         clauses.push(clause);
     }
@@ -157,6 +127,131 @@ pub(crate) fn build_filter_predicate_with_names(
         sql: clauses.join(" AND "),
         parameters,
     })
+}
+
+fn scalar_filter_clause(
+    filter: &DataFilter,
+    identifier: &str,
+    parameters: &mut Vec<Value>,
+) -> String {
+    match filter.operator {
+        DataFilterOperator::Equals => {
+            parameters.push(Value::Text(filter.values[0].clone()));
+            format!("{identifier} = cast_to_type(?, {identifier})")
+        }
+        DataFilterOperator::NotEquals => {
+            parameters.push(Value::Text(filter.values[0].clone()));
+            format!("{identifier} <> cast_to_type(?, {identifier})")
+        }
+        DataFilterOperator::GreaterThan => {
+            parameters.push(Value::Text(filter.values[0].clone()));
+            format!("{identifier} > cast_to_type(?, {identifier})")
+        }
+        DataFilterOperator::GreaterThanOrEqual => {
+            parameters.push(Value::Text(filter.values[0].clone()));
+            format!("{identifier} >= cast_to_type(?, {identifier})")
+        }
+        DataFilterOperator::LessThan => {
+            parameters.push(Value::Text(filter.values[0].clone()));
+            format!("{identifier} < cast_to_type(?, {identifier})")
+        }
+        DataFilterOperator::LessThanOrEqual => {
+            parameters.push(Value::Text(filter.values[0].clone()));
+            format!("{identifier} <= cast_to_type(?, {identifier})")
+        }
+        DataFilterOperator::OneOf => {
+            parameters.extend(filter.values.iter().cloned().map(Value::Text));
+            let values = std::iter::repeat_n(
+                format!("cast_to_type(?, {identifier})"),
+                filter.values.len(),
+            )
+            .collect::<Vec<_>>()
+            .join(", ");
+            format!("{identifier} IN ({values})")
+        }
+        DataFilterOperator::Range => {
+            parameters.extend(filter.values.iter().cloned().map(Value::Text));
+            format!(
+                "{identifier} BETWEEN cast_to_type(?, {identifier}) AND cast_to_type(?, {identifier})"
+            )
+        }
+        DataFilterOperator::TextContains => {
+            parameters.push(Value::Text(filter.values[0].clone()));
+            text_predicate("contains", identifier, filter.match_case, false)
+        }
+        DataFilterOperator::NotContains => {
+            parameters.push(Value::Text(filter.values[0].clone()));
+            text_predicate("contains", identifier, filter.match_case, true)
+        }
+        DataFilterOperator::StartsWith => {
+            parameters.push(Value::Text(filter.values[0].clone()));
+            text_predicate("starts_with", identifier, filter.match_case, false)
+        }
+        DataFilterOperator::EndsWith => {
+            parameters.push(Value::Text(filter.values[0].clone()));
+            text_predicate("ends_with", identifier, filter.match_case, false)
+        }
+        DataFilterOperator::IsNull => format!("{identifier} IS NULL"),
+        DataFilterOperator::IsNotNull => format!("{identifier} IS NOT NULL"),
+    }
+}
+
+fn json_number_filter_clause(
+    filter: &DataFilter,
+    number: &JsonNumberExpression,
+    parameters: &mut Vec<Value>,
+) -> Result<String, FilterBuildError> {
+    let comparison = |value: &str, operator: &str, parameters: &mut Vec<Value>| {
+        if json_number_is_exact_integer_bound(value) {
+            parameters.extend(std::iter::repeat_n(Value::Text(value.to_owned()), 3));
+            format!(
+                "CASE WHEN {finite} = CAST(? AS DOUBLE) AND {bucket_tie} IS NOT NULL \
+                 THEN {bucket_tie} {operator} CAST(? AS {JSON_NUMBER_SQL_TYPE}) \
+                 ELSE {finite} {operator} CAST(? AS DOUBLE) END",
+                finite = number.finite,
+                bucket_tie = number.bucket_tie,
+            )
+        } else {
+            parameters.push(Value::Text(value.to_owned()));
+            format!("{} {operator} CAST(? AS DOUBLE)", number.finite)
+        }
+    };
+    Ok(match filter.operator {
+        DataFilterOperator::Equals => comparison(&filter.values[0], "=", parameters),
+        DataFilterOperator::NotEquals => comparison(&filter.values[0], "<>", parameters),
+        DataFilterOperator::GreaterThan => comparison(&filter.values[0], ">", parameters),
+        DataFilterOperator::GreaterThanOrEqual => comparison(&filter.values[0], ">=", parameters),
+        DataFilterOperator::LessThan => comparison(&filter.values[0], "<", parameters),
+        DataFilterOperator::LessThanOrEqual => comparison(&filter.values[0], "<=", parameters),
+        DataFilterOperator::OneOf => {
+            let clause = filter
+                .values
+                .iter()
+                .map(|value| comparison(value, "=", parameters))
+                .collect::<Vec<_>>()
+                .join(" OR ");
+            format!("({clause})")
+        }
+        DataFilterOperator::Range => format!(
+            "({}) AND ({})",
+            comparison(&filter.values[0], ">=", parameters),
+            comparison(&filter.values[1], "<=", parameters),
+        ),
+        DataFilterOperator::IsNull => format!("{} IS NULL", number.finite),
+        DataFilterOperator::IsNotNull => format!("{} IS NOT NULL", number.finite),
+        DataFilterOperator::TextContains
+        | DataFilterOperator::NotContains
+        | DataFilterOperator::StartsWith
+        | DataFilterOperator::EndsWith => return Err(FilterBuildError::Invalid),
+    })
+}
+
+fn json_filter_kind(value_type: JsonValueType) -> ColumnFilterKind {
+    match value_type {
+        JsonValueType::Boolean => ColumnFilterKind::Boolean,
+        JsonValueType::Number => ColumnFilterKind::Number,
+        JsonValueType::Text | JsonValueType::Mixed => ColumnFilterKind::Text,
+    }
 }
 
 pub(crate) fn column_filter_kind(field: &SchemaField) -> ColumnFilterKind {
@@ -290,9 +385,22 @@ pub(crate) fn quote_identifier(identifier: &str) -> String {
     format!("\"{}\"", identifier.replace('"', "\"\""))
 }
 
+pub(crate) const EMPTY_COLUMN_ALIAS: &str = "__viewda_empty_field";
+
+pub(crate) fn quote_column_alias(alias: &str) -> String {
+    // SQL has no empty identifier. Keep the requested path authoritative and
+    // use a reserved transport-only name for DuckDB's Arrow schema.
+    if alias.is_empty() {
+        quote_identifier(EMPTY_COLUMN_ALIAS)
+    } else {
+        quote_identifier(alias)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{JsonPath, JsonPathSegment};
 
     fn build_filter_predicate(
         schema: &[SchemaField],
@@ -327,9 +435,10 @@ mod tests {
         }
     }
 
-    fn text_filter(operator: DataFilterOperator, values: &[&str]) -> DataFilter {
+    fn text_filter(field_name: &str, operator: DataFilterOperator, values: &[&str]) -> DataFilter {
         DataFilter {
-            column_index: 0,
+            field_path: FieldPath::from(field_name),
+            json_target: None,
             operator,
             values: values.iter().map(|value| (*value).to_owned()).collect(),
             match_case: false,
@@ -340,13 +449,15 @@ mod tests {
     fn builds_parameterized_and_conditions_with_quoted_identifiers() {
         let filters = vec![
             DataFilter {
-                column_index: 0,
+                field_path: FieldPath::from("value\"quoted"),
+                json_target: None,
                 operator: DataFilterOperator::Range,
                 values: vec!["10".to_owned(), "20".to_owned()],
                 match_case: false,
             },
             DataFilter {
-                column_index: 1,
+                field_path: FieldPath::from("label"),
+                json_target: None,
                 operator: DataFilterOperator::TextContains,
                 values: vec!["quiet".to_owned()],
                 match_case: false,
@@ -379,7 +490,8 @@ mod tests {
     #[test]
     fn rejects_operators_outside_the_column_filter_family() {
         let filter = DataFilter {
-            column_index: 0,
+            field_path: FieldPath::from("label"),
+            json_target: None,
             operator: DataFilterOperator::Range,
             values: vec!["a".to_owned(), "z".to_owned()],
             match_case: false,
@@ -387,6 +499,23 @@ mod tests {
 
         assert!(
             build_filter_predicate(&[field("label", ColumnFilterKind::Text)], &[filter]).is_err()
+        );
+    }
+
+    #[test]
+    fn rejects_an_empty_field_path_at_the_filter_boundary() {
+        let schema = [field("label", ColumnFilterKind::Text)];
+        let filter = DataFilter {
+            field_path: FieldPath::new(Vec::<String>::new()),
+            json_target: None,
+            operator: DataFilterOperator::Equals,
+            values: vec!["alpha".to_owned()],
+            match_case: false,
+        };
+
+        assert_eq!(
+            build_filter_predicate_with_names(&schema, &[filter], &["label"]).err(),
+            Some(FilterBuildError::Invalid)
         );
     }
 
@@ -409,7 +538,8 @@ mod tests {
         for (operator, sql_operator) in operators {
             for (kind, supported) in kinds {
                 let filter = DataFilter {
-                    column_index: 0,
+                    field_path: FieldPath::from("value"),
+                    json_target: None,
                     operator,
                     values: vec!["1".to_owned()],
                     match_case: false,
@@ -441,7 +571,8 @@ mod tests {
             for kind in [ColumnFilterKind::Number, ColumnFilterKind::Temporal] {
                 for values in [Vec::new(), vec!["1".to_owned(), "2".to_owned()]] {
                     let filter = DataFilter {
-                        column_index: 0,
+                        field_path: FieldPath::from("value"),
+                        json_target: None,
                         operator,
                         values,
                         match_case: false,
@@ -458,17 +589,16 @@ mod tests {
             schema_field("uuid_value", "FIXED_LEN_BYTE_ARRAY", Some("UUID")),
             schema_field("json_value", "BYTE_ARRAY", Some("JSON")),
         ];
-        let filters = [
-            text_filter(DataFilterOperator::Equals, &["alpha"]),
-            text_filter(DataFilterOperator::NotEquals, &["alpha"]),
-            text_filter(DataFilterOperator::OneOf, &["alpha", "beta"]),
-            text_filter(DataFilterOperator::TextContains, &["pha"]),
-            text_filter(DataFilterOperator::NotContains, &["pha"]),
-            text_filter(DataFilterOperator::StartsWith, &["alpha"]),
-            text_filter(DataFilterOperator::EndsWith, &["alpha"]),
-        ];
-
         for column in columns {
+            let filters = [
+                text_filter(&column.name, DataFilterOperator::Equals, &["alpha"]),
+                text_filter(&column.name, DataFilterOperator::NotEquals, &["alpha"]),
+                text_filter(&column.name, DataFilterOperator::OneOf, &["alpha", "beta"]),
+                text_filter(&column.name, DataFilterOperator::TextContains, &["pha"]),
+                text_filter(&column.name, DataFilterOperator::NotContains, &["pha"]),
+                text_filter(&column.name, DataFilterOperator::StartsWith, &["alpha"]),
+                text_filter(&column.name, DataFilterOperator::EndsWith, &["alpha"]),
+            ];
             for filter in &filters {
                 assert!(
                     build_filter_predicate(
@@ -482,6 +612,168 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn builds_json_filters_only_for_explicit_json_columns() {
+        let target = JsonFieldTarget {
+            path: JsonPath::new([JsonPathSegment::Field("amount'quoted".to_owned())]),
+            value_type: JsonValueType::Number,
+        };
+        let filter = DataFilter {
+            field_path: FieldPath::from("payload"),
+            json_target: Some(target),
+            operator: DataFilterOperator::GreaterThan,
+            values: vec!["10".to_owned()],
+            match_case: false,
+        };
+
+        let predicate = build_filter_predicate(
+            &[schema_field("payload", "BYTE_ARRAY", Some("JSON"))],
+            std::slice::from_ref(&filter),
+        )
+        .expect("JSON filter predicate");
+        assert!(predicate.sql.contains("CASE WHEN"));
+        assert!(predicate.sql.contains("DECIMAL(38, 18)"));
+        assert!(predicate.sql.contains("isfinite"));
+        assert!(!predicate.sql.contains("COALESCE"));
+        assert_eq!(
+            predicate.parameters,
+            [
+                Value::Text("10".to_owned()),
+                Value::Text("10".to_owned()),
+                Value::Text("10".to_owned()),
+            ]
+        );
+
+        let fallback = DataFilter {
+            values: vec!["1e100".to_owned()],
+            ..filter.clone()
+        };
+        let predicate = build_filter_predicate(
+            &[schema_field("payload", "BYTE_ARRAY", Some("JSON"))],
+            &[fallback],
+        )
+        .expect("finite fallback predicate");
+        assert!(predicate.sql.contains("isfinite"));
+        assert!(!predicate.sql.contains("DECIMAL"));
+        assert_eq!(predicate.parameters, [Value::Text("1e100".to_owned())]);
+
+        assert_eq!(
+            build_filter_predicate(
+                &[schema_field("payload", "BYTE_ARRAY", Some("String"))],
+                &[filter],
+            )
+            .err(),
+            Some(FilterBuildError::Invalid)
+        );
+    }
+
+    #[test]
+    fn builds_json_boolean_filters_with_the_boolean_operator_family() {
+        let schema = [schema_field("payload", "BYTE_ARRAY", Some("JSON"))];
+        let target = JsonFieldTarget {
+            path: JsonPath::new([
+                JsonPathSegment::Field("flags".to_owned()),
+                JsonPathSegment::Field("enabled".to_owned()),
+            ]),
+            value_type: JsonValueType::Boolean,
+        };
+        let expression = "TRY_CAST(json_extract(TRY_CAST(\"payload\" AS JSON), '$.\"flags\".\"enabled\"') AS BOOLEAN)";
+
+        for (operator, value, sql_operator) in [
+            (DataFilterOperator::Equals, "true", "="),
+            (DataFilterOperator::NotEquals, "false", "<>"),
+        ] {
+            let predicate = build_filter_predicate(
+                &schema,
+                &[DataFilter {
+                    field_path: FieldPath::from("payload"),
+                    json_target: Some(target.clone()),
+                    operator,
+                    values: vec![value.to_owned()],
+                    match_case: false,
+                }],
+            )
+            .expect("JSON boolean predicate");
+
+            assert_eq!(
+                predicate.sql,
+                format!("{expression} {sql_operator} cast_to_type(?, {expression})")
+            );
+            assert_eq!(predicate.parameters, [Value::Text(value.to_owned())]);
+        }
+
+        let null_predicate = build_filter_predicate(
+            &schema,
+            &[DataFilter {
+                field_path: FieldPath::from("payload"),
+                json_target: Some(target.clone()),
+                operator: DataFilterOperator::IsNull,
+                values: Vec::new(),
+                match_case: false,
+            }],
+        )
+        .expect("JSON boolean null predicate");
+        assert_eq!(null_predicate.sql, format!("{expression} IS NULL"));
+        assert!(null_predicate.parameters.is_empty());
+
+        for filter in [
+            DataFilter {
+                field_path: FieldPath::from("payload"),
+                json_target: Some(target.clone()),
+                operator: DataFilterOperator::Equals,
+                values: vec!["TRUE".to_owned()],
+                match_case: false,
+            },
+            DataFilter {
+                field_path: FieldPath::from("payload"),
+                json_target: Some(target),
+                operator: DataFilterOperator::GreaterThan,
+                values: vec!["true".to_owned()],
+                match_case: false,
+            },
+        ] {
+            assert_eq!(
+                build_filter_predicate(&schema, &[filter]).err(),
+                Some(FilterBuildError::Invalid)
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_empty_json_paths_and_operators_outside_the_requested_type() {
+        let json_field = schema_field("payload", "BYTE_ARRAY", Some("JSON"));
+        let filter = |path: JsonPath, value_type, operator| DataFilter {
+            field_path: FieldPath::from("payload"),
+            json_target: Some(JsonFieldTarget { path, value_type }),
+            operator,
+            values: vec!["value".to_owned()],
+            match_case: false,
+        };
+
+        assert!(
+            build_filter_predicate(
+                std::slice::from_ref(&json_field),
+                &[filter(
+                    JsonPath::new(Vec::new()),
+                    JsonValueType::Text,
+                    DataFilterOperator::Equals,
+                )],
+            )
+            .is_err()
+        );
+        assert!(
+            build_filter_predicate(
+                &[json_field],
+                &[filter(
+                    JsonPath::new([JsonPathSegment::Field("flag".to_owned())]),
+                    JsonValueType::Boolean,
+                    DataFilterOperator::TextContains,
+                )],
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -513,15 +805,14 @@ mod tests {
                 Some("Geography (spherical)"),
             ),
         ];
-        let text_filters = [
-            text_filter(DataFilterOperator::Equals, &["alpha"]),
-            text_filter(DataFilterOperator::NotEquals, &["alpha"]),
-            text_filter(DataFilterOperator::OneOf, &["alpha", "beta"]),
-            text_filter(DataFilterOperator::TextContains, &["pha"]),
-        ];
-        let null_filter = text_filter(DataFilterOperator::IsNull, &[]);
-
         for column in columns {
+            let text_filters = [
+                text_filter(&column.name, DataFilterOperator::Equals, &["alpha"]),
+                text_filter(&column.name, DataFilterOperator::NotEquals, &["alpha"]),
+                text_filter(&column.name, DataFilterOperator::OneOf, &["alpha", "beta"]),
+                text_filter(&column.name, DataFilterOperator::TextContains, &["pha"]),
+            ];
+            let null_filter = text_filter(&column.name, DataFilterOperator::IsNull, &[]);
             for filter in &text_filters {
                 assert_eq!(
                     build_filter_predicate(
@@ -552,7 +843,8 @@ mod tests {
         let column = field("value", ColumnFilterKind::Number);
         let filters = (0..=MAX_FILTERS)
             .map(|_| DataFilter {
-                column_index: 0,
+                field_path: FieldPath::from("value"),
+                json_target: None,
                 operator: DataFilterOperator::IsNotNull,
                 values: Vec::new(),
                 match_case: false,
@@ -564,7 +856,8 @@ mod tests {
         );
 
         let one_of = DataFilter {
-            column_index: 0,
+            field_path: FieldPath::from("value"),
+            json_target: None,
             operator: DataFilterOperator::OneOf,
             values: vec!["1".to_owned(); MAX_ONE_OF_VALUES + 1],
             match_case: false,
@@ -579,7 +872,8 @@ mod tests {
     fn accepts_a_value_at_the_byte_limit_and_rejects_the_next_byte() {
         let column = field("label", ColumnFilterKind::Text);
         let filter_with_value = |value: String| DataFilter {
-            column_index: 0,
+            field_path: FieldPath::from("label"),
+            json_target: None,
             operator: DataFilterOperator::Equals,
             values: vec![value],
             match_case: false,
@@ -612,7 +906,8 @@ mod tests {
             DataFilterOperator::EndsWith,
         ] {
             let valid = DataFilter {
-                column_index: 0,
+                field_path: FieldPath::from("label"),
+                json_target: None,
                 operator,
                 values: vec!["value".to_owned()],
                 match_case: true,
@@ -620,7 +915,8 @@ mod tests {
             assert!(build_filter_predicate(std::slice::from_ref(&column), &[valid]).is_ok());
 
             let invalid = DataFilter {
-                column_index: 0,
+                field_path: FieldPath::from("label"),
+                json_target: None,
                 operator,
                 values: Vec::new(),
                 match_case: false,
@@ -632,7 +928,8 @@ mod tests {
         }
 
         let invalid_flag = DataFilter {
-            column_index: 0,
+            field_path: FieldPath::from("label"),
+            json_target: None,
             operator: DataFilterOperator::Equals,
             values: vec!["value".to_owned()],
             match_case: true,

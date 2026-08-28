@@ -2115,7 +2115,16 @@ pub(crate) mod tests {
                 ..
             }
         ));
-        assert!(fetch_opened_source_window(&session, 0, 0, 1, &[0]).is_ok());
+        assert!(
+            fetch_opened_source_window(
+                &session,
+                0,
+                0,
+                1,
+                &[viewda_data_engine::FieldPath::from("value")]
+            )
+            .is_ok()
+        );
         let (sample_reader, sample_facts, sample_preview, construction) = {
             let mut state = session.lock_state().expect("sample state");
             let SessionWindowReader::Dataset(dataset) = &state.reader else {
@@ -2171,13 +2180,15 @@ pub(crate) mod tests {
             DataViewBuilder::for_dataset(
                 &reader,
                 &[DataFilter {
-                    column_index: 0,
+                    field_path: viewda_data_engine::FieldPath::from("value"),
+                    json_target: None,
                     operator: DataFilterOperator::Equals,
                     values: vec!["1".to_owned()],
                     match_case: false,
                 }],
                 &[DataSort {
-                    source_index: 0,
+                    field_path: viewda_data_engine::FieldPath::from("value"),
+                    json_target: None,
                     direction: viewda_data_engine::DataSortDirection::Descending,
                 }],
                 viewda_data_engine::DataViewMemoryLimit::Mb384,
@@ -2294,7 +2305,16 @@ pub(crate) mod tests {
                 ..
             } if summary.member_count == 2 && summary.row_count == 1
         ));
-        assert!(fetch_opened_source_window(&session, 0, 0, 1, &[0]).is_ok());
+        assert!(
+            fetch_opened_source_window(
+                &session,
+                0,
+                0,
+                1,
+                &[viewda_data_engine::FieldPath::from("value")]
+            )
+            .is_ok()
+        );
 
         let continued = discovery.advance(1).expect("continued discovery");
         assert_eq!(continued.discovered_member_count, 3);
@@ -2335,7 +2355,16 @@ pub(crate) mod tests {
                 && sample_summary.member_count == 2
                 && sample_summary.row_count == 2
         ));
-        assert!(fetch_opened_source_window(&session, 0, 0, 2, &[0]).is_ok());
+        assert!(
+            fetch_opened_source_window(
+                &session,
+                0,
+                0,
+                2,
+                &[viewda_data_engine::FieldPath::from("value")]
+            )
+            .is_ok()
+        );
         assert!(
             cancel_dataset_inspection_for(&opened_source, info.generation)
                 .expect("close inspection")
@@ -2611,7 +2640,16 @@ pub(crate) mod tests {
         assert_eq!(schema[0].name, "value");
         assert_eq!(row_count, 2);
         drop(state);
-        assert!(fetch_opened_source_window(&session, 0, 0, 2, &[0]).is_ok());
+        assert!(
+            fetch_opened_source_window(
+                &session,
+                0,
+                0,
+                2,
+                &[viewda_data_engine::FieldPath::from("value")]
+            )
+            .is_ok()
+        );
 
         inspector.advance(32).expect("remaining footer batch");
         let reader = inspector.into_window_reader().expect("completed reader");
@@ -2622,7 +2660,7 @@ pub(crate) mod tests {
         };
         let projection = (0..summary.schema.len())
             .rev()
-            .map(|index| u32::try_from(index).expect("schema index"))
+            .map(|index| viewda_data_engine::FieldPath::from(summary.schema[index].name.as_str()))
             .collect::<Vec<_>>();
         assert!(fetch_opened_source_window(&session, 0, 0, 2, &projection).is_ok());
     }
@@ -2968,13 +3006,15 @@ pub(crate) mod tests {
             match DataViewBuilder::for_dataset(
                 &reader,
                 &[DataFilter {
-                    column_index: 0,
+                    field_path: viewda_data_engine::FieldPath::from("value"),
+                    json_target: None,
                     operator: DataFilterOperator::Equals,
                     values: vec!["1".to_owned()],
                     match_case: false,
                 }],
                 &[DataSort {
-                    source_index: 0,
+                    field_path: viewda_data_engine::FieldPath::from("value"),
+                    json_target: None,
                     direction: DataSortDirection::Descending,
                 }],
                 DataViewMemoryLimit::Mb384,
@@ -3034,7 +3074,7 @@ pub(crate) mod tests {
         let error = suggestions
             .fetch(
                 "private",
-                &column,
+                &viewda_data_engine::FieldPath::from(column.name.as_str()),
                 DataFilterOperator::TextContains,
                 &suggestions.interrupt_handle(),
             )
@@ -3069,7 +3109,7 @@ pub(crate) mod tests {
         fs::set_permissions(&member, fs::Permissions::from_mode(0o000))
             .expect("remove member access");
         let error = statistics
-            .fetch("value", true)
+            .fetch(&viewda_data_engine::FieldPath::from("value"), true)
             .expect_err("permission failure");
         fs::set_permissions(&member, fs::Permissions::from_mode(0o600))
             .expect("restore member access");
@@ -3105,8 +3145,14 @@ pub(crate) mod tests {
         let reader = inspector.into_window_reader().expect("dataset reader");
         assert!(publish_completed_dataset_reader(&session, reader).expect("ready publication"));
         fs::remove_file(directory.path().join("b.parquet")).expect("remove member");
-        let error = fetch_opened_source_window(&session, 0, 1, 1, &[0])
-            .expect_err("removed member must fail the frame");
+        let error = fetch_opened_source_window(
+            &session,
+            0,
+            1,
+            1,
+            &[viewda_data_engine::FieldPath::from("value")],
+        )
+        .expect_err("removed member must fail the frame");
         assert_eq!(
             error,
             DataWindowCommandError::Dataset(DatasetError::SourceChanged {

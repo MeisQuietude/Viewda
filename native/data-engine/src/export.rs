@@ -20,10 +20,12 @@ use tempfile::{TempDir, TempPath};
 use thiserror::Error;
 
 use crate::{
+    FieldPath,
     dataset::{
         DatasetError, DatasetQuerySource, DatasetRowPosition, DatasetSetupError,
         DatasetWindowReader, MAX_EXPORT_SPARSE_MEMBERS, MAX_EXPORT_SPARSE_ROWS,
     },
+    field_path::{field_path_expression, field_path_title, resolve_field_path},
     filter::{DataFilter, FilterPredicate, build_filter_predicate_with_names},
     source::{SchemaField, SourceError, inspect_local_source_for_query},
     view::{PreparedDataViewExport, PreparedDataViewExportSource, read_dataset_positions},
@@ -62,8 +64,8 @@ pub struct ExportRowRange {
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DataExportRequest {
-    /// Source columns in visible grid order.
-    pub column_indices: Vec<u32>,
+    /// Addressable fields in visible grid order.
+    pub field_paths: Vec<FieldPath>,
     /// Selected view rows. An empty list exports every view row.
     #[serde(default)]
     pub row_ranges: Vec<ExportRowRange>,
@@ -456,24 +458,23 @@ impl DataExportReader {
     }
 
     fn export_dataset_batches(&self, dataset: &DatasetQuerySource) -> Result<(), DataExportError> {
-        let source_indices = self
-            .request
-            .column_indices
-            .iter()
-            .map(|index| usize::try_from(*index).map_err(|_| DataExportError::InvalidRequest))
-            .collect::<Result<Vec<_>, _>>()?;
         let selected_columns = self
             .request
-            .column_indices
+            .field_paths
             .iter()
-            .map(|index| {
-                let field = self
-                    .schema
-                    .get(*index as usize)
+            .map(|path| {
+                let resolved = resolve_field_path(&self.schema, path)
+                    .ok_or(DataExportError::InvalidRequest)?;
+                let root = format!(
+                    "source.{}",
+                    quote_identifier(&self.schema[resolved.root_index].name)
+                );
+                let expression = field_path_expression(&self.schema, path, &root)
                     .ok_or(DataExportError::InvalidRequest)?;
                 Ok(export_column_expression_from(
-                    field,
-                    &format!("source.{}", quote_identifier(&field.name)),
+                    resolved.field,
+                    &expression,
+                    &field_path_title(path),
                 ))
             })
             .collect::<Result<Vec<_>, DataExportError>>()?
@@ -509,7 +510,7 @@ impl DataExportReader {
                     let rows = dataset
                         .stage_sparse_export_while(
                             &positions,
-                            &source_indices,
+                            &self.request.field_paths,
                             self._work_directory.path(),
                             || !self.cancelled.load(Ordering::Acquire),
                         )
@@ -737,13 +738,12 @@ fn validate_request(
     filters: &[DataFilter],
     view_row_count: u64,
 ) -> Result<(), DataExportError> {
-    if request.column_indices.is_empty() {
+    if request.field_paths.is_empty() {
         return Err(DataExportError::InvalidRequest);
     }
     let mut columns = HashSet::new();
-    for index in &request.column_indices {
-        let index = usize::try_from(*index).map_err(|_| DataExportError::InvalidRequest)?;
-        if index >= schema.len() || !columns.insert(index) {
+    for path in &request.field_paths {
+        if resolve_field_path(schema, path).is_none() || !columns.insert(path) {
             return Err(DataExportError::InvalidRequest);
         }
     }
@@ -792,13 +792,19 @@ fn build_export_query(
     let predicate = build_export_filter_predicate(schema, filters)
         .map_err(|_| DataExportError::InvalidRequest)?;
     let selected_columns = request
-        .column_indices
+        .field_paths
         .iter()
-        .map(|index| {
-            schema
-                .get(*index as usize)
-                .map(export_column_expression)
-                .ok_or(DataExportError::InvalidRequest)
+        .map(|path| {
+            let resolved =
+                resolve_field_path(schema, path).ok_or(DataExportError::InvalidRequest)?;
+            let root = quote_identifier(&schema[resolved.root_index].name);
+            let expression = field_path_expression(schema, path, &root)
+                .ok_or(DataExportError::InvalidRequest)?;
+            Ok::<String, DataExportError>(export_column_expression_from(
+                resolved.field,
+                &expression,
+                &field_path_title(path),
+            ))
         })
         .collect::<Result<Vec<_>, _>>()?
         .join(", ");
@@ -858,16 +864,10 @@ fn build_selection_query(
         .chain(std::iter::once(quote_identifier(&file_row)))
         .collect::<Vec<_>>()
         .join(", ");
-    let raw_columns = request
-        .column_indices
+    let raw_columns = schema
         .iter()
-        .map(|index| {
-            schema
-                .get(*index as usize)
-                .map(|field| quote_identifier(&field.name))
-                .ok_or(DataExportError::InvalidRequest)
-        })
-        .collect::<Result<Vec<_>, _>>()?
+        .map(|field| quote_identifier(&field.name))
+        .collect::<Vec<_>>()
         .join(", ");
     let where_clause = if predicate_sql.is_empty() {
         String::new()
@@ -931,17 +931,21 @@ fn build_sorted_view_query(
         .collect::<Vec<_>>()
         .join(", ");
     let selected_columns = request
-        .column_indices
+        .field_paths
         .iter()
-        .map(|index| {
-            let index = usize::try_from(*index).map_err(|_| DataExportError::InvalidRequest)?;
-            let field = schema.get(index).ok_or(DataExportError::InvalidRequest)?;
+        .map(|path| {
+            let resolved =
+                resolve_field_path(schema, path).ok_or(DataExportError::InvalidRequest)?;
             let source_column = source_columns
-                .get(index)
+                .get(resolved.root_index)
+                .ok_or(DataExportError::InvalidRequest)?;
+            let root = format!("{source}.{}", quote_identifier(source_column));
+            let expression = field_path_expression(schema, path, &root)
                 .ok_or(DataExportError::InvalidRequest)?;
             Ok(export_column_expression_from(
-                field,
-                &format!("{source}.{}", quote_identifier(source_column)),
+                resolved.field,
+                &expression,
+                &field_path_title(path),
             ))
         })
         .collect::<Result<Vec<_>, DataExportError>>()?
@@ -1010,13 +1014,14 @@ fn build_view_range_clause(
     (format!(" WHERE {conditions}"), parameters)
 }
 
-fn export_column_expression(field: &SchemaField) -> String {
-    let identifier = quote_identifier(&field.name);
-    export_column_expression_from(field, &identifier)
-}
-
-fn export_column_expression_from(field: &SchemaField, value: &str) -> String {
-    let identifier = quote_identifier(&field.name);
+fn export_column_expression_from(field: &SchemaField, value: &str, output_name: &str) -> String {
+    let identifier = quote_identifier(output_name);
+    if field.physical_type == "GROUP" {
+        return format!(
+            "{} AS {identifier}",
+            canonical_json_expression(field, value)
+        );
+    }
     if field.physical_type == "INT96"
         || field
             .logical_type
@@ -1035,10 +1040,140 @@ fn export_column_expression_from(field: &SchemaField, value: &str) -> String {
         );
     }
     if value == identifier {
-        identifier
+        value.to_owned()
     } else {
         format!("{value} AS {identifier}")
     }
+}
+
+fn canonical_json_expression(field: &SchemaField, value: &str) -> String {
+    let non_null = match field.logical_type.as_deref() {
+        Some("Map") => canonical_map_json_expression(field, value),
+        Some("List") => canonical_list_json_expression(field, value),
+        _ if field.physical_type == "GROUP" => canonical_struct_json_expression(field, value),
+        _ => canonical_scalar_json_expression(field, value),
+    };
+    format!("coalesce({non_null}, CAST('null' AS JSON))")
+}
+
+fn canonical_struct_json_expression(field: &SchemaField, value: &str) -> String {
+    if field.children.is_empty() {
+        return format!("to_json({value})");
+    }
+    let members = field
+        .children
+        .iter()
+        .flat_map(|child| {
+            let child_value = format!(
+                "struct_extract({value}, {})",
+                quote_string_literal(&child.name)
+            );
+            [
+                quote_string_literal(&child.name),
+                canonical_json_expression(child, &child_value),
+            ]
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        "CASE WHEN {value} IS NULL THEN CAST('null' AS JSON) \
+         ELSE json_object({members}) END"
+    )
+}
+
+fn canonical_list_json_expression(field: &SchemaField, value: &str) -> String {
+    let Some(element) = list_element_field(field) else {
+        return format!("to_json({value})");
+    };
+    let element_json = canonical_json_expression(element, "element");
+    format!("to_json(list_transform({value}, element -> {element_json}))")
+}
+
+fn canonical_map_json_expression(field: &SchemaField, value: &str) -> String {
+    let Some((key, map_value)) = map_entry_fields(field) else {
+        return format!("to_json({value})");
+    };
+    let key_json = canonical_json_expression(key, "entry.key");
+    let value_json = canonical_json_expression(map_value, "entry.value");
+    format!(
+        "to_json(list_transform(map_entries({value}), \
+         entry -> json_array({key_json}, {value_json})))"
+    )
+}
+
+fn canonical_scalar_json_expression(field: &SchemaField, value: &str) -> String {
+    let logical_type = field.logical_type.as_deref().unwrap_or_default();
+    if field.physical_type == "INT96" || logical_type.starts_with("Timestamp") {
+        let epoch = if field.physical_type == "INT96" || logical_type.contains("microseconds") {
+            format!("epoch_us({value})")
+        } else if logical_type.contains("milliseconds") {
+            format!("epoch_ms({value})")
+        } else {
+            format!("epoch_ns({value})")
+        };
+        return canonical_integer_json_expression(&epoch);
+    }
+    if logical_type.starts_with("Time") {
+        let epoch = if logical_type.contains("milliseconds") {
+            format!("epoch_us({value}) / 1000")
+        } else if logical_type.contains("microseconds") {
+            format!("epoch_us({value})")
+        } else {
+            format!("epoch_us({value}) * 1000")
+        };
+        return canonical_integer_json_expression(&epoch);
+    }
+    if logical_type.starts_with("Decimal") {
+        // JSON numbers cannot preserve decimal scale or every exact decimal value.
+        return format!("to_json(CAST({value} AS VARCHAR))");
+    }
+    if matches!(field.physical_type.as_str(), "INT32" | "INT64") && logical_type != "Date" {
+        return canonical_integer_json_expression(value);
+    }
+    if matches!(field.physical_type.as_str(), "FLOAT" | "DOUBLE") {
+        // Grid copy and CSV use shortest round-trip finite numbers without an optional positive
+        // exponent sign. DuckDB additionally retains fixed-point `.0`, so remove it for integers.
+        return format!(
+            "CASE WHEN {value} IS NULL THEN NULL \
+             WHEN {value} = 0 THEN CAST('0' AS JSON) \
+             WHEN isfinite({value}) AND {value} = trunc({value}) AND abs({value}) < 1e21 \
+             THEN CAST(substring(CAST(to_json({value}) AS VARCHAR), 1, \
+             length(CAST(to_json({value}) AS VARCHAR)) - 2) AS JSON) \
+             WHEN isfinite({value}) THEN to_json({value}) \
+             WHEN isnan({value}) THEN to_json('NaN') \
+             WHEN {value} > 0 THEN to_json('Infinity') \
+             ELSE to_json('-Infinity') END"
+        );
+    }
+    if matches!(
+        field.physical_type.as_str(),
+        "BYTE_ARRAY" | "FIXED_LEN_BYTE_ARRAY"
+    ) && !matches!(logical_type, "String" | "Enum" | "JSON" | "BSON")
+    {
+        return format!("to_json(to_base64({value}))");
+    }
+    format!("to_json({value})")
+}
+
+fn canonical_integer_json_expression(value: &str) -> String {
+    format!(
+        "CASE WHEN {value} BETWEEN -9007199254740991 AND 9007199254740991 \
+         THEN to_json({value}) ELSE to_json(CAST({value} AS VARCHAR)) END"
+    )
+}
+
+fn list_element_field(field: &SchemaField) -> Option<&SchemaField> {
+    let repeated = field.children.first()?;
+    repeated.children.first().or(Some(repeated))
+}
+
+fn map_entry_fields(field: &SchemaField) -> Option<(&SchemaField, &SchemaField)> {
+    let entries = field.children.first()?;
+    Some((entries.children.first()?, entries.children.get(1)?))
+}
+
+fn quote_string_literal(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "''"))
 }
 
 fn available_name(base: &str, names: &HashSet<String>) -> String {
@@ -1162,8 +1297,13 @@ mod tests {
         time::{Duration, Instant},
     };
 
-    use arrow_array::{ArrayRef, Int64Array, RecordBatch, StringArray, TimestampNanosecondArray};
-    use arrow_schema::{DataType, Field, Schema, TimeUnit};
+    use arrow_array::{
+        Array, ArrayRef, BinaryArray, Decimal128Array, Float64Array, Int64Array, ListArray,
+        RecordBatch, StringArray, StructArray, TimestampNanosecondArray,
+        builder::{Int64Builder, MapBuilder, NullBufferBuilder, StringBuilder},
+        types::Int64Type,
+    };
+    use arrow_schema::{DataType, Field, Fields, Schema, TimeUnit};
     use parquet::arrow::ArrowWriter;
     use tempfile::{NamedTempFile, tempdir};
 
@@ -1181,7 +1321,8 @@ mod tests {
         let view = DataViewBuilder::new(
             source.path().to_owned(),
             &[DataFilter {
-                column_index: 0,
+                field_path: field("id"),
+                json_target: None,
                 operator: DataFilterOperator::Range,
                 values: vec!["2".to_owned(), "3".to_owned()],
                 match_case: false,
@@ -1196,7 +1337,9 @@ mod tests {
             source.path().to_owned(),
             target.clone(),
             DataExportRequest {
-                column_indices: vec![1, 0, 2, 3, 4],
+                field_paths: ["text", "id", "recorded_at", "recorded_at_utc", "optional"]
+                    .map(field)
+                    .to_vec(),
                 row_ranges: vec![ExportRowRange { start: 0, end: 2 }],
                 output: DataExportFormat::Csv {
                     options: CsvExportOptions::default(),
@@ -1221,13 +1364,55 @@ mod tests {
     }
 
     #[test]
+    fn exports_nested_values_with_the_grid_canonical_json_shape() {
+        let source = write_nested_export_parquet();
+        let output_directory = tempdir().expect("output directory");
+        let target = output_directory.path().join("nested.csv");
+        let reader = DataExportReader::new(
+            source.path().to_owned(),
+            target.clone(),
+            DataExportRequest {
+                field_paths: vec![
+                    FieldPath::from("profile"),
+                    FieldPath::from("tags"),
+                    FieldPath::from("attributes"),
+                    FieldPath::new(["profile", "weird.name"]),
+                ],
+                row_ranges: Vec::new(),
+                output: DataExportFormat::Csv {
+                    options: CsvExportOptions::default(),
+                },
+            },
+            None,
+        )
+        .expect("nested export reader");
+
+        reader.export().expect("nested CSV export");
+
+        let profile = include_str!("../../test-fixtures/canonical-nested-profile.json").trim_end();
+        let quoted_profile = format!("\"{}\"", profile.replace('"', "\"\""));
+        assert_eq!(
+            fs::read_to_string(target).expect("nested CSV"),
+            format!(
+                concat!(
+                    "profile,tags,attributes,\"profile.\"\"weird.name\"\"\"\r\n",
+                    "{},\"[1,2]\",\"[[\"\"a\"\",1],[\"\"b\"\",2]]\",Ada\r\n",
+                    "null,null,null,\r\n",
+                ),
+                quoted_profile
+            )
+        );
+    }
+
+    #[test]
     fn current_view_query_is_a_flat_streaming_copy_source() {
         let source = write_export_parquet();
         let output_directory = tempdir().expect("output directory");
         let view = DataViewBuilder::new(
             source.path().to_owned(),
             &[DataFilter {
-                column_index: 0,
+                field_path: field("id"),
+                json_target: None,
                 operator: DataFilterOperator::Equals,
                 values: vec!["1".to_owned()],
                 match_case: false,
@@ -1263,13 +1448,15 @@ mod tests {
         let view = DataViewBuilder::new(
             source.path().to_owned(),
             &[DataFilter {
-                column_index: 0,
+                field_path: field("id"),
+                json_target: None,
                 operator: DataFilterOperator::GreaterThanOrEqual,
                 values: vec!["2".to_owned()],
                 match_case: false,
             }],
             &[DataSort {
-                source_index: 0,
+                field_path: field("id"),
+                json_target: None,
                 direction: DataSortDirection::Descending,
             }],
         )
@@ -1460,7 +1647,8 @@ mod tests {
             other_source.path().to_owned(),
             &[],
             &[DataSort {
-                source_index: 0,
+                field_path: field("id"),
+                json_target: None,
                 direction: DataSortDirection::Ascending,
             }],
         )
@@ -1547,7 +1735,8 @@ mod tests {
         let view = DataViewBuilder::for_dataset(
             &reader,
             &[DataFilter {
-                column_index: 0,
+                field_path: field("id"),
+                json_target: None,
                 operator: DataFilterOperator::Equals,
                 values: vec!["999".to_owned()],
                 match_case: false,
@@ -1623,14 +1812,9 @@ mod tests {
         let mut inspector = source.inspector();
         inspector.advance(2).expect("dataset inspection");
         let mut reader = inspector.into_window_reader().expect("dataset reader");
-        let year = reader
-            .summary()
-            .schema
-            .iter()
-            .position(|field| field.name == "year")
-            .expect("partition column") as u32;
         let filter = DataFilter {
-            column_index: year,
+            field_path: field("year"),
+            json_target: None,
             operator: DataFilterOperator::Equals,
             values: vec!["2025".to_owned()],
             match_case: false,
@@ -1745,13 +1929,21 @@ mod tests {
     }
 
     fn request(column_indices: Vec<u32>) -> DataExportRequest {
+        let names = ["id", "text", "recorded_at", "recorded_at_utc", "optional"];
         DataExportRequest {
-            column_indices,
+            field_paths: column_indices
+                .into_iter()
+                .map(|index| field(names[index as usize]))
+                .collect(),
             row_ranges: Vec::new(),
             output: DataExportFormat::Csv {
                 options: CsvExportOptions::default(),
             },
         }
+    }
+
+    fn field(name: &str) -> FieldPath {
+        FieldPath::new(vec![name.to_owned()])
     }
 
     fn write_export_parquet() -> NamedTempFile {
@@ -1798,6 +1990,130 @@ mod tests {
         let mut writer = ArrowWriter::try_new(file, schema, None).expect("Parquet writer");
         writer.write(&batch).expect("write batch");
         writer.close().expect("write footer");
+        source
+    }
+
+    fn write_nested_export_parquet() -> NamedTempFile {
+        let source = NamedTempFile::new().expect("temporary nested source");
+        let mut labels = MapBuilder::new(None, StringBuilder::new(), StringBuilder::new());
+        for value in ["English", "French"] {
+            labels.keys().append_value("language");
+            labels.values().append_value(value);
+        }
+        labels.append(true).expect("duplicate-key map");
+        labels.keys().append_value("masked");
+        labels.values().append_value("value");
+        labels.append(true).expect("masked map");
+        let labels = labels.finish();
+        let profile_fields = Fields::from(vec![
+            Field::new("weird.name", DataType::Utf8, false),
+            Field::new("age", DataType::Int64, false),
+            Field::new("scale_zero", DataType::Decimal128(10, 0), false),
+            Field::new("trailing_zero", DataType::Decimal128(10, 2), false),
+            Field::new("unsafe_decimal", DataType::Decimal128(38, 0), false),
+            Field::new("small_decimal", DataType::Decimal128(38, 20), false),
+            Field::new("finite_one", DataType::Float64, false),
+            Field::new("negative_zero", DataType::Float64, false),
+            Field::new("large_finite", DataType::Float64, false),
+            Field::new("fractional_exponent", DataType::Float64, false),
+            Field::new("positive_exponent", DataType::Float64, false),
+            Field::new("negative_exponent", DataType::Float64, false),
+            Field::new("rounding_sensitive_integral", DataType::Float64, false),
+            Field::new("nan", DataType::Float64, false),
+            Field::new("positive_infinity", DataType::Float64, false),
+            Field::new("negative_infinity", DataType::Float64, false),
+            Field::new("nullable_float", DataType::Float64, true),
+            Field::new("unsafe", DataType::Int64, false),
+            Field::new("payload", DataType::Binary, false),
+            Field::new("labels", labels.data_type().clone(), false),
+            Field::new(
+                "recorded_at",
+                DataType::Timestamp(TimeUnit::Nanosecond, None),
+                false,
+            ),
+        ]);
+        let mut profile_validity = NullBufferBuilder::new(2);
+        profile_validity.append(true);
+        profile_validity.append(false);
+        let profile = StructArray::new(
+            profile_fields.clone(),
+            vec![
+                Arc::new(StringArray::from(vec!["Ada", "masked"])) as ArrayRef,
+                Arc::new(Int64Array::from(vec![37, 99])) as ArrayRef,
+                Arc::new(
+                    Decimal128Array::from(vec![37, 0])
+                        .with_precision_and_scale(10, 0)
+                        .expect("scale-zero decimal"),
+                ) as ArrayRef,
+                Arc::new(
+                    Decimal128Array::from(vec![120, 0])
+                        .with_precision_and_scale(10, 2)
+                        .expect("trailing-zero decimal"),
+                ) as ArrayRef,
+                Arc::new(
+                    Decimal128Array::from(vec![9_007_199_254_740_993, 0])
+                        .with_precision_and_scale(38, 0)
+                        .expect("unsafe decimal"),
+                ) as ArrayRef,
+                Arc::new(
+                    Decimal128Array::from(vec![1, 0])
+                        .with_precision_and_scale(38, 20)
+                        .expect("small decimal"),
+                ) as ArrayRef,
+                Arc::new(Float64Array::from(vec![1.0, 0.0])) as ArrayRef,
+                Arc::new(Float64Array::from(vec![-0.0, 0.0])) as ArrayRef,
+                Arc::new(Float64Array::from(vec![1e20, 0.0])) as ArrayRef,
+                Arc::new(Float64Array::from(vec![1.25e-7, 0.0])) as ArrayRef,
+                Arc::new(Float64Array::from(vec![1e21, 0.0])) as ArrayRef,
+                Arc::new(Float64Array::from(vec![-1e21, 0.0])) as ArrayRef,
+                Arc::new(Float64Array::from(vec![1_000_000_000_000_000_100_f64, 0.0])) as ArrayRef,
+                Arc::new(Float64Array::from(vec![f64::NAN, 0.0])) as ArrayRef,
+                Arc::new(Float64Array::from(vec![f64::INFINITY, 0.0])) as ArrayRef,
+                Arc::new(Float64Array::from(vec![f64::NEG_INFINITY, 0.0])) as ArrayRef,
+                Arc::new(Float64Array::from(vec![None, Some(0.0)])) as ArrayRef,
+                Arc::new(Int64Array::from(vec![9_007_199_254_740_993, 0])) as ArrayRef,
+                Arc::new(BinaryArray::from_iter_values([
+                    [1_u8, 2, 3].as_slice(),
+                    [4_u8].as_slice(),
+                ])) as ArrayRef,
+                Arc::new(labels) as ArrayRef,
+                Arc::new(TimestampNanosecondArray::from(vec![
+                    9_007_199_254_740_993,
+                    0,
+                ])) as ArrayRef,
+            ],
+            profile_validity.finish(),
+        );
+        let tags = ListArray::from_iter_primitive::<Int64Type, _, _>(vec![
+            Some(vec![Some(1), Some(2)]),
+            None,
+        ]);
+        let mut attributes = MapBuilder::new(None, StringBuilder::new(), Int64Builder::new());
+        for (key, value) in [("a", 1), ("b", 2)] {
+            attributes.keys().append_value(key);
+            attributes.values().append_value(value);
+        }
+        attributes.append(true).expect("two-pair map");
+        attributes.append(false).expect("null map");
+        let attributes = attributes.finish();
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("profile", DataType::Struct(profile_fields), true),
+            Field::new("tags", tags.data_type().clone(), true),
+            Field::new("attributes", attributes.data_type().clone(), true),
+        ]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(profile) as ArrayRef,
+                Arc::new(tags) as ArrayRef,
+                Arc::new(attributes) as ArrayRef,
+            ],
+        )
+        .expect("nested export batch");
+        let file = File::create(source.path()).expect("nested Parquet file");
+        let mut writer = ArrowWriter::try_new(file, schema, None).expect("nested Parquet writer");
+        writer.write(&batch).expect("write nested batch");
+        writer.close().expect("write nested footer");
         source
     }
 

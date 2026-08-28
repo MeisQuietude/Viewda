@@ -574,8 +574,8 @@ const DatasetPreview = memo(function DatasetPreview({
         <tbody>
           {rows.map((row) => (
             <tr key={row}>
-              {source.schema.map((_, column) => {
-                const value = windowValue(preview, column, row);
+              {source.schema.map((field, column) => {
+                const value = windowValue(preview, [field.name], row);
                 return (
                   <td key={column}>{value == null ? "" : String(value)}</td>
                 );

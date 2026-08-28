@@ -149,6 +149,73 @@ export interface SchemaField {
   children: SchemaField[];
 }
 
+/** Stable engine address for a top-level or nested schema field. */
+export type FieldPath = string[];
+
+export type JsonPathSegment = { field: string } | { index: number };
+
+/** Address inside a logical JSON column; independent from FieldPath. */
+export type JsonPath = JsonPathSegment[];
+
+export const JSON_PATH_BYTE_LIMIT = 4_096;
+const JSON_PATH_SEGMENT_LIMIT = 64;
+const JSON_PATH_MAX_ARRAY_INDEX = 4_294_967_295;
+
+export function jsonPathIsValid(path: readonly JsonPathSegment[]): boolean {
+  if (path.length === 0 || path.length > JSON_PATH_SEGMENT_LIMIT) return false;
+  let bytes = 0;
+  for (const segment of path) {
+    if ("index" in segment) {
+      if (
+        !Number.isSafeInteger(segment.index) ||
+        segment.index < 0 ||
+        segment.index > JSON_PATH_MAX_ARRAY_INDEX
+      ) {
+        return false;
+      }
+      bytes += String(segment.index).length;
+    } else {
+      if (!hasValidUtf16(segment.field)) return false;
+      bytes += new TextEncoder().encode(segment.field).byteLength;
+    }
+    if (bytes > JSON_PATH_BYTE_LIMIT) return false;
+  }
+  return true;
+}
+
+export type JsonValueType = "boolean" | "number" | "text" | "mixed";
+
+export interface JsonFieldTarget {
+  path: JsonPath;
+  valueType: JsonValueType;
+}
+
+export type JsonObservedType =
+  "null" | "boolean" | "number" | "string" | "object" | "array";
+
+export interface JsonSchemaNode {
+  segment: JsonPathSegment;
+  observedTypes: JsonObservedType[];
+  effectiveType: JsonValueType | null;
+  children: JsonSchemaNode[];
+}
+
+export interface JsonSchemaInference {
+  isSampleDerived: boolean;
+  sampleRowLimit: number;
+  sampleValueByteLimit: number;
+  sampleValueCharacterLimit: number;
+  sampleTotalByteLimit: number;
+  sampleArrowByteLimit: number;
+  sampledRowCount: number;
+  sampledValueBytes: number;
+  hasMoreRows: boolean;
+  isTruncated: boolean;
+  invalidValueCount: number;
+  oversizedValueCount: number;
+  nodes: JsonSchemaNode[];
+}
+
 export interface SourceSchemaPage {
   offset: number;
   totalCount: number;
@@ -173,7 +240,8 @@ export type DataFilterOperator =
   | "isNotNull";
 
 export interface DataFilter {
-  columnIndex: number;
+  fieldPath: FieldPath;
+  jsonTarget?: JsonFieldTarget;
   operator: DataFilterOperator;
   values: string[];
   matchCase?: boolean;
@@ -182,7 +250,8 @@ export interface DataFilter {
 export type SortDirection = "ascending" | "descending";
 
 export interface SortColumn {
-  sourceIndex: number;
+  fieldPath: FieldPath;
+  jsonTarget?: JsonFieldTarget;
   direction: SortDirection;
 }
 
@@ -221,7 +290,7 @@ export interface ExportRowRange {
 }
 
 export interface DataExportRequest {
-  columnIndices: number[];
+  fieldPaths: FieldPath[];
   rowRanges: ExportRowRange[];
   output: { format: "csv"; options: Record<string, never> };
 }
@@ -265,7 +334,14 @@ export interface ColumnStatistics {
   maximum: string | null;
   minMaxComputed: boolean;
   nullShare: number;
-  approximateDistinctCount: number;
+  nullCount: number;
+  approximateDistinctCount: number | null;
+  containerCount: {
+    minimum: number | null;
+    average: number | null;
+    maximum: number | null;
+    emptyCount: number;
+  } | null;
 }
 
 export type StructureByteUnit = "compressed" | "uncompressed";
@@ -990,7 +1066,7 @@ export async function getDataWindow(
   viewRevision: number,
   rowOffset: number,
   rowCount: number,
-  sourceIndices: readonly number[],
+  fieldPaths: readonly FieldPath[],
 ): Promise<ArrayBuffer> {
   try {
     return await invoke<ArrayBuffer>("get_data_window", {
@@ -998,7 +1074,21 @@ export async function getDataWindow(
       viewRevision,
       rowOffset,
       rowCount,
-      sourceIndices,
+      fieldPaths,
+    });
+  } catch (error) {
+    throw readDataWindowCommandError(error);
+  }
+}
+
+export async function inferJsonSchema(
+  generation: number,
+  fieldPath: FieldPath,
+): Promise<JsonSchemaInference> {
+  try {
+    return await invoke<JsonSchemaInference>("infer_json_schema", {
+      generation,
+      fieldPath,
     });
   } catch (error) {
     throw readDataWindowCommandError(error);
@@ -1012,6 +1102,15 @@ export async function prepareDataView(
   sort: SortColumn[],
   settings: DataViewSettings,
 ): Promise<DataViewStatus> {
+  if (
+    [...filters, ...sort].some(
+      (target) =>
+        target.jsonTarget !== undefined &&
+        !jsonPathIsValid(target.jsonTarget.path),
+    )
+  ) {
+    throw new DataWindowCommandError("unsupported");
+  }
   try {
     return await invoke<DataViewStatus>("prepare_data_view", {
       generation,
@@ -1023,6 +1122,20 @@ export async function prepareDataView(
   } catch (error) {
     throw readDataWindowCommandError(error);
   }
+}
+
+function hasValidUtf16(value: string): boolean {
+  for (let index = 0; index < value.length; index += 1) {
+    const unit = value.charCodeAt(index);
+    if (unit >= 0xd800 && unit <= 0xdbff) {
+      const next = value.charCodeAt(index + 1);
+      if (!(next >= 0xdc00 && next <= 0xdfff)) return false;
+      index += 1;
+    } else if (unit >= 0xdc00 && unit <= 0xdfff) {
+      return false;
+    }
+  }
+  return true;
 }
 
 export async function getDataViewStatus(
@@ -1091,7 +1204,7 @@ export async function revealDataExport(id: number): Promise<void> {
 export async function getTextValueSuggestions(
   generation: number,
   suggestionRevision: number,
-  columnIndex: number,
+  fieldPath: FieldPath,
   prefix: string,
   operator: DataFilterOperator,
 ): Promise<TextValueSuggestions> {
@@ -1099,7 +1212,7 @@ export async function getTextValueSuggestions(
     return await invoke<TextValueSuggestions>("get_text_value_suggestions", {
       generation,
       suggestionRevision,
-      columnIndex,
+      fieldPath,
       prefix,
       operator,
     });
@@ -1124,13 +1237,13 @@ export async function cancelTextValueSuggestions(
 
 export async function getColumnStatistics(
   generation: number,
-  columnIndex: number,
+  fieldPath: FieldPath,
   includeMinMax: boolean,
 ): Promise<ColumnStatistics> {
   try {
     return await invoke<ColumnStatistics>("get_column_statistics", {
       generation,
-      columnIndex,
+      fieldPath,
       includeMinMax,
     });
   } catch (error) {

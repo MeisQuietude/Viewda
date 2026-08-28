@@ -12,8 +12,10 @@ use tempfile::TempDir;
 use thiserror::Error;
 
 use crate::{
+    FieldPath,
     dataset::{DatasetError, DatasetQuerySource, DatasetSetupError, DatasetWindowReader},
-    source::{SourceError, open_local_source},
+    field_path::{field_path_expression, resolve_field_path},
+    source::{SourceError, inspect_local_source_for_query, open_local_source},
     view::create_temporary_directory,
 };
 
@@ -47,8 +49,32 @@ pub struct ColumnStatistics {
     pub min_max_computed: bool,
     /// Fraction of rows whose selected value is null.
     pub null_share: f64,
-    /// Approximate number of distinct non-null values.
-    pub approximate_distinct_count: u64,
+    /// Rows whose selected value is null.
+    pub null_count: u64,
+    /// Approximate number of distinct non-null values when measured for this result.
+    pub approximate_distinct_count: Option<u64>,
+    /// Length or pair-count distribution for list and map fields.
+    pub container_count: Option<ContainerCountStatistics>,
+}
+
+/// Cardinality facts for a list's elements or a map's key-value pairs.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ContainerCountStatistics {
+    /// Smallest non-null container cardinality.
+    pub minimum: Option<u64>,
+    /// Mean non-null container cardinality.
+    pub average: Option<f64>,
+    /// Largest non-null container cardinality.
+    pub maximum: Option<u64>,
+    /// Non-null containers with zero elements or pairs.
+    pub empty_count: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ContainerCountKind {
+    List,
+    Map,
 }
 
 /// Stable failures from a column-statistics request.
@@ -164,20 +190,20 @@ impl ColumnStatisticsReader {
     /// Scans one trusted schema column and computes the requested aggregates together.
     pub fn fetch(
         self,
-        column_name: &str,
+        field_path: &FieldPath,
         include_min_max: bool,
     ) -> Result<ColumnStatistics, ColumnStatisticsError> {
-        self.fetch_checked(column_name, include_min_max, || {})
+        self.fetch_checked(field_path, include_min_max, || {})
     }
 
     fn fetch_checked(
         self,
-        column_name: &str,
+        field_path: &FieldPath,
         include_min_max: bool,
         after_setup: impl FnOnce(),
     ) -> Result<ColumnStatistics, ColumnStatisticsError> {
         self.require_active()?;
-        let (relation, parameters) = match &self.source {
+        let (relation, parameters, container_kind, schema) = match &self.source {
             ColumnStatisticsSource::File(source_path) => {
                 let (source, _) =
                     open_local_source(source_path).map_err(ColumnStatisticsError::from)?;
@@ -185,29 +211,44 @@ impl ColumnStatisticsReader {
                 let path = source_path
                     .to_str()
                     .ok_or(ColumnStatisticsError::Unsupported)?;
+                let summary = inspect_local_source_for_query(source_path)
+                    .map_err(ColumnStatisticsError::from)?;
+                let resolved = resolve_field_path(&summary.schema, field_path)
+                    .ok_or(ColumnStatisticsError::Unsupported)?;
                 (
                     "read_parquet(?)".to_owned(),
                     vec![Value::Text(path.to_owned())],
+                    container_count_kind(resolved.field),
+                    summary.schema,
                 )
             }
             ColumnStatisticsSource::Dataset(dataset) => {
-                if !dataset
-                    .schema()
-                    .iter()
-                    .any(|field| field.name == column_name)
-                {
-                    return Err(ColumnStatisticsError::Unsupported);
-                }
+                let resolved = resolve_field_path(dataset.schema(), field_path)
+                    .ok_or(ColumnStatisticsError::Unsupported)?;
+                let container_kind = container_count_kind(resolved.field);
                 dataset
                     .install_while(&self.connection, || !self.cancelled.load(Ordering::Acquire))
                     .map_err(|error| self.classify_setup_error(error))?;
                 after_setup();
-                return self.fetch_dataset(dataset, column_name, include_min_max);
+                return self.fetch_dataset(dataset, field_path, include_min_max, container_kind);
             }
         };
         after_setup();
         self.require_active()?;
-        let identifier = quote_identifier(column_name);
+        let root = format!(
+            "source.{}",
+            quote_identifier(
+                field_path
+                    .segments()
+                    .first()
+                    .ok_or(ColumnStatisticsError::Unsupported)?,
+            )
+        );
+        let identifier = field_path_expression(&schema, field_path, &root)
+            .ok_or(ColumnStatisticsError::Unsupported)?;
+        if let Some(kind) = container_kind {
+            return self.fetch_container(&relation, &parameters, &identifier, kind);
+        }
         let (minimum, maximum) = if include_min_max {
             (
                 format!("CAST(min({identifier}) AS VARCHAR)"),
@@ -220,7 +261,7 @@ impl ColumnStatisticsReader {
             "SELECT {minimum}, {maximum}, \
              count(*) - count({identifier}), \
              approx_count_distinct({identifier}), count(*) \
-             FROM {relation}"
+             FROM {relation} source"
         );
         let mut statement = self
             .connection
@@ -260,11 +301,25 @@ impl ColumnStatisticsReader {
     fn fetch_dataset(
         &self,
         dataset: &DatasetQuerySource,
-        column_name: &str,
+        field_path: &FieldPath,
         include_min_max: bool,
+        container_kind: Option<ContainerCountKind>,
     ) -> Result<ColumnStatistics, ColumnStatisticsError> {
         self.require_active()?;
-        let identifier = quote_identifier(column_name);
+        let root = format!(
+            "source.{}",
+            quote_identifier(
+                field_path
+                    .segments()
+                    .first()
+                    .ok_or(ColumnStatisticsError::Unsupported)?,
+            )
+        );
+        let identifier = field_path_expression(dataset.schema(), field_path, &root)
+            .ok_or(ColumnStatisticsError::Unsupported)?;
+        if let Some(kind) = container_kind {
+            return self.fetch_dataset_container(dataset, &identifier, kind);
+        }
         let state_projection = statistics_state_projection(&identifier, include_min_max);
         let empty_relation = dataset
             .sparse_empty_relation_sql()
@@ -333,6 +388,65 @@ impl ColumnStatisticsReader {
         column_statistics(result, include_min_max)
     }
 
+    fn fetch_container(
+        &self,
+        relation: &str,
+        parameters: &[Value],
+        identifier: &str,
+        kind: ContainerCountKind,
+    ) -> Result<ColumnStatistics, ColumnStatisticsError> {
+        let query = container_statistics_query(relation, identifier, kind);
+        let mut statement = self
+            .connection
+            .prepare(&query)
+            .map_err(|error| self.classify_scan_error(error))?;
+        self.require_active()?;
+        let result = statement
+            .query_row(
+                params_from_iter(parameters.iter()),
+                read_container_statistics_row,
+            )
+            .map_err(|error| self.classify_scan_error(error))?;
+        self.require_active()?;
+        container_statistics(result)
+    }
+
+    fn fetch_dataset_container(
+        &self,
+        dataset: &DatasetQuerySource,
+        identifier: &str,
+        kind: ContainerCountKind,
+    ) -> Result<ColumnStatistics, ColumnStatisticsError> {
+        let mut aggregate = ContainerStatisticsAggregate::default();
+        let mut cursor = dataset.candidate_batches(&[]);
+        while dataset
+            .bind_next_candidate_batch(&self.connection, &mut cursor, || {
+                !self.cancelled.load(Ordering::Acquire)
+            })
+            .map_err(|error| self.classify_setup_error(error))?
+        {
+            dataset
+                .validate_bound_members_while(|| !self.cancelled.load(Ordering::Acquire))
+                .map_err(dataset_statistics_error)?;
+            self.require_active()?;
+            let query = container_statistics_query(&dataset.relation_sql(), identifier, kind);
+            let result = self
+                .connection
+                .query_row(&query, [], read_container_statistics_row)
+                .map_err(|error| self.classify_scan_error(error))?;
+            aggregate.add(result)?;
+            self.require_active()?;
+            dataset
+                .validate_bound_members_while(|| !self.cancelled.load(Ordering::Acquire))
+                .map_err(dataset_statistics_error)?;
+        }
+        dataset
+            .require_active_while(|| !self.cancelled.load(Ordering::Acquire))
+            .map_err(dataset_statistics_error)?;
+        self.require_active()?;
+        container_statistics(aggregate.finish()?)
+    }
+
     fn require_active(&self) -> Result<(), ColumnStatisticsError> {
         if self.cancelled.load(Ordering::Acquire) {
             Err(ColumnStatisticsError::QueryFailed)
@@ -357,14 +471,14 @@ impl ColumnStatisticsReader {
 fn statistics_state_projection(identifier: &str, include_min_max: bool) -> String {
     let min_max = include_min_max.then(|| {
         format!(
-            "min(source.{identifier}) AS minimum, \
-             max(source.{identifier}) AS maximum, "
+            "min({identifier}) AS minimum, \
+             max({identifier}) AS maximum, "
         )
     });
     format!(
         "{}count(*) EXPORT_STATE AS rows, \
-         count(source.{identifier}) EXPORT_STATE AS non_null, \
-         approx_count_distinct(source.{identifier}) EXPORT_STATE AS distinct_values",
+         count({identifier}) EXPORT_STATE AS non_null, \
+         approx_count_distinct({identifier}) EXPORT_STATE AS distinct_values",
         min_max.as_deref().unwrap_or("")
     )
 }
@@ -380,6 +494,123 @@ fn statistics_combine_projection(include_min_max: bool) -> String {
          combine(accumulator.distinct_values, batch.distinct_values) AS distinct_values",
         min_max.unwrap_or("")
     )
+}
+
+type ContainerStatisticsRow = (Option<i64>, Option<i64>, Option<f64>, i64, i64, i64);
+
+#[derive(Default)]
+struct ContainerStatisticsAggregate {
+    minimum: Option<i64>,
+    maximum: Option<i64>,
+    total: f64,
+    non_null_count: u64,
+    empty_count: u64,
+    null_count: u64,
+}
+
+impl ContainerStatisticsAggregate {
+    fn add(&mut self, row: ContainerStatisticsRow) -> Result<(), ColumnStatisticsError> {
+        let (minimum, maximum, total, non_null_count, empty_count, null_count) = row;
+        self.minimum = self.minimum.into_iter().chain(minimum).min();
+        self.maximum = self.maximum.into_iter().chain(maximum).max();
+        self.total += total.unwrap_or(0.0);
+        self.non_null_count = self
+            .non_null_count
+            .checked_add(nonnegative_u64(non_null_count)?)
+            .ok_or(ColumnStatisticsError::Unsupported)?;
+        self.empty_count = self
+            .empty_count
+            .checked_add(nonnegative_u64(empty_count)?)
+            .ok_or(ColumnStatisticsError::Unsupported)?;
+        self.null_count = self
+            .null_count
+            .checked_add(nonnegative_u64(null_count)?)
+            .ok_or(ColumnStatisticsError::Unsupported)?;
+        Ok(())
+    }
+
+    fn finish(self) -> Result<ContainerStatisticsRow, ColumnStatisticsError> {
+        Ok((
+            self.minimum,
+            self.maximum,
+            Some(self.total),
+            i64::try_from(self.non_null_count).map_err(|_| ColumnStatisticsError::Unsupported)?,
+            i64::try_from(self.empty_count).map_err(|_| ColumnStatisticsError::Unsupported)?,
+            i64::try_from(self.null_count).map_err(|_| ColumnStatisticsError::Unsupported)?,
+        ))
+    }
+}
+
+fn container_count_kind(field: &crate::SchemaField) -> Option<ContainerCountKind> {
+    match field.logical_type.as_deref() {
+        Some("List") => Some(ContainerCountKind::List),
+        Some("Map") => Some(ContainerCountKind::Map),
+        _ => None,
+    }
+}
+
+fn container_statistics_query(
+    relation: &str,
+    identifier: &str,
+    kind: ContainerCountKind,
+) -> String {
+    let count = match kind {
+        ContainerCountKind::List => format!("length({identifier})"),
+        ContainerCountKind::Map => format!("cardinality({identifier})"),
+    };
+    format!(
+        "SELECT min(value_count), max(value_count), sum(value_count)::DOUBLE, \
+                count(value_count), count(*) FILTER (WHERE value_count = 0), \
+                count(*) - count(value_count) \
+         FROM (SELECT {count} AS value_count FROM {relation} source) container_values"
+    )
+}
+
+fn read_container_statistics_row(row: &duckdb::Row<'_>) -> duckdb::Result<ContainerStatisticsRow> {
+    Ok((
+        row.get(0)?,
+        row.get(1)?,
+        row.get(2)?,
+        row.get(3)?,
+        row.get(4)?,
+        row.get(5)?,
+    ))
+}
+
+fn container_statistics(
+    row: ContainerStatisticsRow,
+) -> Result<ColumnStatistics, ColumnStatisticsError> {
+    let (minimum, maximum, total, non_null_count, empty_count, null_count) = row;
+    let minimum = minimum.map(nonnegative_u64).transpose()?;
+    let maximum = maximum.map(nonnegative_u64).transpose()?;
+    let non_null_count = nonnegative_u64(non_null_count)?;
+    let empty_count = nonnegative_u64(empty_count)?;
+    let null_count = nonnegative_u64(null_count)?;
+    let row_count = non_null_count
+        .checked_add(null_count)
+        .ok_or(ColumnStatisticsError::Unsupported)?;
+    Ok(ColumnStatistics {
+        minimum: None,
+        maximum: None,
+        min_max_computed: false,
+        null_share: if row_count == 0 {
+            0.0
+        } else {
+            null_count as f64 / row_count as f64
+        },
+        null_count,
+        approximate_distinct_count: None,
+        container_count: Some(ContainerCountStatistics {
+            minimum,
+            average: (non_null_count > 0).then(|| total.unwrap_or(0.0) / non_null_count as f64),
+            maximum,
+            empty_count,
+        }),
+    })
+}
+
+fn nonnegative_u64(value: i64) -> Result<u64, ColumnStatisticsError> {
+    u64::try_from(value).map_err(|_| ColumnStatisticsError::Unsupported)
 }
 
 fn column_statistics(
@@ -400,7 +631,9 @@ fn column_statistics(
         } else {
             null_count as f64 / row_count as f64
         },
-        approximate_distinct_count,
+        null_count,
+        approximate_distinct_count: Some(approximate_distinct_count),
+        container_count: None,
     })
 }
 
@@ -509,8 +742,12 @@ fn classify_statistics_scan_error(
 mod tests {
     use std::{fs::File, sync::Arc};
 
-    use arrow_array::{ArrayRef, Int64Array, RecordBatch, StringArray};
-    use arrow_schema::{DataType, Field, Schema};
+    use arrow_array::{
+        Array, ArrayRef, Int64Array, ListArray, RecordBatch, StringArray, StructArray,
+        builder::{Int64Builder, MapBuilder, NullBufferBuilder, StringBuilder},
+        types::Int64Type,
+    };
+    use arrow_schema::{DataType, Field, Fields, Schema};
     use parquet::arrow::ArrowWriter;
     use tempfile::{NamedTempFile, tempdir};
 
@@ -524,13 +761,17 @@ mod tests {
             .expect("statistics reader should start");
 
         assert_eq!(
-            reader.fetch("value", true).expect("statistics should load"),
+            reader
+                .fetch(&FieldPath::from("value"), true)
+                .expect("statistics should load"),
             ColumnStatistics {
                 minimum: Some("2".to_owned()),
                 maximum: Some("7".to_owned()),
                 min_max_computed: true,
                 null_share: 0.25,
-                approximate_distinct_count: 2,
+                null_count: 1,
+                approximate_distinct_count: Some(2),
+                container_count: None,
             }
         );
     }
@@ -609,7 +850,9 @@ mod tests {
 
         assert_ne!(temporary_path.parent(), Some(source_parent.path()));
         assert!(temporary_path.exists());
-        statistics.fetch("value", true).expect("dataset statistics");
+        statistics
+            .fetch(&FieldPath::from("value"), true)
+            .expect("dataset statistics");
         assert_eq!(
             source.identity_check_count() - identity_checks,
             2,
@@ -640,14 +883,16 @@ mod tests {
 
         assert_eq!(
             reader
-                .fetch("odd\"name", false)
+                .fetch(&FieldPath::from("odd\"name"), false)
                 .expect("summary statistics should load"),
             ColumnStatistics {
                 minimum: None,
                 maximum: None,
                 min_max_computed: false,
                 null_share: 0.0,
-                approximate_distinct_count: 3,
+                null_count: 0,
+                approximate_distinct_count: Some(3),
+                container_count: None,
             }
         );
     }
@@ -660,11 +905,96 @@ mod tests {
 
         assert_eq!(
             reader
-                .fetch("odd\"name", true)
+                .fetch(&FieldPath::from("odd\"name"), true)
                 .expect("quoted identifier should load")
                 .approximate_distinct_count,
-            3
+            Some(3)
         );
+    }
+
+    #[test]
+    fn computes_nested_struct_list_length_and_map_pair_statistics() {
+        let source = write_nested_statistics_parquet();
+
+        let nested = ColumnStatisticsReader::new(source.path().to_owned())
+            .expect("nested statistics reader")
+            .fetch(&FieldPath::new(["profile", "score"]), true)
+            .expect("nested scalar statistics");
+        assert_eq!(
+            nested,
+            ColumnStatistics {
+                minimum: Some("2".to_owned()),
+                maximum: Some("7".to_owned()),
+                min_max_computed: true,
+                null_share: 0.25,
+                null_count: 1,
+                approximate_distinct_count: Some(2),
+                container_count: None,
+            }
+        );
+
+        let structure = ColumnStatisticsReader::new(source.path().to_owned())
+            .expect("struct statistics reader")
+            .fetch(&FieldPath::from("profile"), false)
+            .expect("addressable struct statistics");
+        assert_eq!(structure.null_count, 1);
+        assert_eq!(structure.null_share, 0.25);
+        assert!(!structure.min_max_computed);
+
+        let lists = ColumnStatisticsReader::new(source.path().to_owned())
+            .expect("list statistics reader")
+            .fetch(&FieldPath::from("tags"), false)
+            .expect("list length statistics");
+        assert_eq!(
+            lists.container_count,
+            Some(ContainerCountStatistics {
+                minimum: Some(0),
+                average: Some(5.0 / 3.0),
+                maximum: Some(3),
+                empty_count: 1,
+            })
+        );
+        assert_eq!(lists.null_count, 1);
+        assert_eq!(lists.approximate_distinct_count, None);
+        assert!(
+            serde_json::to_value(&lists).expect("list statistics wire")["approximateDistinctCount"]
+                .is_null()
+        );
+
+        let maps = ColumnStatisticsReader::new(source.path().to_owned())
+            .expect("map statistics reader")
+            .fetch(&FieldPath::from("attributes"), false)
+            .expect("map pair-count statistics");
+        assert_eq!(
+            maps.container_count,
+            Some(ContainerCountStatistics {
+                minimum: Some(0),
+                average: Some(1.0),
+                maximum: Some(2),
+                empty_count: 1,
+            })
+        );
+        assert_eq!(maps.null_count, 1);
+        assert_eq!(maps.approximate_distinct_count, None);
+    }
+
+    #[test]
+    fn computes_nested_statistics_for_a_dataset_staging_relation() {
+        let directory = tempdir().expect("dataset directory");
+        write_nested_statistics_parquet_to(&directory.path().join("part.parquet"));
+        let source = DatasetSource::open_folder(directory.path()).expect("dataset source");
+        let mut inspector = source.inspector();
+        inspector.advance(1).expect("dataset inspection");
+        let dataset = inspector.into_window_reader().expect("dataset reader");
+
+        let statistics = ColumnStatisticsReader::for_dataset(&dataset)
+            .expect("dataset statistics reader")
+            .fetch(&FieldPath::new(["profile", "score"]), true)
+            .expect("dataset nested statistics");
+
+        assert_eq!(statistics.minimum.as_deref(), Some("2"));
+        assert_eq!(statistics.maximum.as_deref(), Some("7"));
+        assert_eq!(statistics.null_count, 1);
     }
 
     #[test]
@@ -705,7 +1035,7 @@ mod tests {
         let interrupt = statistics.interrupt_handle();
 
         assert_eq!(
-            statistics.fetch_checked("value", true, || interrupt.interrupt()),
+            statistics.fetch_checked(&FieldPath::from("value"), true, || interrupt.interrupt()),
             Err(ColumnStatisticsError::QueryFailed)
         );
         assert!(dataset.member_snapshot(0).is_ok());
@@ -756,5 +1086,60 @@ mod tests {
             ArrowWriter::try_new(file, schema, None).expect("Parquet writer can be created");
         writer.write(&batch).expect("record batch can be written");
         writer.close().expect("Parquet footer can be written");
+    }
+
+    fn write_nested_statistics_parquet() -> NamedTempFile {
+        let source = NamedTempFile::new().expect("temporary nested statistics file");
+        write_nested_statistics_parquet_to(source.path());
+        source
+    }
+
+    fn write_nested_statistics_parquet_to(path: &std::path::Path) {
+        let profile_fields = Fields::from(vec![Field::new("score", DataType::Int64, false)]);
+        let mut profile_validity = NullBufferBuilder::new(4);
+        for valid in [true, false, true, true] {
+            profile_validity.append(valid);
+        }
+        let profile = StructArray::new(
+            profile_fields.clone(),
+            vec![Arc::new(Int64Array::from(vec![2, 99, 7, 2])) as ArrayRef],
+            profile_validity.finish(),
+        );
+        let tags = ListArray::from_iter_primitive::<Int64Type, _, _>(vec![
+            Some(vec![Some(1), Some(2)]),
+            Some(Vec::<Option<i64>>::new()),
+            None,
+            Some(vec![Some(3), Some(4), Some(5)]),
+        ]);
+        let mut attributes = MapBuilder::new(None, StringBuilder::new(), Int64Builder::new());
+        for (key, value) in [("a", 1), ("b", 2)] {
+            attributes.keys().append_value(key);
+            attributes.values().append_value(value);
+        }
+        attributes.append(true).expect("two-pair map");
+        attributes.append(true).expect("empty map");
+        attributes.append(false).expect("null map");
+        attributes.keys().append_value("c");
+        attributes.values().append_value(3);
+        attributes.append(true).expect("one-pair map");
+        let attributes = attributes.finish();
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("profile", DataType::Struct(profile_fields), true),
+            Field::new("tags", tags.data_type().clone(), true),
+            Field::new("attributes", attributes.data_type().clone(), true),
+        ]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(profile) as ArrayRef,
+                Arc::new(tags) as ArrayRef,
+                Arc::new(attributes) as ArrayRef,
+            ],
+        )
+        .expect("nested statistics record batch");
+        let file = File::create(path).expect("nested statistics file");
+        let mut writer = ArrowWriter::try_new(file, schema, None).expect("nested Parquet writer");
+        writer.write(&batch).expect("nested statistics batch");
+        writer.close().expect("nested statistics footer");
     }
 }

@@ -1,6 +1,18 @@
 import { TimeUnit, Type, type DataType } from "@uwdata/flechette";
 
-import type { DataFilter, SchemaField, SortColumn } from "../desktop";
+import type {
+  DataFilter,
+  FieldPath,
+  JsonValueType,
+  SchemaField,
+  SortColumn,
+} from "../desktop";
+import {
+  formatSqlFieldPath,
+  resolveSchemaField,
+  sameFieldPath,
+} from "./field-path";
+import { formatJsonFieldTarget } from "./json-path";
 
 export type ColumnFilterKind =
   "boolean" | "number" | "text" | "temporal" | "nullOnly";
@@ -19,6 +31,10 @@ export type TemporalFormat =
 
 const TEMPORAL_TYPE_PATTERN =
   /^(Time|Timestamp) \((milliseconds|microseconds|nanoseconds), (local|UTC)\)$/;
+
+export function isJsonField(field: SchemaField): boolean {
+  return field.physicalType !== "GROUP" && field.logicalType === "JSON";
+}
 
 export function columnFilterKind(field: SchemaField): ColumnFilterKind {
   if (field.physicalType === "GROUP") {
@@ -153,7 +169,7 @@ export function formatWhereClause(
 ): string {
   return filters
     .map((filter) => {
-      const field = schema[filter.columnIndex];
+      const field = resolveSchemaField(schema, filter.fieldPath);
       return field === undefined ? "" : formatFilterCondition(filter, field);
     })
     .filter((condition) => condition.length > 0)
@@ -161,19 +177,21 @@ export function formatWhereClause(
 }
 
 export function formatSelectClause(
-  sourceIndices: readonly number[],
+  fieldPaths: readonly FieldPath[],
   schema: readonly SchemaField[],
 ): string {
-  const fields = sourceIndices.flatMap((sourceIndex) => {
-    const field = schema[sourceIndex];
-    return field === undefined ? [] : [[sourceIndex, field] as const];
+  const fields = fieldPaths.flatMap((fieldPath) => {
+    const field = resolveSchemaField(schema, fieldPath);
+    return field === undefined ? [] : [[fieldPath, field] as const];
   });
   const identityProjection =
     fields.length === schema.length &&
-    fields.every(([sourceIndex], index) => sourceIndex === index);
+    fields.every(([fieldPath], index) =>
+      sameFieldPath(fieldPath, [schema[index]!.name]),
+    );
   return identityProjection
     ? "*"
-    : fields.map(([, field]) => quoteIdentifier(field.name)).join(", ");
+    : fields.map(([fieldPath]) => formatSqlFieldPath(fieldPath)).join(", ");
 }
 
 export function formatOrderByClause(
@@ -182,12 +200,16 @@ export function formatOrderByClause(
 ): string {
   return sort
     .map((column) => {
-      const field = schema[column.sourceIndex];
+      const field = resolveSchemaField(schema, column.fieldPath);
       if (field === undefined) {
         return "";
       }
       const direction = column.direction === "ascending" ? "ASC" : "DESC";
-      return `${quoteIdentifier(field.name)} ${direction}`;
+      const identifier =
+        column.jsonTarget === undefined
+          ? formatSqlFieldPath(column.fieldPath)
+          : formatJsonFieldTarget(column.fieldPath, column.jsonTarget.path);
+      return identifier + " " + direction;
     })
     .filter((condition) => condition.length > 0)
     .join(", ");
@@ -197,9 +219,17 @@ export function formatFilterCondition(
   filter: DataFilter,
   field: SchemaField,
 ): string {
-  const identifier = quoteIdentifier(field.name);
+  const identifier =
+    filter.jsonTarget === undefined
+      ? formatSqlFieldPath(filter.fieldPath)
+      : formatJsonFieldTarget(filter.fieldPath, filter.jsonTarget.path);
   const literal = (value: string | undefined) =>
-    formatFilterLiteral(value ?? "", field, identifier);
+    formatFilterLiteral(
+      value ?? "",
+      field,
+      identifier,
+      filter.jsonTarget?.valueType,
+    );
   switch (filter.operator) {
     case "equals":
       return `${identifier} = ${literal(filter.values[0])}`;
@@ -247,7 +277,17 @@ function formatFilterLiteral(
   value: string,
   field: SchemaField,
   identifier: string,
+  jsonValueType?: JsonValueType,
 ): string {
+  if (jsonValueType === "boolean") {
+    return value.toUpperCase();
+  }
+  if (jsonValueType === "number") {
+    return value;
+  }
+  if (jsonValueType === "text" || jsonValueType === "mixed") {
+    return quoteString(value);
+  }
   const logicalType = field.logicalType;
   if (logicalType?.startsWith("Date")) {
     return `DATE ${quoteString(value)}`;
@@ -269,10 +309,6 @@ function formatFilterLiteral(
     return value;
   }
   return quoteString(value);
-}
-
-function quoteIdentifier(identifier: string): string {
-  return `"${identifier.replaceAll('"', '""')}"`;
 }
 
 function quoteString(value: string): string {

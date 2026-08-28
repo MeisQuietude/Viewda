@@ -4,7 +4,7 @@ use arrow_array::{
     Array, ArrayRef, BooleanArray, Date32Array, Decimal128Array, Float16Array, Float32Array,
     Float64Array, Int32Array, Int64Array, ListArray, RecordBatch, StringArray, StructArray,
     Time64MicrosecondArray, TimestampMicrosecondArray, TimestampMillisecondArray,
-    TimestampNanosecondArray, types::Int32Type,
+    TimestampNanosecondArray, builder::NullBufferBuilder, types::Int32Type,
 };
 use arrow_ipc::reader::StreamReader;
 use arrow_schema::{DataType, Field, Fields, Schema, TimeUnit};
@@ -21,9 +21,12 @@ use parquet::{
 };
 use tempfile::{NamedTempFile, TempDir};
 use viewda_data_engine::{
-    DataFilter, DataFilterOperator, DataSort, DataSortDirection, DataViewBuilder, DataViewError,
-    DataWindowError, DataWindowReader, PreparedDataView, SchemaField, TextValueSuggestionsReader,
-    inspect_local_source,
+    ColumnStatisticsReader, DataFilter, DataFilterOperator, DataSort, DataSortDirection,
+    DataViewBuilder, DataViewError, DataViewMemoryLimit, DataWindowError, DataWindowReader,
+    DatasetSource, FieldPath, JSON_SCHEMA_SAMPLE_ARROW_BYTE_LIMIT, JSON_SCHEMA_SAMPLE_ROW_LIMIT,
+    JSON_SCHEMA_SAMPLE_VALUE_CHARACTER_LIMIT, JsonFieldTarget, JsonObservedType, JsonPath,
+    JsonPathSegment, JsonValueType, PreparedDataView, TextValueSuggestionsReader,
+    infer_json_schema_from_arrow, inspect_local_source,
 };
 
 #[test]
@@ -96,6 +99,300 @@ fn preserves_nested_values_in_the_arrow_window() {
 }
 
 #[test]
+fn projects_filters_sorts_and_statistics_with_parent_and_leaf_nulls() {
+    let source = write_addressable_nested_parquet();
+    let city = FieldPath::new(["profile.with.dot", "city\"name"]);
+    let postal = FieldPath::new(["profile.with.dot", "address", "postal.code"]);
+    let id = path("id");
+    let mut reader = DataWindowReader::new(source.path().to_owned());
+
+    let projected = decode(
+        reader
+            .fetch_fields(0, 8, &[postal.clone(), city.clone(), id.clone()])
+            .expect("nested projection"),
+    );
+    let batch = &projected[0];
+    assert_eq!(
+        batch
+            .schema()
+            .fields()
+            .iter()
+            .map(|field| (field.name().as_str(), field.is_nullable()))
+            .collect::<Vec<_>>(),
+        [("postal.code", true), ("city\"name", true), ("id", true)]
+    );
+    assert_eq!(
+        optional_int32_values(batch, 0),
+        [Some(100), None, None, Some(400)]
+    );
+    assert_eq!(
+        string_values(batch, 1),
+        [Some("A"), None, Some("C"), Some("D")]
+    );
+
+    let filtered = prepare_view(
+        source.path(),
+        &[DataFilter {
+            field_path: postal.clone(),
+            json_target: None,
+            operator: DataFilterOperator::IsNull,
+            values: Vec::new(),
+            match_case: false,
+        }],
+        &[],
+    )
+    .expect("nested null filter");
+    let filtered = decode(
+        filtered
+            .fetch_window_fields(0, 8, std::slice::from_ref(&id))
+            .expect("filtered nested projection"),
+    );
+    assert_eq!(int64_values(&filtered[0], 0), [2, 3]);
+
+    let non_null = prepare_view(
+        source.path(),
+        &[DataFilter {
+            field_path: postal.clone(),
+            json_target: None,
+            operator: DataFilterOperator::IsNotNull,
+            values: Vec::new(),
+            match_case: false,
+        }],
+        &[],
+    )
+    .expect("nested non-null filter");
+    let non_null = decode(
+        non_null
+            .fetch_window_fields(0, 8, std::slice::from_ref(&id))
+            .expect("non-null nested projection"),
+    );
+    assert_eq!(int64_values(&non_null[0], 0), [1, 4]);
+
+    let statistics = ColumnStatisticsReader::new(source.path().to_owned())
+        .expect("nested statistics reader")
+        .fetch(&postal, true)
+        .expect("nullable leaf statistics");
+    assert_eq!(statistics.null_count, 2);
+    assert_eq!(statistics.null_share, 0.5);
+    assert_eq!(statistics.minimum.as_deref(), Some("100"));
+    assert_eq!(statistics.maximum.as_deref(), Some("400"));
+    assert_eq!(statistics.approximate_distinct_count, Some(2));
+
+    let sorted = prepare_view(
+        source.path(),
+        &[],
+        &[DataSort {
+            field_path: postal.clone(),
+            json_target: None,
+            direction: DataSortDirection::Ascending,
+        }],
+    )
+    .expect("nested sort");
+    let sorted = decode(
+        sorted
+            .fetch_window_fields(0, 8, &[id, city, postal])
+            .expect("sorted nested projection"),
+    );
+    assert_eq!(int64_values(&sorted[0], 0), [1, 4, 2, 3]);
+    assert_eq!(
+        string_values(&sorted[0], 1),
+        [Some("A"), Some("D"), None, Some("C")]
+    );
+}
+
+#[test]
+fn projects_filters_sorts_and_counts_an_empty_named_struct_child() {
+    let source = write_empty_named_struct_child_parquet();
+    let paths = [
+        FieldPath::new(["union_value", ""]),
+        FieldPath::new(["union_value", "number"]),
+        FieldPath::new(["union_value", "text"]),
+    ];
+    let filters = [DataFilter {
+        field_path: paths[0].clone(),
+        json_target: None,
+        operator: DataFilterOperator::GreaterThan,
+        values: vec!["5".to_owned()],
+        match_case: false,
+    }];
+    let sort = [DataSort {
+        field_path: paths[0].clone(),
+        json_target: None,
+        direction: DataSortDirection::Descending,
+    }];
+    let mut reader = DataWindowReader::new(source.path().to_owned());
+    let direct = decode(
+        reader
+            .fetch_fields(0, 8, &paths)
+            .expect("direct empty-name projection"),
+    )
+    .remove(0);
+    assert_eq!(
+        optional_int32_values(&direct, 0),
+        [Some(7), Some(3), Some(9)]
+    );
+    assert_eq!(
+        optional_int32_values(&direct, 1),
+        [Some(42), Some(10), Some(99)]
+    );
+    assert_eq!(
+        string_values(&direct, 2),
+        [Some("answer"), Some("ten"), Some("ninety-nine")]
+    );
+
+    let filtered_view =
+        prepare_view(source.path(), &filters, &[]).expect("filtered empty-name view");
+    let filtered = decode(
+        filtered_view
+            .fetch_window_fields(0, 8, &paths)
+            .expect("filtered empty-name projection"),
+    )
+    .remove(0);
+    assert_eq!(optional_int32_values(&filtered, 0), [Some(7), Some(9)]);
+
+    let sorted_view = prepare_view(source.path(), &[], &sort).expect("sorted empty-name view");
+    let sorted = decode(
+        sorted_view
+            .fetch_window_fields(0, 8, &paths)
+            .expect("sorted empty-name projection"),
+    )
+    .remove(0);
+    assert_eq!(
+        optional_int32_values(&sorted, 0),
+        [Some(9), Some(7), Some(3)]
+    );
+    assert_eq!(
+        optional_int32_values(&sorted, 1),
+        [Some(99), Some(42), Some(10)]
+    );
+    assert_eq!(
+        string_values(&sorted, 2),
+        [Some("ninety-nine"), Some("answer"), Some("ten")]
+    );
+
+    let statistics = ColumnStatisticsReader::new(source.path().to_owned())
+        .expect("empty-name statistics reader")
+        .fetch(&paths[0], true)
+        .expect("empty-name statistics");
+    assert_eq!(statistics.minimum.as_deref(), Some("3"));
+    assert_eq!(statistics.maximum.as_deref(), Some("9"));
+    assert_eq!(statistics.approximate_distinct_count, Some(3));
+}
+
+#[test]
+fn keeps_same_named_leaves_correlated_across_file_and_dataset_views() {
+    let source = write_addressable_nested_parquet();
+    let paths = [
+        FieldPath::new(["profile.with.dot", "city\"name"]),
+        FieldPath::new(["alternate", "city\"name"]),
+    ];
+    let mut reader = DataWindowReader::new(source.path().to_owned());
+    let direct_file = decode(
+        reader
+            .fetch_fields(0, 8, &paths)
+            .expect("direct file same-named leaves"),
+    )
+    .remove(0);
+    let file_view = DataViewBuilder::new(source.path().to_owned(), &[], &[])
+        .expect("file view builder")
+        .build()
+        .expect("file view");
+    let prepared_file = decode(
+        file_view
+            .fetch_window_fields(0, 8, &paths)
+            .expect("prepared file same-named leaves"),
+    )
+    .remove(0);
+
+    let directory = TempDir::new().expect("dataset directory");
+    fs::copy(source.path(), directory.path().join("part.parquet")).expect("dataset fixture member");
+    let dataset_source = DatasetSource::open_folder(directory.path()).expect("dataset source");
+    let mut inspector = dataset_source.inspector();
+    inspector.advance(1).expect("dataset inspection");
+    let mut dataset = inspector.into_window_reader().expect("dataset reader");
+    let direct_dataset = decode(
+        dataset
+            .fetch_fields(0, 8, &paths)
+            .expect("direct dataset same-named leaves"),
+    )
+    .remove(0);
+    let dataset_view = DataViewBuilder::for_dataset(&dataset, &[], &[], DataViewMemoryLimit::Mb384)
+        .expect("dataset view builder")
+        .build()
+        .expect("dataset view");
+    let prepared_dataset = decode(
+        dataset_view
+            .fetch_window_fields(0, 8, &paths)
+            .expect("prepared dataset same-named leaves"),
+    )
+    .remove(0);
+
+    for batch in [
+        &direct_file,
+        &prepared_file,
+        &direct_dataset,
+        &prepared_dataset,
+    ] {
+        assert_eq!(
+            batch
+                .schema()
+                .fields()
+                .iter()
+                .map(|field| field.name().as_str())
+                .collect::<Vec<_>>(),
+            ["city\"name", "city\"name"]
+        );
+        assert_eq!(
+            string_values(batch, 0),
+            [Some("A"), None, Some("C"), Some("D")]
+        );
+        assert_eq!(
+            string_values(batch, 1),
+            [Some("W"), Some("X"), Some("Y"), Some("Z")]
+        );
+    }
+}
+
+#[test]
+fn rejects_paths_that_traverse_list_elements() {
+    let source = write_nested_parquet();
+    let mut reader = DataWindowReader::new(source.path().to_owned());
+
+    assert_eq!(
+        reader.fetch_fields(0, 1, &[FieldPath::new(["tags", "element"])]),
+        Err(DataWindowError::Unsupported)
+    );
+}
+
+#[test]
+fn duplicate_top_level_names_remain_readable_only_without_path_projection() {
+    let source = write_duplicate_name_parquet();
+    let mut reader = DataWindowReader::new(source.path().to_owned());
+
+    let batch = decode(
+        reader
+            .fetch(0, 1)
+            .expect("unprojected duplicate-name window"),
+    )
+    .remove(0);
+    assert_eq!(batch.num_columns(), 3);
+    assert_eq!(int32_value(&batch, 0), 11);
+    assert_eq!(int32_value(&batch, 1), 22);
+    assert_eq!(int32_value(&batch, 2), 33);
+    let projected = decode(
+        reader
+            .fetch_fields(0, 1, &[FieldPath::from("payload")])
+            .expect("unambiguous projection after duplicate columns"),
+    )
+    .remove(0);
+    assert_eq!(int32_value(&projected, 0), 33);
+    assert_eq!(
+        reader.fetch_fields(0, 1, &[FieldPath::from("duplicate")]),
+        Err(DataWindowError::Unsupported)
+    );
+}
+
+#[test]
 fn preserves_decimal128_integer_digits_across_the_arrow_window() {
     let source = write_decimal128_parquet();
     let mut reader = DataWindowReader::new(source.path().to_owned());
@@ -134,7 +431,17 @@ fn projects_five_columns_from_a_ten_thousand_column_source_in_requested_order() 
 
     let batches = decode(
         reader
-            .fetch_columns(1, 1, &[9_999, 0, 5_000, 42, 7_000])
+            .fetch_fields(
+                1,
+                1,
+                &[
+                    path("c09999"),
+                    path("c00000"),
+                    path("c05000"),
+                    path("c00042"),
+                    path("c07000"),
+                ],
+            )
             .expect("projected wide window"),
     );
     let batch = &batches[0];
@@ -158,6 +465,53 @@ fn projects_five_columns_from_a_ten_thousand_column_source_in_requested_order() 
 }
 
 #[test]
+fn projects_and_validates_deep_and_wide_struct_paths() {
+    let source = write_deep_and_wide_struct_parquet();
+    let mut reader = DataWindowReader::new(source.path().to_owned());
+    let deep = FieldPath::new([
+        "deep", "level1", "level2", "level3", "level4", "level5", "level6", "value",
+    ]);
+    let first = FieldPath::new(["wide", "field000"]);
+    let middle = FieldPath::new(["wide", "field050"]);
+    let last = FieldPath::new(["wide", "field099"]);
+
+    let batch = decode(
+        reader
+            .fetch_fields(1, 1, &[last, deep.clone(), middle, first])
+            .expect("deep and wide struct projection"),
+    )
+    .remove(0);
+    assert_eq!(
+        batch
+            .schema()
+            .fields()
+            .iter()
+            .map(|field| field.name().as_str())
+            .collect::<Vec<_>>(),
+        ["field099", "value", "field050", "field000"]
+    );
+    assert_eq!(int32_value(&batch, 0), 1_099);
+    assert_eq!(int64_values(&batch, 1), [9]);
+    assert_eq!(int32_value(&batch, 2), 1_050);
+    assert_eq!(int32_value(&batch, 3), 1_000);
+
+    assert_eq!(
+        reader.fetch_fields(
+            0,
+            1,
+            &[FieldPath::new([
+                "deep", "level1", "level2", "level3", "level4", "level5", "missing", "value",
+            ])],
+        ),
+        Err(DataWindowError::Unsupported)
+    );
+    assert_eq!(
+        reader.fetch_fields(0, 1, &[FieldPath::new(["wide", "field100"])]),
+        Err(DataWindowError::Unsupported)
+    );
+}
+
+#[test]
 fn projects_a_column_whose_name_exceeds_the_wire_summary_limit() {
     let column_name = format!("long_{}", "界".repeat(100));
     let source = write_named_parquet(&column_name);
@@ -165,7 +519,7 @@ fn projects_a_column_whose_name_exceeds_the_wire_summary_limit() {
 
     let batches = decode(
         reader
-            .fetch_columns(0, 1, &[0])
+            .fetch_fields(0, 1, &[FieldPath::new(vec![column_name.clone()])])
             .expect("query schema keeps the complete column name"),
     );
 
@@ -181,7 +535,7 @@ fn projected_direct_windows_preserve_deep_file_order_and_unusual_names() {
     let full = decode(reader.fetch(6, 2).expect("full deep window"));
     let projected = decode(
         reader
-            .fetch_columns(6, 2, &[1, 0])
+            .fetch_fields(6, 2, &[path("select"), path("id\"quoted")])
             .expect("projected deep window"),
     );
     let projected = &projected[0];
@@ -193,13 +547,97 @@ fn projected_direct_windows_preserve_deep_file_order_and_unusual_names() {
 }
 
 #[test]
+fn reordered_top_level_projection_matches_a_full_deep_window() {
+    let (_directory, source) = write_duckdb_nested_sort_parquet();
+    let mut reader = DataWindowReader::new(source);
+
+    let full = decode(reader.fetch(8_150, 100).expect("full deep window")).remove(0);
+    let projected = decode(
+        reader
+            .fetch_fields(8_150, 100, &[path("list_value"), path("file_order")])
+            .expect("reordered top-level deep window"),
+    )
+    .remove(0);
+
+    assert_eq!(projected.num_rows(), 100);
+    assert_eq!(
+        projected
+            .schema()
+            .fields()
+            .iter()
+            .map(|field| field.name().as_str())
+            .collect::<Vec<_>>(),
+        ["list_value", "file_order"]
+    );
+    assert_eq!(projected.column(0).to_data(), full.column(2).to_data());
+    assert_eq!(int64_values(&projected, 1), int64_values(&full, 0));
+}
+
+#[test]
+fn projected_windows_treat_file_row_number_as_data_and_keep_empty_boundaries() {
+    let source = write_file_row_number_parquet();
+    let mut reader = DataWindowReader::new(source.path().to_owned());
+    let payload = path("payload");
+
+    let batch = decode(
+        reader
+            .fetch_fields(1, 1, std::slice::from_ref(&payload))
+            .expect("projected window after the first row"),
+    )
+    .remove(0);
+    assert_eq!(string_values(&batch, 0), [Some("row-1")]);
+
+    for (offset, count) in [(1, 0), (100, 2)] {
+        let bytes = reader
+            .fetch_fields(offset, count, std::slice::from_ref(&payload))
+            .expect("empty projected window");
+        let stream = StreamReader::try_new(Cursor::new(bytes), None).expect("Arrow IPC stream");
+        assert_eq!(stream.schema().field(0).name(), "payload");
+        assert_eq!(stream.count(), 0, "window at offset {offset}");
+    }
+}
+
+#[test]
+fn projected_windows_keep_empty_schema_and_cross_row_group_order() {
+    let empty_source = write_empty_projected_parquet();
+    let mut empty_reader = DataWindowReader::new(empty_source.path().to_owned());
+    let empty_bytes = empty_reader
+        .fetch_fields(0, 4, &[path("file_order")])
+        .expect("zero-row projected window");
+    let empty = StreamReader::try_new(Cursor::new(empty_bytes), None).expect("Arrow IPC stream");
+    assert_eq!(empty.schema().field(0).name(), "file_order");
+    assert_eq!(empty.count(), 0);
+
+    let grouped_source = write_multi_group_parquet();
+    let mut grouped_reader = DataWindowReader::new(grouped_source.path().to_owned());
+    let batch = decode(
+        grouped_reader
+            .fetch_fields(3, 4, &[path("file_order")])
+            .expect("projected window across a row-group boundary"),
+    )
+    .remove(0);
+    assert_eq!(batch.num_rows(), 4);
+    assert_eq!(int64_values(&batch, 0), [3, 4, 5, 6]);
+}
+
+#[test]
 fn identity_projection_keeps_the_direct_window_wire_format() {
     let source = write_basic_parquet();
     let mut reader = DataWindowReader::new(source.path().to_owned());
 
     let full = reader.fetch(2, 3).expect("full window");
     let identity = reader
-        .fetch_columns(2, 3, &[0, 1, 2, 3, 4])
+        .fetch_fields(
+            2,
+            3,
+            &[
+                path("id\"quoted"),
+                path("select"),
+                path("active"),
+                path("day"),
+                path("score"),
+            ],
+        )
         .expect("identity-projected window");
 
     assert_eq!(identity, full);
@@ -211,15 +649,15 @@ fn rejects_invalid_direct_projections() {
     let mut reader = DataWindowReader::new(source.path().to_owned());
 
     assert_eq!(
-        reader.fetch_columns(0, 1, &[]),
+        reader.fetch_fields(0, 1, &[]),
         Err(DataWindowError::Unsupported)
     );
     assert_eq!(
-        reader.fetch_columns(0, 1, &[1, 1]),
+        reader.fetch_fields(0, 1, &[path("select"), path("select")]),
         Err(DataWindowError::Unsupported)
     );
     assert_eq!(
-        reader.fetch_columns(0, 1, &[5]),
+        reader.fetch_fields(0, 1, &[path("missing")]),
         Err(DataWindowError::Unsupported)
     );
 }
@@ -234,7 +672,7 @@ fn maps_a_damaged_parquet_source_to_a_typed_error() {
     assert!(matches!(
         prepare_view(
             source.path(),
-            &[filter(0, DataFilterOperator::Equals, &["10"])],
+            &[filter("id\"quoted", DataFilterOperator::Equals, &["10"])],
             &[],
         ),
         Err(DataViewError::Engine(DataWindowError::CorruptSource))
@@ -248,7 +686,7 @@ fn rejects_an_unbounded_window_before_querying_duckdb() {
 
     assert_eq!(reader.fetch(0, 513), Err(DataWindowError::WindowTooLarge));
     assert_eq!(
-        reader.fetch_columns(0, 513, &[0]),
+        reader.fetch_fields(0, 513, &[path("id\"quoted")]),
         Err(DataWindowError::WindowTooLarge)
     );
 }
@@ -267,90 +705,108 @@ fn accepts_a_window_at_the_row_limit() {
 fn applies_every_operator_to_supported_scalar_types() {
     let source = write_basic_parquet();
     let cases = [
-        (filter(0, DataFilterOperator::Equals, &["12"]), vec![12]),
         (
-            filter(0, DataFilterOperator::NotEquals, &["12"]),
-            vec![10, 11, 13, 14, 15, 16, 17],
-        ),
-        (
-            filter(0, DataFilterOperator::GreaterThan, &["12"]),
-            vec![13, 14, 15, 16, 17],
-        ),
-        (
-            filter(0, DataFilterOperator::GreaterThanOrEqual, &["12"]),
-            vec![12, 13, 14, 15, 16, 17],
-        ),
-        (
-            filter(0, DataFilterOperator::LessThan, &["12"]),
-            vec![10, 11],
-        ),
-        (
-            filter(0, DataFilterOperator::LessThanOrEqual, &["12"]),
-            vec![10, 11, 12],
-        ),
-        (
-            filter(0, DataFilterOperator::OneOf, &["11", "14"]),
-            vec![11, 14],
-        ),
-        (
-            filter(0, DataFilterOperator::Range, &["12", "14"]),
-            vec![12, 13, 14],
-        ),
-        (filter(4, DataFilterOperator::IsNull, &[]), vec![15]),
-        (
-            filter(4, DataFilterOperator::IsNotNull, &[]),
-            vec![10, 11, 12, 13, 14, 16, 17],
-        ),
-        (filter(1, DataFilterOperator::Equals, &["row-2"]), vec![12]),
-        (
-            filter(1, DataFilterOperator::NotEquals, &["row-2"]),
-            vec![10, 13, 14, 15, 16, 17],
-        ),
-        (
-            filter(1, DataFilterOperator::OneOf, &["row-2", "row-4"]),
-            vec![12, 14],
-        ),
-        (
-            filter(1, DataFilterOperator::TextContains, &["row-"]),
-            vec![10, 12, 13, 14, 15, 16, 17],
-        ),
-        (filter(1, DataFilterOperator::IsNull, &[]), vec![11]),
-        (
-            filter(1, DataFilterOperator::IsNotNull, &[]),
-            vec![10, 12, 13, 14, 15, 16, 17],
-        ),
-        (
-            filter(2, DataFilterOperator::Equals, &["true"]),
-            vec![10, 12, 14, 16],
-        ),
-        (
-            filter(2, DataFilterOperator::NotEquals, &["true"]),
-            vec![11, 13, 15],
-        ),
-        (filter(2, DataFilterOperator::IsNull, &[]), vec![17]),
-        (
-            filter(2, DataFilterOperator::IsNotNull, &[]),
-            vec![10, 11, 12, 13, 14, 15, 16],
-        ),
-        (
-            filter(3, DataFilterOperator::Equals, &["1970-01-03"]),
+            filter("id\"quoted", DataFilterOperator::Equals, &["12"]),
             vec![12],
         ),
         (
-            filter(3, DataFilterOperator::NotEquals, &["1970-01-03"]),
-            vec![10, 11, 13, 14, 15, 17],
+            filter("id\"quoted", DataFilterOperator::NotEquals, &["12"]),
+            vec![10, 11, 13, 14, 15, 16, 17],
         ),
         (
-            filter(3, DataFilterOperator::OneOf, &["1970-01-02", "1970-01-05"]),
+            filter("id\"quoted", DataFilterOperator::GreaterThan, &["12"]),
+            vec![13, 14, 15, 16, 17],
+        ),
+        (
+            filter(
+                "id\"quoted",
+                DataFilterOperator::GreaterThanOrEqual,
+                &["12"],
+            ),
+            vec![12, 13, 14, 15, 16, 17],
+        ),
+        (
+            filter("id\"quoted", DataFilterOperator::LessThan, &["12"]),
+            vec![10, 11],
+        ),
+        (
+            filter("id\"quoted", DataFilterOperator::LessThanOrEqual, &["12"]),
+            vec![10, 11, 12],
+        ),
+        (
+            filter("id\"quoted", DataFilterOperator::OneOf, &["11", "14"]),
             vec![11, 14],
         ),
         (
-            filter(3, DataFilterOperator::Range, &["1970-01-03", "1970-01-05"]),
+            filter("id\"quoted", DataFilterOperator::Range, &["12", "14"]),
             vec![12, 13, 14],
         ),
-        (filter(3, DataFilterOperator::IsNull, &[]), vec![16]),
+        (filter("score", DataFilterOperator::IsNull, &[]), vec![15]),
         (
-            filter(3, DataFilterOperator::IsNotNull, &[]),
+            filter("score", DataFilterOperator::IsNotNull, &[]),
+            vec![10, 11, 12, 13, 14, 16, 17],
+        ),
+        (
+            filter("select", DataFilterOperator::Equals, &["row-2"]),
+            vec![12],
+        ),
+        (
+            filter("select", DataFilterOperator::NotEquals, &["row-2"]),
+            vec![10, 13, 14, 15, 16, 17],
+        ),
+        (
+            filter("select", DataFilterOperator::OneOf, &["row-2", "row-4"]),
+            vec![12, 14],
+        ),
+        (
+            filter("select", DataFilterOperator::TextContains, &["row-"]),
+            vec![10, 12, 13, 14, 15, 16, 17],
+        ),
+        (filter("select", DataFilterOperator::IsNull, &[]), vec![11]),
+        (
+            filter("select", DataFilterOperator::IsNotNull, &[]),
+            vec![10, 12, 13, 14, 15, 16, 17],
+        ),
+        (
+            filter("active", DataFilterOperator::Equals, &["true"]),
+            vec![10, 12, 14, 16],
+        ),
+        (
+            filter("active", DataFilterOperator::NotEquals, &["true"]),
+            vec![11, 13, 15],
+        ),
+        (filter("active", DataFilterOperator::IsNull, &[]), vec![17]),
+        (
+            filter("active", DataFilterOperator::IsNotNull, &[]),
+            vec![10, 11, 12, 13, 14, 15, 16],
+        ),
+        (
+            filter("day", DataFilterOperator::Equals, &["1970-01-03"]),
+            vec![12],
+        ),
+        (
+            filter("day", DataFilterOperator::NotEquals, &["1970-01-03"]),
+            vec![10, 11, 13, 14, 15, 17],
+        ),
+        (
+            filter(
+                "day",
+                DataFilterOperator::OneOf,
+                &["1970-01-02", "1970-01-05"],
+            ),
+            vec![11, 14],
+        ),
+        (
+            filter(
+                "day",
+                DataFilterOperator::Range,
+                &["1970-01-03", "1970-01-05"],
+            ),
+            vec![12, 13, 14],
+        ),
+        (filter("day", DataFilterOperator::IsNull, &[]), vec![16]),
+        (
+            filter("day", DataFilterOperator::IsNotNull, &[]),
             vec![10, 11, 12, 13, 14, 15, 17],
         ),
     ];
@@ -416,11 +872,42 @@ fn applies_text_operators_case_insensitively_unless_match_case_is_enabled() {
 }
 
 #[test]
+fn applies_nested_text_operators_to_a_dotted_path_segment() {
+    let source = write_addressable_nested_parquet();
+    let field_path = FieldPath::new(["profile.with.dot", "city\"name"]);
+    let id = path("id");
+
+    for (operator, value, expected) in [
+        (DataFilterOperator::TextContains, "c", vec![3]),
+        (DataFilterOperator::StartsWith, "d", vec![4]),
+    ] {
+        let view = prepare_view(
+            source.path(),
+            &[DataFilter {
+                field_path: field_path.clone(),
+                json_target: None,
+                operator,
+                values: vec![value.to_owned()],
+                match_case: false,
+            }],
+            &[],
+        )
+        .expect("nested text-filtered view");
+        let rows = decode(
+            view.fetch_window_fields(0, 8, std::slice::from_ref(&id))
+                .expect("nested text-filtered window"),
+        );
+
+        assert_eq!(int64_values(&rows[0], 0), expected);
+    }
+}
+
+#[test]
 fn empty_string_equals_matches_empty_cells_but_not_nulls() {
     let source = write_text_parquet(vec![Some(String::new()), None, Some("value".to_owned())]);
     let view = prepare_view(
         source.path(),
-        &[filter(0, DataFilterOperator::Equals, &[""])],
+        &[filter("label", DataFilterOperator::Equals, &[""])],
         &[],
     )
     .expect("empty-string filtered view");
@@ -442,13 +929,9 @@ fn suggests_distinct_substring_matches_with_a_fixed_cap() {
     ]);
     let source = write_text_parquet(values);
 
-    let suggestions = fetch_text_suggestions(
-        source.path(),
-        "PHA",
-        &text_schema_field(),
-        DataFilterOperator::Equals,
-    )
-    .expect("suggestions");
+    let suggestions =
+        fetch_text_suggestions(source.path(), "PHA", "label", DataFilterOperator::Equals)
+            .expect("suggestions");
 
     assert_eq!(suggestions.values.len(), 20);
     assert!(suggestions.is_partial);
@@ -476,7 +959,7 @@ fn equals_and_not_equals_suggest_uuid_values_by_middle_fragments() {
     let uuid = &summary.schema[1];
 
     for operator in [DataFilterOperator::Equals, DataFilterOperator::NotEquals] {
-        let suggestions = fetch_text_suggestions(source.path(), "E89B-12D3", uuid, operator)
+        let suggestions = fetch_text_suggestions(source.path(), "E89B-12D3", &uuid.name, operator)
             .expect("UUID suggestions");
 
         assert_eq!(
@@ -503,8 +986,7 @@ fn positional_operators_keep_their_input_positions() {
         (DataFilterOperator::EndsWith, "bet", vec!["Alphabet"]),
     ] {
         let suggestions =
-            fetch_text_suggestions(source.path(), input, &text_schema_field(), operator)
-                .expect("suggestions");
+            fetch_text_suggestions(source.path(), input, "label", operator).expect("suggestions");
 
         assert_eq!(suggestions.values, expected);
         assert!(!suggestions.is_partial);
@@ -517,13 +999,9 @@ fn finds_a_match_beyond_ten_thousand_rows() {
     values.push(Some("late".to_owned()));
     let source = write_text_parquet(values);
 
-    let suggestions = fetch_text_suggestions(
-        source.path(),
-        "late",
-        &text_schema_field(),
-        DataFilterOperator::Equals,
-    )
-    .expect("suggestions");
+    let suggestions =
+        fetch_text_suggestions(source.path(), "late", "label", DataFilterOperator::Equals)
+            .expect("suggestions");
 
     assert_eq!(suggestions.values, ["late"]);
     assert!(!suggestions.is_partial);
@@ -537,13 +1015,9 @@ fn marks_a_suggestion_scan_complete_when_the_column_ends_before_twenty_matches()
         None,
     ]);
 
-    let suggestions = fetch_text_suggestions(
-        source.path(),
-        "",
-        &text_schema_field(),
-        DataFilterOperator::Equals,
-    )
-    .expect("suggestions");
+    let suggestions =
+        fetch_text_suggestions(source.path(), "", "label", DataFilterOperator::Equals)
+            .expect("suggestions");
 
     assert_eq!(suggestions.values, vec!["Alpha", "Beta"]);
     assert!(!suggestions.is_partial);
@@ -559,12 +1033,7 @@ fn cancels_text_value_suggestions_before_scanning() {
     interrupt.interrupt();
 
     assert_eq!(
-        reader.fetch(
-            "",
-            &text_schema_field(),
-            DataFilterOperator::Equals,
-            &interrupt,
-        ),
+        reader.fetch("", &path("label"), DataFilterOperator::Equals, &interrupt,),
         Err(DataWindowError::Cancelled)
     );
 }
@@ -572,21 +1041,12 @@ fn cancels_text_value_suggestions_before_scanning() {
 fn fetch_text_suggestions(
     source_path: &std::path::Path,
     input: &str,
-    column: &SchemaField,
+    column_name: &str,
     operator: DataFilterOperator,
 ) -> Result<viewda_data_engine::TextValueSuggestions, DataWindowError> {
     let reader = TextValueSuggestionsReader::new(source_path.to_owned())?;
     let interrupt = reader.interrupt_handle();
-    reader.fetch(input, column, operator, &interrupt)
-}
-
-fn text_schema_field() -> SchemaField {
-    SchemaField {
-        name: "label".to_owned(),
-        physical_type: "BYTE_ARRAY".to_owned(),
-        logical_type: Some("String".to_owned()),
-        children: Vec::new(),
-    }
+    reader.fetch(input, &path(column_name), operator, &interrupt)
 }
 
 #[test]
@@ -598,15 +1058,12 @@ fn applies_numeric_comparisons_to_each_numeric_storage_type() {
         (DataFilterOperator::LessThan, &[10, 11, 12][..]),
         (DataFilterOperator::LessThanOrEqual, &[10, 11, 12, 13][..]),
     ];
+    let column_names = ["id", "integer", "float", "double", "decimal", "half"];
 
-    for column_index in 1..=5 {
+    for (column_index, column_name) in column_names.iter().enumerate().skip(1) {
         for (operator, expected) in cases {
-            let view = prepare_view(
-                source.path(),
-                &[filter(column_index, operator, &["2"])],
-                &[],
-            )
-            .expect("filtered numeric view");
+            let view = prepare_view(source.path(), &[filter(column_name, operator, &["2"])], &[])
+                .expect("filtered numeric view");
             let batches = decode(view.fetch_window(0, 32).expect("filtered numeric window"));
 
             assert_eq!(
@@ -624,7 +1081,7 @@ fn filters_uuid_and_json_columns_as_text() {
     let cases = [
         (
             filter(
-                1,
+                "uuid_value",
                 DataFilterOperator::Equals,
                 &["123e4567-e89b-12d3-a456-426614174001"],
             ),
@@ -632,7 +1089,7 @@ fn filters_uuid_and_json_columns_as_text() {
         ),
         (
             filter(
-                1,
+                "uuid_value",
                 DataFilterOperator::OneOf,
                 &[
                     "123e4567-e89b-12d3-a456-426614174000",
@@ -642,11 +1099,11 @@ fn filters_uuid_and_json_columns_as_text() {
             vec![1, 3],
         ),
         (
-            filter(1, DataFilterOperator::TextContains, &["e89b"]),
+            filter("uuid_value", DataFilterOperator::TextContains, &["e89b"]),
             vec![1, 2],
         ),
         (
-            filter(2, DataFilterOperator::TextContains, &["beta"]),
+            filter("json_value", DataFilterOperator::TextContains, &["beta"]),
             vec![2],
         ),
     ];
@@ -663,13 +1120,666 @@ fn filters_uuid_and_json_columns_as_text() {
 }
 
 #[test]
+fn manual_json_path_works_when_the_path_appears_after_the_schema_sample() {
+    let mut values = vec![r#"{"known":1}"#.to_owned(); JSON_SCHEMA_SAMPLE_ROW_LIMIT as usize];
+    values.push(r#"{"late":"found"}"#.to_owned());
+    let source = write_json_path_parquet(&values);
+    let summary = inspect_local_source(source.path()).expect("JSON source summary");
+    let mut reader = DataWindowReader::new(source.path().to_owned());
+    let sample = reader
+        .fetch_json_schema_sample(&path("payload"))
+        .expect("JSON sample window");
+    let inferred = infer_json_schema_from_arrow(&summary.schema[1], &sample, summary.row_count)
+        .expect("sampled JSON schema");
+
+    assert!(inferred.is_sample_derived);
+    assert_eq!(inferred.sample_row_limit, JSON_SCHEMA_SAMPLE_ROW_LIMIT);
+    assert_eq!(inferred.sampled_row_count, JSON_SCHEMA_SAMPLE_ROW_LIMIT);
+    assert!(inferred.has_more_rows);
+    assert!(
+        inferred
+            .nodes
+            .iter()
+            .all(|node| { node.segment != JsonPathSegment::Field("late".to_owned()) })
+    );
+
+    let filtered = prepare_view(
+        source.path(),
+        &[json_filter(
+            JsonPath::new([JsonPathSegment::Field("late".to_owned())]),
+            JsonValueType::Text,
+            DataFilterOperator::Equals,
+            &["found"],
+        )],
+        &[],
+    )
+    .expect("manual path filter");
+    let rows = decode(
+        filtered
+            .fetch_window_fields(0, 8, &[path("id")])
+            .expect("manual path result"),
+    );
+    assert_eq!(int64_values(&rows[0], 0), [512]);
+}
+
+#[test]
+fn json_schema_sample_bounds_arrow_output_for_oversized_values() {
+    let oversized = format!(
+        r#"{{"large":"{}"}}"#,
+        "x".repeat(JSON_SCHEMA_SAMPLE_VALUE_CHARACTER_LIMIT + 1)
+    );
+    let values = vec![oversized; JSON_SCHEMA_SAMPLE_ROW_LIMIT as usize];
+    let source = write_json_path_parquet(&values);
+    let summary = inspect_local_source(source.path()).expect("oversized JSON summary");
+    let mut reader = DataWindowReader::new(source.path().to_owned());
+
+    let sample = reader
+        .fetch_json_schema_sample(&path("payload"))
+        .expect("bounded oversized JSON sample");
+    assert!(sample.len() <= JSON_SCHEMA_SAMPLE_ARROW_BYTE_LIMIT);
+    let inferred = infer_json_schema_from_arrow(&summary.schema[1], &sample, summary.row_count)
+        .expect("oversized JSON inference");
+
+    assert_eq!(inferred.oversized_value_count, JSON_SCHEMA_SAMPLE_ROW_LIMIT);
+    assert_eq!(inferred.sampled_value_bytes, 0);
+    assert!(inferred.is_truncated);
+    assert!(inferred.nodes.is_empty());
+
+    let directory = TempDir::new().expect("oversized JSON dataset directory");
+    fs::copy(source.path(), directory.path().join("part.parquet"))
+        .expect("oversized JSON dataset member");
+    let dataset_source = DatasetSource::open_folder(directory.path()).expect("JSON dataset source");
+    let mut inspector = dataset_source.inspector();
+    inspector.advance(1).expect("JSON dataset inspection");
+    let mut dataset = inspector.into_window_reader().expect("JSON dataset reader");
+    let dataset_sample = dataset
+        .fetch_json_schema_sample_while(&path("payload"), || true)
+        .expect("bounded oversized dataset JSON sample");
+    assert!(dataset_sample.len() <= JSON_SCHEMA_SAMPLE_ARROW_BYTE_LIMIT);
+    let dataset_inferred =
+        infer_json_schema_from_arrow(&summary.schema[1], &dataset_sample, summary.row_count)
+            .expect("oversized dataset JSON inference");
+    assert_eq!(
+        dataset_inferred.oversized_value_count,
+        JSON_SCHEMA_SAMPLE_ROW_LIMIT
+    );
+}
+
+#[test]
+fn filters_a_json_number_through_a_nested_array_index() {
+    let source = write_json_path_parquet(&[
+        r#"{"items":[{"score":12}]}"#.to_owned(),
+        r#"{"items":[{"score":3}]}"#.to_owned(),
+        r#"{"items":[]}"#.to_owned(),
+    ]);
+    let filtered = prepare_view(
+        source.path(),
+        &[json_filter(
+            JsonPath::new([
+                JsonPathSegment::Field("items".to_owned()),
+                JsonPathSegment::Index(0),
+                JsonPathSegment::Field("score".to_owned()),
+            ]),
+            JsonValueType::Number,
+            DataFilterOperator::GreaterThan,
+            &["10"],
+        )],
+        &[],
+    )
+    .expect("array-index JSON filter");
+    let rows = decode(
+        filtered
+            .fetch_window_fields(0, 8, &[path("id")])
+            .expect("array-index filter result"),
+    );
+
+    assert_eq!(int64_values(&rows[0], 0), [0]);
+}
+
+#[test]
+fn filters_and_sorts_a_nested_json_boolean_with_nulls_last() {
+    let source = write_nullable_json_path_parquet(&[
+        Some(r#"{"nested":{"enabled":true}}"#),
+        Some(r#"{"nested":{"enabled":false}}"#),
+        Some(r#"{"nested":{"enabled":true}}"#),
+        Some(r#"{"nested":{"enabled":null}}"#),
+        Some(r#"{"nested":{}}"#),
+        None,
+    ]);
+    let json_path = || {
+        JsonPath::new([
+            JsonPathSegment::Field("nested".to_owned()),
+            JsonPathSegment::Field("enabled".to_owned()),
+        ])
+    };
+
+    for (operator, value, expected) in [
+        (DataFilterOperator::Equals, "true", vec![0, 2]),
+        (DataFilterOperator::Equals, "false", vec![1]),
+        (DataFilterOperator::NotEquals, "false", vec![0, 2]),
+    ] {
+        let filtered = prepare_view(
+            source.path(),
+            &[json_filter(
+                json_path(),
+                JsonValueType::Boolean,
+                operator,
+                &[value],
+            )],
+            &[],
+        )
+        .expect("nested JSON boolean filter");
+        let rows = decode(
+            filtered
+                .fetch_window_fields(0, 8, &[path("id")])
+                .expect("nested JSON boolean rows"),
+        );
+
+        assert_eq!(int64_values(&rows[0], 0), expected);
+    }
+
+    let nulls = prepare_view(
+        source.path(),
+        &[json_filter(
+            json_path(),
+            JsonValueType::Boolean,
+            DataFilterOperator::IsNull,
+            &[],
+        )],
+        &[],
+    )
+    .expect("nested JSON boolean null filter");
+    let rows = decode(
+        nulls
+            .fetch_window_fields(0, 8, &[path("id")])
+            .expect("nested JSON boolean null rows"),
+    );
+    assert_eq!(int64_values(&rows[0], 0), [3, 4, 5]);
+
+    let sorted = prepare_view(
+        source.path(),
+        &[],
+        &[DataSort {
+            field_path: path("payload"),
+            json_target: Some(JsonFieldTarget {
+                path: json_path(),
+                value_type: JsonValueType::Boolean,
+            }),
+            direction: DataSortDirection::Ascending,
+        }],
+    )
+    .expect("nested JSON boolean sort");
+    let rows = decode(
+        sorted
+            .fetch_window_fields(0, 8, &[path("id")])
+            .expect("nested JSON boolean sorted rows"),
+    );
+
+    assert_eq!(int64_values(&rows[0], 0), [1, 0, 2, 3, 4, 5]);
+}
+
+#[test]
+fn json_path_execution_keeps_numeric_object_keys_distinct_from_array_indices() {
+    let key = "a.b\"\\[]'";
+    let source = write_json_path_parquet(&[
+        r#"{"0":{"a.b\"\\[]'":11}}"#.to_owned(),
+        r#"[{"a.b\"\\[]'":22}]"#.to_owned(),
+    ]);
+    let cases = [
+        (
+            JsonPath::new([
+                JsonPathSegment::Field("0".to_owned()),
+                JsonPathSegment::Field(key.to_owned()),
+            ]),
+            "11",
+            vec![0],
+        ),
+        (
+            JsonPath::new([
+                JsonPathSegment::Index(0),
+                JsonPathSegment::Field(key.to_owned()),
+            ]),
+            "22",
+            vec![1],
+        ),
+    ];
+
+    for (json_path, value, expected) in cases {
+        let filtered = prepare_view(
+            source.path(),
+            &[json_filter(
+                json_path,
+                JsonValueType::Number,
+                DataFilterOperator::Equals,
+                &[value],
+            )],
+            &[],
+        )
+        .expect("typed JSON-path filter");
+        let rows = decode(
+            filtered
+                .fetch_window_fields(0, 8, &[path("id")])
+                .expect("typed JSON-path rows"),
+        );
+
+        assert_eq!(int64_values(&rows[0], 0), expected);
+    }
+}
+
+#[test]
+fn json_numbers_keep_exact_decimal_and_finite_double_branches() {
+    let source = write_nullable_json_path_parquet(&[
+        Some(r#"{"value":9007199254740992}"#),
+        Some(r#"{"value":9007199254740993}"#),
+        Some(r#"{"value":9223372036854775807}"#),
+        Some(r#"{"value":0.1}"#),
+        Some(r#"{"value":0.100000000000000001}"#),
+        Some(r#"{"value":100000000000000000000}"#),
+        Some(r#"{"value":1e100}"#),
+        Some(r#"{"value":0.1000000000000000001}"#),
+        Some(r#"{"value":-1e100}"#),
+        Some(r#"{"value":"not-a-number"}"#),
+        Some(r#"{"value":null}"#),
+        Some("{}"),
+        None,
+    ]);
+    let json_path = || JsonPath::new([JsonPathSegment::Field("value".to_owned())]);
+    let exact = prepare_view(
+        source.path(),
+        &[json_filter(
+            json_path(),
+            JsonValueType::Number,
+            DataFilterOperator::Equals,
+            &["9007199254740993"],
+        )],
+        &[],
+    )
+    .expect("exact JSON number filter");
+    let rows = decode(
+        exact
+            .fetch_window_fields(0, 8, &[path("id")])
+            .expect("exact JSON number rows"),
+    );
+    assert_eq!(int64_values(&rows[0], 0), [1]);
+
+    let exact_range = prepare_view(
+        source.path(),
+        &[json_filter(
+            json_path(),
+            JsonValueType::Number,
+            DataFilterOperator::Range,
+            &["9007199254740992", "9007199254740993"],
+        )],
+        &[],
+    )
+    .expect("exact JSON number range");
+    let rows = decode(
+        exact_range
+            .fetch_window_fields(0, 8, &[path("id")])
+            .expect("exact JSON number range rows"),
+    );
+    assert_eq!(int64_values(&rows[0], 0), [0, 1]);
+
+    let i64_max = prepare_view(
+        source.path(),
+        &[json_filter(
+            json_path(),
+            JsonValueType::Number,
+            DataFilterOperator::Equals,
+            &["9223372036854775807"],
+        )],
+        &[],
+    )
+    .expect("i64 max JSON number filter");
+    let rows = decode(
+        i64_max
+            .fetch_window_fields(0, 8, &[path("id")])
+            .expect("i64 max JSON number rows"),
+    );
+    assert_eq!(int64_values(&rows[0], 0), [2]);
+
+    let finite_fallback = prepare_view(
+        source.path(),
+        &[json_filter(
+            json_path(),
+            JsonValueType::Number,
+            DataFilterOperator::OneOf,
+            &["1e100", "0.1000000000000000001"],
+        )],
+        &[],
+    )
+    .expect("finite fallback JSON number filter");
+    let rows = decode(
+        finite_fallback
+            .fetch_window_fields(0, 16, &[path("id")])
+            .expect("finite fallback JSON number rows"),
+    );
+    assert_eq!(int64_values(&rows[0], 0), [3, 4, 6, 7]);
+
+    let sorted = prepare_view(
+        source.path(),
+        &[],
+        &[DataSort {
+            field_path: path("payload"),
+            json_target: Some(JsonFieldTarget {
+                path: json_path(),
+                value_type: JsonValueType::Number,
+            }),
+            direction: DataSortDirection::Ascending,
+        }],
+    )
+    .expect("exact JSON number sort");
+    let rows = decode(
+        sorted
+            .fetch_window_fields(0, 16, &[path("id")])
+            .expect("exact JSON number sorted rows"),
+    );
+    assert_eq!(
+        int64_values(&rows[0], 0),
+        [8, 3, 4, 7, 0, 1, 2, 5, 6, 9, 10, 11, 12]
+    );
+
+    let sorted = prepare_view(
+        source.path(),
+        &[],
+        &[DataSort {
+            field_path: path("payload"),
+            json_target: Some(JsonFieldTarget {
+                path: json_path(),
+                value_type: JsonValueType::Number,
+            }),
+            direction: DataSortDirection::Descending,
+        }],
+    )
+    .expect("descending JSON number sort");
+    let rows = decode(
+        sorted
+            .fetch_window_fields(0, 16, &[path("id")])
+            .expect("descending JSON number sorted rows"),
+    );
+    assert_eq!(
+        int64_values(&rows[0], 0),
+        [6, 5, 2, 1, 0, 3, 4, 7, 8, 9, 10, 11, 12]
+    );
+
+    let non_null = prepare_view(
+        source.path(),
+        &[json_filter(
+            json_path(),
+            JsonValueType::Number,
+            DataFilterOperator::IsNotNull,
+            &[],
+        )],
+        &[],
+    )
+    .expect("finite JSON number presence filter");
+    let rows = decode(
+        non_null
+            .fetch_window_fields(0, 16, &[path("id")])
+            .expect("finite JSON number presence rows"),
+    );
+    assert_eq!(int64_values(&rows[0], 0), (0..=8).collect::<Vec<_>>());
+}
+
+#[test]
+fn json_number_bucket_ties_distinguish_exact_integers_from_fractional_doubles() {
+    let source = write_nullable_json_path_parquet(&[
+        Some(r#"{"value":9007199254740992.0}"#),
+        Some(r#"{"value":9007199254740993}"#),
+        Some(r#"{"value":9007199254740992}"#),
+        Some(r#"{"value":0.1000000000000000001}"#),
+        Some(r#"{"value":"not-a-number"}"#),
+        None,
+    ]);
+    let json_path = || JsonPath::new([JsonPathSegment::Field("value".to_owned())]);
+    let filter_ids = |operator, values: &[&str]| {
+        let view = prepare_view(
+            source.path(),
+            &[json_filter(
+                json_path(),
+                JsonValueType::Number,
+                operator,
+                values,
+            )],
+            &[],
+        )
+        .expect("JSON number collision filter");
+        let rows = decode(
+            view.fetch_window_fields(0, 16, &[path("id")])
+                .expect("JSON number collision rows"),
+        );
+        int64_values(&rows[0], 0)
+    };
+
+    assert_eq!(
+        filter_ids(DataFilterOperator::Equals, &["9007199254740993"]),
+        [1]
+    );
+    assert_eq!(
+        filter_ids(DataFilterOperator::NotEquals, &["9007199254740993"]),
+        [0, 2, 3]
+    );
+    assert_eq!(
+        filter_ids(DataFilterOperator::LessThan, &["9007199254740993"]),
+        [0, 2, 3]
+    );
+    assert_eq!(
+        filter_ids(DataFilterOperator::Equals, &["9007199254740992"]),
+        [0, 2]
+    );
+    assert_eq!(
+        filter_ids(DataFilterOperator::Equals, &["0.1000000000000000001"]),
+        [3]
+    );
+
+    for (direction, expected) in [
+        (DataSortDirection::Ascending, vec![3, 0, 2, 1, 4, 5]),
+        (DataSortDirection::Descending, vec![1, 0, 2, 3, 4, 5]),
+    ] {
+        let view = prepare_view(
+            source.path(),
+            &[],
+            &[DataSort {
+                field_path: path("payload"),
+                json_target: Some(JsonFieldTarget {
+                    path: json_path(),
+                    value_type: JsonValueType::Number,
+                }),
+                direction,
+            }],
+        )
+        .expect("JSON number collision sort");
+        let rows = decode(
+            view.fetch_window_fields(0, 16, &[path("id")])
+                .expect("JSON number collision sorted rows"),
+        );
+
+        assert_eq!(int64_values(&rows[0], 0), expected);
+    }
+}
+
+#[test]
+fn json_null_filter_covers_missing_json_null_and_null_root() {
+    let source = write_nullable_json_path_parquet(&[
+        Some(r#"{"value":null}"#),
+        Some("{}"),
+        Some(r#"{"value":"not-a-number"}"#),
+        None,
+        Some(r#"{"value":1}"#),
+    ]);
+    let target = || JsonPath::new([JsonPathSegment::Field("value".to_owned())]);
+
+    for (operator, expected) in [
+        (DataFilterOperator::IsNull, vec![0, 1, 2, 3]),
+        (DataFilterOperator::IsNotNull, vec![4]),
+    ] {
+        let filtered = prepare_view(
+            source.path(),
+            &[json_filter(target(), JsonValueType::Number, operator, &[])],
+            &[],
+        )
+        .expect("JSON null-semantics filter");
+        let rows = decode(
+            filtered
+                .fetch_window_fields(0, 8, &[path("id")])
+                .expect("JSON null-semantics rows"),
+        );
+
+        assert_eq!(int64_values(&rows[0], 0), expected);
+    }
+}
+
+#[test]
+fn invalid_logical_json_is_rejected_by_the_source_scan() {
+    let source = write_json_path_parquet(&["not-json".to_owned()]);
+
+    assert!(matches!(
+        prepare_view(
+            source.path(),
+            &[json_filter(
+                JsonPath::new([JsonPathSegment::Field("value".to_owned())]),
+                JsonValueType::Number,
+                DataFilterOperator::IsNull,
+                &[],
+            )],
+            &[],
+        ),
+        Err(DataViewError::Engine(DataWindowError::CorruptSource))
+    ));
+}
+
+#[test]
+fn dataset_json_filter_and_sort_use_the_same_path_contract() {
+    let first =
+        write_json_path_parquet(&[r#"{"value":2}"#.to_owned(), r#"{"value":12}"#.to_owned()]);
+    let second =
+        write_json_path_parquet(&[r#"{"value":7}"#.to_owned(), r#"{"value":20}"#.to_owned()]);
+    let directory = TempDir::new().expect("JSON dataset directory");
+    fs::copy(first.path(), directory.path().join("a.parquet")).expect("first JSON member");
+    fs::copy(second.path(), directory.path().join("b.parquet")).expect("second JSON member");
+    let source = DatasetSource::open_folder(directory.path()).expect("JSON dataset source");
+    let mut inspector = source.inspector();
+    inspector.advance(2).expect("JSON dataset inspection");
+    let reader = inspector.into_window_reader().expect("JSON dataset reader");
+    let target = JsonFieldTarget {
+        path: JsonPath::new([JsonPathSegment::Field("value".to_owned())]),
+        value_type: JsonValueType::Number,
+    };
+    let view = DataViewBuilder::for_dataset(
+        &reader,
+        &[json_filter(
+            target.path.clone(),
+            target.value_type,
+            DataFilterOperator::GreaterThan,
+            &["5"],
+        )],
+        &[DataSort {
+            field_path: path("payload"),
+            json_target: Some(target),
+            direction: DataSortDirection::Descending,
+        }],
+        DataViewMemoryLimit::Mb384,
+    )
+    .expect("JSON dataset view builder")
+    .build()
+    .expect("JSON dataset view");
+    let rows = decode(
+        view.fetch_window_fields(0, 8, &[path("payload")])
+            .expect("JSON dataset rows"),
+    );
+
+    assert_eq!(
+        string_values(&rows[0], 0),
+        [
+            Some(r#"{"value":20}"#),
+            Some(r#"{"value":12}"#),
+            Some(r#"{"value":7}"#),
+        ]
+    );
+}
+
+#[test]
+fn mixed_json_types_infer_and_sort_with_the_text_fallback() {
+    let source = write_json_path_parquet(&[
+        r#"{"value":2}"#.to_owned(),
+        r#"{"value":"10"}"#.to_owned(),
+        r#"{"value":1}"#.to_owned(),
+    ]);
+    let summary = inspect_local_source(source.path()).expect("mixed JSON summary");
+    let mut reader = DataWindowReader::new(source.path().to_owned());
+    let sample = reader
+        .fetch_json_schema_sample(&path("payload"))
+        .expect("mixed JSON sample");
+    let inferred = infer_json_schema_from_arrow(&summary.schema[1], &sample, summary.row_count)
+        .expect("mixed JSON inference");
+    let value = inferred
+        .nodes
+        .iter()
+        .find(|node| node.segment == JsonPathSegment::Field("value".to_owned()))
+        .expect("inferred value path");
+    assert_eq!(
+        value.observed_types,
+        [JsonObservedType::Number, JsonObservedType::String]
+    );
+    assert_eq!(value.effective_type, Some(JsonValueType::Mixed));
+
+    let sorted = prepare_view(
+        source.path(),
+        &[],
+        &[DataSort {
+            field_path: path("payload"),
+            json_target: Some(JsonFieldTarget {
+                path: JsonPath::new([JsonPathSegment::Field("value".to_owned())]),
+                value_type: JsonValueType::Mixed,
+            }),
+            direction: DataSortDirection::Ascending,
+        }],
+    )
+    .expect("mixed JSON sort");
+    let rows = decode(
+        sorted
+            .fetch_window_fields(0, 8, &[path("id")])
+            .expect("mixed JSON sorted rows"),
+    );
+
+    assert_eq!(int64_values(&rows[0], 0), [2, 1, 0]);
+}
+
+#[test]
+fn json_filter_uses_the_existing_prepared_view_cancellation_handle() {
+    let source = write_json_path_parquet(&[r#"{"value":1}"#.to_owned()]);
+    let builder = DataViewBuilder::new(
+        source.path().to_owned(),
+        &[json_filter(
+            JsonPath::new([JsonPathSegment::Field("value".to_owned())]),
+            JsonValueType::Number,
+            DataFilterOperator::Equals,
+            &["1"],
+        )],
+        &[],
+    )
+    .expect("JSON view builder");
+    let interrupt = builder.interrupt_handle();
+    interrupt.interrupt();
+
+    assert!(matches!(
+        builder.build(),
+        Err(DataViewError::Engine(DataWindowError::Cancelled))
+    ));
+}
+
+#[test]
 fn keeps_plain_binary_columns_null_only() {
     let source = write_special_types_parquet();
 
     assert!(matches!(
         prepare_view(
             source.path(),
-            &[filter(3, DataFilterOperator::TextContains, &["alpha"],)],
+            &[filter(
+                "binary_value",
+                DataFilterOperator::TextContains,
+                &["alpha"],
+            )],
             &[],
         ),
         Err(DataViewError::Engine(DataWindowError::InvalidFilter))
@@ -677,7 +1787,7 @@ fn keeps_plain_binary_columns_null_only() {
 
     let view = prepare_view(
         source.path(),
-        &[filter(3, DataFilterOperator::IsNotNull, &[])],
+        &[filter("binary_value", DataFilterOperator::IsNotNull, &[])],
         &[],
     )
     .expect("binary null-check view");
@@ -731,12 +1841,14 @@ fn assert_temporal_comparisons(source: &NamedTempFile, cases: &[(u32, &str)]) {
         (DataFilterOperator::LessThan, &[0][..]),
         (DataFilterOperator::LessThanOrEqual, &[0, 1][..]),
     ];
+    let schema = inspect_local_source(source.path()).expect("temporal schema");
 
     for &(column_index, value) in cases {
+        let column_name = &schema.schema[column_index as usize].name;
         for (operator, expected) in operators {
             let view = prepare_view(
                 source.path(),
-                &[filter(column_index, operator, &[value])],
+                &[filter(column_name, operator, &[value])],
                 &[],
             )
             .unwrap_or_else(|error| {
@@ -759,7 +1871,7 @@ fn accepts_an_explicit_offset_for_a_utc_timestamp_filter() {
     let view = prepare_view(
         source.path(),
         &[filter(
-            3,
+            "micros_utc",
             DataFilterOperator::Equals,
             &["1970-01-02T03:00:00.123456+03:00"],
         )],
@@ -779,7 +1891,11 @@ fn accepts_a_timezone_free_value_for_a_utc_time_filter() {
     let source = write_raw_temporal_parquet();
     let view = prepare_view(
         source.path(),
-        &[filter(2, DataFilterOperator::Equals, &["12:00:00.123"])],
+        &[filter(
+            "time_ms_utc",
+            DataFilterOperator::Equals,
+            &["12:00:00.123"],
+        )],
         &[],
     )
     .expect("UTC time view without an offset");
@@ -797,7 +1913,7 @@ fn uses_a_timestamp_filter_boundary_beyond_the_column_storage_precision() {
     let view = prepare_view(
         source.path(),
         &[filter(
-            2,
+            "millis",
             DataFilterOperator::GreaterThanOrEqual,
             &["1970-01-02T00:00:00.1234"],
         )],
@@ -892,8 +2008,12 @@ fn returns_duckdb_types_for_all_time_units_legacy_types_and_int96() {
 fn combines_conditions_and_offsets_the_filtered_view() {
     let source = write_basic_parquet();
     let filters = vec![
-        filter(0, DataFilterOperator::Range, &["11", "17"]),
-        filter(1, DataFilterOperator::OneOf, &["row-2", "row-4", "row-6"]),
+        filter("id\"quoted", DataFilterOperator::Range, &["11", "17"]),
+        filter(
+            "select",
+            DataFilterOperator::OneOf,
+            &["row-2", "row-4", "row-6"],
+        ),
     ];
     let view = prepare_view(source.path(), &filters, &[]).expect("filtered view");
 
@@ -908,7 +2028,7 @@ fn returns_a_schema_only_window_for_an_empty_filter_result() {
     let source = write_basic_parquet();
     let view = prepare_view(
         source.path(),
-        &[filter(0, DataFilterOperator::Equals, &["999"])],
+        &[filter("id\"quoted", DataFilterOperator::Equals, &["999"])],
         &[],
     )
     .expect("empty filtered view");
@@ -925,7 +2045,11 @@ fn rejects_an_operator_not_supported_by_the_column_type() {
     assert!(matches!(
         prepare_view(
             source.path(),
-            &[filter(0, DataFilterOperator::TextContains, &["1"])],
+            &[filter(
+                "id\"quoted",
+                DataFilterOperator::TextContains,
+                &["1"],
+            )],
             &[],
         ),
         Err(DataViewError::Engine(DataWindowError::InvalidFilter))
@@ -938,7 +2062,11 @@ fn rejects_bound_values_that_cannot_convert_to_the_column_type() {
     assert!(matches!(
         prepare_view(
             source.path(),
-            &[filter(0, DataFilterOperator::Equals, &["1 OR 1=1"])],
+            &[filter(
+                "id\"quoted",
+                DataFilterOperator::Equals,
+                &["1 OR 1=1"],
+            )],
             &[],
         ),
         Err(DataViewError::Engine(DataWindowError::InvalidFilter))
@@ -952,7 +2080,8 @@ fn sorts_large_mixed_type_sources_once_for_start_middle_and_end_windows() {
         source.path(),
         &[],
         &[DataSort {
-            source_index: 1,
+            field_path: path("number"),
+            json_target: None,
             direction: DataSortDirection::Ascending,
         }],
     )
@@ -968,11 +2097,13 @@ fn sorts_large_mixed_type_sources_once_for_start_middle_and_end_windows() {
         &[],
         &[
             DataSort {
-                source_index: 2,
+                field_path: path("label"),
+                json_target: None,
                 direction: DataSortDirection::Ascending,
             },
             DataSort {
-                source_index: 3,
+                field_path: path("recorded_at"),
+                json_target: None,
                 direction: DataSortDirection::Descending,
             },
         ],
@@ -997,7 +2128,8 @@ fn reads_first_and_deep_sorted_windows_from_duckdb_nested_parquet() {
         &source,
         &[],
         &[DataSort {
-            source_index: 1,
+            field_path: path("int8_value"),
+            json_target: None,
             direction: DataSortDirection::Ascending,
         }],
     )
@@ -1030,12 +2162,17 @@ fn reads_first_and_deep_sorted_windows_from_duckdb_nested_parquet() {
 #[test]
 fn combines_filter_sort_windows_and_exact_count_in_one_view() {
     let source = write_basic_parquet();
-    let filters = [filter(0, DataFilterOperator::Range, &["11", "16"])];
+    let filters = [filter(
+        "id\"quoted",
+        DataFilterOperator::Range,
+        &["11", "16"],
+    )];
     let view = prepare_view(
         source.path(),
         &filters,
         &[DataSort {
-            source_index: 1,
+            field_path: path("select"),
+            json_target: None,
             direction: DataSortDirection::Descending,
         }],
     )
@@ -1046,7 +2183,7 @@ fn combines_filter_sort_windows_and_exact_count_in_one_view() {
     assert_eq!(view.row_count(), 6);
     assert_eq!(int64_values(&window[0], 0), vec![15, 14, 13]);
     let projected = decode(
-        view.fetch_window_columns(1, 3, &[2])
+        view.fetch_window_fields(1, 3, &[path("active")])
             .expect("window projected away from filter and sort columns"),
     );
     assert_eq!(projected[0].num_columns(), 1);
@@ -1086,7 +2223,8 @@ fn keeps_nulls_last_in_both_directions_and_direct_windows_in_file_order() {
             source.path(),
             &[],
             &[DataSort {
-                source_index: 1,
+                field_path: path("number"),
+                json_target: None,
                 direction,
             }],
         )
@@ -1115,7 +2253,8 @@ fn cancelled_replacement_does_not_damage_the_completed_view() {
         source.path(),
         &[],
         &[DataSort {
-            source_index: 0,
+            field_path: path("file_order"),
+            json_target: None,
             direction: DataSortDirection::Descending,
         }],
     )
@@ -1124,7 +2263,8 @@ fn cancelled_replacement_does_not_damage_the_completed_view() {
         source.path().to_owned(),
         &[],
         &[DataSort {
-            source_index: 0,
+            field_path: path("file_order"),
+            json_target: None,
             direction: DataSortDirection::Ascending,
         }],
     )
@@ -1148,11 +2288,13 @@ fn rejects_duplicate_and_out_of_bounds_sort_columns() {
             &[],
             &[
                 DataSort {
-                    source_index: 0,
+                    field_path: path("id\"quoted"),
+                    json_target: None,
                     direction: DataSortDirection::Ascending,
                 },
                 DataSort {
-                    source_index: 0,
+                    field_path: path("id\"quoted"),
+                    json_target: None,
                     direction: DataSortDirection::Descending,
                 },
             ],
@@ -1164,7 +2306,8 @@ fn rejects_duplicate_and_out_of_bounds_sort_columns() {
             source.path(),
             &[],
             &[DataSort {
-                source_index: 5,
+                field_path: path("missing"),
+                json_target: None,
                 direction: DataSortDirection::Ascending,
             }],
         ),
@@ -1179,7 +2322,8 @@ fn uses_file_order_as_a_stable_tie_break_across_row_groups() {
         source.path(),
         &[],
         &[DataSort {
-            source_index: 1,
+            field_path: path("group"),
+            json_target: None,
             direction: DataSortDirection::Ascending,
         }],
     )
@@ -1200,7 +2344,8 @@ fn orders_nan_after_finite_values_ascending_and_before_them_descending() {
         source.path(),
         &[],
         &[DataSort {
-            source_index: 1,
+            field_path: path("value"),
+            json_target: None,
             direction: DataSortDirection::Ascending,
         }],
     )
@@ -1209,7 +2354,8 @@ fn orders_nan_after_finite_values_ascending_and_before_them_descending() {
         source.path(),
         &[],
         &[DataSort {
-            source_index: 1,
+            field_path: path("value"),
+            json_target: None,
             direction: DataSortDirection::Descending,
         }],
     )
@@ -1249,7 +2395,8 @@ fn distinguishes_a_physical_file_row_number_column_from_the_virtual_position() {
         source.path(),
         &[],
         &[DataSort {
-            source_index: 0,
+            field_path: path("file_row_number"),
+            json_target: None,
             direction: DataSortDirection::Ascending,
         }],
     )
@@ -1308,9 +2455,28 @@ fn prepare_view(
     DataViewBuilder::new(source.to_owned(), filters, sort)?.build()
 }
 
-fn filter(column_index: u32, operator: DataFilterOperator, values: &[&str]) -> DataFilter {
+fn filter(column_name: &str, operator: DataFilterOperator, values: &[&str]) -> DataFilter {
     DataFilter {
-        column_index,
+        field_path: path(column_name),
+        json_target: None,
+        operator,
+        values: values.iter().map(|value| (*value).to_owned()).collect(),
+        match_case: false,
+    }
+}
+
+fn json_filter(
+    json_path: JsonPath,
+    value_type: JsonValueType,
+    operator: DataFilterOperator,
+    values: &[&str],
+) -> DataFilter {
+    DataFilter {
+        field_path: path("payload"),
+        json_target: Some(JsonFieldTarget {
+            path: json_path,
+            value_type,
+        }),
         operator,
         values: values.iter().map(|value| (*value).to_owned()).collect(),
         match_case: false,
@@ -1319,11 +2485,16 @@ fn filter(column_index: u32, operator: DataFilterOperator, values: &[&str]) -> D
 
 fn text_filter(operator: DataFilterOperator, value: &str, match_case: bool) -> DataFilter {
     DataFilter {
-        column_index: 0,
+        field_path: path("label"),
+        json_target: None,
         operator,
         values: vec![value.to_owned()],
         match_case,
     }
+}
+
+fn path(name: &str) -> FieldPath {
+    FieldPath::new(vec![name.to_owned()])
 }
 
 fn decode(bytes: Vec<u8>) -> Vec<RecordBatch> {
@@ -1361,6 +2532,17 @@ fn int32_value(batch: &RecordBatch, column: usize) -> i32 {
         .downcast_ref::<Int32Array>()
         .expect("int32 column")
         .value(0)
+}
+
+fn optional_int32_values(batch: &RecordBatch, column: usize) -> Vec<Option<i32>> {
+    let values = batch
+        .column(column)
+        .as_any()
+        .downcast_ref::<Int32Array>()
+        .expect("int32 column");
+    (0..values.len())
+        .map(|index| (!values.is_null(index)).then(|| values.value(index)))
+        .collect()
 }
 
 fn write_basic_parquet() -> NamedTempFile {
@@ -1617,6 +2799,86 @@ fn write_nested_parquet() -> NamedTempFile {
     source
 }
 
+fn write_empty_named_struct_child_parquet() -> NamedTempFile {
+    let source = NamedTempFile::new().expect("temporary empty-name source");
+    let fields = Fields::from(vec![
+        Field::new("", DataType::Int32, false),
+        Field::new("number", DataType::Int32, false),
+        Field::new("text", DataType::Utf8, false),
+    ]);
+    let value = StructArray::new(
+        fields,
+        vec![
+            Arc::new(Int32Array::from(vec![7, 3, 9])) as ArrayRef,
+            Arc::new(Int32Array::from(vec![42, 10, 99])) as ArrayRef,
+            Arc::new(StringArray::from(vec!["answer", "ten", "ninety-nine"])) as ArrayRef,
+        ],
+        None,
+    );
+    let schema = Arc::new(Schema::new(vec![Field::new(
+        "union_value",
+        value.data_type().clone(),
+        false,
+    )]));
+    let batch = RecordBatch::try_new(Arc::clone(&schema), vec![Arc::new(value) as ArrayRef])
+        .expect("empty-name record batch");
+    write_batch(&source, schema, &batch);
+    source
+}
+
+fn write_addressable_nested_parquet() -> NamedTempFile {
+    let source = NamedTempFile::new().expect("temporary source");
+    let address_fields = Fields::from(vec![Field::new("postal.code", DataType::Int32, true)]);
+    let address = StructArray::new(
+        address_fields.clone(),
+        vec![Arc::new(Int32Array::from(vec![
+            Some(100),
+            Some(200),
+            None,
+            Some(400),
+        ])) as ArrayRef],
+        None,
+    );
+    let profile_fields = Fields::from(vec![
+        Field::new("city\"name", DataType::Utf8, false),
+        Field::new("address", DataType::Struct(address_fields), true),
+    ]);
+    let mut profile_validity = NullBufferBuilder::new(4);
+    for valid in [true, false, true, true] {
+        profile_validity.append(valid);
+    }
+    let profile = StructArray::new(
+        profile_fields.clone(),
+        vec![
+            Arc::new(StringArray::from(vec!["A", "masked", "C", "D"])) as ArrayRef,
+            Arc::new(address) as ArrayRef,
+        ],
+        profile_validity.finish(),
+    );
+    let alternate_fields = Fields::from(vec![Field::new("city\"name", DataType::Utf8, false)]);
+    let alternate = StructArray::new(
+        alternate_fields.clone(),
+        vec![Arc::new(StringArray::from(vec!["W", "X", "Y", "Z"])) as ArrayRef],
+        None,
+    );
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int64, false),
+        Field::new("profile.with.dot", DataType::Struct(profile_fields), true),
+        Field::new("alternate", DataType::Struct(alternate_fields), false),
+    ]));
+    let batch = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![
+            Arc::new(Int64Array::from(vec![1, 2, 3, 4])) as ArrayRef,
+            Arc::new(profile) as ArrayRef,
+            Arc::new(alternate) as ArrayRef,
+        ],
+    )
+    .expect("addressable nested record batch");
+    write_batch(&source, schema, &batch);
+    source
+}
+
 fn write_decimal128_parquet() -> NamedTempFile {
     let source = NamedTempFile::new().expect("temporary source");
     let two_to_64 = 1_i128 << 64;
@@ -1771,6 +3033,115 @@ fn write_special_types_parquet() -> NamedTempFile {
     source
 }
 
+fn write_json_path_parquet(values: &[String]) -> NamedTempFile {
+    let source = NamedTempFile::new().expect("temporary JSON source");
+    let schema = Arc::new(
+        parse_message_type(
+            "message json_paths {
+                REQUIRED INT64 id;
+                REQUIRED BYTE_ARRAY payload (JSON);
+            }",
+        )
+        .expect("JSON-path Parquet schema"),
+    );
+    let file = source
+        .reopen()
+        .expect("temporary JSON source is reopenable");
+    let mut writer =
+        SerializedFileWriter::new(file, schema, Default::default()).expect("Parquet writer");
+    let mut row_group = writer.next_row_group().expect("Parquet row group");
+
+    let mut column = row_group
+        .next_column()
+        .expect("id column")
+        .expect("id column writer");
+    let ids = (0..values.len())
+        .map(|index| i64::try_from(index).expect("fixture row fits i64"))
+        .collect::<Vec<_>>();
+    column
+        .typed::<ParquetInt64Type>()
+        .write_batch(&ids, None, None)
+        .expect("id values");
+    column.close().expect("id column footer");
+
+    let mut column = row_group
+        .next_column()
+        .expect("JSON column")
+        .expect("JSON column writer");
+    let values = values
+        .iter()
+        .map(|value| ByteArray::from(value.as_str()))
+        .collect::<Vec<_>>();
+    column
+        .typed::<ByteArrayType>()
+        .write_batch(&values, None, None)
+        .expect("JSON values");
+    column.close().expect("JSON column footer");
+
+    assert!(
+        row_group
+            .next_column()
+            .expect("end of JSON-path columns")
+            .is_none()
+    );
+    row_group.close().expect("Parquet row group footer");
+    writer.close().expect("Parquet footer");
+    source
+}
+
+fn write_nullable_json_path_parquet(values: &[Option<&str>]) -> NamedTempFile {
+    let source = NamedTempFile::new().expect("temporary nullable JSON source");
+    let schema = Arc::new(
+        parse_message_type(
+            "message json_paths {
+                REQUIRED INT64 id;
+                OPTIONAL BYTE_ARRAY payload (JSON);
+            }",
+        )
+        .expect("nullable JSON-path Parquet schema"),
+    );
+    let file = source
+        .reopen()
+        .expect("temporary nullable JSON source is reopenable");
+    let mut writer =
+        SerializedFileWriter::new(file, schema, Default::default()).expect("Parquet writer");
+    let mut row_group = writer.next_row_group().expect("Parquet row group");
+
+    let mut column = row_group
+        .next_column()
+        .expect("id column")
+        .expect("id column writer");
+    let ids = (0..values.len())
+        .map(|index| i64::try_from(index).expect("fixture row fits i64"))
+        .collect::<Vec<_>>();
+    column
+        .typed::<ParquetInt64Type>()
+        .write_batch(&ids, None, None)
+        .expect("id values");
+    column.close().expect("id column footer");
+
+    let mut column = row_group
+        .next_column()
+        .expect("JSON column")
+        .expect("JSON column writer");
+    let definition_levels = values
+        .iter()
+        .map(|value| i16::from(value.is_some()))
+        .collect::<Vec<_>>();
+    let present_values = values
+        .iter()
+        .filter_map(|value| value.map(ByteArray::from))
+        .collect::<Vec<_>>();
+    column
+        .typed::<ByteArrayType>()
+        .write_batch(&present_values, Some(&definition_levels), None)
+        .expect("nullable JSON values");
+    column.close().expect("JSON column footer");
+    row_group.close().expect("Parquet row group footer");
+    writer.close().expect("Parquet footer");
+    source
+}
+
 fn write_wide_parquet(column_count: usize) -> NamedTempFile {
     let source = NamedTempFile::new().expect("temporary source");
     let schema = Arc::new(Schema::new(
@@ -1785,6 +3156,70 @@ fn write_wide_parquet(column_count: usize) -> NamedTempFile {
         })
         .collect::<Vec<_>>();
     let batch = RecordBatch::try_new(Arc::clone(&schema), columns).expect("wide record batch");
+    write_batch(&source, schema, &batch);
+    source
+}
+
+fn write_deep_and_wide_struct_parquet() -> NamedTempFile {
+    let source = NamedTempFile::new().expect("temporary nested-shape source");
+
+    let mut deep: ArrayRef = Arc::new(Int64Array::from(vec![7, 9]));
+    let mut child_name = "value".to_owned();
+    for level in (1..=6).rev() {
+        let fields = Fields::from(vec![Field::new(
+            &child_name,
+            deep.data_type().clone(),
+            false,
+        )]);
+        deep = Arc::new(StructArray::new(fields, vec![deep], None));
+        child_name = format!("level{level}");
+    }
+    let deep_fields = Fields::from(vec![Field::new(
+        child_name,
+        deep.data_type().clone(),
+        false,
+    )]);
+    let deep = StructArray::new(deep_fields, vec![deep], None);
+
+    let wide_fields = Fields::from(
+        (0..100)
+            .map(|index| Field::new(format!("field{index:03}"), DataType::Int32, false))
+            .collect::<Vec<_>>(),
+    );
+    let wide_columns = (0..100)
+        .map(|index| Arc::new(Int32Array::from(vec![index, 1_000 + index])) as ArrayRef)
+        .collect::<Vec<_>>();
+    let wide = StructArray::new(wide_fields, wide_columns, None);
+
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("deep", deep.data_type().clone(), false),
+        Field::new("wide", wide.data_type().clone(), false),
+    ]));
+    let batch = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![Arc::new(deep) as ArrayRef, Arc::new(wide) as ArrayRef],
+    )
+    .expect("deep and wide struct batch");
+    write_batch(&source, schema, &batch);
+    source
+}
+
+fn write_duplicate_name_parquet() -> NamedTempFile {
+    let source = NamedTempFile::new().expect("temporary duplicate-name source");
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("duplicate", DataType::Int32, false),
+        Field::new("duplicate", DataType::Int32, false),
+        Field::new("payload", DataType::Int32, false),
+    ]));
+    let batch = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![
+            Arc::new(Int32Array::from(vec![11])) as ArrayRef,
+            Arc::new(Int32Array::from(vec![22])) as ArrayRef,
+            Arc::new(Int32Array::from(vec![33])) as ArrayRef,
+        ],
+    )
+    .expect("duplicate-name record batch");
     write_batch(&source, schema, &batch);
     source
 }
@@ -1805,6 +3240,24 @@ fn write_named_parquet(column_name: &str) -> NamedTempFile {
         .expect("Parquet writer");
     writer.write(&batch).expect("write batch");
     writer.close().expect("write footer");
+    source
+}
+
+fn write_file_row_number_parquet() -> NamedTempFile {
+    let source = NamedTempFile::new().expect("temporary file-row-number source");
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("file_row_number", DataType::Int64, false),
+        Field::new("payload", DataType::Utf8, false),
+    ]));
+    let batch = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![
+            Arc::new(Int64Array::from(vec![40, 41, 42])) as ArrayRef,
+            Arc::new(StringArray::from(vec!["row-0", "row-1", "row-2"])) as ArrayRef,
+        ],
+    )
+    .expect("file-row-number record batch");
+    write_batch(&source, schema, &batch);
     source
 }
 
@@ -1897,6 +3350,17 @@ fn write_multi_group_parquet() -> NamedTempFile {
         writer.flush().expect("flush row group");
     }
     writer.close().expect("write footer");
+    source
+}
+
+fn write_empty_projected_parquet() -> NamedTempFile {
+    let source = NamedTempFile::new().expect("temporary zero-row source");
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("file_order", DataType::Int64, false),
+        Field::new("group", DataType::Int32, false),
+    ]));
+    let batch = RecordBatch::new_empty(Arc::clone(&schema));
+    write_batch(&source, schema, &batch);
     source
 }
 

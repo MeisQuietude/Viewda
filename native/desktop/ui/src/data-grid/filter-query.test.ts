@@ -9,7 +9,7 @@ import {
 } from "@uwdata/flechette";
 import { describe, expect, it } from "vitest";
 
-import type { DataFilter, SchemaField, SortColumn } from "../desktop";
+import type { DataFilter, JsonPath, SchemaField, SortColumn } from "../desktop";
 import {
   columnFilterKind,
   filterInputFromCell,
@@ -77,7 +77,11 @@ describe("canonical filter query formatting", () => {
   ])("formats %s literals", (schemaField, value, expected) => {
     expect(
       formatFilterCondition(
-        { columnIndex: 0, operator: "equals", values: [value] },
+        {
+          fieldPath: [schemaField.name],
+          operator: "equals",
+          values: [value],
+        },
         schemaField,
       ),
     ).toBe(`"${schemaField.name}" = ${expected}`);
@@ -89,9 +93,9 @@ describe("canonical filter query formatting", () => {
       field("label", "BYTE_ARRAY", "String"),
     ];
     const filters: DataFilter[] = [
-      { columnIndex: 0, operator: "range", values: ["-2", "9"] },
+      { fieldPath: ['value"quoted'], operator: "range", values: ["-2", "9"] },
       {
-        columnIndex: 1,
+        fieldPath: ["label"],
         operator: "textContains",
         values: ["O'Reilly"],
       },
@@ -107,16 +111,16 @@ describe("canonical filter query formatting", () => {
 
   it.each([
     [
-      { columnIndex: 0, operator: "textContains", values: ["Alpha"] },
+      { fieldPath: ["label"], operator: "textContains", values: ["Alpha"] },
       `contains(lower(CAST("label" AS VARCHAR)), lower('Alpha'))`,
     ],
     [
-      { columnIndex: 0, operator: "notContains", values: ["Alpha"] },
+      { fieldPath: ["label"], operator: "notContains", values: ["Alpha"] },
       `NOT contains(lower(CAST("label" AS VARCHAR)), lower('Alpha'))`,
     ],
     [
       {
-        columnIndex: 0,
+        fieldPath: ["label"],
         operator: "startsWith",
         values: ["Alpha"],
         matchCase: true,
@@ -124,7 +128,7 @@ describe("canonical filter query formatting", () => {
       `starts_with(CAST("label" AS VARCHAR), 'Alpha')`,
     ],
     [
-      { columnIndex: 0, operator: "endsWith", values: ["Alpha"] },
+      { fieldPath: ["label"], operator: "endsWith", values: ["Alpha"] },
       `ends_with(lower(CAST("label" AS VARCHAR)), lower('Alpha'))`,
     ],
   ] satisfies [DataFilter, string][])(
@@ -139,10 +143,10 @@ describe("canonical filter query formatting", () => {
   it("renders numeric comparisons in the WHERE bar", () => {
     const schema = [field("amount", "DOUBLE", null)];
     const filters: DataFilter[] = [
-      { columnIndex: 0, operator: "greaterThan", values: ["1"] },
-      { columnIndex: 0, operator: "greaterThanOrEqual", values: ["2"] },
-      { columnIndex: 0, operator: "lessThan", values: ["9"] },
-      { columnIndex: 0, operator: "lessThanOrEqual", values: ["8"] },
+      { fieldPath: ["amount"], operator: "greaterThan", values: ["1"] },
+      { fieldPath: ["amount"], operator: "greaterThanOrEqual", values: ["2"] },
+      { fieldPath: ["amount"], operator: "lessThan", values: ["9"] },
+      { fieldPath: ["amount"], operator: "lessThanOrEqual", values: ["8"] },
     ];
 
     expect(formatWhereClause(filters, schema)).toBe(
@@ -158,33 +162,33 @@ describe("canonical filter query formatting", () => {
 
   it.each([
     [
-      { columnIndex: 0, operator: "equals", values: ["true"] },
+      { fieldPath: ["active"], operator: "equals", values: ["true"] },
       field("active", "BOOLEAN", null),
       '"active" = TRUE',
     ],
     [
-      { columnIndex: 0, operator: "oneOf", values: ["-2", "9"] },
+      { fieldPath: ["amount"], operator: "oneOf", values: ["-2", "9"] },
       field("amount", "INT64", null),
       '"amount" IN (-2, 9)',
     ],
     [
-      { columnIndex: 0, operator: "isNull", values: [] },
+      { fieldPath: ["label"], operator: "isNull", values: [] },
       field("label", "BYTE_ARRAY", "String"),
       '"label" IS NULL',
     ],
     [
-      { columnIndex: 0, operator: "isNotNull", values: [] },
+      { fieldPath: ["label"], operator: "isNotNull", values: [] },
       field("label", "BYTE_ARRAY", "String"),
       '"label" IS NOT NULL',
     ],
     [
-      { columnIndex: 0, operator: "greaterThan", values: ["2026-08-01"] },
+      { fieldPath: ["day"], operator: "greaterThan", values: ["2026-08-01"] },
       field("day", "INT32", "Date"),
       "\"day\" > DATE '2026-08-01'",
     ],
     [
       {
-        columnIndex: 0,
+        fieldPath: ["clock"],
         operator: "greaterThanOrEqual",
         values: ["06:07:08.009+00:00"],
       },
@@ -193,7 +197,7 @@ describe("canonical filter query formatting", () => {
     ],
     [
       {
-        columnIndex: 0,
+        fieldPath: ["recorded_at"],
         operator: "lessThan",
         values: ["2026-08-01T06:07:08.009456Z"],
       },
@@ -202,7 +206,7 @@ describe("canonical filter query formatting", () => {
     ],
     [
       {
-        columnIndex: 0,
+        fieldPath: ["legacy_at"],
         operator: "lessThanOrEqual",
         values: ["2026-08-01T06:07:08.009456789"],
       },
@@ -222,13 +226,57 @@ describe("canonical filter query formatting", () => {
       field("label", "BYTE_ARRAY", "String"),
     ];
     const sort: SortColumn[] = [
-      { sourceIndex: 1, direction: "descending" },
-      { sourceIndex: 0, direction: "ascending" },
+      { fieldPath: ["label"], direction: "descending" },
+      { fieldPath: ['value"quoted'], direction: "ascending" },
     ];
 
     expect(formatOrderByClause(sort, schema)).toBe(
       '"label" DESC, "value""quoted" ASC',
     );
+  });
+
+  it("identifies JSON paths and formats their effective scalar types", () => {
+    const jsonField = field("payload.data", "BYTE_ARRAY", "JSON");
+    const path: JsonPath = [
+      { field: "items" },
+      { index: 0 },
+      { field: "unit.price" },
+    ];
+
+    expect(
+      formatFilterCondition(
+        {
+          fieldPath: ["payload.data"],
+          jsonTarget: { path, valueType: "number" },
+          operator: "greaterThan",
+          values: ["10"],
+        },
+        jsonField,
+      ),
+    ).toBe('"payload.data".items[0]."unit.price" > 10');
+    expect(
+      formatFilterCondition(
+        {
+          fieldPath: ["payload.data"],
+          jsonTarget: { path, valueType: "mixed" },
+          operator: "equals",
+          values: ["O'Reilly"],
+        },
+        jsonField,
+      ),
+    ).toBe("\"payload.data\".items[0].\"unit.price\" = 'O''Reilly'");
+    expect(
+      formatOrderByClause(
+        [
+          {
+            fieldPath: ["payload.data"],
+            jsonTarget: { path, valueType: "mixed" },
+            direction: "descending",
+          },
+        ],
+        [jsonField],
+      ),
+    ).toBe('"payload.data".items[0]."unit.price" DESC');
   });
 
   it("renders SELECT in projection order with the engine's identifier quoting", () => {
@@ -238,9 +286,59 @@ describe("canonical filter query formatting", () => {
       field("amount", "DOUBLE", null),
     ];
 
-    expect(formatSelectClause([1, 0], schema)).toBe('"label", "value""quoted"');
-    expect(formatSelectClause([0, 1, 2], schema)).toBe("*");
+    expect(formatSelectClause([["label"], ['value"quoted']], schema)).toBe(
+      '"label", "value""quoted"',
+    );
+    expect(
+      formatSelectClause([['value"quoted'], ["label"], ["amount"]], schema),
+    ).toBe("*");
   });
+
+  it("quotes every nested path segment independently", () => {
+    const schema = [
+      {
+        ...field("root.with.dot", "GROUP", null),
+        children: [field('leaf"quoted', "INT64", null)],
+      },
+    ];
+    const fieldPath = ["root.with.dot", 'leaf"quoted'];
+
+    expect(
+      formatWhereClause(
+        [{ fieldPath, operator: "greaterThan", values: ["4"] }],
+        schema,
+      ),
+    ).toBe('"root.with.dot"."leaf""quoted" > 4');
+    expect(formatSelectClause([fieldPath], schema)).toBe(
+      '"root.with.dot"."leaf""quoted"',
+    );
+  });
+
+  it.each([
+    [
+      { operator: "textContains", matchCase: false },
+      `contains(lower(CAST("profile"."display name" AS VARCHAR)), lower('Ada'))`,
+    ],
+    [
+      { operator: "startsWith", matchCase: true },
+      `starts_with(CAST("profile"."display name" AS VARCHAR), 'Ada')`,
+    ],
+  ] as const)(
+    "renders nested string operator $operator with a spaced field name",
+    ({ operator, matchCase }, expected) => {
+      expect(
+        formatFilterCondition(
+          {
+            fieldPath: ["profile", "display name"],
+            operator,
+            values: ["Ada"],
+            matchCase,
+          },
+          field("display name", "BYTE_ARRAY", "String"),
+        ),
+      ).toBe(expected);
+    },
+  );
 });
 
 describe("filter prefill", () => {

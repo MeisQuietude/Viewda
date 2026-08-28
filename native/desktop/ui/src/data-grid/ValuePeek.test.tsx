@@ -6,19 +6,10 @@ import {
   screen,
 } from "@testing-library/react";
 import { binary, struct, utf8 } from "@uwdata/flechette";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { ValuePeek, placePeek } from "./ValuePeek";
 import { typedValue } from "./value-format";
-
-beforeEach(() => {
-  const values = new Map<string, string>();
-  vi.stubGlobal("localStorage", {
-    getItem: (key: string) => values.get(key) ?? null,
-    setItem: (key: string, value: string) => values.set(key, value),
-    clear: () => values.clear(),
-  });
-});
 
 afterEach(() => {
   cleanup();
@@ -111,7 +102,7 @@ describe("ValuePeek", () => {
         anchor={{ x: 700, y: 200, width: 100, height: 28 }}
       />,
     );
-    expect(dialog).toHaveStyle({ left: "332px", width: "360px" });
+    expect(dialog).toHaveStyle({ left: "392px", width: "300px" });
   });
 
   it("keeps a functional full width while following cells in a narrow viewport", () => {
@@ -187,11 +178,15 @@ describe("ValuePeek", () => {
     expect(onReturnFocus).toHaveBeenCalledOnce();
     expect(document.activeElement).toBe(tree);
     fireEvent.keyDown(tree, { key: "Tab", shiftKey: true });
-    expect(document.activeElement).toBe(close);
+    expect(document.activeElement).toBe(
+      screen.getByRole("button", { name: "Close Peek" }),
+    );
     expect(onReturnFocus).toHaveBeenCalledOnce();
     close.focus();
     fireEvent.keyDown(close, { key: "Tab", shiftKey: true });
-    expect(document.activeElement).toBe(tree);
+    expect(document.activeElement).toBe(
+      screen.getByRole("button", { name: "Resize Peek" }),
+    );
   });
 
   it("moves backward from a structured tree to its last toolbar control", () => {
@@ -211,6 +206,60 @@ describe("ValuePeek", () => {
     expect(document.activeElement).toBe(
       screen.getByRole("button", { name: "Collapse all" }),
     );
+  });
+
+  it("keeps its geometry while selecting and copying a structured child", async () => {
+    vi.useFakeTimers();
+    const onCopy = vi.fn();
+    render(
+      <ValuePeek
+        label="profile"
+        value={typedValue(
+          { name: "Ada", city: "Utrecht" },
+          struct({ name: utf8(), city: utf8() }),
+        )}
+        anchor={defaultAnchor}
+        onClose={vi.fn()}
+        onReturnFocus={vi.fn()}
+        onCopy={onCopy}
+      />,
+    );
+    const dialog = screen.getByRole("dialog", { name: "Peek profile" });
+    const tree = screen.getByRole("tree");
+    const initial = { width: dialog.style.width, height: dialog.style.height };
+
+    fireEvent.keyDown(tree, { key: "ArrowDown" });
+    expect(dialog).toHaveStyle(initial);
+    fireEvent.keyDown(tree, { key: "c", ctrlKey: true });
+    await act(async () => vi.runAllTimersAsync());
+
+    expect(onCopy).toHaveBeenCalledWith('"Ada"');
+    expect(dialog).toHaveStyle(initial);
+    expect(document.querySelector(".value-tree-status")).toBeNull();
+    vi.useRealTimers();
+  });
+
+  it("hides only Copy path when path actions are unavailable", () => {
+    render(
+      <ValuePeek
+        label="profile"
+        value={typedValue({ name: "Ada" }, struct({ name: utf8() }))}
+        anchor={defaultAnchor}
+        showCopyPath={false}
+        onClose={vi.fn()}
+        onReturnFocus={vi.fn()}
+        onCopy={vi.fn()}
+      />,
+    );
+
+    expect(
+      screen.queryByRole("button", { name: "Copy path" }),
+    ).not.toBeInTheDocument();
+    expect(
+      screen.getByRole("searchbox", { name: "Search keys and values" }),
+    ).toBeVisible();
+    expect(screen.getByRole("button", { name: "Expand all" })).toBeVisible();
+    expect(screen.getByRole("button", { name: "Collapse all" })).toBeVisible();
   });
 
   it("keeps Space inert in the focused tree and closes Esc back to the grid", () => {
@@ -255,7 +304,7 @@ describe("ValuePeek", () => {
     expect(onClose).toHaveBeenCalledOnce();
   });
 
-  it("keeps copying on the tree keyboard contract without header copy buttons", async () => {
+  it("copies the selected path and keeps JSON copying on the tree keyboard contract", async () => {
     vi.useFakeTimers();
     const onCopy = vi.fn();
     render(
@@ -272,23 +321,30 @@ describe("ValuePeek", () => {
     expect(
       screen.queryByRole("button", { name: "Copy JSON" }),
     ).not.toBeInTheDocument();
+    expect(screen.queryByRole("searchbox")).not.toBeInTheDocument();
     expect(
-      screen.queryByRole("button", { name: "Copy path" }),
+      screen.queryByRole("button", { name: "Expand all" }),
     ).not.toBeInTheDocument();
+    expect(
+      screen.queryByRole("button", { name: "Collapse all" }),
+    ).not.toBeInTheDocument();
+    fireEvent.keyDown(screen.getByRole("tree"), {
+      key: "c",
+      ctrlKey: true,
+      shiftKey: true,
+    });
+    await act(async () => vi.runAllTimersAsync());
+    expect(onCopy).toHaveBeenCalledWith("note");
     fireEvent.keyDown(screen.getByRole("tree"), {
       key: "c",
       ctrlKey: true,
     });
     await act(async () => vi.runAllTimersAsync());
-    expect(onCopy).toHaveBeenCalledWith('"text"');
+    expect(onCopy).toHaveBeenLastCalledWith('"text"');
     vi.useRealTimers();
   });
 
-  it("reopens with its remembered size", () => {
-    localStorage.setItem(
-      "viewda.value-peek.size",
-      JSON.stringify({ width: 420, height: 430 }),
-    );
+  it("sizes a scalar from its content instead of using a persisted default", () => {
     render(
       <ValuePeek
         label="note"
@@ -301,18 +357,39 @@ describe("ValuePeek", () => {
     );
 
     expect(screen.getByRole("dialog", { name: "Peek note" })).toHaveStyle({
-      width: "420px",
-      height: "430px",
+      width: "300px",
+      height: "138px",
     });
   });
 
-  it("clamps an oversized remembered size beside an edge anchor", () => {
+  it("keeps the current anchor side when the next value needs less space", () => {
+    vi.stubGlobal("innerWidth", 1_000);
+    vi.stubGlobal("innerHeight", 800);
+    const anchor = { x: 550, y: 100, width: 100, height: 28 };
+    const props = {
+      label: "profile",
+      anchor,
+      onClose: vi.fn(),
+      onReturnFocus: vi.fn(),
+      onCopy: vi.fn(),
+    };
+    const view = render(
+      <ValuePeek
+        {...props}
+        value={typedValue({ name: "Ada" }, struct({ name: utf8() }))}
+      />,
+    );
+    const dialog = screen.getByRole("dialog", { name: "Peek profile" });
+    expect(dialog).toHaveStyle({ left: "8px", width: "534px" });
+
+    view.rerender(<ValuePeek {...props} value={typedValue("Ada", utf8())} />);
+
+    expect(dialog).toHaveStyle({ left: "241px", width: "301px" });
+  });
+
+  it("clamps an auto-sized scalar beside an edge anchor", () => {
     vi.stubGlobal("innerWidth", 600);
     vi.stubGlobal("innerHeight", 500);
-    localStorage.setItem(
-      "viewda.value-peek.size",
-      JSON.stringify({ width: 2_000, height: 2_000 }),
-    );
     render(
       <ValuePeek
         label="note"
@@ -325,10 +402,10 @@ describe("ValuePeek", () => {
     );
 
     expect(screen.getByRole("dialog", { name: "Peek note" })).toHaveStyle({
-      left: "8px",
-      top: "8px",
-      width: "464px",
-      height: "424px",
+      left: "172px",
+      top: "294px",
+      width: "300px",
+      height: "138px",
     });
   });
 
@@ -349,7 +426,7 @@ describe("ValuePeek", () => {
     const handle = dialog.querySelector(
       ".value-peek-resize-hint",
     ) as HTMLElement;
-    expect(dialog).toHaveStyle({ left: "482px", top: "212px" });
+    expect(dialog).toHaveStyle({ left: "542px", top: "554px" });
 
     fireEvent.pointerDown(handle, {
       button: 0,
@@ -364,10 +441,10 @@ describe("ValuePeek", () => {
     });
     fireEvent.pointerUp(handle, { pointerId: 12 });
 
-    expect(dialog).toHaveStyle({ top: "112px", height: "580px" });
+    expect(dialog).toHaveStyle({ top: "554px", height: "238px" });
   });
 
-  it("resizes from a fixed corner and persists only dimensions the user changed", () => {
+  it("resizes from a fixed corner and returns to auto-size for another value", () => {
     vi.stubGlobal("innerWidth", 1_000);
     vi.stubGlobal("innerHeight", 800);
     const view = render(
@@ -399,72 +476,23 @@ describe("ValuePeek", () => {
     expect(dialog).toHaveStyle({
       left: "128px",
       top: "56px",
-      width: "440px",
-      height: "400px",
+      width: "380px",
+      height: "132px",
     });
-    expect(localStorage.getItem("viewda.value-peek.size")).toBeNull();
     fireEvent.pointerUp(handle, { pointerId: 1 });
-    expect(JSON.parse(localStorage.getItem("viewda.value-peek.size")!)).toEqual(
-      { width: 440, height: 400 },
-    );
+    expect(dialog).toHaveStyle({ width: "380px", height: "132px" });
 
-    view.unmount();
-    vi.stubGlobal("innerWidth", 180);
-    const constrained = render(
+    view.rerender(
       <ValuePeek
         label="note"
-        value={typedValue("text", utf8())}
+        value={typedValue({ name: "Ada" }, struct({ name: utf8() }))}
         anchor={{ x: 20, y: 20, width: 100, height: 28 }}
         onClose={vi.fn()}
         onReturnFocus={vi.fn()}
         onCopy={vi.fn()}
       />,
     );
-    const constrainedDialog = screen.getByRole("dialog", {
-      name: "Peek note",
-    });
-    expect(constrainedDialog).toHaveStyle({
-      left: "8px",
-      width: "164px",
-    });
-    const constrainedHandle = constrainedDialog.querySelector(
-      ".value-peek-resize-hint",
-    ) as HTMLElement;
-    fireEvent.pointerDown(constrainedHandle, {
-      button: 0,
-      pointerId: 2,
-      clientX: 172,
-      clientY: 456,
-    });
-    fireEvent.pointerMove(constrainedHandle, {
-      pointerId: 2,
-      clientX: 172,
-      clientY: 476,
-    });
-    fireEvent.pointerUp(constrainedHandle, { pointerId: 2 });
-    expect(JSON.parse(localStorage.getItem("viewda.value-peek.size")!)).toEqual(
-      {
-        width: 440,
-        height: 420,
-      },
-    );
-    constrained.unmount();
-
-    vi.stubGlobal("innerWidth", 1_000);
-    render(
-      <ValuePeek
-        label="note"
-        value={typedValue("text", utf8())}
-        anchor={{ x: 20, y: 20, width: 100, height: 28 }}
-        onClose={vi.fn()}
-        onReturnFocus={vi.fn()}
-        onCopy={vi.fn()}
-      />,
-    );
-    expect(screen.getByRole("dialog", { name: "Peek note" })).toHaveStyle({
-      width: "440px",
-      height: "420px",
-    });
+    expect(dialog).toHaveStyle({ width: "560px", height: "188px" });
   });
 
   it("clamps pointer resizing to the viewport without moving its origin", () => {
@@ -505,8 +533,7 @@ describe("ValuePeek", () => {
       height: "336px",
     });
     fireEvent.pointerCancel(handle, { pointerId: 3 });
-    expect(dialog).toHaveStyle({ ...origin, width: "360px", height: "336px" });
-    expect(localStorage.getItem("viewda.value-peek.size")).toBeNull();
+    expect(dialog).toHaveStyle({ ...origin, width: "300px", height: "138px" });
   });
 
   it("cancels resizing when pointer capture is lost", () => {
@@ -527,11 +554,10 @@ describe("ValuePeek", () => {
     expect(dialog).toHaveStyle({
       left: "128px",
       top: "56px",
-      width: "360px",
-      height: "480px",
+      width: "300px",
+      height: "138px",
     });
     fireEvent.pointerUp(handle, { pointerId: 4 });
-    expect(localStorage.getItem("viewda.value-peek.size")).toBeNull();
   });
 
   it("does not cancel a completed resize when releasing capture", () => {
@@ -563,9 +589,7 @@ describe("ValuePeek", () => {
     fireEvent.pointerUp(handle, { pointerId: 5 });
 
     expect(dialog).not.toHaveClass("is-resizing");
-    expect(JSON.parse(localStorage.getItem("viewda.value-peek.size")!)).toEqual(
-      { width: 400, height: 440 },
-    );
+    expect(dialog).toHaveStyle({ width: "340px", height: "132px" });
   });
 
   it("ignores non-primary resize gestures", () => {
@@ -586,8 +610,7 @@ describe("ValuePeek", () => {
     });
 
     expect(dialog).not.toHaveClass("is-resizing");
-    expect(dialog).toHaveStyle({ width: "360px", height: "480px" });
-    expect(localStorage.getItem("viewda.value-peek.size")).toBeNull();
+    expect(dialog).toHaveStyle({ width: "300px", height: "138px" });
   });
 
   it("replays an anchor change after a completed resize", () => {
@@ -611,14 +634,11 @@ describe("ValuePeek", () => {
     fireEvent.pointerUp(handle, { pointerId: 7 });
 
     expect(dialog).toHaveStyle({
-      left: "252px",
-      top: "92px",
-      width: "440px",
-      height: "400px",
+      left: "312px",
+      top: "536px",
+      width: "380px",
+      height: "132px",
     });
-    expect(JSON.parse(localStorage.getItem("viewda.value-peek.size")!)).toEqual(
-      { width: 440, height: 400 },
-    );
   });
 
   it("cancels an active resize and re-places after a viewport resize", () => {
@@ -642,9 +662,8 @@ describe("ValuePeek", () => {
       left: "8px",
       top: "56px",
       width: "284px",
-      height: "236px",
+      height: "138px",
     });
-    expect(localStorage.getItem("viewda.value-peek.size")).toBeNull();
   });
 
   it("recomputes placement when the window resizes", () => {
@@ -661,7 +680,7 @@ describe("ValuePeek", () => {
       />,
     );
     const dialog = screen.getByRole("dialog", { name: "Peek note" });
-    expect(dialog).toHaveStyle({ width: "360px" });
+    expect(dialog).toHaveStyle({ width: "300px" });
 
     vi.stubGlobal("innerWidth", 300);
     fireEvent(window, new Event("resize"));
@@ -669,6 +688,6 @@ describe("ValuePeek", () => {
 
     vi.stubGlobal("innerWidth", 1_000);
     fireEvent(window, new Event("resize"));
-    expect(dialog).toHaveStyle({ width: "360px" });
+    expect(dialog).toHaveStyle({ width: "300px" });
   });
 });

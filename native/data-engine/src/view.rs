@@ -29,17 +29,22 @@ use serde::{Deserialize, Serialize};
 use tempfile::TempDir;
 
 use crate::{
+    FieldPath, JsonFieldTarget,
     dataset::{
         DatasetError, DatasetQuerySource, DatasetRowPosition, DatasetSessionToken,
         DatasetSetupError, DatasetSparseRows, DatasetWindowReader, redact_path_aliases,
         validate_produced_arrow_schema,
     },
-    filter::{DataFilter, FilterPredicate, build_filter_predicate_with_names, quote_identifier},
-    source::{inspect_local_source, inspect_local_source_for_query, open_local_source},
-    window::{
-        DataWindowError, MAX_WINDOW_ROWS, classify_query_error, set_utc_session_timezone,
-        validate_projection,
+    field_path::{
+        field_path_expression, project_arrow_field_paths, resolve_field_path, validate_field_paths,
     },
+    filter::{
+        DataFilter, FilterPredicate, build_filter_predicate_with_names, quote_column_alias,
+        quote_identifier,
+    },
+    json_path::{JsonFieldExpression, field_is_json, json_field_expression},
+    source::{inspect_local_source, inspect_local_source_for_query, open_local_source},
+    window::{DataWindowError, MAX_WINDOW_ROWS, classify_query_error, set_utc_session_timezone},
 };
 
 #[cfg(test)]
@@ -101,12 +106,15 @@ impl DataViewMemoryLimit {
     }
 }
 
-/// One source column in the view's canonical sort order.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+/// One addressable field in the view's canonical sort order.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DataSort {
-    /// Zero-based top-level column index from the source summary.
-    pub source_index: u32,
+    /// Field-name segments from the top-level column through struct fields.
+    pub field_path: FieldPath,
+    /// Optional extraction below a Parquet column explicitly annotated as JSON.
+    #[serde(default)]
+    pub json_target: Option<JsonFieldTarget>,
     /// Direction applied before the stable file-order tie-break.
     pub direction: DataSortDirection,
 }
@@ -427,10 +435,18 @@ impl DataViewBuilder {
 
     /// Builds one position index shared by counts and all subsequent windows.
     pub fn build(self) -> Result<PreparedDataView, DataViewError> {
-        self.build_inner(|| {})
+        self.build_inner(
+            #[cfg(test)]
+            || {},
+            || {},
+        )
     }
 
-    fn build_inner(self, before_publish: impl FnOnce()) -> Result<PreparedDataView, DataViewError> {
+    fn build_inner(
+        self,
+        #[cfg(test)] before_execute: impl FnOnce(),
+        before_publish: impl FnOnce(),
+    ) -> Result<PreparedDataView, DataViewError> {
         let facts = self.source.facts()?;
         self.require_active()?;
         validate_sort(&facts.schema, &self.sort)?;
@@ -482,6 +498,8 @@ impl DataViewBuilder {
         );
         let mut parameters = prepared_relation.parameters;
         parameters.extend(predicate.parameters);
+        #[cfg(test)]
+        before_execute();
         self.connection
             .execute(&query, params_from_iter(parameters.iter()))
             .map_err(|error| {
@@ -591,8 +609,14 @@ impl DataViewBuilder {
                 let mut needed_indices = self
                     .filters
                     .iter()
-                    .map(|filter| filter.column_index as usize)
-                    .chain(self.sort.iter().map(|sort| sort.source_index as usize))
+                    .filter_map(|filter| {
+                        resolve_field_path(&facts.schema, &filter.field_path)
+                            .map(|resolved| resolved.root_index)
+                    })
+                    .chain(self.sort.iter().filter_map(|sort| {
+                        resolve_field_path(&facts.schema, &sort.field_path)
+                            .map(|resolved| resolved.root_index)
+                    }))
                     .collect::<Vec<_>>();
                 needed_indices.sort_unstable();
                 needed_indices.dedup();
@@ -702,7 +726,7 @@ impl DataViewBuilder {
             .sort
             .iter()
             .filter_map(|sort| {
-                let field = facts.schema.get(sort.source_index as usize)?;
+                let field = resolve_field_path(&facts.schema, &sort.field_path)?.field;
                 Some(DataViewSortDiagnostic {
                     physical_type: field.physical_type.clone(),
                     logical_type: field.logical_type.clone(),
@@ -912,23 +936,30 @@ impl PreparedDataView {
 
     /// Reads a bounded view window without rerunning its filter or sort.
     pub fn fetch_window(&self, row_offset: u64, row_count: u32) -> Result<Vec<u8>, DataViewError> {
-        let source_indices = (0..self.schema.len())
-            .map(|index| u32::try_from(index).map_err(|_| DataWindowError::Unsupported))
-            .collect::<Result<Vec<_>, _>>()?;
-        self.fetch_window_columns(row_offset, row_count, &source_indices)
+        let field_paths = self
+            .schema
+            .iter()
+            .map(|field| FieldPath::from(field.name.as_str()))
+            .collect::<Vec<_>>();
+        self.fetch_window_fields(row_offset, row_count, &field_paths)
     }
 
-    /// Reads selected source columns without rerunning the view's filter or sort.
-    pub fn fetch_window_columns(
+    /// Reads selected addressable fields without rerunning the view's filter or sort.
+    pub fn fetch_window_fields(
         &self,
         row_offset: u64,
         row_count: u32,
-        source_indices: &[u32],
+        field_paths: &[FieldPath],
     ) -> Result<Vec<u8>, DataViewError> {
         if row_count > MAX_WINDOW_ROWS {
             return Err(DataWindowError::WindowTooLarge.into());
         }
-        let source_indices = validate_projection(&self.schema, source_indices)?;
+        let resolved =
+            validate_field_paths(&self.schema, field_paths).ok_or(DataWindowError::Unsupported)?;
+        let requested_root_indices = resolved
+            .iter()
+            .map(|resolved| resolved.root_index)
+            .collect::<Vec<_>>();
         if let DataViewSource::Dataset(dataset) = &self.source {
             let offset = usize::try_from(row_offset).map_err(|_| DataWindowError::Unsupported)?;
             let limit = usize::try_from(row_count).map_err(|_| DataWindowError::Unsupported)?;
@@ -940,28 +971,31 @@ impl PreparedDataView {
             )?;
             if positions.is_empty() {
                 let schema = dataset
-                    .projected_arrow_schema(&source_indices)
+                    .projected_field_schema(field_paths)
                     .map_err(dataset_view_error)?;
                 return encode_empty(schema).map_err(DataViewError::from);
             }
             let rows = dataset
                 .stage_sparse_window_while(
                     &positions,
-                    &source_indices,
+                    field_paths,
                     self.temporary_directory.path(),
                     || !self.interrupted.load(Ordering::Acquire),
                 )
                 .map_err(dataset_view_error)?;
-            return self.fetch_sparse_dataset_window(&rows, &source_indices);
+            return self.fetch_sparse_dataset_window(&rows, field_paths);
         }
-        if let (DataViewSource::File(source_path), Some(metadata)) =
-            (&self.source, &self.source_metadata)
+        let top_level_only = field_paths.iter().all(|path| path.segments().len() == 1);
+        if top_level_only
+            && let (DataViewSource::File(source_path), Some(metadata)) =
+                (&self.source, &self.source_metadata)
         {
             let offset = usize::try_from(row_offset).map_err(|_| DataWindowError::Unsupported)?;
             let limit = usize::try_from(row_count).map_err(|_| DataWindowError::Unsupported)?;
             let positions =
                 read_positions(&self.position_index, &self.position_metadata, offset, limit)?;
-            match read_source_positions(source_path, metadata, &positions, &source_indices) {
+            match read_source_positions(source_path, metadata, &positions, &requested_root_indices)
+            {
                 Ok(window) => return Ok(window),
                 Err(DataWindowError::CorruptSource) => {
                     // TODO(Arrow 59): parquet 58 rejects some valid nested-list row groups.
@@ -971,23 +1005,23 @@ impl PreparedDataView {
                 Err(error) => return Err(error.into()),
             }
         }
-        self.fetch_window_columns_with_duckdb(row_offset, row_count, &source_indices)
+        self.fetch_window_fields_with_duckdb(row_offset, row_count, field_paths)
     }
 
-    fn fetch_window_columns_with_duckdb(
+    fn fetch_window_fields_with_duckdb(
         &self,
         row_offset: u64,
         row_count: u32,
-        source_indices: &[usize],
+        field_paths: &[FieldPath],
     ) -> Result<Vec<u8>, DataViewError> {
-        self.fetch_window_columns_with_duckdb_inner(row_offset, row_count, source_indices, || {})
+        self.fetch_window_fields_with_duckdb_inner(row_offset, row_count, field_paths, || {})
     }
 
-    fn fetch_window_columns_with_duckdb_inner(
+    fn fetch_window_fields_with_duckdb_inner(
         &self,
         row_offset: u64,
         row_count: u32,
-        source_indices: &[usize],
+        field_paths: &[FieldPath],
         before_prepare: impl FnOnce(),
     ) -> Result<Vec<u8>, DataViewError> {
         if self.interrupted.load(Ordering::Acquire) {
@@ -1004,7 +1038,7 @@ impl PreparedDataView {
                 self.source_row_count,
                 source_path.to_str().ok_or(DataWindowError::Unsupported)?,
                 position_index_path,
-                source_indices,
+                field_paths,
             )?,
             DataViewSource::Dataset(_) => return Err(DataWindowError::Unsupported.into()),
         };
@@ -1014,22 +1048,25 @@ impl PreparedDataView {
     fn fetch_sparse_dataset_window(
         &self,
         rows: &DatasetSparseRows,
-        source_indices: &[usize],
+        field_paths: &[FieldPath],
     ) -> Result<Vec<u8>, DataViewError> {
         if self.interrupted.load(Ordering::Acquire) {
             return Err(DataWindowError::Cancelled.into());
         }
-        let projection = source_indices
+        let projection = field_paths
             .iter()
-            .map(|index| {
-                let field = self
-                    .schema
-                    .get(*index)
+            .map(|path| {
+                let resolved =
+                    resolve_field_path(&self.schema, path).ok_or(DataWindowError::Unsupported)?;
+                let root = format!(
+                    "source.{}",
+                    quote_identifier(&self.schema[resolved.root_index].name)
+                );
+                let expression = field_path_expression(&self.schema, path, &root)
                     .ok_or(DataWindowError::Unsupported)?;
                 Ok(format!(
-                    "source.{} AS {}",
-                    quote_identifier(&field.name),
-                    quote_identifier(&field.name)
+                    "{expression} AS {}",
+                    quote_column_alias(path.leaf_name().ok_or(DataWindowError::Unsupported)?)
                 ))
             })
             .collect::<Result<Vec<_>, DataWindowError>>()?
@@ -1047,7 +1084,9 @@ impl PreparedDataView {
             .stream_arrow([])
             .map_err(|error| self.classify_sparse_query_error(error))?;
         let produced_schema = batches.get_schema();
-        validate_produced_arrow_schema(rows.schema(), &produced_schema)?;
+        let expected = project_arrow_field_paths(rows.schema(), field_paths)
+            .ok_or(DataWindowError::Unsupported)?;
+        validate_produced_arrow_schema(&expected, &produced_schema)?;
         let mut writer = StreamWriter::try_new(Vec::new(), produced_schema.as_ref())
             .map_err(|_| DataWindowError::EncodingFailed)?;
         let mut written_rows = 0_usize;
@@ -1130,16 +1169,21 @@ fn validate_sort(
     if sort.len() > MAX_SORT_COLUMNS {
         return Err(DataWindowError::InvalidSort);
     }
-    let mut seen = vec![false; schema.len()];
+    let mut seen = Vec::with_capacity(sort.len());
     for column in sort {
-        let index =
-            usize::try_from(column.source_index).map_err(|_| DataWindowError::InvalidSort)?;
-        let Some(slot) = seen.get_mut(index) else {
-            return Err(DataWindowError::InvalidSort);
-        };
-        if std::mem::replace(slot, true) {
+        let resolved =
+            resolve_field_path(schema, &column.field_path).ok_or(DataWindowError::InvalidSort)?;
+        if column.json_target.is_some() && !field_is_json(resolved.field) {
             return Err(DataWindowError::InvalidSort);
         }
+        let identity = (
+            &column.field_path,
+            column.json_target.as_ref().map(|target| &target.path),
+        );
+        if seen.contains(&identity) {
+            return Err(DataWindowError::InvalidSort);
+        }
+        seen.push(identity);
     }
     Ok(())
 }
@@ -1168,21 +1212,36 @@ fn build_order_clause_with_names(
     }
     let mut order = Vec::with_capacity(sort.len() + 1);
     for sort_column in sort {
-        schema
-            .get(sort_column.source_index as usize)
+        let resolved = resolve_field_path(schema, &sort_column.field_path)
             .ok_or(DataWindowError::InvalidSort)?;
         let direction = match sort_column.direction {
             DataSortDirection::Ascending => "ASC",
             DataSortDirection::Descending => "DESC",
         };
-        order.push(format!(
-            "{} {direction} NULLS LAST",
-            quote_identifier(
-                column_names
-                    .get(sort_column.source_index as usize)
-                    .ok_or(DataWindowError::InvalidSort)?,
-            )
-        ));
+        let root = quote_identifier(
+            column_names
+                .get(resolved.root_index)
+                .ok_or(DataWindowError::InvalidSort)?,
+        );
+        let field = field_path_expression(schema, &sort_column.field_path, &root)
+            .ok_or(DataWindowError::InvalidSort)?;
+        let expression = match &sort_column.json_target {
+            Some(target) if field_is_json(resolved.field) => json_field_expression(&field, target),
+            Some(_) => None,
+            None => Some(JsonFieldExpression::Scalar(field)),
+        }
+        .ok_or(DataWindowError::InvalidSort)?;
+        match expression {
+            JsonFieldExpression::Scalar(expression) => {
+                order.push(format!("{expression} {direction} NULLS LAST"));
+            }
+            JsonFieldExpression::Number(number) => {
+                // DOUBLE defines the common numeric bucket. The DECIMAL key preserves exact
+                // integers and orders collisions without coercing them back to DOUBLE.
+                order.push(format!("{} {direction} NULLS LAST", number.finite));
+                order.push(format!("{} {direction} NULLS LAST", number.bucket_tie));
+            }
+        }
     }
     order.push(format!("{source_position} ASC"));
     Ok(order.join(", "))
@@ -1194,7 +1253,7 @@ fn build_window_query(
     source_row_count: u64,
     source_path: &str,
     position_index_path: &str,
-    source_indices: &[usize],
+    field_paths: &[FieldPath],
 ) -> Result<String, DataWindowError> {
     if source_columns.len() != schema.len() {
         return Err(DataWindowError::Unsupported);
@@ -1212,16 +1271,22 @@ fn build_window_query(
         .map(|column| quote_identifier(column))
         .collect::<Vec<_>>()
         .join(", ");
-    let projection = source_indices
+    let projection = field_paths
         .iter()
-        .map(|source_index| {
-            format!(
-                "{source}.{} AS {}",
-                quote_identifier(&source_columns[*source_index]),
-                quote_identifier(&schema[*source_index].name),
-            )
+        .map(|path| {
+            let resolved = resolve_field_path(schema, path).ok_or(DataWindowError::Unsupported)?;
+            let root = format!(
+                "{source}.{}",
+                quote_identifier(&source_columns[resolved.root_index])
+            );
+            let expression =
+                field_path_expression(schema, path, &root).ok_or(DataWindowError::Unsupported)?;
+            Ok(format!(
+                "{expression} AS {}",
+                quote_column_alias(path.leaf_name().ok_or(DataWindowError::Unsupported)?)
+            ))
         })
-        .collect::<Vec<_>>()
+        .collect::<Result<Vec<_>, DataWindowError>>()?
         .join(", ");
     let requested_cte = format!(
         "{requested} AS (\
@@ -1637,7 +1702,7 @@ mod tests {
         arrow::ArrowWriter,
         file::reader::{FileReader, SerializedFileReader},
     };
-    use tempfile::NamedTempFile;
+    use tempfile::{NamedTempFile, TempDir};
 
     use super::*;
     use crate::DataFilterOperator;
@@ -1649,7 +1714,8 @@ mod tests {
             source.path().to_owned(),
             &[],
             &[DataSort {
-                source_index: 1,
+                field_path: field("label"),
+                json_target: None,
                 direction: DataSortDirection::Ascending,
             }],
         )
@@ -1681,7 +1747,8 @@ mod tests {
             &reader,
             &[],
             &[DataSort {
-                source_index: 0,
+                field_path: field("id"),
+                json_target: None,
                 direction: DataSortDirection::Ascending,
             }],
             DataViewMemoryLimit::Mb384,
@@ -1726,7 +1793,8 @@ mod tests {
     fn dataset_staging_applies_the_prepared_filter_predicate() {
         let (_directory, reader) = write_dataset_fixture();
         let filters = [DataFilter {
-            column_index: 0,
+            field_path: field("id"),
+            json_target: None,
             operator: crate::DataFilterOperator::Equals,
             values: vec!["1".to_owned()],
             match_case: false,
@@ -1735,7 +1803,8 @@ mod tests {
             &reader,
             &filters,
             &[DataSort {
-                source_index: 0,
+                field_path: field("id"),
+                json_target: None,
                 direction: DataSortDirection::Ascending,
             }],
             DataViewMemoryLimit::Mb384,
@@ -1778,7 +1847,8 @@ mod tests {
             &reader,
             &[],
             &[DataSort {
-                source_index: 0,
+                field_path: field("id"),
+                json_target: None,
                 direction: DataSortDirection::Ascending,
             }],
             DataViewMemoryLimit::Mb384,
@@ -1817,7 +1887,8 @@ mod tests {
             source.path().to_owned(),
             &[],
             &[DataSort {
-                source_index: 1,
+                field_path: field("label"),
+                json_target: None,
                 direction: DataSortDirection::Descending,
             }],
         )
@@ -1826,7 +1897,7 @@ mod tests {
         .expect("prepared view");
 
         let bytes = view
-            .fetch_window_columns(0, 2, &[1])
+            .fetch_window_fields(0, 2, &[field("label")])
             .expect("projected window");
         let batches = StreamReader::try_new(Cursor::new(bytes), None)
             .expect("Arrow stream")
@@ -1846,7 +1917,7 @@ mod tests {
             "label-1999"
         );
         let reordered = view
-            .fetch_window_columns(0, 1, &[1, 0])
+            .fetch_window_fields(0, 1, &[field("label"), field("id")])
             .expect("reordered projected window");
         let reordered = StreamReader::try_new(Cursor::new(reordered), None)
             .expect("reordered Arrow stream")
@@ -1865,15 +1936,15 @@ mod tests {
             1_999
         );
         assert!(matches!(
-            view.fetch_window_columns(0, 1, &[]),
+            view.fetch_window_fields(0, 1, &[]),
             Err(DataViewError::Engine(DataWindowError::Unsupported))
         ));
         assert!(matches!(
-            view.fetch_window_columns(0, 1, &[1, 1]),
+            view.fetch_window_fields(0, 1, &[field("label"), field("label")]),
             Err(DataViewError::Engine(DataWindowError::Unsupported))
         ));
         assert!(matches!(
-            view.fetch_window_columns(0, 1, &[2]),
+            view.fetch_window_fields(0, 1, &[field("missing")]),
             Err(DataViewError::Engine(DataWindowError::Unsupported))
         ));
     }
@@ -1892,7 +1963,8 @@ mod tests {
             source.path().to_owned(),
             &[],
             &[DataSort {
-                source_index: 0,
+                field_path: field("id"),
+                json_target: None,
                 direction: DataSortDirection::Ascending,
             }],
         )
@@ -1900,7 +1972,7 @@ mod tests {
         .build()
         .expect("prepared view");
         let sparse = view
-            .fetch_window_columns(0, 2, &[1])
+            .fetch_window_fields(0, 2, &[field("utc_at")])
             .expect("sparse window");
         let sparse = StreamReader::try_new(Cursor::new(sparse), None)
             .expect("sparse Arrow stream")
@@ -1908,7 +1980,7 @@ mod tests {
             .expect("sparse Arrow batch")
             .expect("valid sparse Arrow batch");
         let fallback = view
-            .fetch_window_columns_with_duckdb(0, 2, &[1])
+            .fetch_window_fields_with_duckdb(0, 2, &[field("utc_at")])
             .expect("DuckDB fallback window");
         let fallback = StreamReader::try_new(Cursor::new(fallback), None)
             .expect("fallback Arrow stream")
@@ -1937,7 +2009,8 @@ mod tests {
             source.path().to_owned(),
             &[],
             &[DataSort {
-                source_index: 0,
+                field_path: field("id"),
+                json_target: None,
                 direction: DataSortDirection::Ascending,
             }],
         )
@@ -1945,12 +2018,12 @@ mod tests {
         .build()
         .expect("prepared view");
         let sparse = decode_one_window(
-            view.fetch_window_columns(0, 2, &[1])
+            view.fetch_window_fields(0, 2, &[field("payload")])
                 .expect("sparse window"),
             "sparse",
         );
         let fallback = decode_one_window(
-            view.fetch_window_columns_with_duckdb(0, 2, &[1])
+            view.fetch_window_fields_with_duckdb(0, 2, &[field("payload")])
                 .expect("DuckDB fallback window"),
             "fallback",
         );
@@ -1969,6 +2042,62 @@ mod tests {
     }
 
     #[test]
+    fn prepared_nested_window_projects_only_the_requested_parquet_leaf() {
+        let source = write_nested_value_fixture();
+        let view = DataViewBuilder::new(
+            source.path().to_owned(),
+            &[],
+            &[DataSort {
+                field_path: field("id"),
+                json_target: None,
+                direction: DataSortDirection::Ascending,
+            }],
+        )
+        .expect("view builder")
+        .build()
+        .expect("prepared view");
+        let amount = FieldPath::new(["payload", "amount"]);
+        let query = build_window_query(
+            &view.schema,
+            &view.source_columns,
+            view.source_row_count,
+            source.path().to_str().expect("UTF-8 source path"),
+            view.position_index_path()
+                .to_str()
+                .expect("UTF-8 position path"),
+            std::slice::from_ref(&amount),
+        )
+        .expect("DuckDB fallback query");
+        let plan = view
+            .source_connection
+            .prepare(&format!("EXPLAIN {query}"))
+            .expect("explain prepared window")
+            .query_map(duckdb::params![2_i64, 0_i64], |row| row.get::<_, String>(1))
+            .expect("explain rows")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("physical plan")
+            .join("\n");
+        assert!(plan.contains("__viewda_column_1.amount"), "{plan}");
+        assert!(!plan.contains("occurred_at"), "{plan}");
+        assert!(!plan.contains("blob"), "{plan}");
+
+        let batch = decode_one_window(
+            view.fetch_window_fields(0, 2, std::slice::from_ref(&amount))
+                .expect("prepared leaf window"),
+            "prepared leaf",
+        );
+        assert_eq!(
+            batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<Decimal128Array>()
+                .expect("amount decimals")
+                .values(),
+            &[1_234, -5_678]
+        );
+    }
+
+    #[test]
     fn traverses_sparse_position_row_groups_without_gaps_duplicates_or_reordering() {
         const ROW_GROUP_ROWS: i64 = 2_048;
         const ROW_GROUP_COUNT: i64 = 8;
@@ -1980,7 +2109,8 @@ mod tests {
             source.path().to_owned(),
             &[],
             &[DataSort {
-                source_index: 1,
+                field_path: field("sort_key"),
+                json_target: None,
                 direction: DataSortDirection::Ascending,
             }],
         )
@@ -2072,7 +2202,8 @@ mod tests {
             source.path().to_owned(),
             &[],
             &[DataSort {
-                source_index: 1,
+                field_path: field("label"),
+                json_target: None,
                 direction: DataSortDirection::Ascending,
             }],
         )
@@ -2109,7 +2240,62 @@ mod tests {
         let builder = DataViewBuilder::new(source.path().to_owned(), &[], &[]).expect("builder");
         let interrupt = builder.interrupt_handle();
         assert!(matches!(
-            builder.build_inner(|| interrupt.interrupt()),
+            builder.build_inner(|| {}, || interrupt.interrupt()),
+            Err(DataViewError::Engine(DataWindowError::Cancelled))
+        ));
+    }
+
+    #[test]
+    fn interrupt_stops_an_executing_json_filter_scan() {
+        let (_directory, source) = write_large_json_fixture();
+        let builder = DataViewBuilder::new(
+            source,
+            &[DataFilter {
+                field_path: field("payload"),
+                json_target: Some(crate::JsonFieldTarget {
+                    path: crate::JsonPath::new([crate::JsonPathSegment::Field("value".to_owned())]),
+                    value_type: crate::JsonValueType::Number,
+                }),
+                operator: DataFilterOperator::GreaterThanOrEqual,
+                values: vec!["0".to_owned()],
+                match_case: false,
+            }],
+            &[],
+        )
+        .expect("JSON view builder");
+        let position_index = builder.temporary_directory.path().join("positions.parquet");
+        let interrupt = Arc::new(builder.interrupt_handle());
+        let (execute_tx, execute_rx) = mpsc::sync_channel(0);
+        let scan = thread::spawn(move || {
+            builder.build_inner(
+                move || execute_tx.send(()).expect("report JSON query execution"),
+                || {},
+            )
+        });
+        execute_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("JSON query reaches execution");
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !position_index.exists() {
+            assert!(
+                !scan.is_finished(),
+                "JSON scan finished before interruption"
+            );
+            assert!(
+                std::time::Instant::now() < deadline,
+                "JSON scan did not start writing its position index"
+            );
+            thread::yield_now();
+        }
+        assert!(
+            !scan.is_finished(),
+            "JSON scan finished before interruption"
+        );
+
+        interrupt.interrupt();
+
+        assert!(matches!(
+            scan.join().expect("JSON scan thread"),
             Err(DataViewError::Engine(DataWindowError::Cancelled))
         ));
     }
@@ -2121,7 +2307,8 @@ mod tests {
             source.path().to_owned(),
             &[],
             &[DataSort {
-                source_index: 1,
+                field_path: field("label"),
+                json_target: None,
                 direction: DataSortDirection::Descending,
             }],
         )
@@ -2208,7 +2395,8 @@ mod tests {
         let with_filters = DataViewBuilder::new(
             source.path().to_owned(),
             &[DataFilter {
-                column_index: 0,
+                field_path: field("id"),
+                json_target: None,
                 operator: crate::DataFilterOperator::Equals,
                 values: vec!["1".to_owned()],
                 match_case: false,
@@ -2305,7 +2493,12 @@ mod tests {
         };
         fs::remove_file(&removed).expect("remove after position lookup");
         let result = dataset
-            .stage_sparse_window_while(&positions, &[0], view.temporary_directory.path(), || true)
+            .stage_sparse_window_while(
+                &positions,
+                &[field("id")],
+                view.temporary_directory.path(),
+                || true,
+            )
             .map_err(dataset_view_error);
         assert!(matches!(
             result,
@@ -2362,7 +2555,8 @@ mod tests {
             source.path().to_owned(),
             &[],
             &[DataSort {
-                source_index: 1,
+                field_path: field("label"),
+                json_target: None,
                 direction: DataSortDirection::Ascending,
             }],
             DataViewMemoryLimit::Mb768,
@@ -2569,11 +2763,13 @@ mod tests {
                 &schema,
                 &[
                     DataSort {
-                        source_index: 1,
+                        field_path: field("label"),
+                        json_target: None,
                         direction: DataSortDirection::Descending,
                     },
                     DataSort {
-                        source_index: 0,
+                        field_path: field("value\"quoted"),
+                        json_target: None,
                         direction: DataSortDirection::Ascending,
                     },
                 ],
@@ -2584,6 +2780,144 @@ mod tests {
                     .to_owned()
             )
         );
+    }
+
+    #[test]
+    fn data_sort_json_target_keeps_its_exact_bidirectional_wire_shape() {
+        let sort = DataSort {
+            field_path: crate::FieldPath::new(["payload"]),
+            json_target: Some(crate::JsonFieldTarget {
+                path: crate::JsonPath::new([
+                    crate::JsonPathSegment::Field("items".to_owned()),
+                    crate::JsonPathSegment::Index(2),
+                    crate::JsonPathSegment::Field("enabled".to_owned()),
+                ]),
+                value_type: crate::JsonValueType::Boolean,
+            }),
+            direction: DataSortDirection::Descending,
+        };
+        let wire = serde_json::json!({
+            "fieldPath": ["payload"],
+            "jsonTarget": {
+                "path": [
+                    { "field": "items" },
+                    { "index": 2 },
+                    { "field": "enabled" }
+                ],
+                "valueType": "boolean"
+            },
+            "direction": "descending"
+        });
+
+        assert_eq!(
+            serde_json::to_value(&sort).expect("serialize JSON-target sort"),
+            wire
+        );
+        assert_eq!(
+            serde_json::from_value::<DataSort>(wire).expect("deserialize JSON-target sort"),
+            sort
+        );
+    }
+
+    #[test]
+    fn json_sort_uses_text_for_mixed_values_and_requires_a_json_annotation() {
+        let json = crate::SchemaField {
+            name: "payload".to_owned(),
+            physical_type: "BYTE_ARRAY".to_owned(),
+            logical_type: Some("JSON".to_owned()),
+            children: Vec::new(),
+        };
+        let target = crate::JsonFieldTarget {
+            path: crate::JsonPath::new([crate::JsonPathSegment::Field("value".to_owned())]),
+            value_type: crate::JsonValueType::Mixed,
+        };
+        let sort = DataSort {
+            field_path: field("payload"),
+            json_target: Some(target),
+            direction: DataSortDirection::Ascending,
+        };
+
+        assert_eq!(
+            build_order_clause(std::slice::from_ref(&json), std::slice::from_ref(&sort), "row"),
+            Ok("json_extract_string(TRY_CAST(\"payload\" AS JSON), '$.\"value\"') ASC NULLS LAST, row ASC".to_owned())
+        );
+        assert_eq!(
+            validate_sort(std::slice::from_ref(&json), std::slice::from_ref(&sort)),
+            Ok(())
+        );
+
+        let text = crate::SchemaField {
+            logical_type: Some("String".to_owned()),
+            ..json
+        };
+        assert_eq!(
+            validate_sort(&[text], &[sort]),
+            Err(DataWindowError::InvalidSort)
+        );
+    }
+
+    #[test]
+    fn json_number_sort_uses_finite_order_with_an_exact_tie_breaker() {
+        let schema = [crate::SchemaField {
+            name: "payload".to_owned(),
+            physical_type: "BYTE_ARRAY".to_owned(),
+            logical_type: Some("JSON".to_owned()),
+            children: Vec::new(),
+        }];
+        let sort = [DataSort {
+            field_path: field("payload"),
+            json_target: Some(crate::JsonFieldTarget {
+                path: crate::JsonPath::new([crate::JsonPathSegment::Field("value".to_owned())]),
+                value_type: crate::JsonValueType::Number,
+            }),
+            direction: DataSortDirection::Ascending,
+        }];
+
+        let order = build_order_clause(&schema, &sort, "row").expect("JSON numeric order");
+
+        assert!(order.contains("isfinite"));
+        assert!(order.contains("DECIMAL(38, 18)"));
+        assert!(order.find("isfinite").unwrap() < order.find("DECIMAL(38, 18)").unwrap());
+        assert!(!order.contains("COALESCE"));
+        assert!(order.ends_with("row ASC"));
+    }
+
+    #[test]
+    fn json_sort_identity_ignores_the_requested_value_type() {
+        let schema = [crate::SchemaField {
+            name: "payload".to_owned(),
+            physical_type: "BYTE_ARRAY".to_owned(),
+            logical_type: Some("JSON".to_owned()),
+            children: Vec::new(),
+        }];
+        let path = crate::JsonPath::new([crate::JsonPathSegment::Field("value".to_owned())]);
+        let sort = [
+            DataSort {
+                field_path: field("payload"),
+                json_target: Some(crate::JsonFieldTarget {
+                    path: path.clone(),
+                    value_type: crate::JsonValueType::Number,
+                }),
+                direction: DataSortDirection::Ascending,
+            },
+            DataSort {
+                field_path: field("payload"),
+                json_target: Some(crate::JsonFieldTarget {
+                    path,
+                    value_type: crate::JsonValueType::Text,
+                }),
+                direction: DataSortDirection::Descending,
+            },
+        ];
+
+        assert_eq!(
+            validate_sort(&schema, &sort),
+            Err(DataWindowError::InvalidSort)
+        );
+    }
+
+    fn field(name: &str) -> FieldPath {
+        FieldPath::new(vec![name.to_owned()])
     }
 
     fn write_fixture() -> NamedTempFile {
@@ -2607,6 +2941,21 @@ mod tests {
         writer.write(&batch).expect("write batch");
         writer.close().expect("write footer");
         source
+    }
+
+    fn write_large_json_fixture() -> (TempDir, PathBuf) {
+        let directory = tempfile::tempdir().expect("JSON fixture directory");
+        let path = directory.path().join("large-json.parquet");
+        let connection = Connection::open_in_memory().expect("JSON fixture connection");
+        connection
+            .execute_batch(&format!(
+                "COPY (SELECT range AS id, \
+                 CAST(concat('{{\"value\":', CAST(range AS VARCHAR), '}}') AS JSON) AS payload \
+                 FROM range(1000000)) TO {} (FORMAT PARQUET, COMPRESSION ZSTD)",
+                quote_string_literal(path.to_str().expect("UTF-8 JSON fixture path")),
+            ))
+            .expect("large JSON fixture");
+        (directory, path)
     }
 
     fn write_dataset_fixture() -> (tempfile::TempDir, DatasetWindowReader) {
@@ -2645,12 +2994,6 @@ mod tests {
             .is_none()
         {}
         let reader = inspector.into_window_reader().expect("dataset reader");
-        let year = reader
-            .summary()
-            .schema
-            .iter()
-            .position(|field| field.name == "year")
-            .expect("partition column") as u32;
         let identity_checks = source.identity_check_count();
         fs::remove_file(directory.path().join("year=2026/pruned.parquet"))
             .expect("remove pruned member");
@@ -2658,13 +3001,15 @@ mod tests {
         DataViewBuilder::for_dataset(
             &reader,
             &[DataFilter {
-                column_index: year,
+                field_path: field("year"),
+                json_target: None,
                 operator: DataFilterOperator::Equals,
                 values: vec!["2025".to_owned()],
                 match_case: false,
             }],
             &[DataSort {
-                source_index: 0,
+                field_path: field("id"),
+                json_target: None,
                 direction: DataSortDirection::Ascending,
             }],
             DataViewMemoryLimit::Mb384,
@@ -2682,7 +3027,8 @@ mod tests {
             DataViewBuilder::for_dataset(
                 &reader,
                 &[DataFilter {
-                    column_index: year,
+                    field_path: field("year"),
+                    json_target: None,
                     operator: DataFilterOperator::Equals,
                     values: vec!["2026".to_owned()],
                     match_case: false,

@@ -1,5 +1,6 @@
 import {
   binary,
+  decimal128,
   field,
   float64,
   int64,
@@ -10,10 +11,17 @@ import {
   TimeUnit,
   utf8,
 } from "@uwdata/flechette";
+import { readFileSync } from "node:fs";
+import { resolve } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { createValueJsonSerializer } from "./value-json-serializer";
 import { invalidJsonValue, typedValue } from "./value-format";
+
+const canonicalNestedProfile = readFileSync(
+  resolve(process.cwd(), "../test-fixtures/canonical-nested-profile.json"),
+  "utf8",
+).trimEnd();
 
 afterEach(() => {
   vi.useRealTimers();
@@ -32,27 +40,57 @@ function stepUnits(
 }
 
 describe("incremental value JSON serialization", () => {
-  it("matches copy conventions while preserving duplicate map keys", () => {
+  it("matches the shared Grid Copy and CSV canonical nested JSON contract", () => {
     const serializer = createValueJsonSerializer(
       typedValue(
         {
-          safe: 5n,
+          "weird.name": "Ada",
+          age: 37n,
+          scale_zero: 37n,
+          trailing_zero: 120n,
+          unsafe_decimal: 9_007_199_254_740_993n,
+          small_decimal: 1n,
+          finite_one: 1,
+          negative_zero: -0,
+          large_finite: 1e20,
+          fractional_exponent: 1.25e-7,
+          positive_exponent: 1e21,
+          negative_exponent: -1e21,
+          rounding_sensitive_integral: 1_000_000_000_000_000_100,
+          nan: Number.NaN,
+          positive_infinity: Number.POSITIVE_INFINITY,
+          negative_infinity: Number.NEGATIVE_INFINITY,
+          nullable_float: null,
           unsafe: 9_007_199_254_740_993n,
-          nonFinite: Number.NaN,
-          timestamp: 9_007_199_254_740_993n,
-          binary: new Uint8Array([1, 2, 3]),
+          payload: new Uint8Array([1, 2, 3]),
           labels: [
             ["language", "English"],
             ["language", "French"],
           ],
+          recorded_at: 9_007_199_254_740_993n,
         },
         struct({
-          safe: int64(),
+          "weird.name": utf8(),
+          age: int64(),
+          scale_zero: decimal128(10, 0),
+          trailing_zero: decimal128(10, 2),
+          unsafe_decimal: decimal128(38, 0),
+          small_decimal: decimal128(38, 20),
+          finite_one: float64(),
+          negative_zero: float64(),
+          large_finite: float64(),
+          fractional_exponent: float64(),
+          positive_exponent: float64(),
+          negative_exponent: float64(),
+          rounding_sensitive_integral: float64(),
+          nan: float64(),
+          positive_infinity: float64(),
+          negative_infinity: float64(),
+          nullable_float: float64(),
           unsafe: int64(),
-          nonFinite: float64(),
-          timestamp: timestamp(TimeUnit.NANOSECOND),
-          binary: binary(),
+          payload: binary(),
           labels: map(utf8(), utf8()),
+          recorded_at: timestamp(TimeUnit.NANOSECOND),
         }),
       ),
     );
@@ -64,17 +102,7 @@ describe("incremental value JSON serialization", () => {
       throw new Error("Expected serialization to complete");
     }
 
-    expect(JSON.parse(result.text)).toEqual({
-      safe: 5,
-      unsafe: "9007199254740993",
-      nonFinite: "NaN",
-      timestamp: "9007199254740993",
-      binary: "AQID",
-      labels: [
-        ["language", "English"],
-        ["language", "French"],
-      ],
-    });
+    expect(result.text).toBe(canonicalNestedProfile);
   });
 
   it("yields while escaping a multi-megabyte scalar", () => {
