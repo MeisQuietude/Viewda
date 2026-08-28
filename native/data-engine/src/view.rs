@@ -38,7 +38,10 @@ use crate::{
     field_path::{
         field_path_expression, project_arrow_field_paths, resolve_field_path, validate_field_paths,
     },
-    filter::{DataFilter, FilterPredicate, build_filter_predicate_with_names, quote_identifier},
+    filter::{
+        DataFilter, FilterPredicate, build_filter_predicate_with_names, quote_column_alias,
+        quote_identifier,
+    },
     json_path::{JsonFieldExpression, field_is_json, json_field_expression},
     source::{inspect_local_source, inspect_local_source_for_query, open_local_source},
     window::{DataWindowError, MAX_WINDOW_ROWS, classify_query_error, set_utc_session_timezone},
@@ -1059,11 +1062,11 @@ impl PreparedDataView {
                     "source.{}",
                     quote_identifier(&self.schema[resolved.root_index].name)
                 );
-                let expression =
-                    field_path_expression(path, &root).ok_or(DataWindowError::Unsupported)?;
+                let expression = field_path_expression(&self.schema, path, &root)
+                    .ok_or(DataWindowError::Unsupported)?;
                 Ok(format!(
                     "{expression} AS {}",
-                    quote_identifier(path.leaf_name().ok_or(DataWindowError::Unsupported)?)
+                    quote_column_alias(path.leaf_name().ok_or(DataWindowError::Unsupported)?)
                 ))
             })
             .collect::<Result<Vec<_>, DataWindowError>>()?
@@ -1220,7 +1223,7 @@ fn build_order_clause_with_names(
                 .get(resolved.root_index)
                 .ok_or(DataWindowError::InvalidSort)?,
         );
-        let field = field_path_expression(&sort_column.field_path, &root)
+        let field = field_path_expression(schema, &sort_column.field_path, &root)
             .ok_or(DataWindowError::InvalidSort)?;
         let expression = match &sort_column.json_target {
             Some(target) if field_is_json(resolved.field) => json_field_expression(&field, target),
@@ -1277,10 +1280,10 @@ fn build_window_query(
                 quote_identifier(&source_columns[resolved.root_index])
             );
             let expression =
-                field_path_expression(path, &root).ok_or(DataWindowError::Unsupported)?;
+                field_path_expression(schema, path, &root).ok_or(DataWindowError::Unsupported)?;
             Ok(format!(
                 "{expression} AS {}",
-                quote_identifier(path.leaf_name().ok_or(DataWindowError::Unsupported)?)
+                quote_column_alias(path.leaf_name().ok_or(DataWindowError::Unsupported)?)
             ))
         })
         .collect::<Result<Vec<_>, DataWindowError>>()?

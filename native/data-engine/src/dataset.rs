@@ -46,7 +46,7 @@ use crate::{
     field_path::{
         field_path_expression, project_arrow_field_paths, resolve_field_path, validate_field_paths,
     },
-    filter::quote_identifier,
+    filter::{EMPTY_COLUMN_ALIAS, quote_column_alias, quote_identifier},
     json_path::{field_is_json, json_schema_sample_expression},
     source::{
         SourceError, SourceSnapshot, SourceSummary, inspect_local_source,
@@ -2864,11 +2864,11 @@ impl DatasetWindowReader {
                     let resolved = resolve_field_path(&self.summary.schema, path)
                         .ok_or(DataWindowError::Unsupported)?;
                     let root = quote_identifier(&self.summary.schema[resolved.root_index].name);
-                    let expression =
-                        field_path_expression(path, &root).ok_or(DataWindowError::Unsupported)?;
+                    let expression = field_path_expression(&self.summary.schema, path, &root)
+                        .ok_or(DataWindowError::Unsupported)?;
                     Ok(format!(
                         "{expression} AS {}",
-                        quote_identifier(path.leaf_name().ok_or(DataWindowError::Unsupported)?)
+                        quote_column_alias(path.leaf_name().ok_or(DataWindowError::Unsupported)?)
                     ))
                 })
                 .collect::<Result<Vec<_>, DataWindowError>>()?
@@ -2878,12 +2878,12 @@ impl DatasetWindowReader {
                     .filter(|resolved| field_is_json(resolved.field))
                     .ok_or(DataWindowError::Unsupported)?;
                 let root = quote_identifier(&self.summary.schema[resolved.root_index].name);
-                let field =
-                    field_path_expression(path, &root).ok_or(DataWindowError::Unsupported)?;
+                let field = field_path_expression(&self.summary.schema, path, &root)
+                    .ok_or(DataWindowError::Unsupported)?;
                 format!(
                     "{} AS {}",
                     json_schema_sample_expression(&field),
-                    quote_identifier(path.leaf_name().ok_or(DataWindowError::Unsupported)?),
+                    quote_column_alias(path.leaf_name().ok_or(DataWindowError::Unsupported)?),
                 )
             }
         };
@@ -3824,8 +3824,11 @@ pub(crate) fn validate_produced_arrow_schema(
             .iter()
             .zip(produced.fields())
             .any(|(expected, produced)| {
-                expected.name() != produced.name()
-                    || !arrow_data_types_are_compatible(expected.data_type(), produced.data_type())
+                (if expected.name().is_empty() {
+                    produced.name() != EMPTY_COLUMN_ALIAS
+                } else {
+                    expected.name() != produced.name()
+                }) || !arrow_data_types_are_compatible(expected.data_type(), produced.data_type())
             })
     {
         return Err(DataWindowError::EncodingFailed);

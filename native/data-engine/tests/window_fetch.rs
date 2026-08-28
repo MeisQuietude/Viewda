@@ -201,6 +201,85 @@ fn projects_filters_sorts_and_statistics_with_parent_and_leaf_nulls() {
 }
 
 #[test]
+fn projects_filters_sorts_and_counts_an_empty_named_struct_child() {
+    let source = write_empty_named_struct_child_parquet();
+    let paths = [
+        FieldPath::new(["union_value", ""]),
+        FieldPath::new(["union_value", "number"]),
+        FieldPath::new(["union_value", "text"]),
+    ];
+    let filters = [DataFilter {
+        field_path: paths[0].clone(),
+        json_target: None,
+        operator: DataFilterOperator::GreaterThan,
+        values: vec!["5".to_owned()],
+        match_case: false,
+    }];
+    let sort = [DataSort {
+        field_path: paths[0].clone(),
+        json_target: None,
+        direction: DataSortDirection::Descending,
+    }];
+    let mut reader = DataWindowReader::new(source.path().to_owned());
+    let direct = decode(
+        reader
+            .fetch_fields(0, 8, &paths)
+            .expect("direct empty-name projection"),
+    )
+    .remove(0);
+    assert_eq!(
+        optional_int32_values(&direct, 0),
+        [Some(7), Some(3), Some(9)]
+    );
+    assert_eq!(
+        optional_int32_values(&direct, 1),
+        [Some(42), Some(10), Some(99)]
+    );
+    assert_eq!(
+        string_values(&direct, 2),
+        [Some("answer"), Some("ten"), Some("ninety-nine")]
+    );
+
+    let filtered_view =
+        prepare_view(source.path(), &filters, &[]).expect("filtered empty-name view");
+    let filtered = decode(
+        filtered_view
+            .fetch_window_fields(0, 8, &paths)
+            .expect("filtered empty-name projection"),
+    )
+    .remove(0);
+    assert_eq!(optional_int32_values(&filtered, 0), [Some(7), Some(9)]);
+
+    let sorted_view = prepare_view(source.path(), &[], &sort).expect("sorted empty-name view");
+    let sorted = decode(
+        sorted_view
+            .fetch_window_fields(0, 8, &paths)
+            .expect("sorted empty-name projection"),
+    )
+    .remove(0);
+    assert_eq!(
+        optional_int32_values(&sorted, 0),
+        [Some(9), Some(7), Some(3)]
+    );
+    assert_eq!(
+        optional_int32_values(&sorted, 1),
+        [Some(99), Some(42), Some(10)]
+    );
+    assert_eq!(
+        string_values(&sorted, 2),
+        [Some("ninety-nine"), Some("answer"), Some("ten")]
+    );
+
+    let statistics = ColumnStatisticsReader::new(source.path().to_owned())
+        .expect("empty-name statistics reader")
+        .fetch(&paths[0], true)
+        .expect("empty-name statistics");
+    assert_eq!(statistics.minimum.as_deref(), Some("3"));
+    assert_eq!(statistics.maximum.as_deref(), Some("9"));
+    assert_eq!(statistics.approximate_distinct_count, Some(3));
+}
+
+#[test]
 fn keeps_same_named_leaves_correlated_across_file_and_dataset_views() {
     let source = write_addressable_nested_parquet();
     let paths = [
@@ -2716,6 +2795,33 @@ fn write_nested_parquet() -> NamedTempFile {
         vec![Arc::new(profile) as ArrayRef, Arc::new(tags) as ArrayRef],
     )
     .expect("nested record batch");
+    write_batch(&source, schema, &batch);
+    source
+}
+
+fn write_empty_named_struct_child_parquet() -> NamedTempFile {
+    let source = NamedTempFile::new().expect("temporary empty-name source");
+    let fields = Fields::from(vec![
+        Field::new("", DataType::Int32, false),
+        Field::new("number", DataType::Int32, false),
+        Field::new("text", DataType::Utf8, false),
+    ]);
+    let value = StructArray::new(
+        fields,
+        vec![
+            Arc::new(Int32Array::from(vec![7, 3, 9])) as ArrayRef,
+            Arc::new(Int32Array::from(vec![42, 10, 99])) as ArrayRef,
+            Arc::new(StringArray::from(vec!["answer", "ten", "ninety-nine"])) as ArrayRef,
+        ],
+        None,
+    );
+    let schema = Arc::new(Schema::new(vec![Field::new(
+        "union_value",
+        value.data_type().clone(),
+        false,
+    )]));
+    let batch = RecordBatch::try_new(Arc::clone(&schema), vec![Arc::new(value) as ArrayRef])
+        .expect("empty-name record batch");
     write_batch(&source, schema, &batch);
     source
 }

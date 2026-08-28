@@ -105,8 +105,8 @@ pub(crate) fn build_filter_predicate_with_names(
                 .get(resolved.root_index)
                 .ok_or(FilterBuildError::Invalid)?,
         );
-        let field =
-            field_path_expression(&filter.field_path, &root).ok_or(FilterBuildError::Invalid)?;
+        let field = field_path_expression(schema, &filter.field_path, &root)
+            .ok_or(FilterBuildError::Invalid)?;
         let expression = match &filter.json_target {
             Some(target) => json_field_expression(&field, target),
             None => Some(JsonFieldExpression::Scalar(field)),
@@ -383,6 +383,18 @@ fn text_predicate(function: &str, identifier: &str, match_case: bool, negate: bo
 
 pub(crate) fn quote_identifier(identifier: &str) -> String {
     format!("\"{}\"", identifier.replace('"', "\"\""))
+}
+
+pub(crate) const EMPTY_COLUMN_ALIAS: &str = "__viewda_empty_field";
+
+pub(crate) fn quote_column_alias(alias: &str) -> String {
+    // SQL has no empty identifier. Keep the requested path authoritative and
+    // use a reserved transport-only name for DuckDB's Arrow schema.
+    if alias.is_empty() {
+        quote_identifier(EMPTY_COLUMN_ALIAS)
+    } else {
+        quote_identifier(alias)
+    }
 }
 
 #[cfg(test)]

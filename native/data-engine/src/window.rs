@@ -11,7 +11,7 @@ use thiserror::Error;
 use crate::{
     FieldPath,
     field_path::{field_path_expression, validate_field_paths},
-    filter::quote_identifier,
+    filter::{quote_column_alias, quote_identifier},
     json_path::{field_is_json, json_schema_sample_expression},
     source::{
         SchemaField, SourceError, SourceSummary, inspect_local_source_for_query, open_local_source,
@@ -177,12 +177,12 @@ impl DataWindowReader {
                 quote_identifier("__viewda_source"),
                 quote_identifier(&source_columns[resolved.root_index])
             );
-            let field =
-                field_path_expression(field_path, &root).ok_or(DataWindowError::Unsupported)?;
+            let field = field_path_expression(&summary.schema, field_path, &root)
+                .ok_or(DataWindowError::Unsupported)?;
             let projection = format!(
                 "{} AS {}",
                 json_schema_sample_expression(&field),
-                quote_identifier(field_path.leaf_name().ok_or(DataWindowError::Unsupported)?),
+                quote_column_alias(field_path.leaf_name().ok_or(DataWindowError::Unsupported)?),
             );
             let aliases = source_columns
                 .iter()
@@ -341,10 +341,10 @@ fn format_projection_expressions(
                 .map(|source| format!("{}.{}", quote_identifier(source), root))
                 .unwrap_or(root);
             let expression =
-                field_path_expression(path, &root).ok_or(DataWindowError::Unsupported)?;
+                field_path_expression(schema, path, &root).ok_or(DataWindowError::Unsupported)?;
             Ok(format!(
                 "{expression} AS {}",
-                quote_identifier(path.leaf_name().ok_or(DataWindowError::Unsupported)?)
+                quote_column_alias(path.leaf_name().ok_or(DataWindowError::Unsupported)?)
             ))
         })
         .collect::<Result<Vec<_>, DataWindowError>>()

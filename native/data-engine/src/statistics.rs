@@ -203,7 +203,7 @@ impl ColumnStatisticsReader {
         after_setup: impl FnOnce(),
     ) -> Result<ColumnStatistics, ColumnStatisticsError> {
         self.require_active()?;
-        let (relation, parameters, container_kind) = match &self.source {
+        let (relation, parameters, container_kind, schema) = match &self.source {
             ColumnStatisticsSource::File(source_path) => {
                 let (source, _) =
                     open_local_source(source_path).map_err(ColumnStatisticsError::from)?;
@@ -219,6 +219,7 @@ impl ColumnStatisticsReader {
                     "read_parquet(?)".to_owned(),
                     vec![Value::Text(path.to_owned())],
                     container_count_kind(resolved.field),
+                    summary.schema,
                 )
             }
             ColumnStatisticsSource::Dataset(dataset) => {
@@ -243,8 +244,8 @@ impl ColumnStatisticsReader {
                     .ok_or(ColumnStatisticsError::Unsupported)?,
             )
         );
-        let identifier =
-            field_path_expression(field_path, &root).ok_or(ColumnStatisticsError::Unsupported)?;
+        let identifier = field_path_expression(&schema, field_path, &root)
+            .ok_or(ColumnStatisticsError::Unsupported)?;
         if let Some(kind) = container_kind {
             return self.fetch_container(&relation, &parameters, &identifier, kind);
         }
@@ -314,8 +315,8 @@ impl ColumnStatisticsReader {
                     .ok_or(ColumnStatisticsError::Unsupported)?,
             )
         );
-        let identifier =
-            field_path_expression(field_path, &root).ok_or(ColumnStatisticsError::Unsupported)?;
+        let identifier = field_path_expression(dataset.schema(), field_path, &root)
+            .ok_or(ColumnStatisticsError::Unsupported)?;
         if let Some(kind) = container_kind {
             return self.fetch_dataset_container(dataset, &identifier, kind);
         }

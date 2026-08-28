@@ -92,18 +92,42 @@ pub(crate) fn field_is_struct(field: &SchemaField) -> bool {
     field.physical_type == "GROUP" && !matches!(field.logical_type.as_deref(), Some("List" | "Map"))
 }
 
-pub(crate) fn field_path_expression(path: &FieldPath, root: &str) -> Option<String> {
-    let (_, child_names) = path.0.split_first()?;
-    Some(
-        child_names
+pub(crate) fn field_path_expression(
+    schema: &[SchemaField],
+    path: &FieldPath,
+    root: &str,
+) -> Option<String> {
+    let (root_name, child_names) = path.0.split_first()?;
+    let mut roots = schema.iter().filter(|field| field.name == *root_name);
+    let mut field = roots.next()?;
+    if roots.next().is_some() {
+        return None;
+    }
+    let mut expression = root.to_owned();
+    for child_name in child_names {
+        if !field_is_struct(field) {
+            return None;
+        }
+        let mut matches = field
+            .children
             .iter()
-            .fold(root.to_owned(), |expression, name| {
-                format!(
-                    "struct_extract({expression}, {})",
-                    quote_string_literal(name)
-                )
-            }),
-    )
+            .enumerate()
+            .filter(|(_, child)| child.name == *child_name);
+        let (child_index, child) = matches.next()?;
+        if matches.next().is_some() {
+            return None;
+        }
+        expression = if field.children.iter().any(|child| child.name.is_empty()) {
+            format!("struct_extract_at({expression}, {})", child_index + 1)
+        } else {
+            format!(
+                "struct_extract({expression}, {})",
+                quote_string_literal(child_name)
+            )
+        };
+        field = child;
+    }
+    Some(expression)
 }
 
 pub(crate) fn field_path_title(path: &FieldPath) -> String {

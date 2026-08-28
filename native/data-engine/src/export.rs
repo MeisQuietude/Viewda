@@ -469,8 +469,8 @@ impl DataExportReader {
                     "source.{}",
                     quote_identifier(&self.schema[resolved.root_index].name)
                 );
-                let expression =
-                    field_path_expression(path, &root).ok_or(DataExportError::InvalidRequest)?;
+                let expression = field_path_expression(&self.schema, path, &root)
+                    .ok_or(DataExportError::InvalidRequest)?;
                 Ok(export_column_expression_from(
                     resolved.field,
                     &expression,
@@ -798,8 +798,8 @@ fn build_export_query(
             let resolved =
                 resolve_field_path(schema, path).ok_or(DataExportError::InvalidRequest)?;
             let root = quote_identifier(&schema[resolved.root_index].name);
-            let expression =
-                field_path_expression(path, &root).ok_or(DataExportError::InvalidRequest)?;
+            let expression = field_path_expression(schema, path, &root)
+                .ok_or(DataExportError::InvalidRequest)?;
             Ok::<String, DataExportError>(export_column_expression_from(
                 resolved.field,
                 &expression,
@@ -940,8 +940,8 @@ fn build_sorted_view_query(
                 .get(resolved.root_index)
                 .ok_or(DataExportError::InvalidRequest)?;
             let root = format!("{source}.{}", quote_identifier(source_column));
-            let expression =
-                field_path_expression(path, &root).ok_or(DataExportError::InvalidRequest)?;
+            let expression = field_path_expression(schema, path, &root)
+                .ok_or(DataExportError::InvalidRequest)?;
             Ok(export_column_expression_from(
                 resolved.field,
                 &expression,

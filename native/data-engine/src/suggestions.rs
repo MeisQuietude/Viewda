@@ -234,8 +234,7 @@ impl TextValueSuggestionsReader {
                 .first()
                 .ok_or(DataWindowError::InvalidFilter)?,
         );
-        let expression =
-            field_path_expression(field_path, &root).ok_or(DataWindowError::InvalidFilter)?;
+        let expression = self.field_expression(field_path, &root)?;
         let query = suggestion_query(&expression, match_function, &relation);
         let mut statement = connection
             .prepare_cached(&query)
@@ -319,6 +318,30 @@ impl TextValueSuggestionsReader {
         field.ok_or(DataWindowError::InvalidFilter)
     }
 
+    fn field_expression(
+        &self,
+        field_path: &FieldPath,
+        root: &str,
+    ) -> Result<String, DataWindowError> {
+        match &self.source {
+            TextValueSuggestionsSource::File { schema, .. } => {
+                let schema = schema
+                    .lock()
+                    .map_err(|_| DataWindowError::QueryEngineUnavailable)?;
+                field_path_expression(
+                    schema.as_deref().ok_or(DataWindowError::InvalidFilter)?,
+                    field_path,
+                    root,
+                )
+                .ok_or(DataWindowError::InvalidFilter)
+            }
+            TextValueSuggestionsSource::Dataset(dataset) => {
+                field_path_expression(dataset.schema(), field_path, root)
+                    .ok_or(DataWindowError::InvalidFilter)
+            }
+        }
+    }
+
     fn fetch_dataset_batches(
         &self,
         connection: &Connection,
@@ -338,8 +361,8 @@ impl TextValueSuggestionsReader {
                 .first()
                 .ok_or(DataWindowError::InvalidFilter)?,
         );
-        let expression =
-            field_path_expression(field_path, &root).ok_or(DataWindowError::InvalidFilter)?;
+        let expression = field_path_expression(dataset.schema(), field_path, &root)
+            .ok_or(DataWindowError::InvalidFilter)?;
         let query = suggestion_query(&expression, match_function, &dataset.relation_sql());
         let parameters = [duckdb::types::Value::Text(input.to_owned())];
         let mut seen = HashSet::with_capacity(MAX_TEXT_VALUE_SUGGESTIONS);
