@@ -45,16 +45,26 @@ pub(crate) fn resolve_field_path<'a>(
     path: &FieldPath,
 ) -> Option<ResolvedFieldPath<'a>> {
     let (root_name, child_names) = path.0.split_first()?;
-    let root_index = schema.iter().position(|field| field.name == *root_name)?;
-    let mut field = schema.get(root_index)?;
+    let mut roots = schema
+        .iter()
+        .enumerate()
+        .filter(|(_, field)| field.name == *root_name);
+    let (root_index, mut field) = roots.next()?;
+    if roots.next().is_some() {
+        return None;
+    }
     for child_name in child_names {
         if !field_is_struct(field) {
             return None;
         }
-        field = field
+        let mut children = field
             .children
             .iter()
-            .find(|child| child.name == *child_name)?;
+            .filter(|child| child.name == *child_name);
+        field = children.next()?;
+        if children.next().is_some() {
+            return None;
+        }
     }
     Some(ResolvedFieldPath { root_index, field })
 }
@@ -122,16 +132,24 @@ pub(crate) fn project_arrow_field_paths(
         .iter()
         .map(|path| {
             let (root_name, child_names) = path.0.split_first()?;
-            let mut field = schema
+            let mut roots = schema
                 .fields()
                 .iter()
-                .find(|field| field.name() == root_name)?;
+                .filter(|field| field.name() == root_name);
+            let mut field = roots.next()?;
+            if roots.next().is_some() {
+                return None;
+            }
             let mut nullable = field.is_nullable();
             for child_name in child_names {
                 let DataType::Struct(children) = field.data_type() else {
                     return None;
                 };
-                field = children.iter().find(|field| field.name() == child_name)?;
+                let mut matches = children.iter().filter(|field| field.name() == child_name);
+                field = matches.next()?;
+                if matches.next().is_some() {
+                    return None;
+                }
                 nullable |= field.is_nullable();
             }
             Some(Arc::new(

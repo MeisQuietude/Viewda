@@ -12,7 +12,9 @@ use crate::{
     FieldPath,
     field_path::{field_path_expression, validate_field_paths},
     filter::quote_identifier,
-    source::{SchemaField, SourceError, inspect_local_source_for_query, open_local_source},
+    source::{
+        SchemaField, SourceError, SourceSummary, inspect_local_source_for_query, open_local_source,
+    },
 };
 
 // Keep in sync with DataGrid.tsx's MAX_WINDOW_ROWS; this is the authoritative IPC guard.
@@ -70,7 +72,7 @@ pub enum DataWindowError {
 pub struct DataWindowReader {
     source_path: PathBuf,
     connection: Option<Connection>,
-    schema: Option<Vec<SchemaField>>,
+    summary: Option<SourceSummary>,
 }
 
 impl DataWindowReader {
@@ -79,7 +81,7 @@ impl DataWindowReader {
         Self {
             source_path,
             connection: None,
-            schema: None,
+            summary: None,
         }
     }
 
@@ -101,27 +103,60 @@ impl DataWindowReader {
             return Err(DataWindowError::Unsupported);
         }
         let projection = {
-            let schema = match &self.schema {
-                Some(schema) => schema,
-                None => self.schema.insert(
+            let summary = match &self.summary {
+                Some(summary) => summary,
+                None => self.summary.insert(
                     inspect_local_source_for_query(&self.source_path)
-                        .map_err(DataWindowError::from)?
-                        .schema,
+                        .map_err(DataWindowError::from)?,
                 ),
             };
+            let schema = &summary.schema;
             validate_field_paths(schema, field_paths).ok_or(DataWindowError::Unsupported)?;
-            let projection = format_projection_clause(schema, field_paths)?;
-            (projection != "*").then_some(projection)
+            if is_identity_projection(schema, field_paths) {
+                None
+            } else {
+                let source_columns = (0..schema.len())
+                    .map(|index| format!("__viewda_column_{index}"))
+                    .collect::<Vec<_>>();
+                let projection = format_projection_expressions(
+                    schema,
+                    field_paths,
+                    &source_columns,
+                    Some("__viewda_source"),
+                )?;
+                let aliases = source_columns
+                    .iter()
+                    .map(|column| quote_identifier(column))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let source_row_count = if field_paths.iter().any(|path| path.segments().len() > 1) {
+                    Some(
+                        i64::try_from(summary.row_count)
+                            .map_err(|_| DataWindowError::Unsupported)?,
+                    )
+                } else {
+                    None
+                };
+                Some((projection, aliases, source_row_count))
+            }
         };
 
-        self.fetch_projection(row_offset, row_count, projection.as_deref())
+        self.fetch_projection(
+            row_offset,
+            row_count,
+            projection
+                .as_ref()
+                .map(|(projection, aliases, source_row_count)| {
+                    (projection.as_str(), aliases.as_str(), *source_row_count)
+                }),
+        )
     }
 
     fn fetch_projection(
         &mut self,
         row_offset: u64,
         row_count: u32,
-        projection: Option<&str>,
+        projection: Option<(&str, &str, Option<i64>)>,
     ) -> Result<Vec<u8>, DataWindowError> {
         // Keep the preflight to two four-byte reads. Parsing the footer for every
         // scroll window would duplicate DuckDB work and make latency scale with metadata size.
@@ -140,15 +175,30 @@ impl DataWindowReader {
             .connection
             .as_ref()
             .ok_or(DataWindowError::QueryEngineUnavailable)?;
-        let sql = projection.map_or_else(
-            || "SELECT * FROM read_parquet(?) LIMIT ? OFFSET ?".to_owned(),
-            |projection| format!("SELECT {projection} FROM read_parquet(?) LIMIT ? OFFSET ?"),
-        );
-        let parameters = [
-            Value::Text(path.to_owned()),
-            Value::BigInt(i64::from(row_count)),
-            Value::BigInt(row_offset),
-        ];
+        let (sql, parameters) = match projection {
+            None => (
+                "SELECT * FROM read_parquet(?) LIMIT ? OFFSET ?".to_owned(),
+                vec![
+                    Value::Text(path.to_owned()),
+                    Value::BigInt(i64::from(row_count)),
+                    Value::BigInt(row_offset),
+                ],
+            ),
+            Some((projection, aliases, source_row_count)) => {
+                let mut parameters = vec![Value::Text(path.to_owned())];
+                if let Some(source_row_count) = source_row_count {
+                    parameters.push(Value::BigInt(source_row_count));
+                }
+                parameters.extend([
+                    Value::BigInt(i64::from(row_count)),
+                    Value::BigInt(row_offset),
+                ]);
+                (
+                    projected_window_query(projection, aliases, source_row_count.is_some()),
+                    parameters,
+                )
+            }
+        };
         let mut statement = connection
             .prepare_cached(&sql)
             .map_err(|_| DataWindowError::QueryEngineUnavailable)?;
@@ -177,34 +227,75 @@ impl DataWindowReader {
     }
 }
 
+fn projected_window_query(projection: &str, aliases: &str, nested: bool) -> String {
+    // The matching range leaves cardinality and order unchanged while preventing DuckDB's LIMIT
+    // pushdown from widening a nested Parquet leaf projection. Top-level subsets do not need it.
+    let leaf_projection_guard = if nested {
+        " POSITIONAL JOIN range(?)"
+    } else {
+        ""
+    };
+    format!(
+        "SELECT {projection} FROM read_parquet(?) \
+         AS \"__viewda_source\"({aliases}){leaf_projection_guard} LIMIT ? OFFSET ?"
+    )
+}
+
+#[cfg(test)]
 fn format_projection_clause(
     schema: &[SchemaField],
     field_paths: &[FieldPath],
 ) -> Result<String, DataWindowError> {
-    let identity_projection = field_paths.len() == schema.len()
+    if is_identity_projection(schema, field_paths) {
+        Ok("*".to_owned())
+    } else {
+        let roots = schema
+            .iter()
+            .map(|field| field.name.clone())
+            .collect::<Vec<_>>();
+        format_projection_expressions(schema, field_paths, &roots, None)
+    }
+}
+
+fn is_identity_projection(schema: &[SchemaField], field_paths: &[FieldPath]) -> bool {
+    field_paths.len() == schema.len()
         && field_paths
             .iter()
             .zip(schema)
-            .all(|(path, field)| path.segments() == [field.name.as_str()]);
-    if identity_projection {
-        Ok("*".to_owned())
-    } else {
-        field_paths
-            .iter()
-            .map(|path| {
-                let resolved = crate::field_path::resolve_field_path(schema, path)
-                    .ok_or(DataWindowError::Unsupported)?;
-                let root = quote_identifier(&schema[resolved.root_index].name);
-                let expression =
-                    field_path_expression(path, &root).ok_or(DataWindowError::Unsupported)?;
-                Ok(format!(
-                    "{expression} AS {}",
-                    quote_identifier(path.leaf_name().ok_or(DataWindowError::Unsupported)?)
-                ))
-            })
-            .collect::<Result<Vec<_>, DataWindowError>>()
-            .map(|expressions| expressions.join(", "))
+            .all(|(path, field)| path.segments() == [field.name.as_str()])
+}
+
+fn format_projection_expressions(
+    schema: &[SchemaField],
+    field_paths: &[FieldPath],
+    root_names: &[String],
+    source_alias: Option<&str>,
+) -> Result<String, DataWindowError> {
+    if root_names.len() != schema.len() {
+        return Err(DataWindowError::Unsupported);
     }
+    field_paths
+        .iter()
+        .map(|path| {
+            let resolved = crate::field_path::resolve_field_path(schema, path)
+                .ok_or(DataWindowError::Unsupported)?;
+            let root = quote_identifier(
+                root_names
+                    .get(resolved.root_index)
+                    .ok_or(DataWindowError::Unsupported)?,
+            );
+            let root = source_alias
+                .map(|source| format!("{}.{}", quote_identifier(source), root))
+                .unwrap_or(root);
+            let expression =
+                field_path_expression(path, &root).ok_or(DataWindowError::Unsupported)?;
+            Ok(format!(
+                "{expression} AS {}",
+                quote_identifier(path.leaf_name().ok_or(DataWindowError::Unsupported)?)
+            ))
+        })
+        .collect::<Result<Vec<_>, DataWindowError>>()
+        .map(|expressions| expressions.join(", "))
 }
 
 fn validate_window_size(row_count: u32) -> Result<(), DataWindowError> {
@@ -266,7 +357,123 @@ impl From<SourceError> for DataWindowError {
 }
 #[cfg(test)]
 mod tests {
+    use std::io::Cursor;
+
+    use arrow_array::Int64Array;
+    use arrow_ipc::reader::StreamReader;
+    use duckdb::params;
+    use tempfile::tempdir;
+
     use super::*;
+
+    #[test]
+    fn direct_windows_choose_simple_top_level_and_leaf_pruned_nested_plans() {
+        let directory = tempdir().expect("projection fixture directory");
+        let path = directory.path().join("nested-projection.parquet");
+        let path_text = path.to_str().expect("UTF-8 fixture path");
+        let connection = Connection::open_in_memory().expect("fixture connection");
+        connection
+            .execute("SET VARIABLE __test_path = ?", params![path_text])
+            .expect("set fixture path");
+        connection
+            .execute(
+                "COPY (SELECT range AS id, \
+                 struct_pack(wanted := range, ignored := repeat('x', 1000)) AS profile \
+                 FROM range(10)) TO (getvariable('__test_path')) (FORMAT PARQUET)",
+                [],
+            )
+            .expect("nested projection fixture");
+        let schema = inspect_local_source_for_query(&path)
+            .expect("projection fixture schema")
+            .schema;
+        let source_columns = (0..schema.len())
+            .map(|index| format!("__viewda_column_{index}"))
+            .collect::<Vec<_>>();
+        let aliases = source_columns
+            .iter()
+            .map(|column| quote_identifier(column))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let projection = format_projection_expressions(
+            &schema,
+            &[FieldPath::new(["profile", "wanted"])],
+            &source_columns,
+            Some("__viewda_source"),
+        )
+        .expect("nested projection clause");
+        let query = projected_window_query(&projection, &aliases, true);
+        let plan = connection
+            .prepare(&format!("EXPLAIN {query}"))
+            .expect("explain nested window")
+            .query_map(params![path_text, 10_i64, 1_i64, 0_i64], |row| {
+                row.get::<_, String>(1)
+            })
+            .expect("explain rows")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("physical plan")
+            .join("\n");
+
+        assert!(plan.contains("__viewda_column_1.wanted"), "{plan}");
+        assert!(!plan.contains("ignored"), "{plan}");
+
+        let projection = format_projection_expressions(
+            &schema,
+            &[FieldPath::from("id")],
+            &source_columns,
+            Some("__viewda_source"),
+        )
+        .expect("top-level projection clause");
+        let query = projected_window_query(&projection, &aliases, false);
+        let plan = connection
+            .prepare(&format!("EXPLAIN {query}"))
+            .expect("explain top-level window")
+            .query_map(params![path_text, 1_i64, 8_i64], |row| {
+                row.get::<_, String>(1)
+            })
+            .expect("explain rows")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("physical plan")
+            .join("\n");
+        assert!(!plan.contains("POSITIONAL_SCAN"), "{plan}");
+        assert!(plan.contains("__viewda_column_0"), "{plan}");
+
+        let mut reader = DataWindowReader::new(path);
+        let bytes = reader
+            .fetch_fields(0, 1, &[FieldPath::new(["profile", "wanted"])])
+            .expect("nested leaf window");
+        let batch = StreamReader::try_new(Cursor::new(bytes), None)
+            .expect("Arrow IPC stream")
+            .next()
+            .expect("one batch")
+            .expect("valid batch");
+        assert_eq!(batch.schema().field(0).name(), "wanted");
+        assert_eq!(
+            batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .expect("wanted integers")
+                .value(0),
+            0
+        );
+        let bytes = reader
+            .fetch_fields(8, 1, &[FieldPath::from("id")])
+            .expect("top-level projected window");
+        let batch = StreamReader::try_new(Cursor::new(bytes), None)
+            .expect("Arrow IPC stream")
+            .next()
+            .expect("one batch")
+            .expect("valid batch");
+        assert_eq!(
+            batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .expect("id integers")
+                .values(),
+            &[8]
+        );
+    }
 
     #[test]
     fn distinguishes_filter_conversion_resource_corruption_and_query_failures() {

@@ -1995,6 +1995,61 @@ mod tests {
     }
 
     #[test]
+    fn prepared_nested_window_projects_only_the_requested_parquet_leaf() {
+        let source = write_nested_value_fixture();
+        let view = DataViewBuilder::new(
+            source.path().to_owned(),
+            &[],
+            &[DataSort {
+                field_path: field("id"),
+                direction: DataSortDirection::Ascending,
+            }],
+        )
+        .expect("view builder")
+        .build()
+        .expect("prepared view");
+        let amount = FieldPath::new(["payload", "amount"]);
+        let query = build_window_query(
+            &view.schema,
+            &view.source_columns,
+            view.source_row_count,
+            source.path().to_str().expect("UTF-8 source path"),
+            view.position_index_path()
+                .to_str()
+                .expect("UTF-8 position path"),
+            std::slice::from_ref(&amount),
+        )
+        .expect("DuckDB fallback query");
+        let plan = view
+            .source_connection
+            .prepare(&format!("EXPLAIN {query}"))
+            .expect("explain prepared window")
+            .query_map(duckdb::params![2_i64, 0_i64], |row| row.get::<_, String>(1))
+            .expect("explain rows")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("physical plan")
+            .join("\n");
+        assert!(plan.contains("__viewda_column_1.amount"), "{plan}");
+        assert!(!plan.contains("occurred_at"), "{plan}");
+        assert!(!plan.contains("blob"), "{plan}");
+
+        let batch = decode_one_window(
+            view.fetch_window_fields(0, 2, std::slice::from_ref(&amount))
+                .expect("prepared leaf window"),
+            "prepared leaf",
+        );
+        assert_eq!(
+            batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<Decimal128Array>()
+                .expect("amount decimals")
+                .values(),
+            &[1_234, -5_678]
+        );
+    }
+
+    #[test]
     fn traverses_sparse_position_row_groups_without_gaps_duplicates_or_reordering() {
         const ROW_GROUP_ROWS: i64 = 2_048;
         const ROW_GROUP_COUNT: i64 = 8;

@@ -656,6 +656,24 @@ describe("desktop seam", () => {
     });
   });
 
+  it("passes dotted and quoted field-path segments through the window invoke", async () => {
+    const encodedWindow = Uint8Array.from([4, 8, 15, 16, 23, 42]).buffer;
+    invokeMock.mockResolvedValue(encodedWindow);
+
+    const window = await getDataWindow(7, 3, 10, 20, [
+      ["record.with.dot", 'label"quoted'],
+    ]);
+
+    expect(Array.from(new Uint8Array(window))).toEqual([4, 8, 15, 16, 23, 42]);
+    expect(invokeMock).toHaveBeenCalledWith("get_data_window", {
+      generation: 7,
+      viewRevision: 3,
+      rowOffset: 10,
+      rowCount: 20,
+      fieldPaths: [["record.with.dot", 'label"quoted']],
+    });
+  });
+
   it.each(["memoryExhausted", "temporaryStorageExhausted"] as const)(
     "keeps the %s preparation diagnostics typed",
     async (code) => {

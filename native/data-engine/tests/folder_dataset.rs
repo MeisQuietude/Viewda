@@ -1817,6 +1817,61 @@ fn unions_nested_fields_and_qualifies_nested_conflicts() {
 }
 
 #[test]
+fn maps_canonical_paths_to_each_members_exact_case_for_sparse_reads_and_export() {
+    let directory = TempDir::new().expect("case-drift dataset");
+    write_columns(
+        &directory.path().join("a.parquet"),
+        vec![("Profile", case_drift_profile("Address", "City", "Oslo"))],
+    );
+    write_columns(
+        &directory.path().join("b.parquet"),
+        vec![("profile", case_drift_profile("address", "city", "Riga"))],
+    );
+    let mut reader =
+        complete_reader(DatasetSource::open_folder(directory.path()).expect("folder dataset"));
+    let city = FieldPath::new(["Profile", "Address", "City"]);
+
+    let direct = decode_one(
+        &reader
+            .fetch_fields(0, 8, std::slice::from_ref(&city))
+            .expect("direct case-drift window"),
+    );
+    assert_eq!(string_values(&direct, 0), [Some("Oslo"), Some("Riga")]);
+
+    let view = DataViewBuilder::for_dataset(&reader, &[], &[], DataViewMemoryLimit::Mb384)
+        .expect("case-drift view builder")
+        .build()
+        .expect("case-drift view");
+    let prepared = decode_one(
+        &view
+            .fetch_window_fields(0, 8, std::slice::from_ref(&city))
+            .expect("prepared case-drift window"),
+    );
+    assert_eq!(string_values(&prepared, 0), [Some("Oslo"), Some("Riga")]);
+
+    let target = directory.path().join("case-drift.csv");
+    DataExportReader::for_dataset(
+        &reader,
+        target.clone(),
+        DataExportRequest {
+            field_paths: vec![city],
+            row_ranges: Vec::new(),
+            output: DataExportFormat::Csv {
+                options: CsvExportOptions::default(),
+            },
+        },
+        Some(view.export_snapshot()),
+    )
+    .expect("case-drift export reader")
+    .export()
+    .expect("case-drift export");
+    assert_eq!(
+        fs::read_to_string(target).expect("case-drift CSV"),
+        "Profile.Address.City\r\nOslo\r\nRiga\r\n"
+    );
+}
+
+#[test]
 fn widens_safe_numeric_drift_and_rejects_lossy_promotions() {
     let numeric = TempDir::new().expect("numeric dataset");
     write_columns(
@@ -3953,6 +4008,17 @@ fn write_columns(path: &std::path::Path, columns: Vec<(&str, ArrayRef)>) {
     let mut writer = ArrowWriter::try_new(file, schema, None).expect("fixture writer");
     writer.write(&batch).expect("fixture rows");
     writer.close().expect("fixture footer");
+}
+
+fn case_drift_profile(address: &str, city: &str, value: &str) -> ArrayRef {
+    let address_array = StructArray::from(vec![(
+        Arc::new(Field::new(city, DataType::Utf8, true)),
+        Arc::new(StringArray::from(vec![value])) as ArrayRef,
+    )]);
+    Arc::new(StructArray::from(vec![(
+        Arc::new(Field::new(address, address_array.data_type().clone(), true)),
+        Arc::new(address_array) as ArrayRef,
+    )]))
 }
 
 fn corrupt_first_column_data(path: &std::path::Path) {

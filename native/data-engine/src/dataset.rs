@@ -1839,7 +1839,11 @@ impl DatasetQuerySource {
                 .get(source_index)
                 .ok_or(DataWindowError::Unsupported)?;
             if source_index < self.physical_column_count {
-                physical_paths.push(field_path.clone());
+                if let Some(physical_path) =
+                    physical_member_field_path(metadata.schema(), field_path)?
+                {
+                    physical_paths.push(physical_path);
+                }
             } else if !seen_virtual_indices.contains(&source_index) {
                 seen_virtual_indices.push(source_index);
                 virtual_columns.push(SparseVirtualColumn {
@@ -2833,6 +2837,37 @@ struct SparsePhysicalColumn {
     field: Arc<Field>,
 }
 
+// Dataset union identity ignores ASCII case; Parquet physical projection does not.
+fn physical_member_field_path(
+    schema: &Schema,
+    canonical_path: &FieldPath,
+) -> Result<Option<FieldPath>, DatasetError> {
+    let mut fields = schema.fields();
+    let mut physical_segments = Vec::with_capacity(canonical_path.segments().len());
+    for (index, segment) in canonical_path.segments().iter().enumerate() {
+        let mut matches = fields
+            .iter()
+            .filter(|field| field.name().eq_ignore_ascii_case(segment));
+        let Some(field) = matches.next() else {
+            return Ok(None);
+        };
+        if matches.next().is_some() {
+            return Err(DatasetError::Unsupported);
+        }
+        physical_segments.push(field.name().to_owned());
+        if index + 1 < canonical_path.segments().len() {
+            let DataType::Struct(children) = field.data_type() else {
+                return Err(DatasetError::Unsupported);
+            };
+            fields = children;
+        }
+    }
+    if physical_segments.is_empty() {
+        return Err(DatasetError::Unsupported);
+    }
+    Ok(Some(FieldPath::new(physical_segments)))
+}
+
 fn parquet_leaf_projection(
     metadata: &ArrowReaderMetadata,
     field_paths: &[FieldPath],
@@ -2851,7 +2886,7 @@ fn parquet_leaf_projection(
                         && parts
                             .iter()
                             .zip(path.segments())
-                            .all(|(part, segment)| part.eq_ignore_ascii_case(segment))
+                            .all(|(part, segment)| part == segment)
                 })
                 .then_some(index)
         })
@@ -4386,16 +4421,18 @@ mod tests {
     use super::*;
 
     #[test]
-    fn sparse_nested_projection_selects_only_requested_parquet_leaves() {
+    fn sparse_nested_projection_matches_leaf_segments_case_sensitively() {
         let source = tempfile::NamedTempFile::new().expect("nested source");
         let profile_fields = Fields::from(vec![
             Field::new("city", DataType::Utf8, true),
+            Field::new("City", DataType::Utf8, true),
             Field::new("zip", DataType::Int64, true),
         ]);
         let profile = StructArray::new(
             profile_fields.clone(),
             vec![
                 Arc::new(StringArray::from(vec!["Oslo"])) as ArrayRef,
+                Arc::new(StringArray::from(vec!["Bergen"])) as ArrayRef,
                 Arc::new(Int64Array::from(vec![101])) as ArrayRef,
             ],
             None,

@@ -787,11 +787,22 @@ fn schema_field_at_path<'a>(
     field_path: &FieldPath,
 ) -> Option<&'a SchemaField> {
     let (root, descendants) = field_path.segments().split_first()?;
-    let mut field = schema.iter().find(|field| field.name == *root)?;
+    let mut field = unique_schema_field(schema, root)?;
     for segment in descendants {
-        field = field.children.iter().find(|child| child.name == *segment)?;
+        if field.physical_type != "GROUP"
+            || matches!(field.logical_type.as_deref(), Some("List" | "Map"))
+        {
+            return None;
+        }
+        field = unique_schema_field(&field.children, segment)?;
     }
     Some(field)
+}
+
+fn unique_schema_field<'a>(fields: &'a [SchemaField], name: &str) -> Option<&'a SchemaField> {
+    let mut matches = fields.iter().filter(|field| field.name == name);
+    let field = matches.next()?;
+    matches.next().is_none().then_some(field)
 }
 
 struct ColumnStatisticsJob {
@@ -5721,6 +5732,60 @@ mod tests {
             Err(ColumnStatisticsCommandError::UnsupportedColumn)
         );
         assert!(state.session(opened.generation + 1).is_none());
+    }
+
+    #[test]
+    fn bridge_paths_are_case_sensitive_unambiguous_and_struct_only() {
+        let leaf = |name: &str| SchemaField {
+            name: name.to_owned(),
+            physical_type: "INT64".to_owned(),
+            logical_type: None,
+            children: Vec::new(),
+        };
+        let schema = vec![
+            SchemaField {
+                name: "profile".to_owned(),
+                physical_type: "GROUP".to_owned(),
+                logical_type: None,
+                children: vec![leaf("name")],
+            },
+            SchemaField {
+                name: "tags".to_owned(),
+                physical_type: "GROUP".to_owned(),
+                logical_type: Some("List".to_owned()),
+                children: vec![leaf("element")],
+            },
+            SchemaField {
+                name: "attributes".to_owned(),
+                physical_type: "GROUP".to_owned(),
+                logical_type: Some("Map".to_owned()),
+                children: vec![leaf("key_value")],
+            },
+            SchemaField {
+                name: "scalar".to_owned(),
+                physical_type: "INT64".to_owned(),
+                logical_type: None,
+                children: vec![leaf("impossible")],
+            },
+            leaf("duplicate"),
+            leaf("duplicate"),
+        ];
+
+        assert_eq!(
+            schema_field_at_path(&schema, &FieldPath::new(["profile", "name"]))
+                .map(|field| field.name.as_str()),
+            Some("name")
+        );
+        for path in [
+            FieldPath::new(Vec::<String>::new()),
+            FieldPath::new(["Profile", "name"]),
+            FieldPath::new(["tags", "element"]),
+            FieldPath::new(["attributes", "key_value"]),
+            FieldPath::new(["scalar", "impossible"]),
+            FieldPath::from("duplicate"),
+        ] {
+            assert!(schema_field_at_path(&schema, &path).is_none(), "{path:?}");
+        }
     }
 
     #[test]

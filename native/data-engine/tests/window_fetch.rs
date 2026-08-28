@@ -21,9 +21,9 @@ use parquet::{
 };
 use tempfile::{NamedTempFile, TempDir};
 use viewda_data_engine::{
-    DataFilter, DataFilterOperator, DataSort, DataSortDirection, DataViewBuilder, DataViewError,
-    DataViewMemoryLimit, DataWindowError, DataWindowReader, DatasetSource, FieldPath,
-    PreparedDataView, TextValueSuggestionsReader, inspect_local_source,
+    ColumnStatisticsReader, DataFilter, DataFilterOperator, DataSort, DataSortDirection,
+    DataViewBuilder, DataViewError, DataViewMemoryLimit, DataWindowError, DataWindowReader,
+    DatasetSource, FieldPath, PreparedDataView, TextValueSuggestionsReader, inspect_local_source,
 };
 
 #[test]
@@ -96,7 +96,7 @@ fn preserves_nested_values_in_the_arrow_window() {
 }
 
 #[test]
-fn projects_filters_and_sorts_nested_fields_with_ancestor_null_semantics() {
+fn projects_filters_sorts_and_statistics_with_parent_and_leaf_nulls() {
     let source = write_addressable_nested_parquet();
     let city = FieldPath::new(["profile.with.dot", "city\"name"]);
     let postal = FieldPath::new(["profile.with.dot", "address", "postal.code"]);
@@ -144,6 +144,34 @@ fn projects_filters_and_sorts_nested_fields_with_ancestor_null_semantics() {
             .expect("filtered nested projection"),
     );
     assert_eq!(int64_values(&filtered[0], 0), [2, 3]);
+
+    let non_null = prepare_view(
+        source.path(),
+        &[DataFilter {
+            field_path: postal.clone(),
+            operator: DataFilterOperator::IsNotNull,
+            values: Vec::new(),
+            match_case: false,
+        }],
+        &[],
+    )
+    .expect("nested non-null filter");
+    let non_null = decode(
+        non_null
+            .fetch_window_fields(0, 8, std::slice::from_ref(&id))
+            .expect("non-null nested projection"),
+    );
+    assert_eq!(int64_values(&non_null[0], 0), [1, 4]);
+
+    let statistics = ColumnStatisticsReader::new(source.path().to_owned())
+        .expect("nested statistics reader")
+        .fetch(&postal, true)
+        .expect("nullable leaf statistics");
+    assert_eq!(statistics.null_count, 2);
+    assert_eq!(statistics.null_share, 0.5);
+    assert_eq!(statistics.minimum.as_deref(), Some("100"));
+    assert_eq!(statistics.maximum.as_deref(), Some("400"));
+    assert_eq!(statistics.approximate_distinct_count, Some(2));
 
     let sorted = prepare_view(
         source.path(),
@@ -252,6 +280,34 @@ fn rejects_paths_that_traverse_list_elements() {
 }
 
 #[test]
+fn duplicate_top_level_names_remain_readable_only_without_path_projection() {
+    let source = write_duplicate_name_parquet();
+    let mut reader = DataWindowReader::new(source.path().to_owned());
+
+    let batch = decode(
+        reader
+            .fetch(0, 1)
+            .expect("unprojected duplicate-name window"),
+    )
+    .remove(0);
+    assert_eq!(batch.num_columns(), 3);
+    assert_eq!(int32_value(&batch, 0), 11);
+    assert_eq!(int32_value(&batch, 1), 22);
+    assert_eq!(int32_value(&batch, 2), 33);
+    let projected = decode(
+        reader
+            .fetch_fields(0, 1, &[FieldPath::from("payload")])
+            .expect("unambiguous projection after duplicate columns"),
+    )
+    .remove(0);
+    assert_eq!(int32_value(&projected, 0), 33);
+    assert_eq!(
+        reader.fetch_fields(0, 1, &[FieldPath::from("duplicate")]),
+        Err(DataWindowError::Unsupported)
+    );
+}
+
+#[test]
 fn preserves_decimal128_integer_digits_across_the_arrow_window() {
     let source = write_decimal128_parquet();
     let mut reader = DataWindowReader::new(source.path().to_owned());
@@ -324,6 +380,53 @@ fn projects_five_columns_from_a_ten_thousand_column_source_in_requested_order() 
 }
 
 #[test]
+fn projects_and_validates_deep_and_wide_struct_paths() {
+    let source = write_deep_and_wide_struct_parquet();
+    let mut reader = DataWindowReader::new(source.path().to_owned());
+    let deep = FieldPath::new([
+        "deep", "level1", "level2", "level3", "level4", "level5", "level6", "value",
+    ]);
+    let first = FieldPath::new(["wide", "field000"]);
+    let middle = FieldPath::new(["wide", "field050"]);
+    let last = FieldPath::new(["wide", "field099"]);
+
+    let batch = decode(
+        reader
+            .fetch_fields(1, 1, &[last, deep.clone(), middle, first])
+            .expect("deep and wide struct projection"),
+    )
+    .remove(0);
+    assert_eq!(
+        batch
+            .schema()
+            .fields()
+            .iter()
+            .map(|field| field.name().as_str())
+            .collect::<Vec<_>>(),
+        ["field099", "value", "field050", "field000"]
+    );
+    assert_eq!(int32_value(&batch, 0), 1_099);
+    assert_eq!(int64_values(&batch, 1), [9]);
+    assert_eq!(int32_value(&batch, 2), 1_050);
+    assert_eq!(int32_value(&batch, 3), 1_000);
+
+    assert_eq!(
+        reader.fetch_fields(
+            0,
+            1,
+            &[FieldPath::new([
+                "deep", "level1", "level2", "level3", "level4", "level5", "missing", "value",
+            ])],
+        ),
+        Err(DataWindowError::Unsupported)
+    );
+    assert_eq!(
+        reader.fetch_fields(0, 1, &[FieldPath::new(["wide", "field100"])]),
+        Err(DataWindowError::Unsupported)
+    );
+}
+
+#[test]
 fn projects_a_column_whose_name_exceeds_the_wire_summary_limit() {
     let column_name = format!("long_{}", "界".repeat(100));
     let source = write_named_parquet(&column_name);
@@ -356,6 +459,80 @@ fn projected_direct_windows_preserve_deep_file_order_and_unusual_names() {
     assert_eq!(projected.schema().field(1).name(), "id\"quoted");
     assert_eq!(string_values(projected, 0), string_values(&full[0], 1));
     assert_eq!(int64_values(projected, 1), int64_values(&full[0], 0));
+}
+
+#[test]
+fn reordered_top_level_projection_matches_a_full_deep_window() {
+    let (_directory, source) = write_duckdb_nested_sort_parquet();
+    let mut reader = DataWindowReader::new(source);
+
+    let full = decode(reader.fetch(8_150, 100).expect("full deep window")).remove(0);
+    let projected = decode(
+        reader
+            .fetch_fields(8_150, 100, &[path("list_value"), path("file_order")])
+            .expect("reordered top-level deep window"),
+    )
+    .remove(0);
+
+    assert_eq!(projected.num_rows(), 100);
+    assert_eq!(
+        projected
+            .schema()
+            .fields()
+            .iter()
+            .map(|field| field.name().as_str())
+            .collect::<Vec<_>>(),
+        ["list_value", "file_order"]
+    );
+    assert_eq!(projected.column(0).to_data(), full.column(2).to_data());
+    assert_eq!(int64_values(&projected, 1), int64_values(&full, 0));
+}
+
+#[test]
+fn projected_windows_treat_file_row_number_as_data_and_keep_empty_boundaries() {
+    let source = write_file_row_number_parquet();
+    let mut reader = DataWindowReader::new(source.path().to_owned());
+    let payload = path("payload");
+
+    let batch = decode(
+        reader
+            .fetch_fields(1, 1, std::slice::from_ref(&payload))
+            .expect("projected window after the first row"),
+    )
+    .remove(0);
+    assert_eq!(string_values(&batch, 0), [Some("row-1")]);
+
+    for (offset, count) in [(1, 0), (100, 2)] {
+        let bytes = reader
+            .fetch_fields(offset, count, std::slice::from_ref(&payload))
+            .expect("empty projected window");
+        let stream = StreamReader::try_new(Cursor::new(bytes), None).expect("Arrow IPC stream");
+        assert_eq!(stream.schema().field(0).name(), "payload");
+        assert_eq!(stream.count(), 0, "window at offset {offset}");
+    }
+}
+
+#[test]
+fn projected_windows_keep_empty_schema_and_cross_row_group_order() {
+    let empty_source = write_empty_projected_parquet();
+    let mut empty_reader = DataWindowReader::new(empty_source.path().to_owned());
+    let empty_bytes = empty_reader
+        .fetch_fields(0, 4, &[path("file_order")])
+        .expect("zero-row projected window");
+    let empty = StreamReader::try_new(Cursor::new(empty_bytes), None).expect("Arrow IPC stream");
+    assert_eq!(empty.schema().field(0).name(), "file_order");
+    assert_eq!(empty.count(), 0);
+
+    let grouped_source = write_multi_group_parquet();
+    let mut grouped_reader = DataWindowReader::new(grouped_source.path().to_owned());
+    let batch = decode(
+        grouped_reader
+            .fetch_fields(3, 4, &[path("file_order")])
+            .expect("projected window across a row-group boundary"),
+    )
+    .remove(0);
+    assert_eq!(batch.num_rows(), 4);
+    assert_eq!(int64_values(&batch, 0), [3, 4, 5, 6]);
 }
 
 #[test]
@@ -606,6 +783,36 @@ fn applies_text_operators_case_insensitively_unless_match_case_is_enabled() {
             let batches = decode(view.fetch_window(0, 32).expect("text filter window"));
             assert_eq!(string_values(&batches[0], 0), expected);
         }
+    }
+}
+
+#[test]
+fn applies_nested_text_operators_to_a_dotted_path_segment() {
+    let source = write_addressable_nested_parquet();
+    let field_path = FieldPath::new(["profile.with.dot", "city\"name"]);
+    let id = path("id");
+
+    for (operator, value, expected) in [
+        (DataFilterOperator::TextContains, "c", vec![3]),
+        (DataFilterOperator::StartsWith, "d", vec![4]),
+    ] {
+        let view = prepare_view(
+            source.path(),
+            &[DataFilter {
+                field_path: field_path.clone(),
+                operator,
+                values: vec![value.to_owned()],
+                match_case: false,
+            }],
+            &[],
+        )
+        .expect("nested text-filtered view");
+        let rows = decode(
+            view.fetch_window_fields(0, 8, std::slice::from_ref(&id))
+                .expect("nested text-filtered window"),
+        );
+
+        assert_eq!(int64_values(&rows[0], 0), expected);
     }
 }
 
@@ -1824,15 +2031,16 @@ fn write_nested_parquet() -> NamedTempFile {
 
 fn write_addressable_nested_parquet() -> NamedTempFile {
     let source = NamedTempFile::new().expect("temporary source");
-    let address_fields = Fields::from(vec![Field::new("postal.code", DataType::Int32, false)]);
-    let mut address_validity = NullBufferBuilder::new(4);
-    for valid in [true, true, false, true] {
-        address_validity.append(valid);
-    }
+    let address_fields = Fields::from(vec![Field::new("postal.code", DataType::Int32, true)]);
     let address = StructArray::new(
         address_fields.clone(),
-        vec![Arc::new(Int32Array::from(vec![100, 200, 300, 400])) as ArrayRef],
-        address_validity.finish(),
+        vec![Arc::new(Int32Array::from(vec![
+            Some(100),
+            Some(200),
+            None,
+            Some(400),
+        ])) as ArrayRef],
+        None,
     );
     let profile_fields = Fields::from(vec![
         Field::new("city\"name", DataType::Utf8, false),
@@ -2046,6 +2254,70 @@ fn write_wide_parquet(column_count: usize) -> NamedTempFile {
     source
 }
 
+fn write_deep_and_wide_struct_parquet() -> NamedTempFile {
+    let source = NamedTempFile::new().expect("temporary nested-shape source");
+
+    let mut deep: ArrayRef = Arc::new(Int64Array::from(vec![7, 9]));
+    let mut child_name = "value".to_owned();
+    for level in (1..=6).rev() {
+        let fields = Fields::from(vec![Field::new(
+            &child_name,
+            deep.data_type().clone(),
+            false,
+        )]);
+        deep = Arc::new(StructArray::new(fields, vec![deep], None));
+        child_name = format!("level{level}");
+    }
+    let deep_fields = Fields::from(vec![Field::new(
+        child_name,
+        deep.data_type().clone(),
+        false,
+    )]);
+    let deep = StructArray::new(deep_fields, vec![deep], None);
+
+    let wide_fields = Fields::from(
+        (0..100)
+            .map(|index| Field::new(format!("field{index:03}"), DataType::Int32, false))
+            .collect::<Vec<_>>(),
+    );
+    let wide_columns = (0..100)
+        .map(|index| Arc::new(Int32Array::from(vec![index, 1_000 + index])) as ArrayRef)
+        .collect::<Vec<_>>();
+    let wide = StructArray::new(wide_fields, wide_columns, None);
+
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("deep", deep.data_type().clone(), false),
+        Field::new("wide", wide.data_type().clone(), false),
+    ]));
+    let batch = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![Arc::new(deep) as ArrayRef, Arc::new(wide) as ArrayRef],
+    )
+    .expect("deep and wide struct batch");
+    write_batch(&source, schema, &batch);
+    source
+}
+
+fn write_duplicate_name_parquet() -> NamedTempFile {
+    let source = NamedTempFile::new().expect("temporary duplicate-name source");
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("duplicate", DataType::Int32, false),
+        Field::new("duplicate", DataType::Int32, false),
+        Field::new("payload", DataType::Int32, false),
+    ]));
+    let batch = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![
+            Arc::new(Int32Array::from(vec![11])) as ArrayRef,
+            Arc::new(Int32Array::from(vec![22])) as ArrayRef,
+            Arc::new(Int32Array::from(vec![33])) as ArrayRef,
+        ],
+    )
+    .expect("duplicate-name record batch");
+    write_batch(&source, schema, &batch);
+    source
+}
+
 fn write_named_parquet(column_name: &str) -> NamedTempFile {
     let source = NamedTempFile::new().expect("temporary file");
     let schema = Arc::new(Schema::new(vec![Field::new(
@@ -2062,6 +2334,24 @@ fn write_named_parquet(column_name: &str) -> NamedTempFile {
         .expect("Parquet writer");
     writer.write(&batch).expect("write batch");
     writer.close().expect("write footer");
+    source
+}
+
+fn write_file_row_number_parquet() -> NamedTempFile {
+    let source = NamedTempFile::new().expect("temporary file-row-number source");
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("file_row_number", DataType::Int64, false),
+        Field::new("payload", DataType::Utf8, false),
+    ]));
+    let batch = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![
+            Arc::new(Int64Array::from(vec![40, 41, 42])) as ArrayRef,
+            Arc::new(StringArray::from(vec!["row-0", "row-1", "row-2"])) as ArrayRef,
+        ],
+    )
+    .expect("file-row-number record batch");
+    write_batch(&source, schema, &batch);
     source
 }
 
@@ -2154,6 +2444,17 @@ fn write_multi_group_parquet() -> NamedTempFile {
         writer.flush().expect("flush row group");
     }
     writer.close().expect("write footer");
+    source
+}
+
+fn write_empty_projected_parquet() -> NamedTempFile {
+    let source = NamedTempFile::new().expect("temporary zero-row source");
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("file_order", DataType::Int64, false),
+        Field::new("group", DataType::Int32, false),
+    ]));
+    let batch = RecordBatch::new_empty(Arc::clone(&schema));
+    write_batch(&source, schema, &batch);
     source
 }
 
